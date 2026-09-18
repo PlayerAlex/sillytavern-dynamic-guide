@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.2';
+    const VERSION = '1.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -11,7 +11,20 @@
     const MENU_CONTAINER_ID = `${UI_PREFIX}-menu-container`;
     const MENU_ITEM_ID = `${UI_PREFIX}-menu-item`;
     const PANEL_ID = `${UI_PREFIX}-panel`;
+    const EDITOR_ID = `${UI_PREFIX}-stage-editor`;
     const STYLE_ID = `${UI_PREFIX}-style`;
+    const LAYOUT_META_KEY = 'dynamicGuideAssistant';
+    const LAYOUT_VERSION = 1;
+    const DEFAULT_STAGE_COLORS = [
+        '#8b5cf6',
+        '#3b82f6',
+        '#14b8a6',
+        '#f59e0b',
+        '#ef4444',
+        '#ec4899',
+        '#84cc16',
+        '#06b6d4',
+    ];
 
     const currentWindow = typeof window !== 'undefined' ? window : globalThis;
     let hostWindow = currentWindow;
@@ -254,6 +267,251 @@
             mainBlocks,
             addonBlocks,
             warnings,
+        };
+    }
+
+    function normalizeColor(value, fallback) {
+        const color = String(value || '').trim();
+        if (/^#[0-9a-f]{6}$/i.test(color)) return color.toLowerCase();
+        if (/^#[0-9a-f]{3}$/i.test(color)) {
+            return `#${color.slice(1).split('').map(character => character + character).join('')}`.toLowerCase();
+        }
+        return fallback || DEFAULT_STAGE_COLORS[0];
+    }
+
+    function getRangeLayout(entry) {
+        const extra = entry && entry.extra && typeof entry.extra === 'object' ? entry.extra : null;
+        const metadata = extra && extra[LAYOUT_META_KEY] && typeof extra[LAYOUT_META_KEY] === 'object'
+            ? extra[LAYOUT_META_KEY]
+            : null;
+        const layout = metadata && metadata.layout && typeof metadata.layout === 'object'
+            ? metadata.layout
+            : null;
+        if (!layout || layout.mode !== 'ranges') return null;
+        return layout;
+    }
+
+    function makeStageId() {
+        return `stage-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    function completionMarkerId(stage, index) {
+        const source = String(stage && stage.id || '')
+            .toLowerCase()
+            .replace(/[^a-z0-9_-]+/g, '-')
+            .replace(/^-+|-+$/g, '');
+        return source || `stage-${index + 1}-${hashText(stage && stage.name || String(index)).slice(0, 6)}`;
+    }
+
+    function clampOffset(value, textLength) {
+        const number = Number(value);
+        if (!Number.isFinite(number)) return 0;
+        return Math.max(0, Math.min(Math.trunc(number), textLength));
+    }
+
+    function createAnchoredRange(text, start, end) {
+        const normalizedText = normalizeText(text);
+        const safeStart = clampOffset(Math.min(start, end), normalizedText.length);
+        const safeEnd = clampOffset(Math.max(start, end), normalizedText.length);
+        return {
+            start: safeStart,
+            end: safeEnd,
+            quote: normalizedText.slice(safeStart, safeEnd),
+            prefix: normalizedText.slice(Math.max(0, safeStart - 32), safeStart),
+            suffix: normalizedText.slice(safeEnd, Math.min(normalizedText.length, safeEnd + 32)),
+        };
+    }
+
+    function allTextOccurrences(text, quote) {
+        const positions = [];
+        if (!quote) return positions;
+        let offset = 0;
+        while (offset <= text.length - quote.length) {
+            const found = text.indexOf(quote, offset);
+            if (found < 0) break;
+            positions.push(found);
+            offset = found + Math.max(1, quote.length);
+        }
+        return positions;
+    }
+
+    function resolveAnchoredRange(text, rawRange) {
+        const normalizedText = normalizeText(text);
+        if (!rawRange || typeof rawRange !== 'object') return null;
+        const quote = String(rawRange.quote || '');
+        const storedStart = clampOffset(rawRange.start, normalizedText.length);
+        const storedEnd = clampOffset(rawRange.end, normalizedText.length);
+        if (storedEnd > storedStart) {
+            const direct = normalizedText.slice(storedStart, storedEnd);
+            if (!quote || direct === quote) {
+                return {
+                    start: storedStart,
+                    end: storedEnd,
+                    quote: direct,
+                    reanchored: false,
+                };
+            }
+        }
+        if (!quote) return null;
+
+        const prefix = String(rawRange.prefix || '');
+        const suffix = String(rawRange.suffix || '');
+        const candidates = allTextOccurrences(normalizedText, quote);
+        if (candidates.length === 0) return null;
+        let best = null;
+        let bestScore = Number.NEGATIVE_INFINITY;
+        candidates.forEach(position => {
+            let score = -Math.abs(position - storedStart);
+            if (prefix) {
+                const actualPrefix = normalizedText.slice(Math.max(0, position - prefix.length), position);
+                if (actualPrefix === prefix) score += 100000;
+            }
+            if (suffix) {
+                const actualSuffix = normalizedText.slice(position + quote.length, position + quote.length + suffix.length);
+                if (actualSuffix === suffix) score += 100000;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = position;
+            }
+        });
+        return best == null ? null : {
+            start: best,
+            end: best + quote.length,
+            quote,
+            reanchored: best !== storedStart,
+        };
+    }
+
+    function resolveRangeList(text, ranges) {
+        const resolved = [];
+        let unresolvedCount = 0;
+        let reanchoredCount = 0;
+        (Array.isArray(ranges) ? ranges : []).forEach(range => {
+            const result = resolveAnchoredRange(text, range);
+            if (!result || result.end <= result.start) {
+                unresolvedCount += 1;
+                return;
+            }
+            if (result.reanchored) reanchoredCount += 1;
+            resolved.push(result);
+        });
+        resolved.sort((left, right) => left.start - right.start || left.end - right.end);
+        return { resolved, unresolvedCount, reanchoredCount };
+    }
+
+    function resolveRangeLayout(text, layout) {
+        const normalizedText = normalizeText(text);
+        const stages = (Array.isArray(layout && layout.stages) ? layout.stages : []).map((stage, index) => {
+            const rangeResult = resolveRangeList(normalizedText, stage && stage.ranges);
+            return {
+                id: String(stage && stage.id || `stage-${index + 1}-${hashText(stage && stage.name || String(index)).slice(0, 6)}`),
+                name: String(stage && stage.name || `阶段 ${index + 1}`).trim() || `阶段 ${index + 1}`,
+                color: normalizeColor(stage && stage.color, DEFAULT_STAGE_COLORS[index % DEFAULT_STAGE_COLORS.length]),
+                completion: String(stage && stage.completion || '').trim(),
+                ranges: rangeResult.resolved,
+                unresolvedCount: rangeResult.unresolvedCount,
+                reanchoredCount: rangeResult.reanchoredCount,
+            };
+        });
+        const alwaysSource = layout && layout.always && typeof layout.always === 'object' ? layout.always : {};
+        const alwaysResult = resolveRangeList(normalizedText, alwaysSource.ranges);
+        return {
+            sourceHashMatches: String(layout && layout.sourceHash || '') === hashText(normalizedText),
+            stages,
+            always: {
+                color: normalizeColor(alwaysSource.color, '#64748b'),
+                ranges: alwaysResult.resolved,
+                unresolvedCount: alwaysResult.unresolvedCount,
+                reanchoredCount: alwaysResult.reanchoredCount,
+            },
+        };
+    }
+
+    function textFromResolvedRanges(text, ranges) {
+        const normalizedText = normalizeText(text);
+        return (Array.isArray(ranges) ? ranges : [])
+            .map(range => normalizedText.slice(range.start, range.end).trim())
+            .filter(Boolean)
+            .join('\n\n');
+    }
+
+    function parseGuideEntry(entry) {
+        const layout = getRangeLayout(entry);
+        if (!layout) return parseGuideText(entry && entry.content);
+
+        const text = normalizeText(entry && entry.content);
+        const resolved = resolveRangeLayout(text, layout);
+        const warnings = [];
+        const blocks = [];
+        resolved.stages.forEach((stage, index) => {
+            const prompt = textFromResolvedRanges(text, stage.ranges);
+            if (!prompt) {
+                warnings.push(`“${stage.name}”没有可用的文字选区，已跳过。`);
+                return;
+            }
+            if (stage.unresolvedCount > 0) {
+                warnings.push(`“${stage.name}”有 ${stage.unresolvedCount} 个选区无法重新定位，请打开阶段标注器检查。`);
+            }
+            const mainIndex = blocks.filter(block => block.kind === 'main').length;
+            blocks.push({
+                id: completionMarkerId(stage, index),
+                sourceIndex: index,
+                title: stage.name,
+                type: '主线阶段',
+                kind: 'main',
+                whenShow: mainIndex === 0 ? '游戏开始时' : '上一段结束后',
+                prompt,
+                whenHide: stage.completion || '手动推进，或由 AI 判断本阶段大纲已经完成',
+                followStage: '',
+                raw: prompt,
+                mainIndex,
+                anchorMainIndex: mainIndex,
+                color: stage.color,
+            });
+        });
+
+        const mainBlocks = blocks.filter(block => block.kind === 'main');
+        const alwaysPrompt = textFromResolvedRanges(text, resolved.always.ranges);
+        if (resolved.always.unresolvedCount > 0) {
+            warnings.push(`常驻提示有 ${resolved.always.unresolvedCount} 个选区无法重新定位，请打开阶段标注器检查。`);
+        }
+        if (alwaysPrompt) {
+            blocks.push({
+                id: `always-${hashText(alwaysPrompt)}`,
+                sourceIndex: -1,
+                title: '常驻提示',
+                type: '常驻提示',
+                kind: 'addon',
+                whenShow: '游戏开始时',
+                prompt: alwaysPrompt,
+                whenHide: '故事结束时',
+                followStage: '',
+                raw: alwaysPrompt,
+                mainIndex: -1,
+                anchorMainIndex: 0,
+                color: resolved.always.color,
+            });
+        }
+        const addonBlocks = blocks.filter(block => block.kind === 'addon');
+        if (mainBlocks.length === 0) {
+            warnings.push('可视化布局中没有可用的剧情阶段。请打开阶段标注器，为至少一个阶段选择提示词。');
+        }
+        if (!resolved.sourceHashMatches) {
+            const reanchoredCount = resolved.stages.reduce((sum, stage) => sum + stage.reanchoredCount, 0)
+                + resolved.always.reanchoredCount;
+            if (reanchoredCount > 0) {
+                warnings.push(`提示词原文发生过修改，已自动重新定位 ${reanchoredCount} 个选区。`);
+            }
+        }
+        return {
+            format: 'dynamic-guide-ranges-v1',
+            blocks,
+            mainBlocks,
+            addonBlocks,
+            warnings,
+            layout,
+            layoutResolution: resolved,
         };
     }
 
@@ -788,6 +1046,40 @@
         }
     }
 
+    async function writeRangeLayout(worldbookName, selectedEntry, layout) {
+        if (!worldbookName || !selectedEntry) throw new Error('没有可保存的世界书条目');
+        const updateWorldbookWith = resolveFunction('updateWorldbookWith', true);
+        let found = false;
+        await Promise.resolve(updateWorldbookWith(worldbookName, worldbook => {
+            const entry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
+            if (!entry) return worldbook;
+            found = true;
+            const extra = entry.extra && typeof entry.extra === 'object' ? entry.extra : {};
+            const metadata = extra[LAYOUT_META_KEY] && typeof extra[LAYOUT_META_KEY] === 'object'
+                ? extra[LAYOUT_META_KEY]
+                : {};
+            entry.extra = {
+                ...extra,
+                [LAYOUT_META_KEY]: {
+                    ...metadata,
+                    layout,
+                },
+            };
+            return worldbook;
+        }));
+        if (!found) throw new Error(`无法在世界书“${worldbookName}”中找到要保存的指导条目`);
+        const verified = findEntry(
+            await getWorldbook(worldbookName),
+            selectedEntry.uid,
+            entryName(selectedEntry),
+        );
+        const savedLayout = getRangeLayout(verified);
+        if (!verified || !savedLayout || savedLayout.sourceHash !== layout.sourceHash) {
+            throw new Error('阶段划分未能写入世界书条目的隐藏扩展数据');
+        }
+        return verified;
+    }
+
     async function locateConfiguredEntry(config) {
         if (!config) return null;
         const boundNames = await getCharacterWorldbookNames();
@@ -809,7 +1101,9 @@
     }
 
     function makeSourceKey(source) {
-        return `${source.worldbookName}::${source.entry.uid}::${hashText(source.entry.content)}`;
+        const layout = getRangeLayout(source.entry);
+        const layoutHash = layout ? hashText(JSON.stringify(layout)) : 'template';
+        return `${source.worldbookName}::${source.entry.uid}::${hashText(source.entry.content)}::${layoutHash}`;
     }
 
     function reconcileState(rawState, parsed, sourceKey) {
@@ -858,7 +1152,7 @@
             if ('disable' in source.entry) source.entry.disable = true;
         }
 
-        const parsed = parseGuideText(source.entry.content);
+        const parsed = parseGuideEntry(source.entry);
         if (parsed.mainBlocks.length === 0) {
             throw new Error(parsed.warnings.join('\n') || '指导页中没有可用的主线内容');
         }
@@ -957,6 +1251,600 @@
         busy: false,
     };
 
+    const stageEditorState = {
+        worldbookName: '',
+        entry: null,
+        text: '',
+        stages: [],
+        alwaysColor: '#64748b',
+        alwaysRanges: [],
+        activeOwnerId: '',
+        pendingRange: null,
+        selectedMarkedRange: null,
+        unresolvedCount: 0,
+        dirty: false,
+        busy: false,
+    };
+
+    function editorElement(suffix) {
+        const documentRef = getHostDocument();
+        return documentRef ? documentRef.getElementById(`${UI_PREFIX}-editor-${suffix}`) : null;
+    }
+
+    function setEditorMessage(message, type) {
+        const element = editorElement('message');
+        if (!element) return;
+        element.textContent = String(message || '');
+        element.dataset.type = type || 'info';
+        element.hidden = !message;
+    }
+
+    function setEditorBusy(busy) {
+        stageEditorState.busy = Boolean(busy);
+        const editor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
+        if (editor) editor.classList.toggle('dga-busy', stageEditorState.busy);
+        ['save', 'save-bind', 'new-stage', 'assign', 'assign-always', 'clear-range']
+            .map(editorElement)
+            .filter(Boolean)
+            .forEach(element => {
+                element.disabled = stageEditorState.busy;
+            });
+        if (!stageEditorState.busy) updateStageEditorControls();
+    }
+
+    function normalizedIntervals(ranges) {
+        const textLength = stageEditorState.text.length;
+        const sorted = (Array.isArray(ranges) ? ranges : [])
+            .map(range => ({
+                start: clampOffset(Math.min(range.start, range.end), textLength),
+                end: clampOffset(Math.max(range.start, range.end), textLength),
+            }))
+            .filter(range => range.end > range.start)
+            .sort((left, right) => left.start - right.start || left.end - right.end);
+        const merged = [];
+        sorted.forEach(range => {
+            const previous = merged[merged.length - 1];
+            if (previous && range.start <= previous.end) {
+                previous.end = Math.max(previous.end, range.end);
+            } else {
+                merged.push({ ...range });
+            }
+        });
+        return merged;
+    }
+
+    function subtractInterval(ranges, start, end) {
+        const result = [];
+        normalizedIntervals(ranges).forEach(range => {
+            if (range.end <= start || range.start >= end) {
+                result.push(range);
+                return;
+            }
+            if (range.start < start) result.push({ start: range.start, end: start });
+            if (range.end > end) result.push({ start: end, end: range.end });
+        });
+        return normalizedIntervals(result);
+    }
+
+    function activeStage() {
+        return stageEditorState.stages.find(stage => stage.id === stageEditorState.activeOwnerId) || null;
+    }
+
+    function ownerRanges(ownerId) {
+        if (ownerId === 'always') return stageEditorState.alwaysRanges;
+        const stage = stageEditorState.stages.find(item => item.id === ownerId);
+        return stage ? stage.ranges : [];
+    }
+
+    function setOwnerRanges(ownerId, ranges) {
+        const normalized = normalizedIntervals(ranges);
+        if (ownerId === 'always') {
+            stageEditorState.alwaysRanges = normalized;
+            return;
+        }
+        const stage = stageEditorState.stages.find(item => item.id === ownerId);
+        if (stage) stage.ranges = normalized;
+    }
+
+    function clearRangeFromAllOwners(start, end) {
+        stageEditorState.stages.forEach(stage => {
+            stage.ranges = subtractInterval(stage.ranges, start, end);
+        });
+        stageEditorState.alwaysRanges = subtractInterval(stageEditorState.alwaysRanges, start, end);
+    }
+
+    function assignRangeToOwner(ownerId, start, end) {
+        clearRangeFromAllOwners(start, end);
+        setOwnerRanges(ownerId, [...ownerRanges(ownerId), { start, end }]);
+    }
+
+    function ownerColor(ownerId) {
+        if (ownerId === 'always') return stageEditorState.alwaysColor;
+        const stage = stageEditorState.stages.find(item => item.id === ownerId);
+        return stage ? stage.color : '#64748b';
+    }
+
+    function ownerName(ownerId) {
+        if (ownerId === 'always') return '常驻提示';
+        const stage = stageEditorState.stages.find(item => item.id === ownerId);
+        return stage ? (stage.name || '未命名阶段') : '未知阶段';
+    }
+
+    function colorToRgba(color, alpha) {
+        const normalized = normalizeColor(color, '#64748b').slice(1);
+        const red = Number.parseInt(normalized.slice(0, 2), 16);
+        const green = Number.parseInt(normalized.slice(2, 4), 16);
+        const blue = Number.parseInt(normalized.slice(4, 6), 16);
+        return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+    }
+
+    function markStageEditorDirty() {
+        stageEditorState.dirty = true;
+        const indicator = editorElement('dirty');
+        if (indicator) indicator.hidden = false;
+    }
+
+    function clearNativeSelection() {
+        try {
+            const selection = hostWindow.getSelection && hostWindow.getSelection();
+            if (selection && typeof selection.removeAllRanges === 'function') selection.removeAllRanges();
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 清理文字选择失败`, error);
+        }
+    }
+
+    function setActiveOwner(ownerId) {
+        stageEditorState.activeOwnerId = ownerId;
+        stageEditorState.selectedMarkedRange = null;
+        renderStageEditorSidebar();
+        renderStageEditorSettings();
+        renderStageEditorText();
+        updateStageEditorControls();
+    }
+
+    function addStage() {
+        const index = stageEditorState.stages.length;
+        const stage = {
+            id: makeStageId(),
+            name: `阶段 ${index + 1}`,
+            color: DEFAULT_STAGE_COLORS[index % DEFAULT_STAGE_COLORS.length],
+            completion: '',
+            ranges: [],
+        };
+        stageEditorState.stages.push(stage);
+        markStageEditorDirty();
+        setActiveOwner(stage.id);
+        const nameInput = editorElement('stage-name');
+        if (nameInput) {
+            nameInput.focus();
+            nameInput.select();
+        }
+    }
+
+    function moveActiveStage(direction) {
+        const index = stageEditorState.stages.findIndex(stage => stage.id === stageEditorState.activeOwnerId);
+        const target = index + direction;
+        if (index < 0 || target < 0 || target >= stageEditorState.stages.length) return;
+        const [stage] = stageEditorState.stages.splice(index, 1);
+        stageEditorState.stages.splice(target, 0, stage);
+        markStageEditorDirty();
+        renderStageEditorSidebar();
+        renderStageEditorSettings();
+    }
+
+    function deleteActiveStage() {
+        const stage = activeStage();
+        if (!stage) return;
+        if (!hostWindow.confirm(`删除“${stage.name}”阶段？被标记的文字会恢复为未分配。`)) return;
+        const index = stageEditorState.stages.findIndex(item => item.id === stage.id);
+        stageEditorState.stages.splice(index, 1);
+        stageEditorState.activeOwnerId = stageEditorState.stages[index]
+            ? stageEditorState.stages[index].id
+            : (stageEditorState.stages[index - 1] ? stageEditorState.stages[index - 1].id : 'always');
+        markStageEditorDirty();
+        renderStageEditorSidebar();
+        renderStageEditorSettings();
+        renderStageEditorText();
+        updateStageEditorControls();
+    }
+
+    function allEditorMarks() {
+        const marks = [];
+        stageEditorState.stages.forEach(stage => {
+            normalizedIntervals(stage.ranges).forEach(range => marks.push({
+                ...range,
+                ownerId: stage.id,
+                color: stage.color,
+                name: stage.name,
+            }));
+        });
+        normalizedIntervals(stageEditorState.alwaysRanges).forEach(range => marks.push({
+            ...range,
+            ownerId: 'always',
+            color: stageEditorState.alwaysColor,
+            name: '常驻提示',
+        }));
+        return marks.sort((left, right) => left.start - right.start || left.end - right.end);
+    }
+
+    function renderStageEditorSidebar() {
+        const list = editorElement('stage-list');
+        if (!list) return;
+        const documentRef = list.ownerDocument;
+        list.replaceChildren();
+
+        function appendOwnerButton(ownerId, name, color, rangeCount, indexLabel) {
+            const button = documentRef.createElement('button');
+            button.type = 'button';
+            button.className = 'dga-stage-item';
+            if (stageEditorState.activeOwnerId === ownerId) button.classList.add('is-active');
+            button.style.setProperty('--dga-stage-color', normalizeColor(color, '#64748b'));
+            const title = documentRef.createElement('strong');
+            title.textContent = indexLabel ? `${indexLabel} · ${name}` : name;
+            const count = documentRef.createElement('span');
+            count.textContent = `${rangeCount} 处提示词`;
+            button.append(title, count);
+            button.onclick = () => setActiveOwner(ownerId);
+            list.appendChild(button);
+        }
+
+        stageEditorState.stages.forEach((stage, index) => {
+            appendOwnerButton(
+                stage.id,
+                stage.name || '未命名阶段',
+                stage.color,
+                stage.ranges.length,
+                `阶段 ${index + 1}`,
+            );
+        });
+        appendOwnerButton(
+            'always',
+            '常驻提示',
+            stageEditorState.alwaysColor,
+            stageEditorState.alwaysRanges.length,
+            '',
+        );
+    }
+
+    function renderStageEditorSettings() {
+        const stage = activeStage();
+        const isAlways = stageEditorState.activeOwnerId === 'always';
+        const title = editorElement('settings-title');
+        const nameWrap = editorElement('stage-name-wrap');
+        const completionWrap = editorElement('completion-wrap');
+        const orderActions = editorElement('order-actions');
+        const deleteButton = editorElement('delete-stage');
+        const nameInput = editorElement('stage-name');
+        const completionInput = editorElement('stage-completion');
+        const colorInput = editorElement('stage-color');
+        if (title) title.textContent = isAlways ? '常驻提示设置' : (stage ? `${stage.name}设置` : '阶段设置');
+        if (nameWrap) nameWrap.hidden = isAlways || !stage;
+        if (completionWrap) completionWrap.hidden = isAlways || !stage;
+        if (orderActions) orderActions.hidden = isAlways || !stage;
+        if (deleteButton) deleteButton.hidden = isAlways || !stage;
+        if (nameInput) nameInput.value = stage ? stage.name : '';
+        if (completionInput) completionInput.value = stage ? stage.completion : '';
+        if (colorInput) colorInput.value = normalizeColor(
+            isAlways ? stageEditorState.alwaysColor : stage && stage.color,
+            isAlways ? '#64748b' : DEFAULT_STAGE_COLORS[0],
+        );
+        const stageIndex = stage ? stageEditorState.stages.findIndex(item => item.id === stage.id) : -1;
+        const moveUp = editorElement('move-up');
+        const moveDown = editorElement('move-down');
+        if (moveUp) moveUp.disabled = stageIndex <= 0;
+        if (moveDown) moveDown.disabled = stageIndex < 0 || stageIndex >= stageEditorState.stages.length - 1;
+    }
+
+    function renderStageEditorText() {
+        const surface = editorElement('surface');
+        if (!surface) return;
+        const documentRef = surface.ownerDocument;
+        const oldScrollTop = surface.scrollTop;
+        surface.replaceChildren();
+        const text = stageEditorState.text;
+        const marks = allEditorMarks();
+        let cursor = 0;
+        marks.forEach(mark => {
+            const start = Math.max(cursor, mark.start);
+            const end = Math.max(start, mark.end);
+            if (start > cursor) surface.appendChild(documentRef.createTextNode(text.slice(cursor, start)));
+            if (end > start) {
+                const span = documentRef.createElement('span');
+                span.className = 'dga-text-mark';
+                if (mark.ownerId === stageEditorState.activeOwnerId) span.classList.add('is-active');
+                const selected = stageEditorState.selectedMarkedRange;
+                if (selected
+                    && selected.ownerId === mark.ownerId
+                    && selected.start === mark.start
+                    && selected.end === mark.end) {
+                    span.classList.add('is-selected');
+                }
+                span.dataset.ownerId = mark.ownerId;
+                span.dataset.start = String(mark.start);
+                span.dataset.end = String(mark.end);
+                span.style.setProperty('--dga-mark-color', normalizeColor(mark.color, '#64748b'));
+                span.style.backgroundColor = colorToRgba(mark.color, mark.ownerId === stageEditorState.activeOwnerId ? 0.38 : 0.22);
+                span.title = mark.name;
+                span.textContent = text.slice(start, end);
+                surface.appendChild(span);
+            }
+            cursor = Math.max(cursor, end);
+        });
+        if (cursor < text.length) surface.appendChild(documentRef.createTextNode(text.slice(cursor)));
+        if (!text) surface.textContent = '这个世界书条目没有提示词内容。';
+        surface.scrollTop = oldScrollTop;
+    }
+
+    function selectionOffsetsInSurface() {
+        const surface = editorElement('surface');
+        const documentRef = getHostDocument();
+        if (!surface || !documentRef || !hostWindow.getSelection) return null;
+        const selection = hostWindow.getSelection();
+        if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+        const range = selection.getRangeAt(0);
+        if (!surface.contains(range.startContainer) || !surface.contains(range.endContainer)) return null;
+        const beforeStart = documentRef.createRange();
+        beforeStart.selectNodeContents(surface);
+        beforeStart.setEnd(range.startContainer, range.startOffset);
+        const beforeEnd = documentRef.createRange();
+        beforeEnd.selectNodeContents(surface);
+        beforeEnd.setEnd(range.endContainer, range.endOffset);
+        const start = clampOffset(beforeStart.toString().length, stageEditorState.text.length);
+        const end = clampOffset(beforeEnd.toString().length, stageEditorState.text.length);
+        if (end <= start) return null;
+        return { start, end, quote: stageEditorState.text.slice(start, end) };
+    }
+
+    function captureStageEditorSelection() {
+        const result = selectionOffsetsInSurface();
+        if (!result) return;
+        stageEditorState.pendingRange = result;
+        stageEditorState.selectedMarkedRange = null;
+        const preview = result.quote.replace(/\s+/g, ' ').trim();
+        const selectionText = editorElement('selection-text');
+        if (selectionText) {
+            selectionText.textContent = preview.length > 70 ? `${preview.slice(0, 70)}…` : preview;
+        }
+        setEditorMessage(`已选择 ${result.end - result.start} 个字符，可分配给当前阶段或常驻提示。`, 'info');
+        updateStageEditorControls();
+    }
+
+    function selectMarkedRangeFromEvent(event) {
+        const span = event.target && event.target.closest
+            ? event.target.closest('.dga-text-mark')
+            : null;
+        if (!span) return;
+        const ownerId = span.dataset.ownerId;
+        const start = Number(span.dataset.start);
+        const end = Number(span.dataset.end);
+        if (!ownerId || !Number.isFinite(start) || !Number.isFinite(end)) return;
+        stageEditorState.activeOwnerId = ownerId;
+        stageEditorState.pendingRange = null;
+        stageEditorState.selectedMarkedRange = { ownerId, start, end };
+        renderStageEditorSidebar();
+        renderStageEditorSettings();
+        renderStageEditorText();
+        setEditorMessage(`已选中“${ownerName(ownerId)}”的一处标记，可点击“清除所选标记”。`, 'info');
+        updateStageEditorControls();
+    }
+
+    function assignPendingRange(ownerId) {
+        const range = stageEditorState.pendingRange;
+        if (!range || range.end <= range.start) {
+            setEditorMessage('请先在右侧提示词原文中拖选文字。', 'warning');
+            return;
+        }
+        if (ownerId !== 'always' && !stageEditorState.stages.some(stage => stage.id === ownerId)) {
+            setEditorMessage('请先新建或选择一个剧情阶段。', 'warning');
+            return;
+        }
+        assignRangeToOwner(ownerId, range.start, range.end);
+        stageEditorState.activeOwnerId = ownerId;
+        stageEditorState.pendingRange = null;
+        stageEditorState.selectedMarkedRange = null;
+        clearNativeSelection();
+        markStageEditorDirty();
+        renderStageEditorSidebar();
+        renderStageEditorSettings();
+        renderStageEditorText();
+        setEditorMessage(`已把选中文字分配给“${ownerName(ownerId)}”。`, 'success');
+        updateStageEditorControls();
+    }
+
+    function clearSelectedEditorRange() {
+        const range = stageEditorState.pendingRange || stageEditorState.selectedMarkedRange;
+        if (!range) {
+            setEditorMessage('请先拖选文字，或点击一处已有的彩色标记。', 'warning');
+            return;
+        }
+        clearRangeFromAllOwners(range.start, range.end);
+        stageEditorState.pendingRange = null;
+        stageEditorState.selectedMarkedRange = null;
+        clearNativeSelection();
+        markStageEditorDirty();
+        renderStageEditorSidebar();
+        renderStageEditorText();
+        setEditorMessage('所选范围已恢复为未分配。', 'success');
+        updateStageEditorControls();
+    }
+
+    function updateStageEditorControls() {
+        if (stageEditorState.busy) return;
+        const hasPending = Boolean(stageEditorState.pendingRange);
+        const hasMarked = Boolean(stageEditorState.selectedMarkedRange);
+        const hasActive = stageEditorState.activeOwnerId === 'always' || Boolean(activeStage());
+        const assignButton = editorElement('assign');
+        const assignAlwaysButton = editorElement('assign-always');
+        const clearButton = editorElement('clear-range');
+        if (assignButton) {
+            assignButton.disabled = !hasPending || !hasActive;
+            assignButton.textContent = stageEditorState.activeOwnerId === 'always'
+                ? '分配给常驻提示'
+                : `分配给${activeStage() ? `“${activeStage().name || '未命名阶段'}”` : '当前阶段'}`;
+        }
+        if (assignAlwaysButton) assignAlwaysButton.disabled = !hasPending;
+        if (clearButton) clearButton.disabled = !hasPending && !hasMarked;
+        const selectionText = editorElement('selection-text');
+        if (selectionText && !hasPending) selectionText.textContent = '尚未选择文字';
+    }
+
+    function buildRangeLayoutFromEditor() {
+        if (stageEditorState.stages.length === 0) {
+            throw new Error('请至少新建一个剧情阶段');
+        }
+        const emptyStages = stageEditorState.stages.filter(stage => stage.ranges.length === 0);
+        if (emptyStages.length > 0) {
+            throw new Error(`这些阶段还没有选择提示词：${emptyStages.map(stage => stage.name).join('、')}`);
+        }
+        const text = stageEditorState.text;
+        return {
+            version: LAYOUT_VERSION,
+            mode: 'ranges',
+            sourceHash: hashText(text),
+            stages: stageEditorState.stages.map((stage, index) => ({
+                id: stage.id || makeStageId(),
+                name: String(stage.name || `阶段 ${index + 1}`).trim() || `阶段 ${index + 1}`,
+                color: normalizeColor(stage.color, DEFAULT_STAGE_COLORS[index % DEFAULT_STAGE_COLORS.length]),
+                completion: String(stage.completion || '').trim(),
+                ranges: normalizedIntervals(stage.ranges).map(range => (
+                    createAnchoredRange(text, range.start, range.end)
+                )),
+            })),
+            always: {
+                color: normalizeColor(stageEditorState.alwaysColor, '#64748b'),
+                ranges: normalizedIntervals(stageEditorState.alwaysRanges).map(range => (
+                    createAnchoredRange(text, range.start, range.end)
+                )),
+            },
+            updatedAt: new Date().toISOString(),
+        };
+    }
+
+    function loadEntryIntoStageEditor(worldbookName, entry) {
+        const text = normalizeText(entry && entry.content);
+        const layout = getRangeLayout(entry);
+        stageEditorState.worldbookName = worldbookName;
+        stageEditorState.entry = entry;
+        stageEditorState.text = text;
+        stageEditorState.pendingRange = null;
+        stageEditorState.selectedMarkedRange = null;
+        stageEditorState.unresolvedCount = 0;
+        stageEditorState.dirty = false;
+
+        if (layout) {
+            const resolved = resolveRangeLayout(text, layout);
+            stageEditorState.stages = resolved.stages.map(stage => ({
+                id: stage.id,
+                name: stage.name,
+                color: stage.color,
+                completion: stage.completion,
+                ranges: normalizedIntervals(stage.ranges),
+            }));
+            stageEditorState.alwaysColor = resolved.always.color;
+            stageEditorState.alwaysRanges = normalizedIntervals(resolved.always.ranges);
+            stageEditorState.unresolvedCount = resolved.stages.reduce(
+                (sum, stage) => sum + stage.unresolvedCount,
+                resolved.always.unresolvedCount,
+            );
+        } else {
+            const firstStage = {
+                id: makeStageId(),
+                name: '阶段 1',
+                color: DEFAULT_STAGE_COLORS[0],
+                completion: '',
+                ranges: [],
+            };
+            stageEditorState.stages = [firstStage];
+            stageEditorState.alwaysColor = '#64748b';
+            stageEditorState.alwaysRanges = [];
+        }
+        stageEditorState.activeOwnerId = stageEditorState.stages[0]
+            ? stageEditorState.stages[0].id
+            : 'always';
+        const dirty = editorElement('dirty');
+        if (dirty) dirty.hidden = true;
+        const sourceName = editorElement('source-name');
+        if (sourceName) sourceName.textContent = `[${worldbookName}] ${entryName(entry)}`;
+        renderStageEditorSidebar();
+        renderStageEditorSettings();
+        renderStageEditorText();
+        updateStageEditorControls();
+        if (stageEditorState.unresolvedCount > 0) {
+            setEditorMessage(
+                `有 ${stageEditorState.unresolvedCount} 个旧选区无法在当前原文中定位。请重新选择对应文字后再保存。`,
+                'warning',
+            );
+        } else if (layout) {
+            setEditorMessage('阶段划分已载入。拖选原文，可以继续调整。', 'info');
+        } else {
+            setEditorMessage('拖选右侧提示词，然后把文字分配给“阶段 1”或常驻提示。', 'info');
+        }
+    }
+
+    async function saveStageEditorLayout(bindAfterSave) {
+        if (!stageEditorState.entry) throw new Error('没有正在编辑的世界书条目');
+        const layout = buildRangeLayoutFromEditor();
+        setEditorBusy(true);
+        setEditorMessage('正在把阶段划分保存到世界书隐藏数据……', 'info');
+        try {
+            const savedEntry = await writeRangeLayout(
+                stageEditorState.worldbookName,
+                stageEditorState.entry,
+                layout,
+            );
+            stageEditorState.entry = savedEntry;
+            stageEditorState.dirty = false;
+            stageEditorState.unresolvedCount = 0;
+            const dirty = editorElement('dirty');
+            if (dirty) dirty.hidden = true;
+            if (bindAfterSave) {
+                await bindGuideEntry(stageEditorState.worldbookName, savedEntry, { confirm: false });
+            }
+            await refreshManager({
+                worldbookName: stageEditorState.worldbookName,
+                quiet: true,
+            });
+            setEditorMessage(
+                bindAfterSave
+                    ? '阶段划分已保存并绑定，当前聊天已从第一阶段开始。'
+                    : '阶段划分已保存。世界书正文没有被修改。',
+                'success',
+            );
+        } finally {
+            setEditorBusy(false);
+        }
+    }
+
+    function closeStageEditor(force) {
+        if (!force && stageEditorState.dirty) {
+            const accepted = hostWindow.confirm('阶段划分还有未保存的修改，仍然关闭吗？');
+            if (!accepted) return;
+        }
+        const documentRef = getHostDocument();
+        const editor = documentRef && documentRef.getElementById(EDITOR_ID);
+        if (editor) editor.hidden = true;
+        const panel = managerElement('panel');
+        if (panel) panel.hidden = false;
+    }
+
+    async function openStageEditor() {
+        const entry = managerState.entryMap.get(managerState.selectedEntryKey);
+        if (!managerState.selectedWorldbook || !entry) {
+            throw new Error('请先在管理页选择一个世界书条目');
+        }
+        const worldbook = await getWorldbook(managerState.selectedWorldbook);
+        const freshEntry = findEntry(worldbook, entry.uid, entryName(entry));
+        if (!freshEntry) throw new Error('所选世界书条目已经不存在，请刷新后重试');
+        const editor = installStageEditorUi(false);
+        if (!editor) throw new Error('阶段标注器尚未准备好，请稍后重试');
+        const panel = managerElement('panel');
+        if (panel) panel.hidden = true;
+        editor.hidden = false;
+        loadEntryIntoStageEditor(managerState.selectedWorldbook, freshEntry);
+        const surface = editorElement('surface');
+        if (surface) surface.focus();
+    }
+
     function managerElement(suffix) {
         const documentRef = getHostDocument();
         return documentRef ? documentRef.getElementById(`${UI_PREFIX}-${suffix}`) : null;
@@ -980,7 +1868,7 @@
         const panel = managerElement('panel');
         if (panel) panel.classList.toggle('dga-busy', managerState.busy);
         if (managerState.busy) {
-            ['refresh', 'bind', 'previous', 'next', 'reset', 'worldbook-select', 'entry-select']
+            ['refresh', 'bind', 'edit-stages', 'previous', 'next', 'reset', 'worldbook-select', 'entry-select']
                 .map(managerElement)
                 .filter(Boolean)
                 .forEach(element => {
@@ -1019,10 +1907,13 @@
     }
 
     function entryOptionLabel(entry) {
-        const parsed = parseGuideText(entry && entry.content);
+        const parsed = parseGuideEntry(entry);
         const stateLabel = entryIsDisabled(entry) ? ' · 已禁用' : '';
         if (parsed.mainBlocks.length === 0) {
-            return `${entryName(entry)}（未识别到指导内容${stateLabel}）`;
+            return `${entryName(entry)}（尚未划分阶段${stateLabel}）`;
+        }
+        if (parsed.format === 'dynamic-guide-ranges-v1') {
+            return `${entryName(entry)}（可视化 ${parsed.mainBlocks.length} 个阶段${stateLabel}）`;
         }
         return `${entryName(entry)}（${parsed.mainBlocks.length} 段主线，${parsed.addonBlocks.length} 段附加${stateLabel}）`;
     }
@@ -1133,6 +2024,7 @@
         const entrySelect = managerElement('entry-select');
         const refreshButton = managerElement('refresh');
         const bindButton = managerElement('bind');
+        const editStagesButton = managerElement('edit-stages');
         const previousButton = managerElement('previous');
         const nextButton = managerElement('next');
         const resetButton = managerElement('reset');
@@ -1140,6 +2032,7 @@
         if (worldbookSelect) worldbookSelect.disabled = !managerState.binding || managerState.binding.names.length === 0;
         if (entrySelect) entrySelect.disabled = managerState.entries.length === 0;
         if (bindButton) bindButton.disabled = !managerState.entryMap.has(managerState.selectedEntryKey);
+        if (editStagesButton) editStagesButton.disabled = !managerState.entryMap.has(managerState.selectedEntryKey);
         if (previousButton) previousButton.disabled = !configured || currentIndex <= 0;
         if (nextButton) nextButton.disabled = !configured || currentIndex >= total;
         if (resetButton) resetButton.disabled = !configured || currentIndex === 0;
@@ -1212,29 +2105,32 @@
         }
     }
 
-    async function bindGuideEntry(worldbookName, selectedEntry) {
+    async function bindGuideEntry(worldbookName, selectedEntry, options) {
+        const settings = options || {};
         if (!worldbookName || !selectedEntry) throw new Error('请先选择世界书和指导条目');
         const worldbook = await getWorldbook(worldbookName);
         const freshEntry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
         if (!freshEntry) throw new Error('所选条目已经不存在，请刷新后重试');
-        const parsed = parseGuideText(freshEntry.content);
+        const parsed = parseGuideEntry(freshEntry);
         if (parsed.mainBlocks.length === 0) {
             throw new Error(parsed.warnings.join('\n') || '所选条目没有可用的主线内容');
         }
 
-        const accepted = hostWindow.confirm(
-            `绑定“${entryName(freshEntry)}”作为动态指导页？\n\n`
-            + `主线内容：${parsed.mainBlocks.length} 段\n`
-            + `附加内容：${parsed.addonBlocks.length} 段\n\n`
-            + '绑定后会禁用这个世界书原条目，避免完整内容被直接发送给 AI。',
-        );
-        if (!accepted) return false;
+        if (settings.confirm !== false) {
+            const accepted = hostWindow.confirm(
+                `绑定“${entryName(freshEntry)}”作为动态指导页？\n\n`
+                + `剧情阶段：${parsed.mainBlocks.length} 段\n`
+                + `常驻或附加内容：${parsed.addonBlocks.length} 段\n\n`
+                + '绑定后会禁用这个世界书原条目，避免完整大纲被直接发送给 AI。',
+            );
+            if (!accepted) return false;
+        }
 
         await disableSourceEntry(worldbookName, freshEntry.uid, entryName(freshEntry));
         freshEntry.enabled = false;
         if ('disable' in freshEntry) freshEntry.disable = true;
         const config = {
-            format: 'dynamic-guide-v1',
+            format: parsed.format,
             worldbookName,
             entryUid: freshEntry.uid,
             entryName: entryName(freshEntry),
@@ -1287,6 +2183,9 @@
     }
 
     function closeManager() {
+        const documentRef = getHostDocument();
+        const editor = documentRef && documentRef.getElementById(EDITOR_ID);
+        if (editor) editor.hidden = true;
         const panel = managerElement('panel');
         if (panel) panel.hidden = true;
     }
@@ -1403,13 +2302,421 @@
 #${PANEL_ID} .dga-message[data-type="warning"] { background: rgba(230, 165, 60, 0.16); }
 #${PANEL_ID} .dga-message[data-type="error"] { background: rgba(220, 75, 85, 0.17); }
 #${PANEL_ID}.dga-busy .dga-shell { cursor: progress; }
+#${EDITOR_ID} {
+    position: fixed;
+    inset: 0;
+    z-index: 100001;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: rgba(8, 10, 16, 0.76);
+    backdrop-filter: blur(6px);
+    color: var(--SmartThemeBodyColor, #ececf1);
+}
+#${EDITOR_ID}[hidden] { display: none !important; }
+#${EDITOR_ID} * { box-sizing: border-box; }
+#${EDITOR_ID} .dga-editor-shell {
+    width: min(1180px, 100%);
+    height: min(92vh, 940px);
+    min-height: 560px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 22%, transparent);
+    border-radius: 16px;
+    background: var(--SmartThemeBlurTintColor, rgba(28, 30, 38, 0.99));
+    box-shadow: 0 24px 76px rgba(0, 0, 0, 0.5);
+}
+#${EDITOR_ID} .dga-editor-header,
+#${EDITOR_ID} .dga-editor-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
+}
+#${EDITOR_ID} .dga-editor-footer {
+    justify-content: flex-end;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
+    border-bottom: 0;
+}
+#${EDITOR_ID} .dga-editor-title { margin: 0; font-size: 1.12rem; }
+#${EDITOR_ID} .dga-editor-source {
+    margin: 4px 0 0;
+    max-width: min(70vw, 760px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.7;
+    font-size: 0.82rem;
+}
+#${EDITOR_ID} .dga-editor-dirty {
+    margin-left: 7px;
+    color: #f6c453;
+    font-size: 0.78rem;
+}
+#${EDITOR_ID} .dga-editor-main {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(245px, 290px) minmax(0, 1fr);
+}
+#${EDITOR_ID} .dga-editor-sidebar {
+    min-width: 0;
+    overflow-y: auto;
+    padding: 14px;
+    border-right: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
+    background: rgba(0, 0, 0, 0.08);
+}
+#${EDITOR_ID} .dga-editor-workspace {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+}
+#${EDITOR_ID} .dga-editor-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 9px;
+}
+#${EDITOR_ID} h3 { margin: 0; font-size: 0.96rem; }
+#${EDITOR_ID} .dga-editor-help {
+    margin: 7px 0 10px;
+    opacity: 0.72;
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+#${EDITOR_ID} .dga-stage-list { display: grid; gap: 7px; }
+#${EDITOR_ID} .dga-stage-item {
+    width: 100%;
+    display: grid;
+    gap: 4px;
+    padding: 10px 11px 10px 14px;
+    border: 1px solid color-mix(in srgb, var(--dga-stage-color) 46%, transparent);
+    border-radius: 10px;
+    color: inherit;
+    background: color-mix(in srgb, var(--dga-stage-color) 10%, transparent);
+    box-shadow: inset 4px 0 0 var(--dga-stage-color);
+    text-align: left;
+    cursor: pointer;
+}
+#${EDITOR_ID} .dga-stage-item.is-active {
+    border-color: var(--dga-stage-color);
+    background: color-mix(in srgb, var(--dga-stage-color) 23%, transparent);
+}
+#${EDITOR_ID} .dga-stage-item strong { overflow-wrap: anywhere; }
+#${EDITOR_ID} .dga-stage-item span { opacity: 0.68; font-size: 0.76rem; }
+#${EDITOR_ID} .dga-editor-settings {
+    display: grid;
+    gap: 10px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 13%, transparent);
+}
+#${EDITOR_ID} label { display: grid; gap: 6px; font-size: 0.8rem; opacity: 0.9; }
+#${EDITOR_ID} input[type="text"],
+#${EDITOR_ID} textarea {
+    width: 100%;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
+    border-radius: 8px;
+    padding: 8px 9px;
+    color: inherit;
+    background: var(--SmartThemeBotMesBlurTintColor, rgba(20, 22, 28, 0.85));
+    font: inherit;
+}
+#${EDITOR_ID} textarea { min-height: 76px; resize: vertical; line-height: 1.45; }
+#${EDITOR_ID} input[type="color"] {
+    width: 100%;
+    height: 38px;
+    padding: 3px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+}
+#${EDITOR_ID} .dga-editor-actions,
+#${EDITOR_ID} .dga-selection-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+}
+#${EDITOR_ID} .dga-button {
+    min-height: 38px;
+    padding: 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
+    border-radius: 8px;
+    color: inherit;
+    background: var(--SmartThemeBotMesBlurTintColor, rgba(20, 22, 28, 0.85));
+    cursor: pointer;
+    font-weight: 620;
+}
+#${EDITOR_ID} .dga-button.dga-primary {
+    border-color: transparent;
+    color: #fff;
+    background: var(--SmartThemeQuoteColor, #7b62d9);
+}
+#${EDITOR_ID} .dga-button.dga-danger { color: #ff9ba3; }
+#${EDITOR_ID} .dga-close {
+    min-width: 38px;
+    min-height: 38px;
+    border: 0;
+    border-radius: 10px;
+    color: inherit;
+    background: rgba(255, 255, 255, 0.08);
+    cursor: pointer;
+    font-size: 1.35rem;
+}
+#${EDITOR_ID} button:disabled { opacity: 0.44; cursor: not-allowed; }
+#${EDITOR_ID} .dga-selection-bar {
+    display: grid;
+    gap: 8px;
+    padding: 10px 11px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 13%, transparent);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.045);
+}
+#${EDITOR_ID} .dga-selection-preview {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.82rem;
+    opacity: 0.78;
+}
+#${EDITOR_ID} .dga-text-surface {
+    flex: 1;
+    min-height: 260px;
+    overflow: auto;
+    padding: 18px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 16%, transparent);
+    border-radius: 12px;
+    outline: none;
+    background: rgba(0, 0, 0, 0.19);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+    cursor: text;
+    font-family: inherit;
+    font-size: 0.94rem;
+    line-height: 1.75;
+}
+#${EDITOR_ID} .dga-text-surface:focus {
+    border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 72%, transparent);
+}
+#${EDITOR_ID} .dga-text-mark {
+    padding: 1px 0;
+    border-bottom: 2px solid var(--dga-mark-color);
+    border-radius: 3px;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+    cursor: pointer;
+}
+#${EDITOR_ID} .dga-text-mark.is-active { box-shadow: 0 0 0 1px var(--dga-mark-color); }
+#${EDITOR_ID} .dga-text-mark.is-selected { outline: 2px solid #fff; outline-offset: 2px; }
+#${EDITOR_ID} .dga-editor-message {
+    padding: 9px 11px;
+    border-radius: 9px;
+    font-size: 0.82rem;
+    line-height: 1.45;
+}
+#${EDITOR_ID} .dga-editor-message[data-type="info"] { background: rgba(80, 140, 220, 0.15); }
+#${EDITOR_ID} .dga-editor-message[data-type="success"] { background: rgba(70, 180, 115, 0.16); }
+#${EDITOR_ID} .dga-editor-message[data-type="warning"] { background: rgba(230, 165, 60, 0.16); }
+#${EDITOR_ID} .dga-editor-message[data-type="error"] { background: rgba(220, 75, 85, 0.17); }
+#${EDITOR_ID}.dga-busy .dga-editor-shell { cursor: progress; }
 @media (max-width: 680px) {
     #${PANEL_ID} { padding: 0; align-items: stretch; }
     #${PANEL_ID} .dga-shell { width: 100%; max-height: 100vh; min-height: 100vh; border-radius: 0; }
     #${PANEL_ID} .dga-summary, #${PANEL_ID} .dga-fields, #${PANEL_ID} .dga-meta { grid-template-columns: 1fr; }
     #${PANEL_ID} .dga-actions { flex-wrap: wrap; }
     #${PANEL_ID} .dga-actions .dga-button { flex: 1 1 42%; }
+    #${EDITOR_ID} { padding: 0; align-items: stretch; }
+    #${EDITOR_ID} .dga-editor-shell { width: 100%; height: 100vh; min-height: 100vh; border-radius: 0; }
+    #${EDITOR_ID} .dga-editor-main { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+    #${EDITOR_ID} .dga-editor-sidebar {
+        max-height: 42vh;
+        border-right: 0;
+        border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
+    }
+    #${EDITOR_ID} .dga-editor-workspace { padding: 10px; }
+    #${EDITOR_ID} .dga-editor-footer { flex-wrap: wrap; padding: 10px; }
+    #${EDITOR_ID} .dga-editor-footer .dga-button { flex: 1 1 42%; }
+    #${EDITOR_ID} .dga-selection-actions .dga-button { flex: 1 1 45%; }
+    #${EDITOR_ID} .dga-text-surface { padding: 13px; font-size: 0.9rem; }
 }`;
+    }
+
+    function runStageEditorAction(label, action) {
+        Promise.resolve()
+            .then(action)
+            .catch(error => {
+                console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
+                setEditorMessage(error.message || String(error), 'error');
+                notify(error.message || String(error), 'error');
+            });
+    }
+
+    function installStageEditorUi(force) {
+        const documentRef = getHostDocument();
+        if (!documentRef || !documentRef.body) return null;
+        if (force) {
+            const oldEditor = documentRef.getElementById(EDITOR_ID);
+            if (oldEditor) oldEditor.remove();
+        }
+        const existing = documentRef.getElementById(EDITOR_ID);
+        if (existing) return existing;
+
+        const editor = documentRef.createElement('div');
+        editor.id = EDITOR_ID;
+        editor.hidden = true;
+        editor.setAttribute('role', 'dialog');
+        editor.setAttribute('aria-modal', 'true');
+        editor.setAttribute('aria-labelledby', `${UI_PREFIX}-editor-title`);
+        editor.innerHTML = `
+<div class="dga-editor-shell" tabindex="-1">
+    <header class="dga-editor-header">
+        <div>
+            <h2 class="dga-editor-title" id="${UI_PREFIX}-editor-title">划分提示词阶段</h2>
+            <p class="dga-editor-source"><span id="${UI_PREFIX}-editor-source-name">尚未选择条目</span><span class="dga-editor-dirty" id="${UI_PREFIX}-editor-dirty" hidden>● 未保存</span></p>
+        </div>
+        <button class="dga-close" id="${UI_PREFIX}-editor-close" type="button" aria-label="返回管理页">×</button>
+    </header>
+    <div class="dga-editor-main">
+        <aside class="dga-editor-sidebar">
+            <div class="dga-editor-section-head">
+                <h3>剧情阶段</h3>
+                <button class="dga-button" id="${UI_PREFIX}-editor-new-stage" type="button">＋ 新建</button>
+            </div>
+            <p class="dga-editor-help">每个颜色是一段故事指导。可让同一阶段包含多处不连续文字；“常驻提示”会在全部阶段发送。</p>
+            <div class="dga-stage-list" id="${UI_PREFIX}-editor-stage-list"></div>
+
+            <div class="dga-editor-settings">
+                <h3 id="${UI_PREFIX}-editor-settings-title">阶段设置</h3>
+                <label id="${UI_PREFIX}-editor-stage-name-wrap">阶段名称
+                    <input id="${UI_PREFIX}-editor-stage-name" type="text" maxlength="80" placeholder="例如：雨夜初遇">
+                </label>
+                <label>标记颜色
+                    <input id="${UI_PREFIX}-editor-stage-color" type="color" value="#8b5cf6">
+                </label>
+                <label id="${UI_PREFIX}-editor-completion-wrap">什么时候进入下一阶段
+                    <textarea id="${UI_PREFIX}-editor-stage-completion" placeholder="例如：两人完成第一次正式交谈。留空时也可以手动点“下一段”。"></textarea>
+                </label>
+                <div class="dga-editor-actions" id="${UI_PREFIX}-editor-order-actions">
+                    <button class="dga-button" id="${UI_PREFIX}-editor-move-up" type="button">上移</button>
+                    <button class="dga-button" id="${UI_PREFIX}-editor-move-down" type="button">下移</button>
+                </div>
+                <button class="dga-button dga-danger" id="${UI_PREFIX}-editor-delete-stage" type="button">删除这个阶段</button>
+            </div>
+        </aside>
+
+        <section class="dga-editor-workspace">
+            <div>
+                <h3>世界书提示词原文</h3>
+                <p class="dga-editor-help">像涂色一样拖选文字，再分配给左侧阶段。这里只决定哪些提示词在何时发送，世界书正文不会被改写。</p>
+            </div>
+            <div class="dga-selection-bar">
+                <div class="dga-selection-preview"><b>当前选择：</b><span id="${UI_PREFIX}-editor-selection-text">尚未选择文字</span></div>
+                <div class="dga-selection-actions">
+                    <button class="dga-button dga-primary" id="${UI_PREFIX}-editor-assign" type="button" disabled>分配给当前阶段</button>
+                    <button class="dga-button" id="${UI_PREFIX}-editor-assign-always" type="button" disabled>设为常驻提示</button>
+                    <button class="dga-button" id="${UI_PREFIX}-editor-clear-range" type="button" disabled>清除所选标记</button>
+                </div>
+            </div>
+            <div class="dga-text-surface" id="${UI_PREFIX}-editor-surface" tabindex="0" aria-label="可拖选的世界书提示词原文"></div>
+            <div class="dga-editor-message" id="${UI_PREFIX}-editor-message" data-type="info" hidden></div>
+        </section>
+    </div>
+    <footer class="dga-editor-footer">
+        <button class="dga-button" id="${UI_PREFIX}-editor-save" type="button">保存划分</button>
+        <button class="dga-button dga-primary" id="${UI_PREFIX}-editor-save-bind" type="button">保存并绑定</button>
+    </footer>
+</div>`;
+        documentRef.body.appendChild(editor);
+
+        editorElement('close').onclick = () => closeStageEditor(false);
+        editor.onclick = event => {
+            if (event.target === editor) closeStageEditor(false);
+        };
+        editor.onkeydown = event => {
+            if (event.key === 'Escape') closeStageEditor(false);
+        };
+
+        editorElement('new-stage').onclick = addStage;
+        editorElement('move-up').onclick = () => moveActiveStage(-1);
+        editorElement('move-down').onclick = () => moveActiveStage(1);
+        editorElement('delete-stage').onclick = deleteActiveStage;
+        editorElement('assign').onclick = () => assignPendingRange(stageEditorState.activeOwnerId);
+        editorElement('assign-always').onclick = () => assignPendingRange('always');
+        editorElement('clear-range').onclick = clearSelectedEditorRange;
+        editorElement('save').onclick = () => runStageEditorAction(
+            '保存阶段划分',
+            () => saveStageEditorLayout(false),
+        );
+        editorElement('save-bind').onclick = () => runStageEditorAction(
+            '保存并绑定阶段划分',
+            () => saveStageEditorLayout(true),
+        );
+
+        const nameInput = editorElement('stage-name');
+        nameInput.oninput = event => {
+            const stage = activeStage();
+            if (!stage) return;
+            stage.name = event.target.value;
+            markStageEditorDirty();
+            renderStageEditorSidebar();
+            const title = editorElement('settings-title');
+            if (title) title.textContent = `${stage.name || '未命名阶段'}设置`;
+            updateStageEditorControls();
+        };
+        nameInput.onblur = event => {
+            const stage = activeStage();
+            if (!stage || String(event.target.value || '').trim()) return;
+            const index = stageEditorState.stages.findIndex(item => item.id === stage.id);
+            stage.name = `阶段 ${index + 1}`;
+            event.target.value = stage.name;
+            renderStageEditorSidebar();
+            renderStageEditorSettings();
+            updateStageEditorControls();
+        };
+        editorElement('stage-completion').oninput = event => {
+            const stage = activeStage();
+            if (!stage) return;
+            stage.completion = event.target.value;
+            markStageEditorDirty();
+        };
+        editorElement('stage-color').oninput = event => {
+            const color = normalizeColor(event.target.value, '#64748b');
+            if (stageEditorState.activeOwnerId === 'always') {
+                stageEditorState.alwaysColor = color;
+            } else {
+                const stage = activeStage();
+                if (!stage) return;
+                stage.color = color;
+            }
+            markStageEditorDirty();
+            renderStageEditorSidebar();
+            renderStageEditorText();
+        };
+
+        const surface = editorElement('surface');
+        const captureSoon = () => hostWindow.setTimeout(captureStageEditorSelection, 0);
+        surface.addEventListener('mouseup', captureStageEditorSelection);
+        surface.addEventListener('keyup', captureStageEditorSelection);
+        surface.addEventListener('touchend', captureSoon, { passive: true });
+        surface.addEventListener('click', event => {
+            if (selectionOffsetsInSurface()) {
+                captureStageEditorSelection();
+                return;
+            }
+            selectMarkedRangeFromEvent(event);
+        });
+        updateStageEditorControls();
+        return editor;
     }
 
     function installManagerUi(force) {
@@ -1417,12 +2724,17 @@
         if (!documentRef || !documentRef.body) return null;
         if (force) {
             const oldPanel = documentRef.getElementById(PANEL_ID);
+            const oldEditor = documentRef.getElementById(EDITOR_ID);
             const oldStyle = documentRef.getElementById(STYLE_ID);
             if (oldPanel) oldPanel.remove();
+            if (oldEditor) oldEditor.remove();
             if (oldStyle) oldStyle.remove();
         }
         const existing = documentRef.getElementById(PANEL_ID);
-        if (existing) return existing;
+        if (existing) {
+            installStageEditorUi(false);
+            return existing;
+        }
 
         const style = documentRef.createElement('style');
         style.id = STYLE_ID;
@@ -1467,6 +2779,7 @@
                 </label>
             </div>
             <div class="dga-actions">
+                <button class="dga-button dga-primary" id="${UI_PREFIX}-edit-stages" type="button">划分提示词阶段</button>
                 <button class="dga-button dga-primary" id="${UI_PREFIX}-bind" type="button">绑定所选条目</button>
             </div>
         </section>
@@ -1493,6 +2806,7 @@
     </div>
 </div>`;
         documentRef.body.appendChild(panel);
+        installStageEditorUi(false);
 
         managerElement('close').onclick = closeManager;
         panel.onclick = event => {
@@ -1510,6 +2824,18 @@
         managerElement('entry-select').onchange = event => {
             managerState.selectedEntryKey = event.target.value;
             updateManagerControls();
+        };
+        managerElement('edit-stages').onclick = () => {
+            setManagerBusy(true);
+            setManagerMessage('正在打开提示词阶段标注器……', 'info');
+            Promise.resolve()
+                .then(openStageEditor)
+                .catch(error => {
+                    console.error(`[${SCRIPT_NAME}] 打开阶段标注器失败`, error);
+                    setManagerMessage(error.message || String(error), 'error');
+                    notify(error.message || String(error), 'error');
+                })
+                .finally(() => setManagerBusy(false));
         };
         managerElement('bind').onclick = () => {
             const entry = managerState.entryMap.get(managerState.selectedEntryKey);
@@ -1550,6 +2876,9 @@
         const panel = installManagerUi(false);
         if (!panel) throw new Error('管理页面尚未准备好，请稍后重试');
         closeExtensionsMenu();
+        const documentRef = getHostDocument();
+        const editor = documentRef && documentRef.getElementById(EDITOR_ID);
+        if (editor) editor.hidden = true;
         panel.hidden = false;
         const shell = panel.querySelector('.dga-shell');
         if (shell) shell.focus();
@@ -1718,6 +3047,10 @@
     const publicApi = {
         version: VERSION,
         parseGuideText,
+        parseGuideEntry,
+        getRangeLayout,
+        resolveRangeLayout,
+        createAnchoredRange,
         getActiveAddons,
         formatInjection,
         bindGuide,
