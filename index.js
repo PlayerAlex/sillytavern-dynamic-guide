@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3.3';
+    const VERSION = '1.3.4';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1689,14 +1689,24 @@
         const deleteButton = editorElement('delete-stage');
         const nameInput = editorElement('stage-name');
         const completionInput = editorElement('stage-completion');
+        const completionStage = editorElement('completion-stage');
         const colorInput = editorElement('stage-color');
-        if (title) title.textContent = isAlways ? '常驻提示设置' : (stage ? `${stage.name}设置` : '阶段设置');
+        if (title) {
+            title.textContent = isAlways
+                ? '常驻提示设置'
+                : (stage ? `${stage.name || '未命名阶段'} · 名称、颜色与顺序` : '阶段设置');
+        }
         if (nameWrap) nameWrap.hidden = isAlways || !stage;
         if (completionWrap) completionWrap.hidden = isAlways || !stage;
         if (orderActions) orderActions.hidden = isAlways || !stage;
         if (deleteButton) deleteButton.hidden = isAlways || !stage;
         if (nameInput) nameInput.value = stage ? stage.name : '';
         if (completionInput) completionInput.value = stage ? stage.completion : '';
+        if (completionStage) {
+            completionStage.textContent = isAlways
+                ? '常驻提示不需要'
+                : (stage ? `当前：${stage.name || '未命名阶段'}` : '未选择阶段');
+        }
         if (colorInput) colorInput.value = normalizeColor(
             isAlways ? stageEditorState.alwaysColor : stage && stage.color,
             isAlways ? '#64748b' : DEFAULT_STAGE_COLORS[0],
@@ -1900,6 +1910,7 @@
             addPendingRanges([{ start, end }]);
             stageEditorState.tapHead = null;
             stageEditorState.tapTail = null;
+            clearNativeSelection();
             const count = pendingRangeList().length;
             updateSelectionPreview();
             setEditorMessage(`这一段已加入待分配（共 ${count} 段），可以继续点下一段，或直接分配。`, 'success');
@@ -2677,6 +2688,7 @@
     color: var(--SmartThemeBodyColor, #ececf1);
 }
 #${EDITOR_ID}[hidden] { display: none !important; }
+#${EDITOR_ID} [hidden] { display: none !important; }
 #${EDITOR_ID} * { box-sizing: border-box; }
 #${EDITOR_ID} .dga-editor-shell {
     width: min(1180px, 100%);
@@ -2773,6 +2785,20 @@
 }
 #${EDITOR_ID} .dga-stage-item strong { overflow-wrap: anywhere; }
 #${EDITOR_ID} .dga-stage-item span { opacity: 0.68; font-size: 0.76rem; }
+#${EDITOR_ID} .dga-completion-field {
+    display: grid;
+    gap: 6px;
+    margin-top: 12px;
+    padding: 10px 11px;
+    border: 1px solid rgba(246, 196, 83, 0.38);
+    border-radius: 10px;
+    background: rgba(246, 196, 83, 0.08);
+    font-size: 0.8rem;
+}
+#${EDITOR_ID} .dga-field-title { font-weight: 650; line-height: 1.4; }
+#${EDITOR_ID} .dga-field-title b { color: #f6c453; font-weight: 650; }
+#${EDITOR_ID} .dga-completion-field textarea { min-height: 50px; }
+#${EDITOR_ID} .dga-field-hint { opacity: 0.62; font-size: 0.74rem; line-height: 1.4; }
 #${EDITOR_ID} .dga-editor-settings {
     display: block;
     margin-top: 14px;
@@ -2889,8 +2915,8 @@
     cursor: default;
 }
 #${EDITOR_ID} .dga-hide-pending .dga-text-mark.is-pending {
-    background: transparent;
-    border-bottom-color: transparent;
+    background: color-mix(in srgb, var(--dga-mark-color, #8b5cf6) 10%, transparent);
+    border-bottom-color: color-mix(in srgb, var(--dga-mark-color, #8b5cf6) 48%, transparent);
 }
 #${EDITOR_ID} .dga-tap-caret {
     display: inline-block;
@@ -3102,17 +3128,20 @@
             <p class="dga-editor-help">每个颜色是一段故事指导。可让同一阶段包含多处不连续文字；“常驻提示”会在全部阶段发送。</p>
             <div class="dga-stage-list" id="${UI_PREFIX}-editor-stage-list"></div>
 
+            <label class="dga-completion-field" id="${UI_PREFIX}-editor-completion-wrap">
+                <span class="dga-field-title">什么时候进入下一阶段 <b id="${UI_PREFIX}-editor-completion-stage">阶段 1</b></span>
+                <textarea id="${UI_PREFIX}-editor-stage-completion" rows="2" placeholder="例如：两人完成第一次正式交谈。留空时也可以手动点“下一段”。"></textarea>
+                <span class="dga-field-hint">AI 判断满足这里的条件后，下一段才会替换当前内容。</span>
+            </label>
+
             <details class="dga-editor-settings" id="${UI_PREFIX}-editor-settings" open>
-                <summary class="dga-editor-settings-summary" id="${UI_PREFIX}-editor-settings-title">阶段设置</summary>
+                <summary class="dga-editor-settings-summary" id="${UI_PREFIX}-editor-settings-title">阶段名称、颜色与顺序</summary>
                 <div class="dga-editor-settings-body">
                     <label id="${UI_PREFIX}-editor-stage-name-wrap">阶段名称
                         <input id="${UI_PREFIX}-editor-stage-name" type="text" maxlength="80" placeholder="例如：雨夜初遇">
                     </label>
                     <label>标记颜色
                         <input id="${UI_PREFIX}-editor-stage-color" type="color" value="#8b5cf6">
-                    </label>
-                    <label id="${UI_PREFIX}-editor-completion-wrap">什么时候进入下一阶段
-                        <textarea id="${UI_PREFIX}-editor-stage-completion" placeholder="例如：两人完成第一次正式交谈。留空时也可以手动点“下一段”。"></textarea>
                     </label>
                     <div class="dga-editor-actions" id="${UI_PREFIX}-editor-order-actions">
                         <button class="dga-button" id="${UI_PREFIX}-editor-move-up" type="button">上移</button>
@@ -3185,7 +3214,9 @@
             markStageEditorDirty();
             renderStageEditorSidebar();
             const title = editorElement('settings-title');
-            if (title) title.textContent = `${stage.name || '未命名阶段'}设置`;
+            if (title) title.textContent = `${stage.name || '未命名阶段'} · 名称、颜色与顺序`;
+            const completionStage = editorElement('completion-stage');
+            if (completionStage) completionStage.textContent = `当前：${stage.name || '未命名阶段'}`;
             updateStageEditorControls();
         };
         nameInput.onblur = event => {
