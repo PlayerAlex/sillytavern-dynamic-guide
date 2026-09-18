@@ -463,3 +463,97 @@ test('跨域顶层窗口不会阻止同源页面注册入口', () => {
     assert.ok(documentRef.getElementById('dynamic-guide-assistant-style'), '入口注册时应同时安装手机触摸样式');
     assert.deepEqual(errors, []);
 });
+
+test('“合并到：阶段名”让一个阶段吃掉几段不连续的内容', () => {
+    const parsed = core.parseOutline('## 第一幕\n开头正文\n\n## 第二幕\n第二段正文\n\n## 第一幕补充\n合并到：第一幕\n补充正文\n\n## 道具 [附加]\n从：第一幕\n到：第二幕\n道具正文');
+    assert.equal(parsed.stages.length, 2);
+    assert.equal(parsed.stages[0].prompt, '开头正文\n\n补充正文');
+    assert.equal(parsed.blocks.filter(item => item.kind === 'merged').length, 1);
+    assert.equal(parsed.addons.length, 1);
+    const injected = core.formatInjection(parsed.stages[0], core.activeAddons(parsed, 0));
+    assert.match(injected, /开头正文[\s\S]*补充正文/);
+    assert.match(injected, /道具正文/);
+    assert.doesNotMatch(injected, /第二段正文/);
+});
+
+test('“合并到”找不到阶段时按独立阶段处理并给出提醒', () => {
+    const parsed = core.parseOutline('## 第一幕\n正文一\n\n## 补充\n合并到：不存在\n补充正文');
+    assert.equal(parsed.stages.length, 2);
+    assert.equal(parsed.blocks.filter(item => item.kind === 'merged').length, 0);
+    assert.match(parsed.warnings.join('\n'), /找不到同名阶段/);
+});
+
+test('编辑器写出的“并入”标题能解析，阶段改名时引用同步更新', () => {
+    let parsed = core.parseOutline('## 第一幕\n正文一\n\n## 第二幕\n正文二');
+    const lines = core.insertHeading(parsed.lines, parsed.lines.length, { kind: 'merged', name: '补充', merge: '第一幕' });
+    parsed = core.parseOutline(lines.join('\n'));
+    const merged = parsed.blocks.find(item => item.kind === 'merged');
+    assert.ok(merged, '写出的“合并到：”应当被解析成并入块');
+    assert.equal(merged.name, '补充');
+    assert.equal(parsed.stages.length, 2);
+    const renamed = core.replaceHeading(parsed.lines, parsed.stages[0], { kind: 'stage', name: '开场' });
+    const after = core.parseOutline(renamed.join('\n'));
+    assert.equal(after.stages[0].name, '开场');
+    assert.equal(after.blocks.find(item => item.kind === 'merged').labels.merge, '开场');
+});
+
+test('注入位置跟随大纲条目的深度与角色', async () => {
+    const entry = {
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n正文',
+        enabled: false,
+        position: { type: 'at_depth', depth: 4, role: 'assistant', order: 100 },
+    };
+    const run = runtime(entry);
+    await new Promise(setImmediate);
+    assert.equal(run.injected.length, 1);
+    assert.equal(run.injected[0].depth, 4);
+    assert.equal(run.injected[0].role, 'assistant');
+    assert.deepEqual(run.errors, []);
+});
+
+test('条目不在“按深度插入”位置时，指导仍注入到聊天末尾', async () => {
+    const entry = {
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n正文',
+        enabled: false,
+        position: { type: 'before_character_definition', depth: 4, role: 'user', order: 100 },
+    };
+    const run = runtime(entry);
+    await new Promise(setImmediate);
+    assert.equal(run.injected.length, 1);
+    assert.equal(run.injected[0].depth, 0);
+    assert.equal(run.injected[0].role, 'system');
+    assert.deepEqual(run.errors, []);
+});
+
+test('魔法棒入口沿用酒馆原生条目结构，图标主题样式不会走样', () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false });
+    const { errors } = loadWithDocument(documentRef, helper);
+    const entry = documentRef.getElementById('dynamic-guide-assistant-menu-item');
+    assert.ok(entry, '应当注册魔法棒菜单入口');
+    assert.equal(entry.className, 'extension_container', '外层必须是 extension_container');
+    const row = entry.children[0];
+    assert.match(row.className, /list-group-item/, '内层必须是 list-group-item');
+    assert.match(row.className, /interactable/);
+    const icon = row.children[0];
+    assert.equal(icon.tagName, 'DIV', '图标要和酒馆自带条目一样是 div');
+    assert.match(icon.className, /extensionsMenuExtensionButton/);
+    assert.deepEqual(errors, []);
+});
+
+test('面板高度写死成视口高度，不再靠 inset 定位', () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false });
+    loadWithDocument(documentRef, helper);
+    const style = documentRef.getElementById('dynamic-guide-assistant-style');
+    assert.ok(style, '应当安装面板样式');
+    const css = style.textContent;
+    assert.match(css, /height:\s*100vh/, '要有 100vh 兜底');
+    assert.match(css, /height:\s*100dvh/, '手机要用 100dvh 撑满');
+    assert.match(css, /max-height:\s*100dvh/);
+    assert.doesNotMatch(css, /position:\s*fixed;\s*inset:\s*0/, '单独用 inset 定位会在手机上算出 0 高度');
+});

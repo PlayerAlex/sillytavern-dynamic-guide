@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.0.1
+     * 动态指导助手 v2.0.2
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
@@ -20,7 +20,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.0.1';
+    const VERSION = '2.0.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -32,9 +32,10 @@
     const COMPLETE_MARKER_RE = /<!--\s*DGA_COMPLETE:([a-z0-9_-]+)\s*-->/gi;
 
     const STAGE_COLORS = ['#8b5cf6', '#3b82f6', '#14b8a6', '#f59e0b', '#ef4444', '#ec4899', '#84cc16', '#06b6d4'];
-    const KIND_COLORS = { addon: '#9ca3af', always: '#0ea5e9', note: '#6b7280' };
-    const KIND_LABELS = { stage: '剧情阶段', addon: '附加内容', always: '常驻', note: '备注' };
+    const KIND_COLORS = { addon: '#9ca3af', always: '#0ea5e9', note: '#6b7280', merged: '#a78bfa' };
+    const KIND_LABELS = { stage: '剧情阶段', addon: '附加内容', always: '常驻', note: '备注', merged: '并入已有阶段' };
     const TAG_BY_KIND = { addon: '附加', always: '常驻', note: '备注' };
+    const LABEL_TEXT_BY_KEY = { from: '从', to: '到', merge: '合并到' };
     const KIND_BY_TAG = {
         '附加': 'addon', '附加内容': 'addon', '物品': 'addon',
         '常驻': 'always', '常驻提示': 'always',
@@ -74,6 +75,7 @@
     //   完成：xxx     剧情阶段什么时候算完成（留空 = 只能手动点“下一段”）
     //   从：阶段名    附加内容从哪一段开始有效（默认：它所在的那一段）
     //   到：阶段名    附加内容到哪一段为止（默认：和“从”相同）
+    //   合并到：阶段名 把这段文字并进已有的阶段，一个阶段就能吃掉好几段正文
     // ---------------------------------------------------------------
 
     const MD_HEADING_RE = /^\s*#{1,6}\s+(.+?)\s*#*\s*$/;
@@ -84,6 +86,7 @@
         completion: ['完成', '完成条件', '什么时候完成', '结束条件', '进入下一阶段', '下一阶段', '什么时候进入下一阶段'],
         from: ['从', '开始于', '什么时候出现', '出现时机', '出现条件', '开始条件', '触发时机'],
         to: ['到', '直到', '结束于', '什么时候消失', '消失时机', '消失条件'],
+        merge: ['合并到', '并入', '归入', '归属到', '追加到', '属于', '归到'],
         type: ['类型', '内容类型', '分类'],
         prompt: ['告诉ai', '提示词', '指导内容', '发送给ai', '让ai知道'],
     };
@@ -227,6 +230,21 @@
                 .join('\n\n');
         });
 
+        // “合并到：阶段名”能让一段文字并进已有的阶段，于是一个阶段可以由
+        // 几段不连续的文字组成，不需要靠选区，也不需要额外存一份数据。
+        const stageCandidates = blocks.filter(item => item.kind === 'stage');
+        blocks.forEach(item => {
+            const ref = item.labels.merge;
+            if (!ref) return;
+            const target = resolveStageRef(ref, stageCandidates);
+            if (target < 0) {
+                warnings.push(`“${item.name}”写的“合并到：${ref}”找不到同名阶段，已按独立阶段处理。`);
+                return;
+            }
+            item.kind = 'merged';
+            item.mergeInto = target;
+        });
+
         const stages = [];
         blocks.forEach(item => {
             if (item.kind === 'stage') {
@@ -241,6 +259,15 @@
                 item.anchorStage = Math.max(0, stages.length - 1);
                 item.color = KIND_COLORS[item.kind];
             }
+        });
+
+        blocks.forEach(item => {
+            if (item.kind !== 'merged') return;
+            const stage = stages[item.mergeInto];
+            if (!stage) return;
+            stage.prompt = [stage.prompt, item.prompt].filter(Boolean).join('\n\n');
+            item.anchorStage = stage.stageIndex;
+            item.color = KIND_COLORS.merged;
         });
 
         const addons = [];
@@ -351,6 +378,7 @@
             if (oneLine(spec.from)) out.push(`从：${oneLine(spec.from)}`);
             if (oneLine(spec.to)) out.push(`到：${oneLine(spec.to)}`);
         }
+        if (spec.kind === 'merged' && oneLine(spec.merge)) out.push(`合并到：${oneLine(spec.merge)}`);
         return out;
     }
 
@@ -370,16 +398,17 @@
             const parsed = parseOutline(lines.join('\n'));
             const target = parsed.stages.findIndex(stage => stage.headingLine === block.headingLine);
             // 旧模板允许《阶段名》、引号和换行标签；按解析后的端点更新。
-            parsed.addons.filter(item => item.kind === 'addon').forEach(item => {
-                ['from', 'to'].forEach(key => {
+            parsed.blocks.filter(item => item.kind === 'addon' || item.kind === 'merged').forEach(item => {
+                const keys = item.kind === 'addon' ? ['from', 'to'] : ['merge'];
+                keys.forEach(key => {
                     const value = item.labels[key];
                     if (target < 0 || resolveStageRef(value, parsed.stages) !== target) return;
                     if (/^第?\s*\d+\s*(?:段|章|节|阶段)?$/.test(String(value).trim())
                         && squash(value) !== squash(block.name)) return;
                     item.labelLines.forEach(at => {
-                        const label = parseLabelLine(lines[at]);
+                        const label = at < lines.length ? parseLabelLine(lines[at]) : null;
                         if (!label || label.key !== key) return;
-                        references.set(at, `${key === 'from' ? '从' : '到'}：${spec.name}`);
+                        references.set(at, `${LABEL_TEXT_BY_KEY[key]}：${spec.name}`);
                         if (!label.value) {
                             for (let next = at + 1; item.labelLines.includes(next) && !parseLabelLine(lines[next]); next += 1) {
                                 remove.add(next);
@@ -945,7 +974,23 @@
     // 注入内容必须始终等于“现在该发的那一段”。酒馆或酒馆助手是否等待事件监听器
     // 返回的 Promise 因版本而异，所以这里不依赖生成事件：状态一变就同步更新注入，
     // 生成事件里再用缓存同步兜底一次，然后异步读回权威内容纠正。
-    const injectionCache = { context: null, text: undefined };
+    const injectionCache = { context: null, text: undefined, key: null };
+
+    // 把指导放回来源条目原来在提示词里的位置：条目是“按深度插入”时，跟随它的
+    // 深度和角色；其它位置（角色定义前/后等）没法用注入复制，仍然放在聊天末尾。
+    function injectionPlacement(entry) {
+        const position = (entry && entry.position) || {};
+        if (position.type !== 'at_depth') return { depth: 0, role: 'system', followed: false };
+        const depth = Math.max(0, Number(position.depth) || 0);
+        const role = position.role === 'user' || position.role === 'assistant' ? position.role : 'system';
+        return { depth, role, followed: true };
+    }
+
+    function injectionPlacementText(placement) {
+        return placement && placement.followed
+            ? `跟随大纲条目：深度 ${placement.depth} · ${placement.role}`
+            : '聊天末尾（深度 0）';
+    }
 
     function currentMessageId() {
         const getLastMessageId = api('getLastMessageId', false);
@@ -974,25 +1019,30 @@
         return formatInjection(stage, activeAddons(context.parsed, index));
     }
 
-    function applyInjection(text) {
-        if (text != null && injectionCache.text === text) return;
+    function applyInjection(text, placement) {
+        const spot = placement || { depth: 0, role: 'system', followed: false };
+        const key = text == null ? null : `${spot.depth}|${spot.role}|${text}`;
+        if (text != null && injectionCache.key === key) return;
         const uninjectPrompts = api('uninjectPrompts', false);
         if (text == null) {
             // undefined 表示“还不知道有没有注入过”，这时要清一次；null 表示已经清干净了。
             if (uninjectPrompts && injectionCache.text !== null) uninjectPrompts([INJECTION_ID]);
             injectionCache.text = null;
+            injectionCache.key = null;
             return;
         }
         const injectPrompts = api('injectPrompts', true);
         injectPrompts([{
             id: INJECTION_ID,
             position: 'in_chat',
-            depth: 0,
-            role: 'system',
+            depth: spot.depth,
+            role: spot.role,
             content: text,
             should_scan: false,
         }]);
         injectionCache.text = text;
+        injectionCache.key = key;
+        injectionCache.placement = spot;
     }
 
     function rememberContext(context) {
@@ -1004,7 +1054,7 @@
     function syncInjection(generationType) {
         const context = injectionCache.context;
         if (!context) return;
-        applyInjection(injectionTextFor(context, generationType));
+        applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry));
     }
 
     async function injectCurrentGuide(generationType) {
@@ -1034,7 +1084,7 @@
         if (statesDiffer(context.rawState, context.state)) {
             await writeState({ ...context.state, updatedAt: new Date().toISOString() });
         }
-        applyInjection(injectionTextFor(context, generationType));
+        applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry));
     }
 
     async function moveToIndex(context, target, options) {
@@ -1450,6 +1500,7 @@
             parts.push('现在不发送任何指导。');
         }
         details.append(el('pre', { class: 'dga-pre', text: parts.join('\n\n') }));
+        details.append(muted(`注入位置：${injectionPlacementText(injectionPlacement(context.entry))}`));
         if (context.parsed.warnings.length > 0) {
             details.append(messageBar({ type: 'warning', text: context.parsed.warnings.join('\n') }));
         }
@@ -1523,10 +1574,10 @@
         return card('怎么用',
             el('ol', { class: 'dga-steps' },
                 el('li', {}, '在角色绑定的世界书里新建一个条目，把完整大纲写进去，用空行分开各段。'),
-                el('li', {}, '在上面选中这个条目，点“划分阶段”：点一个段落，把它设为某一阶段的开头。'),
+                el('li', {}, '在上面选中这个条目，点“划分阶段”：点一个段落把它设成某一阶段的开头，也可以切到“编辑原文”直接改正文。'),
                 el('li', {}, '点“保存并绑定”。之后每次聊天，AI 只会收到当前这一段的内容。'),
             ),
-            muted('也可以直接在正文里写“## 阶段名”这样的标题行分段，脚本能直接认出来。'),
+            muted('也可以直接在正文里写“## 阶段名”分段；写“合并到：阶段名”可以把这段并进已有阶段，一个阶段就能由几段不连续的文字组成。'),
         );
     }
 
@@ -1559,6 +1610,7 @@
             parsed: parseOutline(lines.join('\n')),
             dirty: false,
             sheet: null,
+            mode: 'doc',
         };
         ui.view = 'editor';
     }
@@ -1573,6 +1625,7 @@
     function renderEditor() {
         const editor = ui.editor;
         const parsed = editor.parsed;
+        const raw = editor.mode === 'raw';
         const hasHeadings = parsed.blocks.length > 0;
         const docChildren = [];
         if (parsed.items.length === 0) {
@@ -1591,23 +1644,48 @@
             docChildren.push(paragraphCard(item));
         });
 
+        const rawArea = el('textarea', { class: 'dga-raw', rows: 14, spellcheck: 'false' });
+        rawArea.value = editor.lines.join('\n');
+        // 原文编辑时不要整页重绘，否则每敲一个字就会丢焦点。
+        rawArea.addEventListener('input', event => {
+            editor.lines = normalizeText(event.target.value).split('\n');
+            editor.dirty = true;
+        });
+        const toolbar = el('div', { class: 'dga-toolbar' },
+            btn(raw ? '看分段' : '编辑原文', () => {
+                if (raw) {
+                    editor.lines = normalizeText(rawArea.value).split('\n');
+                    editor.parsed = parseOutline(editor.lines.join('\n'));
+                }
+                editor.mode = raw ? 'doc' : 'raw';
+                render();
+            }, { ghost: true }),
+            raw || !hasHeadings ? null : muted('点段落设开头 · 点标题改名或改条件'),
+        );
         const body = el('div', { class: 'dga-body' },
             messageBar(),
-            el('p', { class: 'dga-help', text: '点一个段落，可以把它设成某个阶段的开头；点已有的标题，可以改名、设置进入下一段的条件，或者删掉它。正文文字不会被改动，只会增减标题行。' }),
+            el('p', {
+                class: 'dga-help',
+                text: raw
+                    ? '这里是世界书条目的原文，可以直接改：增删文字、调整顺序、自己写“## 阶段名”都行。回到“看分段”会重新按标题分段。'
+                    : '想怎么分就怎么分：点一个段落设成某一阶段的开头，点标题改名、改条件、并入别的阶段或删掉。也可以切到“编辑原文”直接改正文。',
+            }),
+            toolbar,
             !hasHeadings && parsed.items.length > 0
                 ? btn('按空行自动分段（每块的第一行当标题）', () => {
                     editor.lines = autoSplitByBlankLines(editor.lines);
+                    editor.mode = 'doc';
                     afterEdit();
                 }, { primary: true })
                 : null,
-            el('div', { class: 'dga-doc' }, ...docChildren),
-            hasHeadings ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` }) : null,
+            raw ? rawArea : el('div', { class: 'dga-doc' }, ...docChildren),
+            !raw && hasHeadings ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` }) : null,
         );
         const foot = el('footer', { class: 'dga-foot' },
-            btn('保存', () => runAction('保存', () => saveEditor(false), { refresh: false }), { disabled: !editor.dirty }),
+            btn('保存', () => runAction('保存', () => saveEditor(false), { refresh: false })),
             btn('保存并绑定', () => runAction('保存并绑定', () => saveEditor(true), { refresh: false }), {
                 primary: true,
-                disabled: parsed.stages.length === 0,
+                disabled: !raw && parsed.stages.length === 0,
             }),
         );
         const parts = [
@@ -1627,6 +1705,10 @@
             return block.fromIndex === block.toIndex
                 ? `只在第 ${block.fromIndex + 1} 段有效`
                 : `第 ${block.fromIndex + 1} 段到第 ${block.toIndex + 1} 段有效`;
+        }
+        if (block.kind === 'merged') {
+            const stage = ui.editor.parsed.stages[block.mergeInto];
+            return stage ? `并入「${stage.name}」，和它一起发送` : '找不到要并入的阶段，已按独立阶段处理';
         }
         if (block.kind === 'always') return '每一段都发送';
         return '只给自己看，不发送';
@@ -1683,6 +1765,11 @@
                 completion: '',
                 from: nameAt(anchor),
                 to: nameAt(anchor),
+                merge: nameAt(anchor),
+                lineOptions: item.lines.map((text, offset) => ({
+                    value: String(item.start + offset),
+                    label: `${item.start + offset + 1}. ${oneLine(text).slice(0, 20) || '（空行）'}`,
+                })),
                 canConsumeFirstLine: titleLike,
                 consumeFirstLine: titleLike,
                 error: '',
@@ -1690,6 +1777,7 @@
         } else {
             const block = spec.block;
             const isAddon = block.kind === 'addon';
+            const isMerged = block.kind === 'merged';
             editor.sheet = {
                 mode: 'edit',
                 block,
@@ -1698,6 +1786,7 @@
                 completion: block.completion || '',
                 from: nameAt(isAddon ? block.fromIndex : block.anchorStage),
                 to: nameAt(isAddon ? block.toIndex : block.anchorStage),
+                merge: nameAt(isMerged ? block.mergeInto : block.anchorStage),
                 canConsumeFirstLine: false,
                 consumeFirstLine: false,
                 error: '',
@@ -1741,14 +1830,21 @@
         nameInput.value = sheet.name;
         box.append(field('名称', nameInput));
 
+        if (sheet.mode === 'new' && sheet.lineOptions && sheet.lineOptions.length > 1) {
+            box.append(field('从这一段的哪一行开始', selectControl(sheet.lineOptions, String(sheet.atLine), value => {
+                sheet.atLine = Number(value);
+                render();
+            })));
+        }
+
         if (sheet.canConsumeFirstLine) {
             const checkbox = el('input', { type: 'checkbox', onchange: event => { sheet.consumeFirstLine = event.target.checked; } });
             checkbox.checked = sheet.consumeFirstLine;
-            box.append(el('label', { class: 'dga-check' }, checkbox, el('span', { text: '这一段的第一行就是标题，把它变成标题行' })));
+            box.append(el('label', { class: 'dga-check' }, checkbox, el('span', { text: '选中的那一行就是标题，把它变成标题行' })));
         }
 
         box.append(field('这是什么', el('div', { class: 'dga-seg' },
-            ...['stage', 'addon', 'always', 'note'].map(kind => el('button', {
+            ...['stage', 'merged', 'addon', 'always', 'note'].map(kind => el('button', {
                 type: 'button',
                 class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
                 onclick: () => {
@@ -1785,6 +1881,19 @@
             }
             box.append(muted('附加内容不占进度，只在指定的几段里一起发给 AI，适合物品、地点规则、秘密。'));
         }
+        if (sheet.kind === 'merged') {
+            if (stages.length === 0) {
+                box.append(muted('还没有剧情阶段。先把某个段落设成阶段，再让这段文字并进去。'));
+            } else {
+                const options = stages.map(stage => ({ value: stage.name, label: `第 ${stage.stageIndex + 1} 段 · ${stage.name}` }));
+                if (!options.some(option => option.value === sheet.merge)) sheet.merge = options[0].value;
+                box.append(field('并进哪一个阶段', selectControl(options, sheet.merge, value => {
+                    sheet.merge = value;
+                    render();
+                })));
+            }
+            box.append(muted('这段文字会和那个阶段一起发给 AI，但它自己不占进度：一个阶段就能吃掉几段不连续的内容。'));
+        }
         if (sheet.kind === 'always') box.append(muted('这部分会在每一段都发给 AI。'));
         if (sheet.kind === 'note') box.append(muted('这部分只给作者自己看，不会发给 AI。'));
 
@@ -1813,12 +1922,18 @@
             render();
             return;
         }
+        if (sheet.kind === 'merged' && !String(sheet.merge || '').trim()) {
+            sheet.error = '请选择要并进的阶段。';
+            render();
+            return;
+        }
         const spec = {
             name,
             kind: sheet.kind,
             completion: sheet.completion,
             from: sheet.kind === 'addon' ? sheet.from : '',
             to: sheet.kind === 'addon' ? sheet.to : '',
+            merge: sheet.kind === 'merged' ? sheet.merge : '',
         };
         if (sheet.mode === 'new') {
             editor.lines = insertHeading(editor.lines, sheet.atLine, spec, sheet.canConsumeFirstLine && sheet.consumeFirstLine);
@@ -1867,7 +1982,7 @@
     function styles() {
         const P = `#${PANEL_ID}`;
         return `
-${P} { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(6, 8, 14, 0.62); backdrop-filter: blur(4px); color: var(--SmartThemeBodyColor, #ececf1); font-size: 15px; line-height: 1.55; box-sizing: border-box; }
+${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(6, 8, 14, 0.62); backdrop-filter: blur(4px); color: var(--SmartThemeBodyColor, #ececf1); font-size: 15px; line-height: 1.55; box-sizing: border-box; }
 ${P}[hidden] { display: none; }
 ${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
 ${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: 720px; max-height: 100%; background: var(--SmartThemeBlurTintColor, #1b1d24); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 18px; box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5); overflow: hidden; outline: none; }
@@ -1911,6 +2026,10 @@ ${P} .dga-fold[open] > summary::after { content: ' ▴'; }
 ${P} .dga-fold > *:not(summary) { margin-top: 10px; }
 ${P} .dga-steps { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-doc { display: flex; flex-direction: column; gap: 8px; }
+${P} .dga-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+${P} .dga-toolbar .dga-btn { flex: 0 0 auto; min-height: 40px; padding: 8px 12px; }
+${P} .dga-toolbar .dga-muted { flex: 1 1 auto; opacity: 0.55; }
+${P} textarea.dga-raw { min-height: 46vh; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92rem; line-height: 1.5; }
 ${P} .dga-para { padding: 11px 13px; border-radius: 12px; border: 1px dashed rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.03); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.93rem; cursor: pointer; }
 ${P} .dga-para:hover, ${P} .dga-para:focus-visible, ${P} .dga-heading:hover, ${P} .dga-heading:focus-visible { outline: 2px solid var(--SmartThemeQuoteColor, #7c6cf0); outline-offset: 1px; }
 ${P} .dga-para.dga-dim { opacity: 0.5; }
@@ -1930,7 +2049,7 @@ ${P} .dga-sheet h3 { margin: 0; font-size: 1.05rem; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
 ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-events: none; }
-#${MENU_ITEM_ID} { width: 100%; min-height: 44px; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+#${MENU_ITEM_ID} { width: 100%; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 @media (max-width: 680px) {
     ${P} { padding: 0; }
     ${P} .dga-shell { max-width: none; height: 100%; max-height: none; border-radius: 0; border: 0; }
@@ -2033,16 +2152,24 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
         ensureStyle(doc);
         removeNode(doc.getElementById(MENU_ITEM_ID));
         removeNode(doc.getElementById(LEGACY_MENU_CONTAINER_ID));
-        const item = doc.createElement('a');
+        // 和酒馆自带条目、酒馆助手工具箱用同一套结构：
+        // #extensionsMenu > .extension_container > div，图标也是 div。
+        // 主题里 ".options-content a"、"#extensionsMenu>.extension_container>div"
+        // 这些规则才会命中，入口不会变成样式走样的按钮。
+        const item = doc.createElement('div');
         item.id = MENU_ITEM_ID;
-        item.className = 'list-group-item flex-container flexGap5 interactable';
-        item.href = 'javascript:void(0)';
-        item.title = '打开动态指导助手';
-        const icon = doc.createElement('span');
+        item.className = 'extension_container';
+        const row = doc.createElement('div');
+        row.className = 'list-group-item flex-container flexGap5 interactable';
+        row.tabIndex = 0;
+        row.setAttribute('role', 'listitem');
+        row.title = '打开动态指导助手';
+        const icon = doc.createElement('div');
         icon.className = 'fa-fw fa-solid fa-book-open extensionsMenuExtensionButton';
         const label = doc.createElement('span');
         label.textContent = '动态指导助手';
-        item.append(icon, label);
+        row.append(icon, label);
+        item.append(row);
         let lastOpen = 0;
         const openFromMenu = event => {
             if (event) {
