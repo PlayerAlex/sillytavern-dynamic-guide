@@ -4,7 +4,7 @@
 
 作者可以把完整的剧情阶段、重要物品、地点规则和秘密写在一个角色绑定世界书条目中。脚本会禁用完整来源条目，每次生成时只向 AI 注入当前有效内容。
 
-当前发布版本：**v1.1.0**
+当前发布版本：**v1.2.0**
 
 ## 推荐安装方法
 
@@ -17,13 +17,13 @@
 在线版的脚本正文只有一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.0/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.2.0/index.js';
 ```
 
 如果 `gcore.jsdelivr.net` 在你的网络中无法访问，可以改用：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.0/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.2.0/index.js';
 ```
 
 固定版本地址不会随着仓库后续更新自动改变，角色卡作者可以在测试完成后稳定发布。
@@ -35,7 +35,8 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.0/
 3. 导入 `酒馆助手脚本-动态指导助手-在线版.json`。
 4. 确认脚本已启用。
 5. 打开要制作的角色聊天。
-6. 点击“绑定指导页”，选择角色绑定世界书中的剧情指导条目。
+6. 点击左下角魔法棒，在菜单中打开“动态指导助手”。
+7. 在独立管理页里选择角色世界书和剧情指导条目，然后点击“绑定所选条目”。
 
 如果不想联网加载，可以导入：
 
@@ -50,16 +51,12 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.0/
 也可以在酒馆助手中新建脚本，把脚本正文替换为：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.0/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.2.0/index.js';
 ```
 
-保存并启用后，远程脚本会自动注册以下按钮：
+保存并启用后，远程脚本会在左下角魔法棒菜单中注册一个“动态指导助手”入口。绑定、状态查看、上一段、下一段和重置都集中在独立管理页中。
 
-- 绑定指导页
-- 查看当前内容
-- 下一段
-- 上一段
-- 重置进度
+从 v1.1 升级时，v1.2 会自动清理旧版遗留的五个脚本按钮。重新导入在线版 JSON 也会同步清空旧按钮配置。
 
 ## 世界书写法
 
@@ -135,7 +132,7 @@ import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.
 - 每次生成只发送当前主线和当前有效的附加内容。
 - AI 判断当前目标已经完成后，会输出隐藏完成标记并推进到下一段。
 - 每个聊天独立保存进度。
-- 判断错误时可以使用上一段、下一段和重置按钮修正。
+- 判断错误时可以在魔法棒菜单的管理页中使用上一段、下一段和重置修正。
 - 不需要额外的大模型 API。
 
 ## 文件说明
@@ -145,6 +142,14 @@ import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.
 - `酒馆助手脚本-动态指导助手-离线版.json`：不依赖远程加载的完整版本。
 
 ## 版本记录
+
+### v1.2.0 — 2026-09-18
+
+- 将五个脚本按钮合并为左下角魔法棒菜单中的单一入口。
+- 增加独立管理页，集中显示角色、绑定世界书、指导条目、当前进度与实际发送内容。
+- 修复角色已经绑定世界书却显示“没有绑定”的问题。
+- 兼容 TavernHelper 返回、角色卡原生绑定字段、附加世界书设置，以及三种世界书条目结构。
+- 自动清理 v1.1 遗留按钮，并在页面中显示绑定识别来源与具体错误。
 
 ### v1.1.0 — 2026-09-18
 
