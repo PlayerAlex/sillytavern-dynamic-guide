@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3.4';
+    const VERSION = '1.3.5';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -754,6 +754,44 @@
         });
     }
 
+    function progressIdentity(source) {
+        if (!source || !source.entry) return '';
+        return `${cleanWorldbookName(source.worldbookName)}::${source.entry.uid}`;
+    }
+
+    async function readRememberedProgress(source) {
+        const identity = progressIdentity(source);
+        if (!identity) return null;
+        const variables = await readVariables('character');
+        const root = variables[VARIABLE_ROOT];
+        const progress = root && typeof root === 'object' ? root.progress : null;
+        if (!progress || typeof progress !== 'object') return null;
+        const record = progress[identity];
+        return record && typeof record === 'object' ? record : null;
+    }
+
+    async function writeRememberedProgress(source, state) {
+        const identity = progressIdentity(source);
+        if (!identity) return null;
+        const record = {
+            sourceKey: state.sourceKey,
+            mainIndex: state.mainIndex,
+            mainName: state.mainName || '',
+            updatedAt: state.updatedAt || new Date().toISOString(),
+        };
+        return updateVariables('character', variables => {
+            const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
+                ? variables[VARIABLE_ROOT]
+                : {};
+            const progress = root.progress && typeof root.progress === 'object'
+                ? { ...root.progress }
+                : {};
+            progress[identity] = record;
+            variables[VARIABLE_ROOT] = { ...root, progress };
+            return variables;
+        });
+    }
+
     async function readChatState() {
         const variables = await readVariables('chat');
         const root = variables[VARIABLE_ROOT];
@@ -1158,7 +1196,10 @@
         }
 
         const sourceKey = makeSourceKey(source);
-        const oldState = await readChatState();
+        const chatState = await readChatState();
+        const hasChatState = Boolean(chatState && typeof chatState === 'object' && Object.keys(chatState).length > 0);
+        const remembered = hasChatState ? null : await readRememberedProgress(source);
+        const oldState = hasChatState ? chatState : remembered;
         const state = reconcileState(oldState, parsed, sourceKey);
         if (settings.persistState !== false && statesDiffer(oldState, state)) {
             state.updatedAt = new Date().toISOString();
@@ -1175,6 +1216,7 @@
             state,
             mainBlock,
             addons,
+            inherited: Boolean(remembered),
         };
     }
 
@@ -1228,6 +1270,7 @@
 
         const nextState = stateForIndex(context, targetIndex, settings);
         await writeChatState(nextState);
+        await writeRememberedProgress(context.source, nextState);
         await safeUninject();
 
         const nextBlock = context.parsed.mainBlocks[nextState.mainIndex];
@@ -2346,6 +2389,20 @@
         return sections.join('\n');
     }
 
+    function progressHelpText(context) {
+        if (!context || !context.configured) {
+            return '绑定并推进剧情后，进度会记在这个角色上；之后新建聊天可以直接继续，不用重头开始。';
+        }
+        const total = context.parsed.mainBlocks.length;
+        const position = context.mainBlock
+            ? `第 ${context.state.mainIndex + 1} 段（共 ${total} 段）`
+            : `已完成全部 ${total} 段`;
+        const lead = context.inherited
+            ? `这是一个新聊天，已从上次进度继续：${position}。`
+            : `这个角色记住的进度：${position}。`;
+        return `${lead}新建聊天仍会从这里继续；点“重置到第一段”可以让之后的聊天也从头开始。`;
+    }
+
     function renderManager(binding, config, context, contextError) {
         managerState.binding = binding;
         managerState.context = context;
@@ -2361,6 +2418,7 @@
                 : `${context.parsed.mainBlocks.length} / ${context.parsed.mainBlocks.length}（已完成）`;
             setManagerText('binding-value', `${context.source.worldbookName} → ${entryName(context.source.entry)}`);
             setManagerText('progress-value', progress);
+            setManagerText('progress-help', progressHelpText(context));
             setManagerText('current-title', context.mainBlock ? context.mainBlock.title : '主线已完成');
             setManagerText(
                 'addons-value',
@@ -2379,6 +2437,7 @@
                 : '尚未绑定';
             setManagerText('binding-value', configuredLabel);
             setManagerText('progress-value', '—');
+            setManagerText('progress-help', progressHelpText(null));
             setManagerText('current-title', contextError ? '读取失败' : '等待绑定');
             setManagerText('addons-value', '无');
             setManagerText('preview', contextError || currentContentPreview(null));
@@ -2511,14 +2570,16 @@
         };
         await writeCharacterConfig(config);
         const source = { worldbookName, entry: freshEntry };
-        await writeChatState({
+        const boundState = {
             sourceKey: makeSourceKey(source),
             mainIndex: 0,
             mainName: parsed.mainBlocks[0].title,
             lastCompletionMessageId: null,
             lastCompletionFingerprint: '',
             updatedAt: new Date().toISOString(),
-        });
+        };
+        await writeChatState(boundState);
+        await writeRememberedProgress(source, boundState);
         await safeUninject();
         notify(`已绑定“${entryName(freshEntry)}”，当前内容：${parsed.mainBlocks[0].title}`, 'success');
         return true;
@@ -3457,6 +3518,7 @@
 
         <section class="dga-section">
             <div class="dga-section-head"><h3>当前聊天进度</h3></div>
+            <p class="dga-help" id="${UI_PREFIX}-progress-help">绑定并推进剧情后，进度会记在这个角色上；之后新建聊天可以直接继续。</p>
             <div class="dga-actions">
                 <button class="dga-button" id="${UI_PREFIX}-previous" type="button">上一段</button>
                 <button class="dga-button dga-primary" id="${UI_PREFIX}-next" type="button">下一段</button>
@@ -3523,12 +3585,12 @@
             '已切换到下一段。',
         );
         managerElement('reset').onclick = () => runManagerAction(
-            '正在重置当前聊天进度……',
+            '正在重置剧情进度……',
             async () => {
-                if (!hostWindow.confirm('把当前聊天的动态指导进度重置到第一段？')) return false;
+                if (!hostWindow.confirm('把动态指导进度重置到第一段？\n\n当前聊天和之后新建的聊天都会从第一段重新开始。')) return false;
                 return moveToIndex(0);
             },
-            '当前聊天已重置到第一段。',
+            '已重置到第一段，新聊天也会从第一段开始。',
         );
         return panel;
     }
@@ -3615,7 +3677,7 @@
         try {
             const context = await loadContext();
             if (!context.configured) throw new Error('尚未绑定动态指导页');
-            if (!hostWindow.confirm('把当前聊天的动态指导进度重置到第一段？')) return;
+            if (!hostWindow.confirm('把动态指导进度重置到第一段？\n\n当前聊天和之后新建的聊天都会从第一段重新开始。')) return;
             await moveToIndex(0);
         } catch (error) {
             notify(error.message || String(error), 'error');
@@ -3765,6 +3827,19 @@
         eventOn(tavernEvents.CHAT_CHANGED, () => {
             runEventTask('切换聊天', async () => {
                 await safeUninject();
+                try {
+                    const context = await loadContext();
+                    if (context.configured && context.inherited) {
+                        notify(
+                            context.mainBlock
+                                ? `新聊天已继续上次进度：${context.mainBlock.title}`
+                                : '新聊天已继续上次进度：主线已完成',
+                            'success',
+                        );
+                    }
+                } catch (error) {
+                    console.warn(`[${SCRIPT_NAME}] 读取进度失败`, error);
+                }
                 const panel = managerElement('panel');
                 if (panel && !panel.hidden) await refreshManager({ quiet: true });
             });
