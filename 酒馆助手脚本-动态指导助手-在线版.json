@@ -1,0 +1,38 @@
+{
+  "type": "script",
+  "enabled": true,
+  "name": "动态指导助手（在线版）",
+  "id": "912c8dc1-cf5c-4c9f-a8a1-2bf8b2d4cf79",
+  "content": "import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v1.1.0/index.js';\n",
+  "info": "动态指导助手在线加载版。通过固定版本 jsDelivr 地址加载完整脚本，只向 AI 注入当前有效的剧情、物品或规则内容。",
+  "button": {
+    "enabled": true,
+    "buttons": [
+      {
+        "name": "绑定指导页",
+        "visible": true
+      },
+      {
+        "name": "查看当前内容",
+        "visible": true
+      },
+      {
+        "name": "下一段",
+        "visible": true
+      },
+      {
+        "name": "上一段",
+        "visible": true
+      },
+      {
+        "name": "重置进度",
+        "visible": true
+      }
+    ]
+  },
+  "data": {
+    "version": "1.1",
+    "loader": "jsdelivr",
+    "source": "PlayerAlex/sillytavern-dynamic-guide@v1.1.0"
+  }
+}
