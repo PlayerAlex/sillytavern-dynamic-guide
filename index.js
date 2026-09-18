@@ -1,51 +1,50 @@
 (function () {
     'use strict';
 
+    /* ================================================================
+     * 动态指导助手 v2.0
+     *
+     * 这个文件分三部分：
+     *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
+     *       拼成注入文本。不碰页面，不碰酒馆接口，可以单独测试。
+     *   二、适配层：读写酒馆助手的变量、世界书、注入和事件。
+     *   三、界面：管理页和“划分阶段”编辑器。
+     *
+     * 数据只存两处：
+     *   - 阶段结构就是世界书条目正文本身，用标题行（## 名称）分段。
+     *   - 进度存在当前聊天的聊天变量里；绑定了哪个条目存在角色变量里。
+     * ================================================================ */
+
+    // ---------------------------------------------------------------
+    // 一、核心：常量与文本工具
+    // ---------------------------------------------------------------
+
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3.6';
+    const VERSION = '2.0';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
-    const COMPLETE_MARKER_RE = /<!--\s*DGA_COMPLETE:([a-z0-9_-]+)\s*-->/gi;
     const UI_PREFIX = 'dynamic-guide-assistant';
+    const PANEL_ID = `${UI_PREFIX}-panel`;
+    const STYLE_ID = `${UI_PREFIX}-style`;
     const MENU_CONTAINER_ID = `${UI_PREFIX}-menu-container`;
     const MENU_ITEM_ID = `${UI_PREFIX}-menu-item`;
-    const PANEL_ID = `${UI_PREFIX}-panel`;
-    const EDITOR_ID = `${UI_PREFIX}-stage-editor`;
-    const STYLE_ID = `${UI_PREFIX}-style`;
-    const LAYOUT_META_KEY = 'dynamicGuideAssistant';
-    const LAYOUT_VERSION = 1;
-    const LAYOUT_EMBED_BEGIN = '<!-- DGA_LAYOUT_V1:BEGIN -->';
-    const LAYOUT_EMBED_END = '<!-- DGA_LAYOUT_V1:END -->';
-    const LAYOUT_EMBED_RE = /(?:\r?\n)?<!--\s*DGA_LAYOUT_V1:BEGIN\s*-->[\s\S]*?<!--\s*DGA_LAYOUT_V1:END\s*-->(?:\r?\n)?/gi;
-    const LAYOUT_EMBED_CAPTURE_RE = /<!--\s*DGA_LAYOUT_V1:BEGIN\s*-->([\s\S]*?)<!--\s*DGA_LAYOUT_V1:END\s*-->/i;
-    const DEFAULT_STAGE_COLORS = [
-        '#8b5cf6',
-        '#3b82f6',
-        '#14b8a6',
-        '#f59e0b',
-        '#ef4444',
-        '#ec4899',
-        '#84cc16',
-        '#06b6d4',
-    ];
+    const COMPLETE_MARKER_RE = /<!--\s*DGA_COMPLETE:([a-z0-9_-]+)\s*-->/gi;
 
-    const currentWindow = typeof window !== 'undefined' ? window : globalThis;
-    let hostWindow = currentWindow;
-    try {
-        if (currentWindow.frameElement && currentWindow.parent) {
-            hostWindow = currentWindow.parent;
-        }
-    } catch (error) {
-        hostWindow = currentWindow;
-    }
+    const STAGE_COLORS = ['#8b5cf6', '#3b82f6', '#14b8a6', '#f59e0b', '#ef4444', '#ec4899', '#84cc16', '#06b6d4'];
+    const KIND_COLORS = { addon: '#9ca3af', always: '#0ea5e9', note: '#6b7280' };
+    const KIND_LABELS = { stage: '剧情阶段', addon: '附加内容', always: '常驻', note: '备注' };
+    const TAG_BY_KIND = { addon: '附加', always: '常驻', note: '备注' };
+    const KIND_BY_TAG = {
+        '附加': 'addon', '附加内容': 'addon', '物品': 'addon',
+        '常驻': 'always', '常驻提示': 'always',
+        '备注': 'note', '不发送': 'note', '注释': 'note',
+    };
 
-    const helper = currentWindow.TavernHelper || hostWindow.TavernHelper || null;
-    const instanceToken = `dga-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    currentWindow[INSTANCE_KEY] = instanceToken;
-
-    function isCurrentInstance() {
-        return currentWindow[INSTANCE_KEY] === instanceToken;
+    function normalizeText(text) {
+        return String(text == null ? '' : text)
+            .replace(/^\uFEFF/, '')
+            .replace(/\r\n?/g, '\n');
     }
 
     function hashText(text) {
@@ -58,688 +57,554 @@
         return (hash >>> 0).toString(16).padStart(8, '0');
     }
 
-    function normalizeText(text) {
-        return String(text == null ? '' : text)
-            .replace(/^\uFEFF/, '')
-            .replace(/\r\n?/g, '\n');
+    function squash(text) {
+        return String(text == null ? '' : text).replace(/\s+/g, '').toLowerCase();
     }
 
-    function utf8ToBase64(text) {
-        const source = String(text == null ? '' : text);
-        const encode = hostWindow.TextEncoder || currentWindow.TextEncoder || globalThis.TextEncoder;
-        const btoaFn = hostWindow.btoa || currentWindow.btoa || globalThis.btoa;
-        if (encode && btoaFn) {
-            const bytes = new encode().encode(source);
-            let binary = '';
-            for (let index = 0; index < bytes.length; index += 1) {
-                binary += String.fromCharCode(bytes[index]);
-            }
-            return btoaFn(binary);
-        }
-        if (typeof Buffer !== 'undefined') return Buffer.from(source, 'utf8').toString('base64');
-        throw new Error('当前环境无法编码阶段划分');
+    function oneLine(text) {
+        return String(text == null ? '' : text).replace(/\s*\n\s*/g, ' ').trim();
     }
+
+    // ---------------------------------------------------------------
+    // 一、核心：识别标题行和标签行
+    //
+    // 标题行有两种写法：`## 名称` 或 `【名称】`（旧模板的 `【内容：名称】` 也认）。
+    // 标题末尾可以带 [附加] / [常驻] / [备注]，不带就是剧情阶段。
+    // 标题下面可以跟几行“标签”：
+    //   完成：xxx     剧情阶段什么时候算完成（留空 = 只能手动点“下一段”）
+    //   从：阶段名    附加内容从哪一段开始有效（默认：它所在的那一段）
+    //   到：阶段名    附加内容到哪一段为止（默认：和“从”相同）
+    // ---------------------------------------------------------------
+
+    const MD_HEADING_RE = /^\s*#{1,6}\s+(.+?)\s*#*\s*$/;
+    const BRACKET_HEADING_RE = /^\s*【\s*(?:(?:内容|剧情|阶段|指导|章节)\s*[：:]\s*)?([^【】\n]+?)\s*】\s*$/;
+    const TRAILING_TAG_RE = /\s*[\[［(（]\s*([^\[\]［］()（）\s]{1,6})\s*[\]］)）]\s*$/;
+    const LABEL_RE = /^\s*([^\s：:【】\[\]#]{1,10})\s*[：:]\s*(.*)$/;
+    const LABEL_WORDS = {
+        completion: ['完成', '完成条件', '什么时候完成', '结束条件', '进入下一阶段', '下一阶段', '什么时候进入下一阶段'],
+        from: ['从', '开始于', '什么时候出现', '出现时机', '出现条件', '开始条件', '触发时机'],
+        to: ['到', '直到', '结束于', '什么时候消失', '消失时机', '消失条件'],
+        type: ['类型', '内容类型', '分类'],
+        prompt: ['告诉ai', '提示词', '指导内容', '发送给ai', '让ai知道'],
+    };
+
+    function parseHeadingLine(line) {
+        let rest = String(line == null ? '' : line);
+        let kind = 'stage';
+        for (;;) {
+            const match = rest.match(TRAILING_TAG_RE);
+            if (!match || !KIND_BY_TAG[match[1]]) break;
+            kind = KIND_BY_TAG[match[1]];
+            rest = rest.slice(0, match.index);
+        }
+        const markdown = rest.match(MD_HEADING_RE);
+        const bracket = markdown ? null : rest.match(BRACKET_HEADING_RE);
+        if (!markdown && !bracket) return null;
+        const name = (markdown ? markdown[1] : bracket[1]).trim();
+        return name ? { name, kind } : null;
+    }
+
+    function parseLabelLine(line) {
+        const match = String(line == null ? '' : line).match(LABEL_RE);
+        if (!match) return null;
+        const word = squash(match[1]);
+        const key = Object.keys(LABEL_WORDS).find(item => LABEL_WORDS[item].includes(word));
+        return key ? { key, value: match[2].trim() } : null;
+    }
+
+    // 行首反斜杠让标题/标签保持为正文；双反斜杠保留原有反斜杠。
+    function unescapeBodyLine(line) {
+        const match = String(line).match(/^(\s*)\\(.*)$/);
+        if (!match) return null;
+        const rest = match[2];
+        return rest.startsWith('\\') || parseHeadingLine(rest) || parseLabelLine(rest)
+            ? match[1] + rest : null;
+    }
+
+    function escapeBodyText(text) {
+        return normalizeText(text).split('\n').map(line => {
+            if (!parseHeadingLine(line) && !parseLabelLine(line) && !/^\s*\\/.test(line)) return line;
+            return line.replace(/^(\s*)/, '$1\\');
+        }).join('\n');
+    }
+
+    function resolveStageRef(value, stages) {
+        const raw = String(value == null ? '' : value).trim();
+        if (!raw) return -1;
+        const quoted = raw.match(/[《「“"『]([^》」”"』]+)[》」”"』]/);
+        const wanted = squash(quoted ? quoted[1] : raw);
+        const byName = stages.findIndex(stage => squash(stage.name) === wanted);
+        if (byName >= 0) return byName;
+        const numbered = raw.match(/^第?\s*(\d+)\s*(?:段|章|节|阶段)?$/);
+        if (numbered && stages[Number(numbered[1]) - 1]) return Number(numbered[1]) - 1;
+        return -1;
+    }
+
+    // ---------------------------------------------------------------
+    // 一、核心：把正文解析成阶段
+    // ---------------------------------------------------------------
+
+    function parseOutline(input) {
+        const text = normalizeText(input);
+        const lines = text.split('\n');
+        const blocks = [];
+        const items = [];
+        const warnings = [];
+        let block = null;
+        let paragraph = null;
+        // 标签后面空着时（例如旧模板的“什么时候消失：”单独一行），值写在接下来几行里
+        let openLabel = null;
+
+        const closeParagraph = () => {
+            if (!paragraph) return;
+            items.push(paragraph);
+            if (paragraph.block) paragraph.block.paragraphs.push(paragraph);
+            paragraph = null;
+        };
+
+        lines.forEach((line, index) => {
+            const escaped = unescapeBodyLine(line);
+            const heading = escaped == null ? parseHeadingLine(line) : null;
+            if (heading) {
+                closeParagraph();
+                openLabel = null;
+                if (block) block.end = index;
+                block = {
+                    kind: heading.kind,
+                    name: heading.name,
+                    headingLine: index,
+                    labelLines: [],
+                    labels: {},
+                    paragraphs: [],
+                    start: index,
+                    end: lines.length,
+                };
+                blocks.push(block);
+                items.push({ kind: 'heading', block, line: index });
+                return;
+            }
+            if (!line.trim()) {
+                closeParagraph();
+                openLabel = null;
+                return;
+            }
+            const label = block && escaped == null ? parseLabelLine(line) : null;
+            if (label && !(label.key === 'prompt' && label.value)) {
+                closeParagraph();
+                block.labelLines.push(index);
+                if (label.key === 'prompt') {
+                    openLabel = null;
+                } else {
+                    if (!block.labels[label.key]) block.labels[label.key] = label.value;
+                    openLabel = label.value ? null : label.key;
+                }
+                return;
+            }
+            if (openLabel && !label && escaped == null) {
+                block.labelLines.push(index);
+                block.labels[openLabel] = [block.labels[openLabel], line.trim()].filter(Boolean).join(' ');
+                return;
+            }
+            openLabel = null;
+            const content = escaped != null ? escaped : (label ? label.value : line);
+            if (!paragraph) {
+                paragraph = { kind: 'paragraph', block, start: index, end: index + 1, lines: [content] };
+            } else {
+                paragraph.end = index + 1;
+                paragraph.lines.push(content);
+            }
+        });
+        closeParagraph();
+
+        blocks.forEach(item => {
+            // 旧模板用“类型：重要物品”这类写法表示附加内容
+            if (item.kind === 'stage' && item.labels.type && !/主线|剧情|阶段|章节/.test(item.labels.type)) {
+                item.kind = 'addon';
+            }
+            item.prompt = item.paragraphs
+                .map(part => part.lines.join('\n').trim())
+                .filter(Boolean)
+                .join('\n\n');
+        });
+
+        const stages = [];
+        blocks.forEach(item => {
+            if (item.kind === 'stage') {
+                item.stageIndex = stages.length;
+                item.anchorStage = stages.length;
+                item.id = `stage-${stages.length + 1}-${hashText(item.name).slice(0, 6)}`;
+                item.color = STAGE_COLORS[stages.length % STAGE_COLORS.length];
+                // 旧模板的“什么时候消失”对剧情阶段来说就是完成条件
+                item.completion = String(item.labels.completion || item.labels.to || '').trim();
+                stages.push(item);
+            } else {
+                item.anchorStage = Math.max(0, stages.length - 1);
+                item.color = KIND_COLORS[item.kind];
+            }
+        });
+
+        const addons = [];
+        blocks.forEach(item => {
+            if (item.kind === 'always') {
+                item.fromIndex = 0;
+                item.toIndex = Number.POSITIVE_INFINITY;
+                addons.push(item);
+                return;
+            }
+            if (item.kind !== 'addon') return;
+            const from = resolveStageRef(item.labels.from, stages);
+            const to = resolveStageRef(item.labels.to, stages);
+            if (item.labels.from && from < 0) {
+                warnings.push(`“${item.name}”写的“从：${item.labels.from}”找不到同名阶段，已改成从它所在的阶段开始。`);
+            }
+            if (item.labels.to && to < 0) {
+                warnings.push(`“${item.name}”写的“到：${item.labels.to}”找不到同名阶段，已改成和开始阶段相同。`);
+            }
+            item.fromIndex = from >= 0 ? from : item.anchorStage;
+            item.toIndex = to >= 0 ? to : item.fromIndex;
+            if (item.toIndex < item.fromIndex) {
+                warnings.push(`“${item.name}”的结束阶段排在开始阶段前面，已按只在开始阶段有效处理。`);
+                item.toIndex = item.fromIndex;
+            }
+            addons.push(item);
+        });
+
+        blocks.forEach(item => {
+            if (item.kind !== 'note' && !item.prompt) {
+                warnings.push(`“${item.name}”下面没有文字，这一段不会发送任何内容。`);
+            }
+        });
+        if (stages.length === 0) {
+            warnings.push(blocks.length > 0
+                ? '没有剧情阶段：所有标题都被标成了附加、常驻或备注。'
+                : '还没有分阶段。打开“划分阶段”，点一个段落把它设为第一阶段的开头。');
+        }
+
+        return { text, lines, blocks, items, stages, addons, warnings };
+    }
+
+    function activeAddons(parsed, stageIndex) {
+        if (!parsed || stageIndex < 0 || stageIndex >= parsed.stages.length) return [];
+        return parsed.addons.filter(item => stageIndex >= item.fromIndex && stageIndex <= item.toIndex && item.prompt);
+    }
+
+    function formatInjection(stage, addons) {
+        if (!stage) return '';
+        const lines = [
+            '[动态指导助手：当前有效内容]',
+            '以下是作者为当前进度准备的内部创作指导。自然地遵守它，不要向用户提及指导系统、阶段、完成判定或隐藏标记。',
+            '',
+            `## 当前阶段：${stage.name}`,
+            stage.prompt,
+        ];
+        if (addons.length > 0) {
+            lines.push('', '## 同时有效的附加内容');
+            addons.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
+        }
+        if (stage.completion) {
+            lines.push(
+                '',
+                '## 当前阶段的完成判定',
+                stage.completion,
+                '',
+                '只有当你确信本次回复已经实际完成上述判定时，才在回复末尾原样附加下面这行 HTML 注释；尚未完成时不要附加：',
+                `<!-- DGA_COMPLETE:${stage.id} -->`,
+            );
+        }
+        return lines.join('\n');
+    }
+
+    function reconcileState(rawState, parsed) {
+        const old = rawState && typeof rawState === 'object' ? rawState : {};
+        // 兼容 1.x 的字段名 mainIndex / mainName
+        const oldIndex = Number.isInteger(old.stageIndex) ? old.stageIndex
+            : (Number.isInteger(old.mainIndex) ? old.mainIndex : 0);
+        const oldName = old.stageName || old.mainName || '';
+        let index = oldIndex;
+        if (oldName) {
+            const byName = parsed.stages.findIndex(stage => stage.name === oldName);
+            if (byName >= 0) index = byName;
+        }
+        index = Math.max(0, Math.min(index, parsed.stages.length));
+        return {
+            stageIndex: index,
+            stageName: parsed.stages[index] ? parsed.stages[index].name : '',
+            lastCompletionMessageId: old.lastCompletionMessageId == null ? null : old.lastCompletionMessageId,
+            lastCompletionFingerprint: old.lastCompletionFingerprint || '',
+            updatedAt: old.updatedAt || new Date().toISOString(),
+        };
+    }
+
+    // ---------------------------------------------------------------
+    // 一、核心：编辑器对正文做的几种改动（只增删标题行和标签行）
+    // ---------------------------------------------------------------
+
+    function headingText(spec) {
+        const tag = TAG_BY_KIND[spec.kind];
+        return `## ${String(spec.name || '').trim()}${tag ? ` [${tag}]` : ''}`;
+    }
+
+    function labelTexts(spec) {
+        const out = [];
+        if (spec.kind === 'stage' && oneLine(spec.completion)) out.push(`完成：${oneLine(spec.completion)}`);
+        if (spec.kind === 'addon') {
+            if (oneLine(spec.from)) out.push(`从：${oneLine(spec.from)}`);
+            if (oneLine(spec.to)) out.push(`到：${oneLine(spec.to)}`);
+        }
+        return out;
+    }
+
+    function insertHeading(lines, atLine, spec, replaceLine) {
+        const at = Math.max(0, Math.min(atLine, lines.length));
+        const before = lines.slice(0, at);
+        const after = lines.slice(replaceLine ? at + 1 : at);
+        const inserted = [headingText(spec), ...labelTexts(spec)];
+        if (before.length > 0 && before[before.length - 1].trim()) inserted.unshift('');
+        return [...before, ...inserted, ...after];
+    }
+
+    function replaceHeading(lines, block, spec) {
+        const remove = new Set([block.headingLine, ...block.labelLines]);
+        const references = new Map();
+        if (block.kind === 'stage' && spec.kind === 'stage' && spec.name !== block.name) {
+            const parsed = parseOutline(lines.join('\n'));
+            const target = parsed.stages.findIndex(stage => stage.headingLine === block.headingLine);
+            // 旧模板允许《阶段名》、引号和换行标签；按解析后的端点更新。
+            parsed.addons.filter(item => item.kind === 'addon').forEach(item => {
+                ['from', 'to'].forEach(key => {
+                    const value = item.labels[key];
+                    if (target < 0 || resolveStageRef(value, parsed.stages) !== target) return;
+                    if (/^第?\s*\d+\s*(?:段|章|节|阶段)?$/.test(String(value).trim())
+                        && squash(value) !== squash(block.name)) return;
+                    item.labelLines.forEach(at => {
+                        const label = parseLabelLine(lines[at]);
+                        if (!label || label.key !== key) return;
+                        references.set(at, `${key === 'from' ? '从' : '到'}：${spec.name}`);
+                        if (!label.value) {
+                            for (let next = at + 1; item.labelLines.includes(next) && !parseLabelLine(lines[next]); next += 1) {
+                                remove.add(next);
+                            }
+                        }
+                    });
+                });
+            });
+        }
+        const result = [];
+        lines.forEach((line, index) => {
+            if (index === block.headingLine) {
+                result.push(headingText(spec), ...labelTexts(spec));
+            } else if (!remove.has(index)) {
+                result.push(references.has(index) ? references.get(index) : line);
+            }
+        });
+        return result;
+    }
+
+    function collapseBlankRuns(lines) {
+        const out = [];
+        lines.forEach(line => {
+            if (!line.trim() && out.length > 0 && !out[out.length - 1].trim()) return;
+            out.push(line);
+        });
+        while (out.length > 0 && !out[0].trim()) out.shift();
+        return out;
+    }
+
+    function deleteHeading(lines, block) {
+        const remove = new Set([block.headingLine, ...block.labelLines]);
+        return collapseBlankRuns(lines.filter((line, index) => !remove.has(index)));
+    }
+
+    // 还没有任何标题时的快捷方式：每个空行隔开的块算一段，短的第一行当标题。
+    function autoSplitByBlankLines(lines) {
+        const result = [];
+        let index = 0;
+        let count = 0;
+        while (index < lines.length) {
+            if (!lines[index].trim()) {
+                result.push(lines[index]);
+                index += 1;
+                continue;
+            }
+            let end = index;
+            while (end < lines.length && lines[end].trim()) end += 1;
+            const chunk = lines.slice(index, end);
+            count += 1;
+            const first = chunk[0].trim();
+            const looksLikeTitle = chunk.length > 1
+                && first.length <= 24
+                && !/[。！？!?，,；;…”"）)]$/.test(first)
+                && !parseLabelLine(first);
+            if (looksLikeTitle) {
+                result.push(`## ${first}`, ...chunk.slice(1));
+            } else {
+                result.push(`## 第 ${count} 段`, ...chunk);
+            }
+            index = end;
+        }
+        return result;
+    }
+
+    // ---------------------------------------------------------------
+    // 一、核心：识别并转换 1.x 的旧版划分
+    //
+    // 1.x 把阶段划分存在 entry.extra 和正文末尾的 Base64 标记里。
+    // 2.0 只认正文里的标题行，所以旧条目要一次性转换成标题行写法。
+    // ---------------------------------------------------------------
+
+    const LEGACY_META_KEY = 'dynamicGuideAssistant';
+    const LEGACY_MARKER_RE = /\n*<!--\s*DGA_LAYOUT_V1:BEGIN\s*-->[\s\S]*?<!--\s*DGA_LAYOUT_V1:END\s*-->\n*/gi;
+    const LEGACY_MARKER_CAPTURE_RE = /<!--\s*DGA_LAYOUT_V1:BEGIN\s*-->([\s\S]*?)<!--\s*DGA_LAYOUT_V1:END\s*-->/i;
 
     function base64ToUtf8(value) {
         const source = String(value || '').replace(/\s+/g, '');
         if (!source) return '';
-        const atobFn = hostWindow.atob || currentWindow.atob || globalThis.atob;
-        const decode = hostWindow.TextDecoder || currentWindow.TextDecoder || globalThis.TextDecoder;
-        if (atobFn && decode) {
-            const binary = atobFn(source);
+        if (typeof atob === 'function' && typeof TextDecoder === 'function') {
+            const binary = atob(source);
             const bytes = new Uint8Array(binary.length);
-            for (let index = 0; index < binary.length; index += 1) {
-                bytes[index] = binary.charCodeAt(index);
-            }
-            return new decode('utf-8').decode(bytes);
+            for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+            return new TextDecoder('utf-8').decode(bytes);
         }
         if (typeof Buffer !== 'undefined') return Buffer.from(source, 'base64').toString('utf8');
-        throw new Error('当前环境无法解码阶段划分');
+        throw new Error('当前环境无法解码旧版划分');
     }
 
-    function isUsableLayoutShape(layout) {
-        return Boolean(
-            layout
-            && typeof layout === 'object'
-            && layout.mode === 'ranges'
-            && Array.isArray(layout.stages)
-            && layout.stages.length > 0,
+    function stripLegacyMarker(content) {
+        return normalizeText(content).replace(LEGACY_MARKER_RE, '\n').replace(/\s+$/, '');
+    }
+
+    function readLegacyLayout(entry) {
+        const usable = layout => Boolean(
+            layout && typeof layout === 'object' && layout.mode === 'ranges'
+            && Array.isArray(layout.stages) && layout.stages.length > 0,
         );
-    }
-
-    function layoutEmbedBlock(layout) {
-        const encoded = utf8ToBase64(JSON.stringify(layout));
-        const lines = encoded.match(/.{1,96}/g) || [encoded];
-        return [
-            LAYOUT_EMBED_BEGIN,
-            '<!-- 动态指导助手：以下标记用于保存阶段划分，普通阅读请忽略。 -->',
-            ...lines,
-            LAYOUT_EMBED_END,
-        ].join('\n');
-    }
-
-    function extractEmbeddedLayout(content) {
-        const match = normalizeText(content).match(LAYOUT_EMBED_CAPTURE_RE);
+        const meta = entry && entry.extra && typeof entry.extra === 'object' ? entry.extra[LEGACY_META_KEY] : null;
+        if (meta && usable(meta.layout)) return meta.layout;
+        const match = normalizeText(entry && entry.content).match(LEGACY_MARKER_CAPTURE_RE);
         if (!match) return null;
         try {
-            // 标记块里夹着一行给人看的 HTML 注释，解码前先去掉，只留 Base64 正文。
-            const encoded = match[1].replace(/<!--[\s\S]*?-->/g, '');
-            const parsed = JSON.parse(base64ToUtf8(encoded));
-            return isUsableLayoutShape(parsed) ? parsed : null;
+            const parsed = JSON.parse(base64ToUtf8(match[1].replace(/<!--[\s\S]*?-->/g, '')));
+            return usable(parsed) ? parsed : null;
         } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 读取条目正文里的阶段划分失败`, error);
             return null;
         }
     }
 
-    function stripLayoutMarker(content) {
-        return normalizeText(content)
-            .replace(LAYOUT_EMBED_RE, '')
-            .replace(/\n{3,}$/g, '\n')
-            .replace(/\s+$/g, '');
+    function hasLegacyLayout(entry) {
+        return Boolean(readLegacyLayout(entry));
     }
 
-    function entryDisplayContent(entry) {
-        return stripLayoutMarker(entry && entry.content);
-    }
-
-    function contentWithLayoutMarker(content, layout) {
-        const base = stripLayoutMarker(content);
-        const marker = layoutEmbedBlock(layout);
-        return base ? `${base}\n\n${marker}` : marker;
-    }
-
-    function normalizeFieldKey(key) {
-        return String(key || '')
-            .toLowerCase()
-            .replace(/\s+/g, '');
-    }
-
-    function fieldKind(key) {
-        const normalized = normalizeFieldKey(key);
-        const aliases = {
-            type: ['类型', '内容类型', '分类'],
-            show: ['什么时候出现', '出现时机', '出现条件', '开始条件', '触发时机', '触发条件'],
-            prompt: ['告诉ai', '提示词', '指导内容', '内容', '发送给ai', '让ai知道'],
-            hide: ['什么时候消失', '消失时机', '消失条件', '结束条件', '完成条件'],
-            follow: ['跟随阶段', '所属阶段', '关联阶段'],
-        };
-        return Object.keys(aliases).find(kind => aliases[kind].includes(normalized)) || null;
-    }
-
-    function parseFieldLine(line) {
-        const match = String(line || '').match(/^\s*([^：:\n]{1,20})\s*[：:]\s*(.*)$/);
-        if (!match) return null;
-        const kind = fieldKind(match[1]);
-        return kind ? { kind, inlineValue: match[2] } : null;
-    }
-
-    function lineRecords(text) {
-        const records = [];
-        let offset = 0;
-        for (const line of normalizeText(text).split('\n')) {
-            records.push({ line, start: offset, end: offset + line.length });
-            offset += line.length + 1;
-        }
-        return records;
-    }
-
-    function discoverBlockHeaders(text) {
-        const records = lineRecords(text);
-        const bracketHeaders = [];
-
-        for (let index = 0; index < records.length; index += 1) {
-            const record = records[index];
-            const bracket = record.line.match(/^\s*[【\[]\s*(?:内容|剧情|阶段|指导)\s*[：:]\s*([^】\]\n]+?)\s*[】\]]\s*$/);
-            if (bracket) {
-                bracketHeaders.push({
-                    title: bracket[1].trim(),
-                    start: record.start,
-                    bodyStart: record.end + 1,
-                    lineIndex: index,
-                });
-            }
-        }
-        if (bracketHeaders.length > 0) return bracketHeaders;
-
-        const markdownHeaders = [];
-        for (let index = 0; index < records.length; index += 1) {
-            const record = records[index];
-            const markdown = record.line.match(/^\s*#{1,6}\s+(.+?)\s*#*\s*$/);
-            if (!markdown || parseFieldLine(markdown[1])) continue;
-            markdownHeaders.push({
-                title: markdown[1].trim(),
-                start: record.start,
-                bodyStart: record.end + 1,
-                lineIndex: index,
-            });
-        }
-        if (markdownHeaders.length > 0) return markdownHeaders;
-
-        const plainHeaders = [];
-        for (let index = 0; index < records.length; index += 1) {
-            const title = records[index].line.trim();
-            if (!title || title.length > 80 || parseFieldLine(title)) continue;
-
-            let nextIndex = index + 1;
-            while (nextIndex < records.length && !records[nextIndex].line.trim()) {
-                nextIndex += 1;
-            }
-            if (nextIndex < records.length && parseFieldLine(records[nextIndex].line)) {
-                plainHeaders.push({
-                    title,
-                    start: records[index].start,
-                    bodyStart: records[index].end + 1,
-                    lineIndex: index,
-                });
-            }
-        }
-        return plainHeaders;
-    }
-
-    function parseBlockFields(body) {
-        const fields = {
-            type: '',
-            show: '',
-            prompt: '',
-            hide: '',
-            follow: '',
-            intro: '',
-        };
-        const buckets = {
-            type: [],
-            show: [],
-            prompt: [],
-            hide: [],
-            follow: [],
-            intro: [],
-        };
-        let active = 'intro';
-
-        for (const line of normalizeText(body).split('\n')) {
-            const parsed = parseFieldLine(line);
-            if (parsed) {
-                active = parsed.kind;
-                if (parsed.inlineValue) buckets[active].push(parsed.inlineValue);
-                continue;
-            }
-            buckets[active].push(line);
-        }
-
-        Object.keys(fields).forEach(key => {
-            fields[key] = buckets[key].join('\n').trim();
-        });
-        return fields;
-    }
-
-    function isMainType(type) {
-        const normalized = String(type || '').trim();
-        if (!normalized) return true;
-        return /主线|剧情|阶段|章节/.test(normalized);
-    }
-
-    function parseGuideText(input) {
-        const text = normalizeText(input);
-        const headers = discoverBlockHeaders(text);
-        const warnings = [];
-        const blocks = [];
-
-        if (headers.length === 0) {
-            return {
-                format: 'dynamic-guide-v1',
-                blocks: [],
-                mainBlocks: [],
-                addonBlocks: [],
-                warnings: ['没有找到内容标题。请使用“【内容：名称】”作为每段开头。'],
-            };
-        }
-
-        for (let index = 0; index < headers.length; index += 1) {
-            const header = headers[index];
-            const next = headers[index + 1];
-            const body = text.slice(header.bodyStart, next ? next.start : text.length).trim();
-            const fields = parseBlockFields(body);
-            const prompt = fields.prompt || fields.intro;
-
-            if (!prompt) {
-                warnings.push(`“${header.title}”没有“告诉AI”内容，已跳过。`);
-                continue;
-            }
-
-            const main = isMainType(fields.type);
-            const block = {
-                id: `${main ? 'main' : 'addon'}-${index}-${hashText(`${header.title}\n${body}`)}`,
-                sourceIndex: index,
-                title: header.title,
-                type: fields.type || (main ? '主线内容' : '附加内容'),
-                kind: main ? 'main' : 'addon',
-                whenShow: fields.show,
-                prompt,
-                whenHide: fields.hide,
-                followStage: fields.follow,
-                raw: body,
-                mainIndex: -1,
-                anchorMainIndex: -1,
-            };
-            blocks.push(block);
-        }
-
-        let seenMains = 0;
-        for (const block of blocks) {
-            if (block.kind === 'main') {
-                block.mainIndex = seenMains;
-                block.anchorMainIndex = seenMains;
-                if (!block.whenShow) {
-                    block.whenShow = seenMains === 0 ? '游戏开始时' : '上一段结束后';
-                }
-                if (!block.whenHide) {
-                    block.whenHide = '手动推进，或由 AI 判断本段目标已经完成';
-                }
-                seenMains += 1;
-            } else {
-                block.anchorMainIndex = Math.max(0, seenMains - 1);
-                if (block.followStage && !block.whenShow) {
-                    block.whenShow = `《${block.followStage}》正在进行时`;
-                }
-            }
-        }
-
-        const mainBlocks = blocks.filter(block => block.kind === 'main');
-        const addonBlocks = blocks.filter(block => block.kind === 'addon');
-        if (mainBlocks.length === 0) {
-            warnings.push('没有主线内容。至少需要一个未填写“类型”或类型为“主线/剧情/阶段”的内容块。');
-        }
-
-        return {
-            format: 'dynamic-guide-v1',
-            blocks,
-            mainBlocks,
-            addonBlocks,
-            warnings,
-        };
-    }
-
-    function normalizeColor(value, fallback) {
-        const color = String(value || '').trim();
-        if (/^#[0-9a-f]{6}$/i.test(color)) return color.toLowerCase();
-        if (/^#[0-9a-f]{3}$/i.test(color)) {
-            return `#${color.slice(1).split('').map(character => character + character).join('')}`.toLowerCase();
-        }
-        return fallback || DEFAULT_STAGE_COLORS[0];
-    }
-
-    function getRangeLayout(entry) {
-        const extra = entry && entry.extra && typeof entry.extra === 'object' ? entry.extra : null;
-        const metadata = extra && extra[LAYOUT_META_KEY] && typeof extra[LAYOUT_META_KEY] === 'object'
-            ? extra[LAYOUT_META_KEY]
-            : null;
-        const layout = metadata && metadata.layout && typeof metadata.layout === 'object'
-            ? metadata.layout
-            : null;
-        if (isUsableLayoutShape(layout)) return layout;
-        return extractEmbeddedLayout(entry && entry.content);
-    }
-
-    function makeStageId() {
-        return `stage-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    }
-
-    function completionMarkerId(stage, index) {
-        const source = String(stage && stage.id || '')
-            .toLowerCase()
-            .replace(/[^a-z0-9_-]+/g, '-')
-            .replace(/^-+|-+$/g, '');
-        return source || `stage-${index + 1}-${hashText(stage && stage.name || String(index)).slice(0, 6)}`;
-    }
-
-    function clampOffset(value, textLength) {
-        const number = Number(value);
-        if (!Number.isFinite(number)) return 0;
-        return Math.max(0, Math.min(Math.trunc(number), textLength));
-    }
-
-    function createAnchoredRange(text, start, end) {
-        const normalizedText = normalizeText(text);
-        const safeStart = clampOffset(Math.min(start, end), normalizedText.length);
-        const safeEnd = clampOffset(Math.max(start, end), normalizedText.length);
-        return {
-            start: safeStart,
-            end: safeEnd,
-            quote: normalizedText.slice(safeStart, safeEnd),
-            prefix: normalizedText.slice(Math.max(0, safeStart - 32), safeStart),
-            suffix: normalizedText.slice(safeEnd, Math.min(normalizedText.length, safeEnd + 32)),
-        };
-    }
-
-    function allTextOccurrences(text, quote) {
-        const positions = [];
-        if (!quote) return positions;
-        let offset = 0;
-        while (offset <= text.length - quote.length) {
-            const found = text.indexOf(quote, offset);
-            if (found < 0) break;
-            positions.push(found);
-            offset = found + Math.max(1, quote.length);
-        }
-        return positions;
-    }
-
-    function resolveAnchoredRange(text, rawRange) {
-        const normalizedText = normalizeText(text);
-        if (!rawRange || typeof rawRange !== 'object') return null;
-        const quote = String(rawRange.quote || '');
-        const storedStart = clampOffset(rawRange.start, normalizedText.length);
-        const storedEnd = clampOffset(rawRange.end, normalizedText.length);
-        if (storedEnd > storedStart) {
-            const direct = normalizedText.slice(storedStart, storedEnd);
-            if (!quote || direct === quote) {
-                return {
-                    start: storedStart,
-                    end: storedEnd,
-                    quote: direct,
-                    reanchored: false,
-                };
-            }
+    function resolveLegacyRange(text, range) {
+        if (!range || typeof range !== 'object') return null;
+        const quote = String(range.quote || '');
+        const start = Number(range.start);
+        const end = Number(range.end);
+        if (Number.isInteger(start) && Number.isInteger(end) && end > start && end <= text.length) {
+            if (!quote || text.slice(start, end) === quote) return { start, end };
         }
         if (!quote) return null;
-
-        const prefix = String(rawRange.prefix || '');
-        const suffix = String(rawRange.suffix || '');
-        const candidates = allTextOccurrences(normalizedText, quote);
-        if (candidates.length === 0) return null;
-        let best = null;
+        let best = -1;
         let bestScore = Number.NEGATIVE_INFINITY;
-        candidates.forEach(position => {
-            let score = -Math.abs(position - storedStart);
-            if (prefix) {
-                const actualPrefix = normalizedText.slice(Math.max(0, position - prefix.length), position);
-                if (actualPrefix === prefix) score += 100000;
-            }
-            if (suffix) {
-                const actualSuffix = normalizedText.slice(position + quote.length, position + quote.length + suffix.length);
-                if (actualSuffix === suffix) score += 100000;
-            }
+        let at = text.indexOf(quote);
+        while (at >= 0) {
+            let score = -Math.abs(at - (Number.isFinite(start) ? start : 0));
+            const prefix = String(range.prefix || '');
+            const suffix = String(range.suffix || '');
+            if (prefix && text.slice(Math.max(0, at - prefix.length), at) === prefix) score += 100000;
+            if (suffix && text.slice(at + quote.length, at + quote.length + suffix.length) === suffix) score += 100000;
             if (score > bestScore) {
                 bestScore = score;
-                best = position;
+                best = at;
             }
-        });
-        return best == null ? null : {
-            start: best,
-            end: best + quote.length,
-            quote,
-            reanchored: best !== storedStart,
-        };
+            at = text.indexOf(quote, at + 1);
+        }
+        return best >= 0 ? { start: best, end: best + quote.length } : null;
     }
 
-    function resolveRangeList(text, ranges) {
-        const resolved = [];
-        let unresolvedCount = 0;
-        let reanchoredCount = 0;
-        (Array.isArray(ranges) ? ranges : []).forEach(range => {
-            const result = resolveAnchoredRange(text, range);
-            if (!result || result.end <= result.start) {
-                unresolvedCount += 1;
-                return;
-            }
-            if (result.reanchored) reanchoredCount += 1;
-            resolved.push(result);
+    function convertLegacyLayout(content, layout) {
+        const text = stripLegacyMarker(content);
+        const pieces = [];
+        (layout.stages || []).forEach((stage, index) => {
+            (Array.isArray(stage.ranges) ? stage.ranges : []).forEach(range => {
+                const hit = resolveLegacyRange(text, range);
+                if (hit) pieces.push({ ...hit, owner: index });
+            });
         });
-        resolved.sort((left, right) => left.start - right.start || left.end - right.end);
-        return { resolved, unresolvedCount, reanchoredCount };
-    }
-
-    function resolveRangeLayout(text, layout) {
-        const normalizedText = normalizeText(text);
-        const stages = (Array.isArray(layout && layout.stages) ? layout.stages : []).map((stage, index) => {
-            const rangeResult = resolveRangeList(normalizedText, stage && stage.ranges);
-            return {
-                id: String(stage && stage.id || `stage-${index + 1}-${hashText(stage && stage.name || String(index)).slice(0, 6)}`),
-                name: String(stage && stage.name || `阶段 ${index + 1}`).trim() || `阶段 ${index + 1}`,
-                color: normalizeColor(stage && stage.color, DEFAULT_STAGE_COLORS[index % DEFAULT_STAGE_COLORS.length]),
-                completion: String(stage && stage.completion || '').trim(),
-                ranges: rangeResult.resolved,
-                unresolvedCount: rangeResult.unresolvedCount,
-                reanchoredCount: rangeResult.reanchoredCount,
-            };
+        const alwaysRanges = layout.always && Array.isArray(layout.always.ranges) ? layout.always.ranges : [];
+        alwaysRanges.forEach(range => {
+            const hit = resolveLegacyRange(text, range);
+            if (hit) pieces.push({ ...hit, owner: 'always' });
         });
-        const alwaysSource = layout && layout.always && typeof layout.always === 'object' ? layout.always : {};
-        const alwaysResult = resolveRangeList(normalizedText, alwaysSource.ranges);
-        return {
-            sourceHashMatches: String(layout && layout.sourceHash || '') === hashText(normalizedText),
-            stages,
-            always: {
-                color: normalizeColor(alwaysSource.color, '#64748b'),
-                ranges: alwaysResult.resolved,
-                unresolvedCount: alwaysResult.unresolvedCount,
-                reanchoredCount: alwaysResult.reanchoredCount,
-            },
-        };
-    }
+        pieces.sort((left, right) => left.start - right.start || left.end - right.end);
 
-    function textFromResolvedRanges(text, ranges) {
-        const normalizedText = normalizeText(text);
-        return (Array.isArray(ranges) ? ranges : [])
-            .map(range => normalizedText.slice(range.start, range.end).trim())
+        const bodyOf = owner => pieces
+            .filter(piece => piece.owner === owner)
+            .map(piece => escapeBodyText(text.slice(piece.start, piece.end).trim()))
             .filter(Boolean)
             .join('\n\n');
-    }
 
-    function parseGuideEntry(entry) {
-        const layout = getRangeLayout(entry);
-        const text = entryDisplayContent(entry);
-        if (!layout) return parseGuideText(text);
-
-        const resolved = resolveRangeLayout(text, layout);
-        const warnings = [];
-        const blocks = [];
-        resolved.stages.forEach((stage, index) => {
-            const prompt = textFromResolvedRanges(text, stage.ranges);
-            if (!prompt) {
-                warnings.push(`“${stage.name}”没有可用的文字选区，已跳过。`);
-                return;
-            }
-            if (stage.unresolvedCount > 0) {
-                warnings.push(`“${stage.name}”有 ${stage.unresolvedCount} 个选区无法重新定位，请打开阶段标注器检查。`);
-            }
-            const mainIndex = blocks.filter(block => block.kind === 'main').length;
-            blocks.push({
-                id: completionMarkerId(stage, index),
-                sourceIndex: index,
-                title: stage.name,
-                type: '主线阶段',
-                kind: 'main',
-                whenShow: mainIndex === 0 ? '游戏开始时' : '上一段结束后',
-                prompt,
-                whenHide: stage.completion || '手动推进，或由 AI 判断本阶段大纲已经完成',
-                followStage: '',
-                raw: prompt,
-                mainIndex,
-                anchorMainIndex: mainIndex,
-                color: stage.color,
-            });
+        const sections = [];
+        (layout.stages || []).forEach((stage, index) => {
+            const head = [`## ${String(stage.name || `阶段 ${index + 1}`).trim()}`];
+            if (oneLine(stage.completion)) head.push(`完成：${oneLine(stage.completion)}`);
+            sections.push([...head, bodyOf(index)].filter(Boolean).join('\n'));
         });
+        const alwaysBody = bodyOf('always');
+        if (alwaysBody) sections.push(`## 常驻提示 [常驻]\n${alwaysBody}`);
 
-        const mainBlocks = blocks.filter(block => block.kind === 'main');
-        const alwaysPrompt = textFromResolvedRanges(text, resolved.always.ranges);
-        if (resolved.always.unresolvedCount > 0) {
-            warnings.push(`常驻提示有 ${resolved.always.unresolvedCount} 个选区无法重新定位，请打开阶段标注器检查。`);
-        }
-        if (alwaysPrompt) {
-            blocks.push({
-                id: `always-${hashText(alwaysPrompt)}`,
-                sourceIndex: -1,
-                title: '常驻提示',
-                type: '常驻提示',
-                kind: 'addon',
-                whenShow: '游戏开始时',
-                prompt: alwaysPrompt,
-                whenHide: '故事结束时',
-                followStage: '',
-                raw: alwaysPrompt,
-                mainIndex: -1,
-                anchorMainIndex: 0,
-                color: resolved.always.color,
-            });
-        }
-        const addonBlocks = blocks.filter(block => block.kind === 'addon');
-        if (mainBlocks.length === 0) {
-            warnings.push('可视化布局中没有可用的剧情阶段。请打开阶段标注器，为至少一个阶段选择提示词。');
-        }
-        if (!resolved.sourceHashMatches) {
-            const reanchoredCount = resolved.stages.reduce((sum, stage) => sum + stage.reanchoredCount, 0)
-                + resolved.always.reanchoredCount;
-            if (reanchoredCount > 0) {
-                warnings.push(`提示词原文发生过修改，已自动重新定位 ${reanchoredCount} 个选区。`);
-            }
-        }
-        return {
-            format: 'dynamic-guide-ranges-v1',
-            blocks,
-            mainBlocks,
-            addonBlocks,
-            warnings,
-            layout,
-            layoutResolution: resolved,
-        };
-    }
-
-    function normalizeCondition(value) {
-        return String(value || '')
-            .replace(/\s+/g, '')
-            .replace(/[，。！？、；;,.!?]/g, '')
-            .toLowerCase();
-    }
-
-    function stageToken(name) {
-        return normalizeCondition(name)
-            .replace(/第[一二三四五六七八九十百\d]+[章节幕段]/g, '')
-            .replace(/进入|离开|来到|到达|前往|开始|结束|完成|阶段|剧情|章节/g, '');
-    }
-
-    function findStageIndex(condition, mainBlocks) {
-        const source = normalizeCondition(condition);
-        const quoted = String(condition || '').match(/[《「“"]([^》」”"]+)[》」”"]/);
-        if (quoted) {
-            const quotedName = normalizeCondition(quoted[1]);
-            const exact = mainBlocks.findIndex(block => normalizeCondition(block.title) === quotedName);
-            if (exact >= 0) return exact;
-        }
-
-        let best = -1;
-        let bestLength = 0;
-        mainBlocks.forEach((block, index) => {
-            const full = normalizeCondition(block.title);
-            const token = stageToken(block.title);
-            if (full && source.includes(full) && full.length > bestLength) {
-                best = index;
-                bestLength = full.length;
-            } else if (token.length >= 2 && source.includes(token) && token.length > bestLength) {
-                best = index;
-                bestLength = token.length;
-            }
+        const gaps = [];
+        let cursor = 0;
+        pieces.forEach(piece => {
+            if (piece.start > cursor) gaps.push(text.slice(cursor, piece.start));
+            cursor = Math.max(cursor, piece.end);
         });
-        return best;
+        if (cursor < text.length) gaps.push(text.slice(cursor));
+        const leftover = gaps.map(gap => gap.trim()).filter(Boolean).join('\n\n');
+        if (leftover) sections.push(`## 旧版没有分配的文字 [备注]\n${escapeBodyText(leftover)}`);
+
+        return sections.join('\n\n');
     }
 
-    function addonStartReached(block, mainBlocks, currentIndex) {
-        const condition = normalizeCondition(block.whenShow || block.followStage);
-        if (!condition) return currentIndex === block.anchorMainIndex;
-        if (/游戏开始|开局|一开始/.test(condition)) return currentIndex >= 0;
-        if (/上一段结束|上一阶段结束|前一段结束/.test(condition)) {
-            return currentIndex >= block.anchorMainIndex + 1;
-        }
+    // ---------------------------------------------------------------
+    // 二、适配层：找到酒馆助手接口
+    // ---------------------------------------------------------------
 
-        const referencedIndex = findStageIndex(condition, mainBlocks);
-        if (referencedIndex < 0) return currentIndex === block.anchorMainIndex;
-        if (/结束后|完成后|之后/.test(condition)) return currentIndex > referencedIndex;
-        return currentIndex >= referencedIndex;
+    const currentWindow = typeof window !== 'undefined' ? window : globalThis;
+    let hostWindow = currentWindow;
+    try {
+        if (currentWindow.frameElement && currentWindow.parent) hostWindow = currentWindow.parent;
+    } catch (error) {
+        hostWindow = currentWindow;
+    }
+    const helper = currentWindow.TavernHelper || hostWindow.TavernHelper || null;
+    const instanceToken = `dga-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    currentWindow[INSTANCE_KEY] = instanceToken;
+
+    function isCurrentInstance() {
+        return currentWindow[INSTANCE_KEY] === instanceToken;
     }
 
-    function addonNotExpired(block, mainBlocks, currentIndex) {
-        const condition = normalizeCondition(block.whenHide);
-        const showCondition = normalizeCondition(block.whenShow || block.followStage);
-        if (!condition) {
-            const showIndex = findStageIndex(showCondition, mainBlocks);
-            if (/正在进行|进行期间|阶段内|期间/.test(showCondition) && showIndex >= 0) {
-                return currentIndex <= showIndex;
-            }
-            return true;
+    function api(name, required) {
+        for (const source of [helper, currentWindow, hostWindow]) {
+            if (source && typeof source[name] === 'function') return source[name].bind(source);
         }
-        if (/游戏结束|故事结束|剧情结束/.test(condition)) {
-            return currentIndex < mainBlocks.length;
-        }
-
-        const referencedIndex = findStageIndex(condition, mainBlocks);
-        if (referencedIndex < 0) {
-            return currentIndex === block.anchorMainIndex;
-        }
-        if (/进入|来到|到达|开始|出现/.test(condition) && !/结束|完成|离开/.test(condition)) {
-            return currentIndex < referencedIndex;
-        }
-        return currentIndex <= referencedIndex;
+        if (required) throw new Error(`当前酒馆助手缺少 ${name} 接口`);
+        return null;
     }
 
-    function getActiveAddons(parsed, currentIndex) {
-        if (!parsed || currentIndex < 0 || currentIndex >= parsed.mainBlocks.length) return [];
-        return parsed.addonBlocks.filter(block => (
-            addonStartReached(block, parsed.mainBlocks, currentIndex)
-            && addonNotExpired(block, parsed.mainBlocks, currentIndex)
-        ));
-    }
-
-    function formatInjection(mainBlock, addons) {
-        if (!mainBlock) return '';
-        const lines = [
-            '[动态指导助手：当前有效内容]',
-            '以下内容是作者为当前进度准备的内部创作指导。自然地遵守它，不要向用户提及指导系统、阶段编号、完成判定或隐藏标记。',
-            '',
-            `## 当前内容：${mainBlock.title}`,
-            mainBlock.prompt,
-        ];
-
-        if (addons.length > 0) {
-            lines.push('', '## 同时有效的附加内容');
-            addons.forEach(block => {
-                lines.push(
-                    '',
-                    `### ${block.title}（${block.type}）`,
-                    block.prompt,
-                );
-                if (block.whenHide) {
-                    lines.push(`有效期提示：${block.whenHide}`);
-                }
-            });
-        }
-
-        lines.push(
-            '',
-            '## 当前内容的完成判定',
-            mainBlock.whenHide || '由作者手动推进',
-            '',
-            '只有当你确信“本次回复已经实际完成上述判定”时，才在回复末尾原样附加下面的 HTML 注释；尚未完成时不要附加：',
-            `<!-- DGA_COMPLETE:${mainBlock.id} -->`,
-        );
-        return lines.join('\n');
-    }
-
-    function resolveValue(name) {
-        const sources = [helper, currentWindow, hostWindow];
-        for (const source of sources) {
+    function apiValue(name) {
+        for (const source of [helper, currentWindow, hostWindow]) {
             if (source && source[name] !== undefined) return source[name];
         }
         return undefined;
     }
 
-    function resolveFunction(name, required) {
-        const sources = [helper, currentWindow, hostWindow];
-        for (const source of sources) {
-            if (source && typeof source[name] === 'function') {
-                return source[name].bind(source);
-            }
+    function hostDocument() {
+        try {
+            return hostWindow.document || currentWindow.document || null;
+        } catch (error) {
+            return currentWindow.document || null;
         }
-        if (required) throw new Error(`当前酒馆助手缺少 ${name} 接口`);
-        return null;
     }
 
     function notify(message, type) {
@@ -748,336 +613,155 @@
         if (toast && typeof toast[level] === 'function') {
             toast[level](message, SCRIPT_NAME);
         } else {
-            const logger = level === 'error' ? console.error : (level === 'warning' ? console.warn : console.log);
-            logger(`[${SCRIPT_NAME}] ${message}`);
+            (level === 'error' ? console.error : console.log)(`[${SCRIPT_NAME}] ${message}`);
         }
     }
 
-    const reportedErrors = new Set();
-    const healedLayoutKeys = new Set();
+    const reported = new Set();
     function reportOnce(key, message) {
-        if (reportedErrors.has(key)) return;
-        reportedErrors.add(key);
+        if (reported.has(key)) return;
+        reported.add(key);
         notify(message, 'warning');
     }
 
-    function getHostDocument() {
-        try {
-            return hostWindow.document || currentWindow.document || null;
-        } catch (error) {
-            return currentWindow.document || null;
-        }
-    }
-
-    function getSillyTavernContext() {
-        const candidates = [
-            currentWindow.SillyTavern,
-            hostWindow.SillyTavern,
-            currentWindow.sillyTavern,
-            hostWindow.sillyTavern,
-        ];
-        for (const candidate of candidates) {
-            if (!candidate) continue;
-            try {
-                if (typeof candidate.getContext === 'function') {
-                    const context = candidate.getContext();
-                    if (context) return context;
-                }
-                if (candidate.characters || candidate.chat || candidate.characterId != null) {
-                    return candidate;
-                }
-            } catch (error) {
-                console.warn(`[${SCRIPT_NAME}] 读取 SillyTavern 上下文失败`, error);
-            }
-        }
-        return null;
-    }
-
-    function characterFromContext(context) {
-        if (!context || !Array.isArray(context.characters)) return null;
-        const rawId = context.characterId != null ? context.characterId : context.this_chid;
-        if (rawId == null || rawId === '') return null;
-        const index = Number(rawId);
-        return Number.isInteger(index) ? context.characters[index] || null : null;
-    }
-
-    async function getCurrentCharacterData() {
-        const getCharData = resolveFunction('getCharData', false);
-        if (getCharData) {
-            try {
-                const character = await Promise.resolve(getCharData('current'));
-                if (character && typeof character === 'object') return character;
-            } catch (error) {
-                console.warn(`[${SCRIPT_NAME}] TavernHelper.getCharData('current') 失败`, error);
-            }
-        }
-        return characterFromContext(getSillyTavernContext());
-    }
+    // ---------------------------------------------------------------
+    // 二、适配层：变量（角色变量存绑定，聊天变量存进度）
+    // ---------------------------------------------------------------
 
     async function readVariables(type) {
-        const getVariables = resolveFunction('getVariables', true);
+        const getVariables = api('getVariables', true);
         const variables = await Promise.resolve(getVariables({ type }));
         return variables && typeof variables === 'object' ? variables : {};
     }
 
     async function updateVariables(type, updater) {
-        const updateVariablesWith = resolveFunction('updateVariablesWith', true);
+        const updateVariablesWith = api('updateVariablesWith', true);
         return Promise.resolve(updateVariablesWith(variables => {
-            const safeVariables = variables && typeof variables === 'object' ? variables : {};
-            return updater(safeVariables) || safeVariables;
+            const safe = variables && typeof variables === 'object' ? variables : {};
+            return updater(safe) || safe;
         }, { type }));
     }
 
-    async function readCharacterConfig() {
-        const variables = await readVariables('character');
+    async function readRootField(type, field) {
+        const variables = await readVariables(type);
         const root = variables[VARIABLE_ROOT];
-        return root && typeof root === 'object' ? root.config || null : null;
+        const value = root && typeof root === 'object' ? root[field] : null;
+        return value && typeof value === 'object' ? value : null;
     }
 
-    async function writeCharacterConfig(config) {
-        return updateVariables('character', variables => {
+    async function writeRootField(type, field, value) {
+        return updateVariables(type, variables => {
             const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
                 ? variables[VARIABLE_ROOT]
                 : {};
-            variables[VARIABLE_ROOT] = { ...root, config };
+            variables[VARIABLE_ROOT] = { ...root, [field]: value };
             return variables;
         });
     }
 
-    async function readChatState() {
-        const variables = await readVariables('chat');
-        const root = variables[VARIABLE_ROOT];
-        return root && typeof root === 'object' ? root.state || null : null;
-    }
+    const readConfig = () => readRootField('character', 'config');
+    const writeConfig = config => writeRootField('character', 'config', config);
+    const readState = () => readRootField('chat', 'state');
+    const writeState = state => writeRootField('chat', 'state', state);
 
-    async function writeChatState(state) {
-        return updateVariables('chat', variables => {
-            const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
-                ? variables[VARIABLE_ROOT]
-                : {};
-            variables[VARIABLE_ROOT] = { ...root, state };
-            return variables;
-        });
-    }
+    // ---------------------------------------------------------------
+    // 二、适配层：角色与世界书
+    // ---------------------------------------------------------------
 
-    function cleanWorldbookName(value) {
+    function cleanName(value) {
         return typeof value === 'string' && value.trim() ? value.trim() : '';
     }
 
-    function namesFromList(value) {
-        if (!Array.isArray(value)) return [];
-        return value
-            .map(item => {
-                if (typeof item === 'string') return cleanWorldbookName(item);
-                if (item && typeof item === 'object') {
-                    return cleanWorldbookName(item.name || item.title || item.worldbookName);
-                }
-                return '';
-            })
-            .filter(Boolean);
-    }
-
-    function bindingParts(binding) {
-        if (!binding) return { primary: null, additional: [] };
-        if (typeof binding === 'string') {
-            const name = cleanWorldbookName(binding);
-            return { primary: name || null, additional: [] };
+    function namesFrom(value) {
+        if (!value) return [];
+        if (typeof value === 'string') return cleanName(value) ? [cleanName(value)] : [];
+        if (Array.isArray(value)) return value.flatMap(namesFrom);
+        if (typeof value === 'object') {
+            return [
+                value.primary, value.world, value.worldbook, value.worldbookName, value.name,
+                value.additional, value.worldbooks, value.names, value.books,
+            ].flatMap(namesFrom);
         }
-        if (Array.isArray(binding)) {
-            const names = namesFromList(binding);
-            return {
-                primary: names[0] || null,
-                additional: names.slice(1),
-            };
+        return [];
+    }
+
+    async function currentCharacter() {
+        const getCharData = api('getCharData', false);
+        if (getCharData) {
+            try {
+                const card = await Promise.resolve(getCharData('current'));
+                if (card && typeof card === 'object') return card;
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] 读取角色卡失败`, error);
+            }
         }
-        if (typeof binding !== 'object') return { primary: null, additional: [] };
-
-        const primary = cleanWorldbookName(
-            binding.primary
-            || binding.world
-            || binding.worldbook
-            || binding.worldbookName,
-        ) || null;
-        const additional = [
-            ...namesFromList(binding.additional),
-            ...namesFromList(binding.worldbooks),
-            ...namesFromList(binding.names),
-            ...namesFromList(binding.books),
-        ];
-        if (binding.data && binding.data !== binding) {
-            const nested = bindingParts(binding.data);
-            return {
-                primary: primary || nested.primary,
-                additional: [...additional, nested.primary, ...nested.additional].filter(Boolean),
-            };
-        }
-        return { primary, additional };
-    }
-
-    function worldbookNamesFromBinding(binding) {
-        const parts = bindingParts(binding);
-        return Array.from(new Set([parts.primary, ...parts.additional].filter(Boolean)));
-    }
-
-    function primaryWorldbookFromCharacter(character) {
-        if (!character || typeof character !== 'object') return '';
-        return cleanWorldbookName(
-            character.data && character.data.extensions && character.data.extensions.world
-            || character.extensions && character.extensions.world
-            || character.world,
-        );
-    }
-
-    function additionalWorldbooksFromCharacter(character) {
-        if (!character || typeof character !== 'object') return [];
-        return Array.from(new Set([
-            ...namesFromList(character.data && character.data.extensions && character.data.extensions.worlds),
-            ...namesFromList(character.data && character.data.extensions && character.data.extensions.additionalWorldbooks),
-            ...namesFromList(character.extensions && character.extensions.worlds),
-            ...namesFromList(character.extensions && character.extensions.additionalWorldbooks),
-        ]));
-    }
-
-    let settingsBindingCache = {
-        avatar: '',
-        expiresAt: 0,
-        names: [],
-    };
-
-    async function additionalWorldbooksFromSettings(character, context) {
-        const avatar = cleanWorldbookName(
-            character && (character.avatar || character.data && character.data.avatar),
-        );
-        if (!avatar) return [];
-        const avatarBase = avatar.replace(/\.[^.]+$/, '');
-        if (settingsBindingCache.avatar === avatarBase && settingsBindingCache.expiresAt > Date.now()) {
-            return settingsBindingCache.names;
-        }
-
-        const fetchOwner = hostWindow && typeof hostWindow.fetch === 'function'
-            ? hostWindow
-            : currentWindow;
-        if (!fetchOwner || typeof fetchOwner.fetch !== 'function') return [];
-
         try {
-            const getRequestHeaders = context && typeof context.getRequestHeaders === 'function'
-                ? context.getRequestHeaders.bind(context)
-                : resolveFunction('getRequestHeaders', false);
-            const requestHeaders = getRequestHeaders
-                ? await Promise.resolve(getRequestHeaders())
-                : {};
-            const response = await fetchOwner.fetch('/api/settings/get', {
-                method: 'POST',
-                headers: {
-                    ...(requestHeaders && typeof requestHeaders === 'object' ? requestHeaders : {}),
-                    'Content-Type': 'application/json',
-                },
-                body: '{}',
-            });
-            if (!response.ok) return [];
-            const payload = await response.json();
-            const parsedSettings = typeof payload.settings === 'string'
-                ? JSON.parse(payload.settings)
-                : payload.settings;
-            const charLore = parsedSettings
-                && parsedSettings.world_info
-                && Array.isArray(parsedSettings.world_info.charLore)
-                ? parsedSettings.world_info.charLore
-                : [];
-            const matched = charLore.find(item => item && item.name === avatarBase);
-            const names = namesFromList(matched && matched.extraBooks);
-            settingsBindingCache = {
-                avatar: avatarBase,
-                expiresAt: Date.now() + 8000,
-                names,
-            };
-            return names;
+            const tavern = currentWindow.SillyTavern || hostWindow.SillyTavern;
+            const context = tavern && typeof tavern.getContext === 'function' ? tavern.getContext() : null;
+            if (context && Array.isArray(context.characters)) {
+                const id = Number(context.characterId);
+                if (Number.isInteger(id)) return context.characters[id] || null;
+            }
         } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 读取角色附加世界书设置失败`, error);
+            console.warn(`[${SCRIPT_NAME}] 读取 SillyTavern 上下文失败`, error);
+        }
+        return null;
+    }
+
+    function characterName(card) {
+        return cleanName(card && (card.name || (card.data && card.data.name))) || '当前角色';
+    }
+
+    function characterWorldbooks(card) {
+        if (!card || typeof card !== 'object') return [];
+        const extensions = (card.data && card.data.extensions) || card.extensions || {};
+        return [
+            ...namesFrom(extensions.world),
+            ...namesFrom(card.world),
+            ...namesFrom(extensions.worlds),
+            ...namesFrom(extensions.additionalWorldbooks),
+        ];
+    }
+
+    async function boundWorldbookNames(card) {
+        const names = [];
+        const getCharWorldbookNames = api('getCharWorldbookNames', false);
+        if (getCharWorldbookNames) {
+            try {
+                names.push(...namesFrom(await Promise.resolve(getCharWorldbookNames('current'))));
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] getCharWorldbookNames 失败`, error);
+            }
+        }
+        names.push(...characterWorldbooks(card));
+        return Array.from(new Set(names.filter(Boolean)));
+    }
+
+    async function allWorldbookNames() {
+        const getter = api('getWorldbookNames', false) || api('getLorebooks', false);
+        if (!getter) return [];
+        try {
+            return Array.from(new Set(namesFrom(await Promise.resolve(getter()))));
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 读取世界书列表失败`, error);
             return [];
         }
     }
 
-    async function getCharacterWorldbookBinding() {
-        const context = getSillyTavernContext();
-        const character = await getCurrentCharacterData();
-        const names = [];
-        const sources = [];
-        let primary = null;
-
-        function collect(raw, source) {
-            const parts = bindingParts(raw);
-            const collected = [parts.primary, ...parts.additional].filter(Boolean);
-            if (collected.length === 0) return false;
-            if (!primary && parts.primary) primary = parts.primary;
-            names.push(...collected);
-            sources.push(source);
-            return true;
-        }
-
-        const characterCandidates = Array.from(new Set([
-            'current',
-            cleanWorldbookName(character && (character.name || character.data && character.data.name)),
-            cleanWorldbookName(character && (character.avatar || character.data && character.data.avatar)),
-        ].filter(Boolean)));
-
-        const getCharWorldbookNames = resolveFunction('getCharWorldbookNames', false);
-        if (getCharWorldbookNames) {
-            for (const target of characterCandidates) {
-                try {
-                    const raw = await Promise.resolve(getCharWorldbookNames(target));
-                    if (collect(raw, `TavernHelper:${target}`)) break;
-                } catch (error) {
-                    console.warn(`[${SCRIPT_NAME}] getCharWorldbookNames(${target}) 失败`, error);
-                }
-            }
-        }
-
-        const getCharLorebooks = resolveFunction('getCharLorebooks', false);
-        if (getCharLorebooks && names.length === 0) {
-            try {
-                collect(
-                    await Promise.resolve(getCharLorebooks({ type: 'all' })),
-                    'TavernHelper:getCharLorebooks',
-                );
-            } catch (error) {
-                console.warn(`[${SCRIPT_NAME}] getCharLorebooks 失败`, error);
-            }
-        }
-
-        const nativePrimary = primaryWorldbookFromCharacter(character);
-        if (nativePrimary) {
-            if (!primary) primary = nativePrimary;
-            names.push(nativePrimary);
-            sources.push('角色卡原生绑定');
-        }
-        const embeddedAdditional = additionalWorldbooksFromCharacter(character);
-        if (embeddedAdditional.length > 0) {
-            names.push(...embeddedAdditional);
-            sources.push('角色卡扩展字段');
-        }
-        const settingsAdditional = await additionalWorldbooksFromSettings(character, context);
-        if (settingsAdditional.length > 0) {
-            names.push(...settingsAdditional);
-            sources.push('SillyTavern 附加世界书设置');
-        }
-
-        const orderedNames = Array.from(new Set([primary, ...names].filter(Boolean)));
-        return {
-            primary: primary || null,
-            additional: orderedNames.filter(name => name !== primary),
-            names: orderedNames,
-            sources: Array.from(new Set(sources)),
-            character,
-            characterName: cleanWorldbookName(
-                character && (character.name || character.data && character.data.name),
-            ) || '当前角色',
-            groupChat: Boolean(context && (context.groupId != null || context.selectedGroup)),
-        };
+    async function getWorldbook(name) {
+        return Promise.resolve(api('getWorldbook', true)(name));
     }
 
-    async function getCharacterWorldbookNames() {
-        return (await getCharacterWorldbookBinding()).names;
+    async function updateWorldbook(name, updater) {
+        return Promise.resolve(api('updateWorldbookWith', true)(name, updater));
+    }
+
+    function worldbookEntries(worldbook) {
+        if (Array.isArray(worldbook)) return worldbook;
+        if (!worldbook || typeof worldbook !== 'object') return [];
+        if (Array.isArray(worldbook.entries)) return worldbook.entries;
+        if (worldbook.entries && typeof worldbook.entries === 'object') return Object.values(worldbook.entries);
+        return [];
     }
 
     function entryName(entry) {
@@ -1086,16 +770,6 @@
 
     function sameUid(left, right) {
         return left != null && right != null && String(left) === String(right);
-    }
-
-    function worldbookEntries(worldbook) {
-        if (Array.isArray(worldbook)) return worldbook;
-        if (!worldbook || typeof worldbook !== 'object') return [];
-        if (Array.isArray(worldbook.entries)) return worldbook.entries;
-        if (worldbook.entries && typeof worldbook.entries === 'object') {
-            return Object.values(worldbook.entries);
-        }
-        return [];
     }
 
     function findEntry(worldbook, uid, name) {
@@ -1112,247 +786,60 @@
         return false;
     }
 
-    async function getWorldbook(name) {
-        const getter = resolveFunction('getWorldbook', true);
-        return Promise.resolve(getter(name));
+    function entryKey(entry, index) {
+        return entry && entry.uid != null ? `uid:${String(entry.uid)}` : `index:${index}`;
     }
 
-    async function disableSourceEntry(worldbookName, uid, name) {
-        const updateWorldbookWith = resolveFunction('updateWorldbookWith', true);
+    async function disableEntry(worldbookName, uid, name) {
         let found = false;
-        await Promise.resolve(updateWorldbookWith(worldbookName, worldbook => {
+        await updateWorldbook(worldbookName, worldbook => {
             const entry = findEntry(worldbook, uid, name);
             if (!entry) return worldbook;
             found = true;
             entry.enabled = false;
             if ('disable' in entry) entry.disable = true;
             return worldbook;
-        }));
-        if (!found) throw new Error(`无法在世界书“${worldbookName}”中找到来源条目`);
-
+        });
+        if (!found) throw new Error(`在世界书“${worldbookName}”里找不到要禁用的条目`);
         const verified = findEntry(await getWorldbook(worldbookName), uid, name);
         if (!verified || !entryIsDisabled(verified)) {
-            throw new Error('来源条目未能禁用。为防止完整剧情泄露，本次绑定已停止。');
+            throw new Error('来源条目没能禁用。为了防止整份大纲泄露，这次绑定已停止。');
         }
     }
 
-    async function writeRangeLayout(worldbookName, selectedEntry, layout) {
-        if (!worldbookName || !selectedEntry) throw new Error('没有可保存的世界书条目');
-        const updateWorldbookWith = resolveFunction('updateWorldbookWith', true);
-        await writeLayoutBackup(worldbookName, selectedEntry, layout);
+    async function writeEntryContent(worldbookName, uid, name, content) {
         let found = false;
-        await Promise.resolve(updateWorldbookWith(worldbookName, worldbook => {
-            const entry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
+        await updateWorldbook(worldbookName, worldbook => {
+            const entry = findEntry(worldbook, uid, name);
             if (!entry) return worldbook;
             found = true;
-            const extra = entry.extra && typeof entry.extra === 'object' ? entry.extra : {};
-            const metadata = extra[LAYOUT_META_KEY] && typeof extra[LAYOUT_META_KEY] === 'object'
-                ? extra[LAYOUT_META_KEY]
-                : {};
-            entry.extra = {
-                ...extra,
-                [LAYOUT_META_KEY]: {
-                    ...metadata,
-                    layout,
-                },
-            };
-            /*
-             * 世界书条目的 extra 只有本机认得。为了让阶段划分跟着角色卡、跟着
-             * 条目一起被别人导入，正文末尾再放一段 Base64 隐藏标记。所有读取
-             * 路径都用 entryDisplayContent() 去掉它，绝不会发给 AI。
-             */
-            entry.content = contentWithLayoutMarker(entryDisplayContent(entry), layout);
+            entry.content = content;
+            if (entry.extra && typeof entry.extra === 'object' && entry.extra[LEGACY_META_KEY]) {
+                const extra = { ...entry.extra };
+                delete extra[LEGACY_META_KEY];
+                entry.extra = extra;
+            }
             return worldbook;
-        }));
-        if (!found) throw new Error(`无法在世界书“${worldbookName}”中找到要保存的指导条目`);
-        const verified = findEntry(
-            await getWorldbook(worldbookName),
-            selectedEntry.uid,
-            entryName(selectedEntry),
-        );
-        const savedLayout = getRangeLayout(verified);
-        if (!verified || !savedLayout || savedLayout.sourceHash !== layout.sourceHash) {
-            throw new Error('阶段划分没能写进世界书条目。已保存在这个角色的备份里，重新打开标注器可以恢复。');
-        }
-        if (!extractEmbeddedLayout(verified.content)) {
-            reportOnce(
-                '阶段划分未写入正文标记',
-                '这个世界书条目没能写入可随角色卡分享的隐藏标记，阶段划分目前只保存在本机。',
-            );
-        }
-        return verified;
-    }
-
-    function layoutBackupKey(worldbookName, entry) {
-        if (!entry) return '';
-        return `${cleanWorldbookName(worldbookName)}::${entry.uid}`;
-    }
-
-    function isUsableLayout(layout) {
-        return isUsableLayoutShape(layout);
-    }
-
-    async function readLayoutBackupsFrom(type) {
-        try {
-            const variables = await readVariables(type);
-            const root = variables[VARIABLE_ROOT];
-            const layouts = root && typeof root === 'object' ? root.layouts : null;
-            return layouts && typeof layouts === 'object' ? layouts : {};
-        } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 读取 ${type} 变量里的阶段划分备份失败`, error);
-            return {};
-        }
-    }
-
-    async function readLayoutBackups() {
-        const [characterLayouts, globalLayouts] = await Promise.all([
-            readLayoutBackupsFrom('character'),
-            readLayoutBackupsFrom('global'),
-        ]);
-        return { ...characterLayouts, ...globalLayouts };
-    }
-
-    async function writeLayoutBackup(worldbookName, entry, layout) {
-        const key = layoutBackupKey(worldbookName, entry);
-        if (!key || !isUsableLayout(layout)) return null;
-        const record = {
-            worldbookName: cleanWorldbookName(worldbookName),
-            entryUid: entry.uid == null ? null : entry.uid,
-            entryName: entryName(entry),
-            contentHash: hashText(entryDisplayContent(entry)),
-            layout,
-            updatedAt: new Date().toISOString(),
-        };
-        const results = await Promise.all(['character', 'global'].map(async type => {
-            try {
-                return await updateVariables(type, variables => {
-                    const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
-                        ? variables[VARIABLE_ROOT]
-                        : {};
-                    const layouts = root.layouts && typeof root.layouts === 'object'
-                        ? { ...root.layouts }
-                        : {};
-                    layouts[key] = record;
-                    variables[VARIABLE_ROOT] = { ...root, layouts };
-                    return variables;
-                });
-            } catch (error) {
-                console.warn(`[${SCRIPT_NAME}] 阶段划分备份写入 ${type} 变量失败`, error);
-                return null;
-            }
-        }));
-        return results.find(Boolean) || null;
-    }
-
-    function backupRecordFor(backups, worldbookName, entry) {
-        if (!entry || !backups || typeof backups !== 'object') return null;
-        const worldbook = cleanWorldbookName(worldbookName);
-        const records = Object.keys(backups)
-            .map(key => backups[key])
-            .filter(record => (
-                record
-                && typeof record === 'object'
-                && isUsableLayout(record.layout)
-                && cleanWorldbookName(record.worldbookName) === worldbook
-            ));
-        if (records.length === 0) return null;
-        const exact = records.find(record => sameUid(record.entryUid, entry.uid));
-        if (exact) return exact;
-        const byName = records.find(record => record.entryName === entryName(entry));
-        if (byName) return byName;
-        const contentHash = hashText(entryDisplayContent(entry));
-        return records.find(record => record.contentHash === contentHash) || null;
-    }
-
-    function layoutStillFitsEntry(entry, layout) {
-        const resolved = resolveRangeLayout(entryDisplayContent(entry), layout);
-        return resolved.stages.some(stage => stage.ranges.length > 0)
-            || resolved.always.ranges.length > 0;
-    }
-
-    function applyLayoutBackup(entry, record) {
-        if (!entry || !record || !isUsableLayout(record.layout)) return false;
-        if (!layoutStillFitsEntry(entry, record.layout)) return false;
-        const extra = entry.extra && typeof entry.extra === 'object' ? entry.extra : {};
-        const metadata = extra[LAYOUT_META_KEY] && typeof extra[LAYOUT_META_KEY] === 'object'
-            ? extra[LAYOUT_META_KEY]
-            : {};
-        entry.extra = {
-            ...extra,
-            [LAYOUT_META_KEY]: {
-                ...metadata,
-                layout: record.layout,
-                restoredAt: new Date().toISOString(),
-            },
-        };
-        return true;
-    }
-
-    async function applyLayoutBackupsToEntries(worldbookName, entries) {
-        const targets = (Array.isArray(entries) ? entries : []).filter(entry => entry && !getRangeLayout(entry));
-        if (targets.length === 0) return false;
-        let backups = {};
-        try {
-            backups = await readLayoutBackups();
-        } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 读取阶段划分备份失败`, error);
-            return false;
-        }
-        let restored = false;
-        targets.forEach(entry => {
-            const record = backupRecordFor(backups, worldbookName, entry);
-            if (record && applyLayoutBackup(entry, record)) restored = true;
         });
-        return restored;
+        if (!found) throw new Error(`在世界书“${worldbookName}”里找不到要保存的条目`);
+        const saved = findEntry(await getWorldbook(worldbookName), uid, name);
+        if (!saved || normalizeText(saved.content) !== normalizeText(content)) {
+            throw new Error('保存后读回的正文和要保存的内容不一致，请稍后重试。');
+        }
+        return saved;
     }
 
-    async function ensureEntryLayout(worldbookName, entry, options) {
-        const settings = options || {};
-        if (!entry || getRangeLayout(entry)) return { entry, restored: false };
-        let backups = {};
-        try {
-            backups = await readLayoutBackups();
-        } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 读取阶段划分备份失败`, error);
-            return { entry, restored: false };
-        }
-        const record = backupRecordFor(backups, worldbookName, entry);
-        if (!record || !applyLayoutBackup(entry, record)) return { entry, restored: false };
-        if (settings.selfHeal) {
-            const healKey = `${layoutBackupKey(worldbookName, entry)}::${hashText(JSON.stringify(record.layout))}`;
-            if (!healedLayoutKeys.has(healKey)) {
-                healedLayoutKeys.add(healKey);
-                try {
-                    await writeRangeLayout(worldbookName, entry, record.layout);
-                } catch (error) {
-                    console.warn(`[${SCRIPT_NAME}] 阶段划分回写世界书失败，已改用角色备份继续`, error);
-                }
-            }
-        }
-        return { entry, restored: true };
-    }
+    // ---------------------------------------------------------------
+    // 二、适配层：读取当前状态、注入、推进、绑定
+    // ---------------------------------------------------------------
 
-    async function locateConfiguredEntry(config) {
-        if (!config) return null;
-        const boundNames = await getCharacterWorldbookNames();
-        const candidates = Array.from(new Set([
-            config.worldbookName,
-            ...boundNames,
-        ].filter(Boolean)));
-
+    async function locateEntry(config) {
+        const bound = await boundWorldbookNames(await currentCharacter());
+        const candidates = Array.from(new Set([config.worldbookName, ...bound].filter(Boolean)));
         for (const worldbookName of candidates) {
             try {
-                const worldbook = await getWorldbook(worldbookName);
-                const entry = findEntry(worldbook, config.entryUid, config.entryName);
-                if (entry) {
-                    const ensured = await ensureEntryLayout(worldbookName, entry, { selfHeal: true });
-                    return {
-                        worldbookName,
-                        worldbook,
-                        entry: ensured.entry,
-                        layoutRestored: ensured.restored,
-                    };
-                }
+                const entry = findEntry(await getWorldbook(worldbookName), config.entryUid, config.entryName);
+                if (entry) return { worldbookName, entry };
             } catch (error) {
                 console.warn(`[${SCRIPT_NAME}] 读取世界书“${worldbookName}”失败`, error);
             }
@@ -1360,2580 +847,1033 @@
         return null;
     }
 
-    function makeSourceKey(source) {
-        const layout = getRangeLayout(source.entry);
-        const layoutHash = layout ? hashText(JSON.stringify(layout)) : 'template';
-        return `${source.worldbookName}::${source.entry.uid}::${hashText(entryDisplayContent(source.entry))}::${layoutHash}`;
+    // 只读。绑定、推进、保存这些会写数据的动作都在各自的函数里。
+    async function loadContext() {
+        const config = await readConfig();
+        if (!config) return { configured: false, config: null };
+        const located = await locateEntry(config);
+        if (!located) {
+            throw new Error(`找不到绑定的条目“${config.entryName || ''}”。请在下面重新选择并绑定。`);
+        }
+        const parsed = parseOutline(located.entry.content);
+        const rawState = await readState();
+        const state = reconcileState(rawState, parsed);
+        return {
+            configured: true,
+            config,
+            worldbookName: located.worldbookName,
+            entry: located.entry,
+            parsed,
+            rawState,
+            state,
+            stage: parsed.stages[state.stageIndex] || null,
+            addons: activeAddons(parsed, state.stageIndex),
+            entryEnabled: !entryIsDisabled(located.entry),
+            legacy: hasLegacyLayout(located.entry),
+        };
     }
 
-    function reconcileState(rawState, parsed, sourceKey) {
-        const oldState = rawState && typeof rawState === 'object' ? rawState : {};
-        let mainIndex = Number.isInteger(oldState.mainIndex) ? oldState.mainIndex : 0;
-
-        if (oldState.sourceKey !== sourceKey && oldState.mainName) {
-            const matched = parsed.mainBlocks.findIndex(block => block.title === oldState.mainName);
-            if (matched >= 0) mainIndex = matched;
-        }
-        mainIndex = Math.max(0, Math.min(mainIndex, parsed.mainBlocks.length));
-
-        return {
-            sourceKey,
-            mainIndex,
-            mainName: parsed.mainBlocks[mainIndex] ? parsed.mainBlocks[mainIndex].title : '',
-            lastCompletionMessageId: oldState.lastCompletionMessageId == null
-                ? null
-                : oldState.lastCompletionMessageId,
-            lastCompletionFingerprint: oldState.lastCompletionFingerprint || '',
-            updatedAt: oldState.updatedAt || new Date().toISOString(),
-        };
+    async function requireContext() {
+        const context = await loadContext();
+        if (!context.configured) throw new Error('还没有绑定大纲条目。');
+        return context;
     }
 
     function statesDiffer(left, right) {
         return !left
-            || left.sourceKey !== right.sourceKey
-            || left.mainIndex !== right.mainIndex
-            || left.mainName !== right.mainName
+            || left.stageIndex !== right.stageIndex
+            || left.stageName !== right.stageName
             || left.lastCompletionMessageId !== right.lastCompletionMessageId
             || left.lastCompletionFingerprint !== right.lastCompletionFingerprint;
     }
 
-    async function loadContext(options) {
-        const settings = options || {};
-        const config = await readCharacterConfig();
-        if (!config) return { configured: false };
-
-        const source = await locateConfiguredEntry(config);
-        if (!source) {
-            throw new Error('找不到已绑定的动态指导条目。请重新点击“绑定指导页”。');
-        }
-        if (source.layoutRestored) {
-            reportOnce(
-                '阶段划分已恢复',
-                '世界书条目里没有找到阶段划分，已从角色备份恢复。打开“划分提示词阶段”确认后会写回世界书。',
-            );
-        }
-        if (!entryIsDisabled(source.entry)) {
-            await disableSourceEntry(source.worldbookName, source.entry.uid, entryName(source.entry));
-            source.entry.enabled = false;
-            if ('disable' in source.entry) source.entry.disable = true;
-        }
-
-        const parsed = parseGuideEntry(source.entry);
-        if (parsed.mainBlocks.length === 0) {
-            throw new Error(parsed.warnings.join('\n') || '指导页中没有可用的主线内容');
-        }
-
-        const sourceKey = makeSourceKey(source);
-        const oldState = await readChatState();
-        const state = reconcileState(oldState, parsed, sourceKey);
-        if (settings.persistState !== false && statesDiffer(oldState, state)) {
-            state.updatedAt = new Date().toISOString();
-            await writeChatState(state);
-        }
-
-        const mainBlock = parsed.mainBlocks[state.mainIndex] || null;
-        const addons = getActiveAddons(parsed, state.mainIndex);
-        return {
-            configured: true,
-            config,
-            source,
-            parsed,
-            state,
-            mainBlock,
-            addons,
-            layoutRestored: Boolean(source.layoutRestored),
-        };
-    }
-
     async function safeUninject() {
-        const uninjectPrompts = resolveFunction('uninjectPrompts', false);
-        if (uninjectPrompts) {
-            await Promise.resolve(uninjectPrompts([INJECTION_ID]));
-        }
+        const uninjectPrompts = api('uninjectPrompts', false);
+        if (uninjectPrompts) await Promise.resolve(uninjectPrompts([INJECTION_ID]));
     }
 
-    async function injectCurrentGuide() {
-        if (!isCurrentInstance()) return;
+    async function injectCurrentGuide(generationType) {
         const context = await loadContext();
         await safeUninject();
-        if (!context.configured || !context.mainBlock) return;
+        if (!context.configured) return;
+        if (context.entryEnabled) {
+            // 来源条目又被启用了：为了不让整份大纲直接发给 AI，生成前重新禁用它。
+            // 旧格式尚未转换或正文暂时没有阶段时，也必须保持来源禁用。
+            await disableEntry(context.worldbookName, context.entry.uid, entryName(context.entry));
+            reportOnce('re-disabled', '来源条目被重新启用过，已再次禁用，避免整份大纲直接发给 AI。');
+        }
+        if (context.legacy) {
+            reportOnce('legacy-layout', '绑定的条目仍使用旧版划分。请先打开动态指导助手，点“转换成新版格式”；转换前不会注入指导。');
+            return;
+        }
+        if (context.parsed.stages.length === 0) {
+            reportOnce('no-stages', '绑定的条目还没有分阶段，这次不会注入指导。');
+            return;
+        }
+        if (statesDiffer(context.rawState, context.state)) {
+            await writeState({ ...context.state, updatedAt: new Date().toISOString() });
+        }
 
-        const injectPrompts = resolveFunction('injectPrompts', true);
+        let index = context.state.stageIndex;
+        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段注入
+        if ((generationType === 'swipe' || generationType === 'regenerate')
+            && index > 0
+            && context.state.lastCompletionMessageId != null) {
+            const getLastMessageId = api('getLastMessageId', false);
+            let lastId = null;
+            try {
+                lastId = getLastMessageId ? await Promise.resolve(getLastMessageId()) : null;
+            } catch (error) {
+                lastId = null;
+            }
+            if (lastId != null && String(lastId) === String(context.state.lastCompletionMessageId)) index -= 1;
+        }
+
+        const stage = context.parsed.stages[index];
+        if (!stage) return;
+        const injectPrompts = api('injectPrompts', true);
         await Promise.resolve(injectPrompts([{
             id: INJECTION_ID,
             position: 'in_chat',
             depth: 0,
             role: 'system',
-            content: formatInjection(context.mainBlock, context.addons),
+            content: formatInjection(stage, activeAddons(context.parsed, index)),
             should_scan: false,
         }], { once: true }));
     }
 
-    function stateForIndex(context, mainIndex, options) {
+    async function moveToIndex(context, target, options) {
         const settings = options || {};
-        const safeIndex = Math.max(0, Math.min(mainIndex, context.parsed.mainBlocks.length));
-        return {
-            sourceKey: makeSourceKey(context.source),
-            mainIndex: safeIndex,
-            mainName: context.parsed.mainBlocks[safeIndex]
-                ? context.parsed.mainBlocks[safeIndex].title
-                : '',
+        const total = context.parsed.stages.length;
+        const index = Math.max(0, Math.min(target, total));
+        const next = {
+            stageIndex: index,
+            stageName: context.parsed.stages[index] ? context.parsed.stages[index].name : '',
             lastCompletionMessageId: settings.messageId == null
                 ? context.state.lastCompletionMessageId
                 : settings.messageId,
-            lastCompletionFingerprint: settings.completionFingerprint
-                ? settings.completionFingerprint
-                : context.state.lastCompletionFingerprint,
+            lastCompletionFingerprint: settings.fingerprint || context.state.lastCompletionFingerprint,
             updatedAt: new Date().toISOString(),
         };
-    }
-
-    async function moveToIndex(targetIndex, options) {
-        const settings = options || {};
-        const context = await loadContext();
-        if (!context.configured) throw new Error('尚未绑定动态指导页');
-
-        const nextState = stateForIndex(context, targetIndex, settings);
-        await writeChatState(nextState);
+        await writeState(next);
         await safeUninject();
-
-        const nextBlock = context.parsed.mainBlocks[nextState.mainIndex];
         if (settings.notify !== false) {
-            if (nextBlock) {
-                notify(`当前内容：${nextBlock.title}`, 'success');
-            } else {
-                notify('所有主线内容均已完成，后续不会再注入动态指导。', 'success');
-            }
+            notify(next.stageName ? `当前阶段：${next.stageName}` : '全部阶段已完成，之后不再注入指导。', 'success');
         }
-        return nextState;
+        return next;
     }
 
-    const managerState = {
-        binding: null,
-        context: null,
-        entries: [],
-        entryMap: new Map(),
-        selectedWorldbook: '',
-        selectedEntryKey: '',
-        busy: false,
-    };
-
-    const stageEditorState = {
-        worldbookName: '',
-        entry: null,
-        text: '',
-        stages: [],
-        alwaysColor: '#64748b',
-        alwaysRanges: [],
-        activeOwnerId: '',
-        pendingRanges: [],
-        captureBaseRanges: null,
-        captureGestureOpen: false,
-        lastCaptureAt: 0,
-        selectedMarkedRange: null,
-        tapMode: false,
-        tapHead: null,
-        tapTail: null,
-        touchActive: false,
-        scrollLocked: false,
-        touchSnapshot: null,
-        gestureScrolled: false,
-        ignoreSelectionUntil: 0,
-        lastScrollLockAt: 0,
-        unresolvedCount: 0,
-        dirty: false,
-        busy: false,
-        selectionTimer: null,
-    };
-
-    let stageEditorSelectionBinding = null;
-
-    function editorElement(suffix) {
-        const documentRef = getHostDocument();
-        return documentRef ? documentRef.getElementById(`${UI_PREFIX}-editor-${suffix}`) : null;
-    }
-
-    function setEditorMessage(message, type) {
-        const element = editorElement('message');
-        if (!element) return;
-        element.textContent = String(message || '');
-        element.dataset.type = type || 'info';
-        element.hidden = !message;
-    }
-
-    function setEditorBusy(busy) {
-        stageEditorState.busy = Boolean(busy);
-        const editor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
-        if (editor) editor.classList.toggle('dga-busy', stageEditorState.busy);
-        ['save', 'save-bind', 'new-stage', 'assign', 'assign-always', 'clear-range']
-            .map(editorElement)
-            .filter(Boolean)
-            .forEach(element => {
-                element.disabled = stageEditorState.busy;
-            });
-        if (!stageEditorState.busy) updateStageEditorControls();
-    }
-
-    function normalizedIntervals(ranges) {
-        const textLength = stageEditorState.text.length;
-        const sorted = (Array.isArray(ranges) ? ranges : [])
-            .map(range => ({
-                start: clampOffset(Math.min(range.start, range.end), textLength),
-                end: clampOffset(Math.max(range.start, range.end), textLength),
-            }))
-            .filter(range => range.end > range.start)
-            .sort((left, right) => left.start - right.start || left.end - right.end);
-        const merged = [];
-        sorted.forEach(range => {
-            const previous = merged[merged.length - 1];
-            if (previous && range.start <= previous.end) {
-                previous.end = Math.max(previous.end, range.end);
-            } else {
-                merged.push({ ...range });
-            }
-        });
-        return merged;
-    }
-
-    function subtractInterval(ranges, start, end) {
-        const result = [];
-        normalizedIntervals(ranges).forEach(range => {
-            if (range.end <= start || range.start >= end) {
-                result.push(range);
-                return;
-            }
-            if (range.start < start) result.push({ start: range.start, end: start });
-            if (range.end > end) result.push({ start: end, end: range.end });
-        });
-        return normalizedIntervals(result);
-    }
-
-    function activeStage() {
-        return stageEditorState.stages.find(stage => stage.id === stageEditorState.activeOwnerId) || null;
-    }
-
-    function ownerRanges(ownerId) {
-        if (ownerId === 'always') return stageEditorState.alwaysRanges;
-        const stage = stageEditorState.stages.find(item => item.id === ownerId);
-        return stage ? stage.ranges : [];
-    }
-
-    function setOwnerRanges(ownerId, ranges) {
-        const normalized = normalizedIntervals(ranges);
-        if (ownerId === 'always') {
-            stageEditorState.alwaysRanges = normalized;
-            return;
-        }
-        const stage = stageEditorState.stages.find(item => item.id === ownerId);
-        if (stage) stage.ranges = normalized;
-    }
-
-    function clearRangeFromAllOwners(start, end) {
-        stageEditorState.stages.forEach(stage => {
-            stage.ranges = subtractInterval(stage.ranges, start, end);
-        });
-        stageEditorState.alwaysRanges = subtractInterval(stageEditorState.alwaysRanges, start, end);
-    }
-
-    function assignRangeToOwner(ownerId, start, end) {
-        clearRangeFromAllOwners(start, end);
-        setOwnerRanges(ownerId, [...ownerRanges(ownerId), { start, end }]);
-    }
-
-    function ownerColor(ownerId) {
-        if (ownerId === 'always') return stageEditorState.alwaysColor;
-        const stage = stageEditorState.stages.find(item => item.id === ownerId);
-        return stage ? stage.color : '#64748b';
-    }
-
-    function ownerName(ownerId) {
-        if (ownerId === 'always') return '常驻提示';
-        const stage = stageEditorState.stages.find(item => item.id === ownerId);
-        return stage ? (stage.name || '未命名阶段') : '未知阶段';
-    }
-
-    function colorToRgba(color, alpha) {
-        const normalized = normalizeColor(color, '#64748b').slice(1);
-        const red = Number.parseInt(normalized.slice(0, 2), 16);
-        const green = Number.parseInt(normalized.slice(2, 4), 16);
-        const blue = Number.parseInt(normalized.slice(4, 6), 16);
-        return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
-    }
-
-    function markStageEditorDirty() {
-        stageEditorState.dirty = true;
-        const indicator = editorElement('dirty');
-        if (indicator) indicator.hidden = false;
-    }
-
-    function clearNativeSelection() {
-        try {
-            const selection = hostWindow.getSelection && hostWindow.getSelection();
-            if (selection && typeof selection.removeAllRanges === 'function') selection.removeAllRanges();
-        } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 清理文字选择失败`, error);
-        }
-    }
-
-    /*
-     * 手机上如果一直保留系统原生选区，用户再往下滑动时浏览器会把选区
-     * 一路扩展到顶部。统一改成“自己画高亮”：有原生选区时先隐藏自绘高亮，
-     * 收起原生选区后再把自绘高亮显示出来。
-     */
-    function syncPendingPreviewVisibility() {
-        const surface = editorElement('surface');
-        if (!surface) return;
-        surface.classList.toggle('dga-tap-mode', Boolean(stageEditorState.tapMode));
-        /*
-         * 只在“手指正在拖选”的过程中把待分配高亮压暗，避免和系统蓝色选区
-         * 叠在一起看不清。手指一松开就恢复高亮，这样用户不会以为之前选好
-         * 的段落消失了。
-         */
-        const dragging = Boolean(stageEditorState.captureGestureOpen) && !stageEditorState.tapMode;
-        surface.classList.toggle('dga-hide-pending', dragging);
-    }
-
-    function editorPendingSegments() {
-        const pending = normalizedIntervals(stageEditorState.pendingRanges);
-        if (pending.length === 0) return [];
-        let remaining = pending;
-        allEditorMarks().forEach(mark => {
-            remaining = remaining.flatMap(range => subtractInterval([range], mark.start, mark.end));
-        });
-        return remaining;
-    }
-
-    function rangeWithQuote(range) {
-        const start = clampOffset(range.start, stageEditorState.text.length);
-        const end = clampOffset(range.end, stageEditorState.text.length);
-        return {
-            start,
-            end,
-            quote: stageEditorState.text.slice(start, end),
-        };
-    }
-
-    function setPendingRanges(ranges) {
-        stageEditorState.pendingRanges = normalizedIntervals(ranges).map(rangeWithQuote);
-    }
-
-    function addPendingRanges(ranges) {
-        setPendingRanges([...stageEditorState.pendingRanges, ...(Array.isArray(ranges) ? ranges : [ranges])]);
-    }
-
-    function lastPendingRange() {
-        const list = normalizedIntervals(stageEditorState.pendingRanges);
-        return list.length > 0 ? rangeWithQuote(list[list.length - 1]) : null;
-    }
-
-    function pendingRangeList() {
-        return normalizedIntervals(stageEditorState.pendingRanges);
-    }
-
-    function updateSelectionPreview() {
-        const selectionText = editorElement('selection-text');
-        if (!selectionText) return;
-        const ranges = pendingRangeList();
-        const waitingForTail = stageEditorState.tapMode
-            && stageEditorState.tapHead != null
-            && stageEditorState.tapTail == null;
-        if (ranges.length === 0) {
-            selectionText.textContent = waitingForTail
-                ? '已放下开头，下一步：点这一段的结尾'
-                : '尚未选择文字';
-            return;
-        }
-        const last = ranges[ranges.length - 1];
-        const preview = stageEditorState.text.slice(last.start, last.end).replace(/\s+/g, ' ').trim();
-        const clipped = preview.length > 46 ? `${preview.slice(0, 46)}…` : preview;
-        selectionText.textContent = ranges.length > 1
-            ? `已准备 ${ranges.length} 段，最近一段：${clipped}`
-            : clipped;
-    }
-
-    function updateTapMarkerStatus() {
-        const status = editorElement('tap-state');
-        if (!status) return;
-        if (!stageEditorState.tapMode) {
-            status.hidden = true;
-            return;
-        }
-        const ranges = pendingRangeList();
-        const waitingForTail = stageEditorState.tapHead != null && stageEditorState.tapTail == null;
-        status.hidden = false;
-        if (waitingForTail) {
-            status.dataset.step = 'tail';
-            status.textContent = '已放下开头 · 下一步：点这一段的结尾';
-            return;
-        }
-        if (ranges.length === 0) {
-            status.dataset.step = 'head';
-            status.textContent = '下一步：点这一段的开头';
-            return;
-        }
-        status.dataset.step = 'ready';
-        status.textContent = ranges.length === 1
-            ? '已准备 1 段 · 可以继续点下一段，或直接分配'
-            : `已准备 ${ranges.length} 段 · 可以继续点选，或直接分配`;
-    }
-
-    function canPlaceTapMarkers() {
-        const surface = editorElement('surface');
-        const documentRef = surface && surface.ownerDocument;
-        if (!documentRef) return false;
-        return typeof documentRef.caretRangeFromPoint === 'function'
-            || typeof documentRef.caretPositionFromPoint === 'function';
-    }
-
-    function shouldDefaultToTapMode() {
-        if (!canPlaceTapMarkers()) return false;
-        if (typeof hostWindow.matchMedia !== 'function') return false;
-        try {
-            return hostWindow.matchMedia('(pointer: coarse)').matches;
-        } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 判断触屏输入失败`, error);
-            return false;
-        }
-    }
-
-    function updateStageEditorModeUi() {
-        const surface = editorElement('surface');
-        if (surface) surface.classList.toggle('dga-tap-mode', Boolean(stageEditorState.tapMode));
-        const tapButton = editorElement('mode-tap');
-        if (tapButton) tapButton.classList.toggle('is-active', Boolean(stageEditorState.tapMode));
-        const dragButton = editorElement('mode-drag');
-        if (dragButton) dragButton.classList.toggle('is-active', !stageEditorState.tapMode);
-        const help = editorElement('workspace-help');
-        if (help) {
-            help.textContent = stageEditorState.tapMode
-                ? '点一下某段的开头，再点一下结尾，就会加入“待分配”；可以继续点下一段，最后一起分配。'
-                : '像涂色一样拖选文字。已经准备的范围会保留，可以继续拖选更多段落，最后一起分配。';
-        }
-        updateTapMarkerStatus();
-    }
-
-    function setStageEditorTapMode(enabled, options) {
-        const next = Boolean(enabled);
-        const quiet = Boolean(options && options.quiet);
-        stageEditorState.tapMode = next;
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
-        stageEditorState.selectedMarkedRange = null;
-        stageEditorState.captureGestureOpen = false;
-        stageEditorState.captureBaseRanges = null;
-        if (next) clearNativeSelection();
-        updateStageEditorModeUi();
-        renderStageEditorText();
-        updateStageEditorControls();
-        if (quiet) return;
-        const prepared = pendingRangeList().length;
-        setEditorMessage(
-            next
-                ? (prepared > 0
-                    ? `已切换到点选模式：之前准备的 ${prepared} 段仍保留，可以继续点选。`
-                    : '已切换到点选模式：点一下开头，再点一下结尾，就能加入待分配范围。')
-                : (prepared > 0
-                    ? `已切换到拖选模式：之前准备的 ${prepared} 段仍保留，可以继续拖选。`
-                    : '已切换到拖选模式：直接用手指拖选文字。'),
-            'info',
-        );
-    }
-
-    function setActiveOwner(ownerId) {
-        stageEditorState.activeOwnerId = ownerId;
-        stageEditorState.selectedMarkedRange = null;
-        renderStageEditorSidebar();
-        renderStageEditorSettings();
-        renderStageEditorText();
-        updateStageEditorControls();
-    }
-
-    function addStage() {
-        const index = stageEditorState.stages.length;
-        const stage = {
-            id: makeStageId(),
-            name: `阶段 ${index + 1}`,
-            color: DEFAULT_STAGE_COLORS[index % DEFAULT_STAGE_COLORS.length],
-            completion: '',
-            ranges: [],
-        };
-        stageEditorState.stages.push(stage);
-        markStageEditorDirty();
-        setActiveOwner(stage.id);
-        const settings = editorElement('settings');
-        if (settings) settings.setAttribute('open', '');
-        const nameInput = editorElement('stage-name');
-        if (nameInput) {
-            nameInput.focus();
-            nameInput.select();
-        }
-    }
-
-    function moveActiveStage(direction) {
-        const index = stageEditorState.stages.findIndex(stage => stage.id === stageEditorState.activeOwnerId);
-        const target = index + direction;
-        if (index < 0 || target < 0 || target >= stageEditorState.stages.length) return;
-        const [stage] = stageEditorState.stages.splice(index, 1);
-        stageEditorState.stages.splice(target, 0, stage);
-        markStageEditorDirty();
-        renderStageEditorSidebar();
-        renderStageEditorSettings();
-    }
-
-    function deleteActiveStage() {
-        const stage = activeStage();
-        if (!stage) return;
-        if (!hostWindow.confirm(`删除“${stage.name}”阶段？被标记的文字会恢复为未分配。`)) return;
-        const index = stageEditorState.stages.findIndex(item => item.id === stage.id);
-        stageEditorState.stages.splice(index, 1);
-        stageEditorState.activeOwnerId = stageEditorState.stages[index]
-            ? stageEditorState.stages[index].id
-            : (stageEditorState.stages[index - 1] ? stageEditorState.stages[index - 1].id : 'always');
-        markStageEditorDirty();
-        renderStageEditorSidebar();
-        renderStageEditorSettings();
-        renderStageEditorText();
-        updateStageEditorControls();
-    }
-
-    function allEditorMarks() {
-        const marks = [];
-        stageEditorState.stages.forEach(stage => {
-            normalizedIntervals(stage.ranges).forEach(range => marks.push({
-                ...range,
-                ownerId: stage.id,
-                color: stage.color,
-                name: stage.name,
-            }));
-        });
-        normalizedIntervals(stageEditorState.alwaysRanges).forEach(range => marks.push({
-            ...range,
-            ownerId: 'always',
-            color: stageEditorState.alwaysColor,
-            name: '常驻提示',
-        }));
-        return marks.sort((left, right) => left.start - right.start || left.end - right.end);
-    }
-
-    function renderStageEditorSidebar() {
-        const list = editorElement('stage-list');
-        if (!list) return;
-        const documentRef = list.ownerDocument;
-        list.replaceChildren();
-
-        function appendOwnerButton(ownerId, name, color, rangeCount, indexLabel) {
-            const button = documentRef.createElement('button');
-            button.type = 'button';
-            button.className = 'dga-stage-item';
-            if (stageEditorState.activeOwnerId === ownerId) button.classList.add('is-active');
-            button.style.setProperty('--dga-stage-color', normalizeColor(color, '#64748b'));
-            const title = documentRef.createElement('strong');
-            title.textContent = indexLabel ? `${indexLabel} · ${name}` : name;
-            const count = documentRef.createElement('span');
-            count.textContent = `${rangeCount} 处提示词`;
-            button.append(title, count);
-            button.onclick = () => setActiveOwner(ownerId);
-            list.appendChild(button);
-        }
-
-        stageEditorState.stages.forEach((stage, index) => {
-            appendOwnerButton(
-                stage.id,
-                stage.name || '未命名阶段',
-                stage.color,
-                stage.ranges.length,
-                `阶段 ${index + 1}`,
-            );
-        });
-        appendOwnerButton(
-            'always',
-            '常驻提示',
-            stageEditorState.alwaysColor,
-            stageEditorState.alwaysRanges.length,
-            '',
-        );
-    }
-
-    function renderStageEditorSettings() {
-        const stage = activeStage();
-        const isAlways = stageEditorState.activeOwnerId === 'always';
-        const title = editorElement('settings-title');
-        const nameWrap = editorElement('stage-name-wrap');
-        const completionWrap = editorElement('completion-wrap');
-        const orderActions = editorElement('order-actions');
-        const deleteButton = editorElement('delete-stage');
-        const nameInput = editorElement('stage-name');
-        const completionInput = editorElement('stage-completion');
-        const completionStage = editorElement('completion-stage');
-        const colorInput = editorElement('stage-color');
-        if (title) {
-            title.textContent = isAlways
-                ? '常驻提示设置'
-                : (stage ? `${stage.name || '未命名阶段'} · 名称、颜色与顺序` : '阶段设置');
-        }
-        if (nameWrap) nameWrap.hidden = isAlways || !stage;
-        if (completionWrap) completionWrap.hidden = isAlways || !stage;
-        if (orderActions) orderActions.hidden = isAlways || !stage;
-        if (deleteButton) deleteButton.hidden = isAlways || !stage;
-        if (nameInput) nameInput.value = stage ? stage.name : '';
-        if (completionInput) completionInput.value = stage ? stage.completion : '';
-        if (completionStage) {
-            completionStage.textContent = isAlways
-                ? '常驻提示不需要'
-                : (stage ? `当前：${stage.name || '未命名阶段'}` : '未选择阶段');
-        }
-        if (colorInput) colorInput.value = normalizeColor(
-            isAlways ? stageEditorState.alwaysColor : stage && stage.color,
-            isAlways ? '#64748b' : DEFAULT_STAGE_COLORS[0],
-        );
-        const stageIndex = stage ? stageEditorState.stages.findIndex(item => item.id === stage.id) : -1;
-        const moveUp = editorElement('move-up');
-        const moveDown = editorElement('move-down');
-        if (moveUp) moveUp.disabled = stageIndex <= 0;
-        if (moveDown) moveDown.disabled = stageIndex < 0 || stageIndex >= stageEditorState.stages.length - 1;
-    }
-
-    function renderStageEditorText() {
-        const surface = editorElement('surface');
-        if (!surface) return;
-        const documentRef = surface.ownerDocument;
-        const oldScrollTop = surface.scrollTop;
-        surface.replaceChildren();
-        const text = stageEditorState.text;
-        const marks = allEditorMarks();
-        const pendingSegments = editorPendingSegments();
-        const caretColor = normalizeColor(ownerColor(stageEditorState.activeOwnerId), '#8b5cf6');
-        const carets = [];
-        if (stageEditorState.tapMode) {
-            if (stageEditorState.tapHead != null) {
-                carets.push({ offset: clampOffset(stageEditorState.tapHead, text.length), edge: 'head' });
-            }
-            if (stageEditorState.tapTail != null) {
-                carets.push({ offset: clampOffset(stageEditorState.tapTail, text.length), edge: 'tail' });
-            }
-        }
-
-        const boundaries = new Set([0, text.length]);
-        marks.forEach(mark => {
-            boundaries.add(mark.start);
-            boundaries.add(mark.end);
-        });
-        pendingSegments.forEach(range => {
-            boundaries.add(range.start);
-            boundaries.add(range.end);
-        });
-        carets.forEach(caret => boundaries.add(caret.offset));
-        const points = [...boundaries]
-            .filter(point => point >= 0 && point <= text.length)
-            .sort((left, right) => left - right);
-
-        const appendCaret = caret => {
-            const element = documentRef.createElement('span');
-            element.className = `dga-tap-caret dga-tap-caret-${caret.edge}`;
-            element.dataset.edge = caret.edge;
-            element.dataset.offset = String(caret.offset);
-            element.style.setProperty('--dga-mark-color', caretColor);
-            element.title = caret.edge === 'head' ? '这一段的开头' : '这一段的结尾';
-            surface.appendChild(element);
-        };
-
-        points.forEach((point, index) => {
-            carets
-                .filter(caret => caret.offset === point)
-                .forEach(appendCaret);
-            const next = points[index + 1];
-            if (next == null || next <= point) return;
-            const content = text.slice(point, next);
-            const mark = marks.find(item => item.start <= point && item.end >= next);
-            const pending = pendingSegments.find(item => item.start <= point && item.end >= next);
-            if (mark) {
-                const span = documentRef.createElement('span');
-                span.className = 'dga-text-mark';
-                if (mark.ownerId === stageEditorState.activeOwnerId) span.classList.add('is-active');
-                const selected = stageEditorState.selectedMarkedRange;
-                if (selected
-                    && selected.ownerId === mark.ownerId
-                    && selected.start === mark.start
-                    && selected.end === mark.end) {
-                    span.classList.add('is-selected');
-                }
-                span.dataset.ownerId = mark.ownerId;
-                span.dataset.start = String(mark.start);
-                span.dataset.end = String(mark.end);
-                span.style.setProperty('--dga-mark-color', normalizeColor(mark.color, '#64748b'));
-                span.style.backgroundColor = colorToRgba(
-                    mark.color,
-                    mark.ownerId === stageEditorState.activeOwnerId ? 0.38 : 0.22,
-                );
-                span.title = mark.name;
-                span.textContent = content;
-                surface.appendChild(span);
-                return;
-            }
-            if (pending) {
-                const span = documentRef.createElement('span');
-                span.className = 'dga-text-mark is-pending';
-                span.dataset.pending = '1';
-                span.dataset.start = String(pending.start);
-                span.dataset.end = String(pending.end);
-                span.style.setProperty('--dga-mark-color', caretColor);
-                span.title = '当前选择，还没分配';
-                span.textContent = content;
-                surface.appendChild(span);
-                return;
-            }
-            if (content) surface.appendChild(documentRef.createTextNode(content));
-        });
-
-        if (!text) surface.textContent = '这个世界书条目没有提示词内容。';
-        surface.scrollTop = oldScrollTop;
-        syncPendingPreviewVisibility();
-    }
-
-    function selectionOffsetsInSurface() {
-        const surface = editorElement('surface');
-        const documentRef = getHostDocument();
-        if (!surface || !documentRef || !hostWindow.getSelection) return null;
-        const selection = hostWindow.getSelection();
-        if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
-        const range = selection.getRangeAt(0);
-        if (!surface.contains(range.startContainer) || !surface.contains(range.endContainer)) return null;
-        const beforeStart = documentRef.createRange();
-        beforeStart.selectNodeContents(surface);
-        beforeStart.setEnd(range.startContainer, range.startOffset);
-        const beforeEnd = documentRef.createRange();
-        beforeEnd.selectNodeContents(surface);
-        beforeEnd.setEnd(range.endContainer, range.endOffset);
-        const start = clampOffset(beforeStart.toString().length, stageEditorState.text.length);
-        const end = clampOffset(beforeEnd.toString().length, stageEditorState.text.length);
-        if (end <= start) return null;
-        return { start, end, quote: stageEditorState.text.slice(start, end) };
-    }
-
-    function captureStageEditorSelection() {
-        if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
-        const result = selectionOffsetsInSurface();
-        if (!result) return;
-        const base = stageEditorState.captureGestureOpen && Array.isArray(stageEditorState.captureBaseRanges)
-            ? stageEditorState.captureBaseRanges
-            : stageEditorState.pendingRanges;
-        setPendingRanges([...base, result]);
-        stageEditorState.selectedMarkedRange = null;
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
-        stageEditorState.lastCaptureAt = Date.now();
-        const count = pendingRangeList().length;
-        updateSelectionPreview();
-        setEditorMessage(`已加入待分配范围（共 ${count} 段），可以继续拖选更多文字，或直接分配。`, 'info');
-        updateStageEditorControls();
-        syncPendingPreviewVisibility();
-    }
-
-    function offsetFromPoint(clientX, clientY) {
-        const surface = editorElement('surface');
-        const documentRef = surface && surface.ownerDocument;
-        if (!surface || !documentRef) return null;
-        let caretRange = null;
-        try {
-            if (typeof documentRef.caretRangeFromPoint === 'function') {
-                caretRange = documentRef.caretRangeFromPoint(clientX, clientY);
-            } else if (typeof documentRef.caretPositionFromPoint === 'function') {
-                const position = documentRef.caretPositionFromPoint(clientX, clientY);
-                if (position && position.offsetNode) {
-                    caretRange = documentRef.createRange();
-                    caretRange.setStart(position.offsetNode, position.offset);
-                    caretRange.collapse(true);
-                }
-            }
-        } catch (error) {
-            console.warn(`[${SCRIPT_NAME}] 读取点击位置失败`, error);
-            return null;
-        }
-        if (!caretRange || !surface.contains(caretRange.startContainer)) return null;
-        const before = documentRef.createRange();
-        before.selectNodeContents(surface);
-        before.setEnd(caretRange.startContainer, caretRange.startOffset);
-        return clampOffset(before.toString().length, stageEditorState.text.length);
-    }
-
-    function placeTapMarker(event) {
-        if (Date.now() - stageEditorState.lastScrollLockAt < 450) return;
-        const offset = offsetFromPoint(event.clientX, event.clientY);
-        if (offset == null) {
-            setEditorMessage('没找到这里的文字位置，请点在这一段文字上。', 'warning');
-            return;
-        }
-        const waitingForTail = stageEditorState.tapHead != null && stageEditorState.tapTail == null;
-        if (!waitingForTail) {
-            stageEditorState.tapHead = offset;
-            stageEditorState.tapTail = null;
-            stageEditorState.selectedMarkedRange = null;
-            clearNativeSelection();
-            const prepared = pendingRangeList().length;
-            setEditorMessage(
-                prepared > 0
-                    ? `已放下新一段的开头（之前准备的 ${prepared} 段仍保留），再去这一段的结尾点一下。`
-                    : '起点放好了，再去这一段的结尾点一下。',
-                'info',
-            );
-        } else {
-            const start = Math.min(stageEditorState.tapHead, offset);
-            const end = Math.max(stageEditorState.tapHead, offset);
-            if (end - start < 1) {
-                setEditorMessage('起点和结尾在同一处，请换一个位置再点。', 'warning');
-                return;
-            }
-            addPendingRanges([{ start, end }]);
-            stageEditorState.tapHead = null;
-            stageEditorState.tapTail = null;
-            clearNativeSelection();
-            const count = pendingRangeList().length;
-            updateSelectionPreview();
-            setEditorMessage(`这一段已加入待分配（共 ${count} 段），可以继续点下一段，或直接分配。`, 'success');
-        }
-        renderStageEditorText();
-        updateStageEditorControls();
-    }
-
-    function selectMarkedRangeFromEvent(event) {
-        const span = event.target && event.target.closest
-            ? event.target.closest('.dga-text-mark')
-            : null;
-        if (!span) return;
-        if (span.dataset.pending) return;
-        const ownerId = span.dataset.ownerId;
-        const start = Number(span.dataset.start);
-        const end = Number(span.dataset.end);
-        if (!ownerId || !Number.isFinite(start) || !Number.isFinite(end)) return;
-        stageEditorState.activeOwnerId = ownerId;
-        stageEditorState.selectedMarkedRange = { ownerId, start, end };
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
-        renderStageEditorSidebar();
-        renderStageEditorSettings();
-        renderStageEditorText();
-        setEditorMessage(`已选中“${ownerName(ownerId)}”的一处标记，可点击“清除所选标记”。`, 'info');
-        updateStageEditorControls();
-    }
-
-    function assignPendingRange(ownerId) {
-        const ranges = pendingRangeList();
-        if (ranges.length === 0) {
-            setEditorMessage(
-                stageEditorState.tapMode
-                    ? '请先点一下某段的开头，再点一下结尾，把内容加入待分配。'
-                    : '请先在提示词原文中拖选文字，加入待分配。',
-                'warning',
-            );
-            return;
-        }
-        if (ownerId !== 'always' && !stageEditorState.stages.some(stage => stage.id === ownerId)) {
-            setEditorMessage('请先新建或选择一个剧情阶段。', 'warning');
-            return;
-        }
-        ranges.forEach(range => assignRangeToOwner(ownerId, range.start, range.end));
-        stageEditorState.activeOwnerId = ownerId;
-        stageEditorState.pendingRanges = [];
-        stageEditorState.selectedMarkedRange = null;
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
-        clearNativeSelection();
-        markStageEditorDirty();
-        renderStageEditorSidebar();
-        renderStageEditorSettings();
-        renderStageEditorText();
-        setEditorMessage(
-            ranges.length === 1
-                ? `已把选中文字分配给“${ownerName(ownerId)}”。`
-                : `已把 ${ranges.length} 段待分配文字一起分配给“${ownerName(ownerId)}”。`,
-            'success',
-        );
-        updateStageEditorControls();
-    }
-
-    function clearSelectedEditorRange() {
-        const pending = pendingRangeList();
-        const marked = stageEditorState.selectedMarkedRange;
-        if (pending.length === 0 && !marked) {
-            setEditorMessage('当前没有待分配范围，也没有点选已有标记。', 'warning');
-            return;
-        }
-        const messages = [];
-        if (pending.length > 0) {
-            stageEditorState.pendingRanges = [];
-            stageEditorState.tapHead = null;
-            stageEditorState.tapTail = null;
-            messages.push(`已清除 ${pending.length} 段待分配范围`);
-        }
-        if (marked) {
-            clearRangeFromAllOwners(marked.start, marked.end);
-            stageEditorState.selectedMarkedRange = null;
-            markStageEditorDirty();
-            messages.push(`已把“${ownerName(marked.ownerId)}”的一处标记恢复为未分配`);
-        }
-        clearNativeSelection();
-        renderStageEditorSidebar();
-        renderStageEditorText();
-        setEditorMessage(`${messages.join('；')}。`, 'success');
-        updateStageEditorControls();
-    }
-
-    function updateStageEditorControls() {
-        const pendingCount = pendingRangeList().length;
-        const hasPending = pendingCount > 0;
-        const hasMarked = Boolean(stageEditorState.selectedMarkedRange);
-        const hasActive = stageEditorState.activeOwnerId === 'always' || Boolean(activeStage());
-        const assignButton = editorElement('assign');
-        const assignAlwaysButton = editorElement('assign-always');
-        const clearButton = editorElement('clear-range');
-        updateSelectionPreview();
-        updateTapMarkerStatus();
-        if (stageEditorState.busy) return;
-        if (assignButton) {
-            assignButton.disabled = !hasPending || !hasActive;
-            assignButton.textContent = stageEditorState.activeOwnerId === 'always'
-                ? (pendingCount > 1 ? `分配给常驻提示（${pendingCount} 段）` : '分配给常驻提示')
-                : `分配给${activeStage() ? `“${activeStage().name || '未命名阶段'}”` : '当前阶段'}${pendingCount > 1 ? `（${pendingCount} 段）` : ''}`;
-        }
-        if (assignAlwaysButton) {
-            assignAlwaysButton.disabled = !hasPending;
-            assignAlwaysButton.textContent = pendingCount > 1
-                ? `设为常驻提示（${pendingCount} 段）`
-                : '设为常驻提示';
-        }
-        if (clearButton) {
-            clearButton.disabled = !hasPending && !hasMarked;
-            clearButton.textContent = hasPending
-                ? `清除待分配（${pendingCount} 段）`
-                : '清除所选标记';
-        }
-    }
-
-    function buildRangeLayoutFromEditor() {
-        if (stageEditorState.stages.length === 0) {
-            throw new Error('请至少新建一个剧情阶段');
-        }
-        const emptyStages = stageEditorState.stages.filter(stage => stage.ranges.length === 0);
-        if (emptyStages.length > 0) {
-            throw new Error(`这些阶段还没有选择提示词：${emptyStages.map(stage => stage.name).join('、')}`);
-        }
-        const text = stageEditorState.text;
-        return {
-            version: LAYOUT_VERSION,
-            mode: 'ranges',
-            sourceHash: hashText(text),
-            stages: stageEditorState.stages.map((stage, index) => ({
-                id: stage.id || makeStageId(),
-                name: String(stage.name || `阶段 ${index + 1}`).trim() || `阶段 ${index + 1}`,
-                color: normalizeColor(stage.color, DEFAULT_STAGE_COLORS[index % DEFAULT_STAGE_COLORS.length]),
-                completion: String(stage.completion || '').trim(),
-                ranges: normalizedIntervals(stage.ranges).map(range => (
-                    createAnchoredRange(text, range.start, range.end)
-                )),
-            })),
-            always: {
-                color: normalizeColor(stageEditorState.alwaysColor, '#64748b'),
-                ranges: normalizedIntervals(stageEditorState.alwaysRanges).map(range => (
-                    createAnchoredRange(text, range.start, range.end)
-                )),
-            },
-            updatedAt: new Date().toISOString(),
-        };
-    }
-
-    function loadEntryIntoStageEditor(worldbookName, entry) {
-        const text = entryDisplayContent(entry);
-        const layout = getRangeLayout(entry);
-        stageEditorState.worldbookName = worldbookName;
-        stageEditorState.entry = entry;
-        stageEditorState.text = text;
-        stageEditorState.pendingRanges = [];
-        stageEditorState.captureBaseRanges = null;
-        stageEditorState.captureGestureOpen = false;
-        stageEditorState.selectedMarkedRange = null;
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
-        stageEditorState.tapMode = shouldDefaultToTapMode();
-        stageEditorState.scrollLocked = false;
-        stageEditorState.touchActive = false;
-        stageEditorState.touchSnapshot = null;
-        stageEditorState.unresolvedCount = 0;
-        stageEditorState.dirty = false;
-
-        if (layout) {
-            const resolved = resolveRangeLayout(text, layout);
-            stageEditorState.stages = resolved.stages.map(stage => ({
-                id: stage.id,
-                name: stage.name,
-                color: stage.color,
-                completion: stage.completion,
-                ranges: normalizedIntervals(stage.ranges),
-            }));
-            stageEditorState.alwaysColor = resolved.always.color;
-            stageEditorState.alwaysRanges = normalizedIntervals(resolved.always.ranges);
-            stageEditorState.unresolvedCount = resolved.stages.reduce(
-                (sum, stage) => sum + stage.unresolvedCount,
-                resolved.always.unresolvedCount,
-            );
-        } else {
-            const firstStage = {
-                id: makeStageId(),
-                name: '阶段 1',
-                color: DEFAULT_STAGE_COLORS[0],
-                completion: '',
-                ranges: [],
-            };
-            stageEditorState.stages = [firstStage];
-            stageEditorState.alwaysColor = '#64748b';
-            stageEditorState.alwaysRanges = [];
-        }
-        stageEditorState.activeOwnerId = stageEditorState.stages[0]
-            ? stageEditorState.stages[0].id
-            : 'always';
-        const dirty = editorElement('dirty');
-        if (dirty) dirty.hidden = true;
-        const sourceName = editorElement('source-name');
-        if (sourceName) sourceName.textContent = `[${worldbookName}] ${entryName(entry)}`;
-        renderStageEditorSidebar();
-        renderStageEditorSettings();
-        updateStageEditorModeUi();
-        renderStageEditorText();
-        updateStageEditorControls();
-        if (stageEditorState.unresolvedCount > 0) {
-            setEditorMessage(
-                `有 ${stageEditorState.unresolvedCount} 个旧选区无法在当前原文中定位。请重新选择对应文字后再保存。`,
-                'warning',
-            );
-        } else if (layout) {
-            setEditorMessage(
-                stageEditorState.tapMode
-                    ? '阶段划分已载入。点一下开头、再点一下结尾，就能继续调整。'
-                    : '阶段划分已载入。拖选原文，可以继续调整。',
-                'info',
-            );
-        } else {
-            setEditorMessage(
-                stageEditorState.tapMode
-                    ? '点一下这一段的开头，再点一下结尾，中间会自动选中，然后分配给“阶段 1”。'
-                    : '拖选提示词原文，然后把文字分配给“阶段 1”或常驻提示。',
-                'info',
-            );
-        }
-    }
-
-    async function saveStageEditorLayout(bindAfterSave) {
-        if (!stageEditorState.entry) throw new Error('没有正在编辑的世界书条目');
-        const layout = buildRangeLayoutFromEditor();
-        setEditorBusy(true);
-        setEditorMessage('正在把阶段划分保存到世界书隐藏数据……', 'info');
-        try {
-            const savedEntry = await writeRangeLayout(
-                stageEditorState.worldbookName,
-                stageEditorState.entry,
-                layout,
-            );
-            stageEditorState.entry = savedEntry;
-            stageEditorState.dirty = false;
-            stageEditorState.unresolvedCount = 0;
-            const dirty = editorElement('dirty');
-            if (dirty) dirty.hidden = true;
-            if (bindAfterSave) {
-                await bindGuideEntry(stageEditorState.worldbookName, savedEntry, { confirm: false });
-            }
-            await refreshManager({
-                worldbookName: stageEditorState.worldbookName,
-                quiet: true,
-            });
-            setEditorMessage(
-                bindAfterSave
-                    ? '阶段划分已保存并绑定，当前聊天已从第一阶段开始。'
-                    : '阶段划分已保存。世界书正文没有被修改。',
-                'success',
-            );
-        } finally {
-            setEditorBusy(false);
-        }
-    }
-
-    function closeStageEditor(force) {
-        if (!force && stageEditorState.dirty) {
-            const accepted = hostWindow.confirm('阶段划分还有未保存的修改，仍然关闭吗？');
-            if (!accepted) return;
-        }
-        stageEditorState.scrollLocked = false;
-        stageEditorState.touchActive = false;
-        stageEditorState.touchSnapshot = null;
-        stageEditorState.pendingRanges = [];
-        stageEditorState.captureBaseRanges = null;
-        stageEditorState.captureGestureOpen = false;
-        stageEditorState.selectedMarkedRange = null;
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
-        const documentRef = getHostDocument();
-        const editor = documentRef && documentRef.getElementById(EDITOR_ID);
-        if (editor) editor.hidden = true;
-        const panel = managerElement('panel');
-        if (panel) panel.hidden = false;
-    }
-
-    async function openStageEditor() {
-        const entry = managerState.entryMap.get(managerState.selectedEntryKey);
-        if (!managerState.selectedWorldbook || !entry) {
-            throw new Error('请先在管理页选择一个世界书条目');
-        }
-        const worldbook = await getWorldbook(managerState.selectedWorldbook);
-        const freshEntry = findEntry(worldbook, entry.uid, entryName(entry));
-        if (!freshEntry) throw new Error('所选世界书条目已经不存在，请刷新后重试');
-        const ensured = await ensureEntryLayout(managerState.selectedWorldbook, freshEntry, { selfHeal: false });
-        const editor = installStageEditorUi(false);
-        if (!editor) throw new Error('阶段标注器尚未准备好，请稍后重试');
-        const panel = managerElement('panel');
-        if (panel) panel.hidden = true;
-        editor.hidden = false;
-        loadEntryIntoStageEditor(managerState.selectedWorldbook, ensured.entry);
-        if (ensured.restored) {
-            setEditorMessage(
-                '世界书条目里没有找到阶段划分，已从角色备份恢复。确认无误后点“保存划分”写回世界书。',
-                'warning',
-            );
-        }
-        const surface = editorElement('surface');
-        if (surface) surface.focus();
-    }
-
-    function managerElement(suffix) {
-        const documentRef = getHostDocument();
-        return documentRef ? documentRef.getElementById(`${UI_PREFIX}-${suffix}`) : null;
-    }
-
-    function setManagerText(suffix, value) {
-        const element = managerElement(suffix);
-        if (element) element.textContent = String(value == null ? '' : value);
-    }
-
-    function setManagerMessage(message, type) {
-        const element = managerElement('message');
-        if (!element) return;
-        element.textContent = String(message || '');
-        element.dataset.type = type || 'info';
-        element.hidden = !message;
-    }
-
-    function setManagerBusy(busy) {
-        managerState.busy = Boolean(busy);
-        const panel = managerElement('panel');
-        if (panel) panel.classList.toggle('dga-busy', managerState.busy);
-        if (managerState.busy) {
-            ['refresh', 'bind', 'edit-stages', 'previous', 'next', 'reset', 'worldbook-select', 'entry-select']
-                .map(managerElement)
-                .filter(Boolean)
-                .forEach(element => {
-                    element.disabled = true;
-                });
-        } else {
-            updateManagerControls();
-        }
-    }
-
-    function populateSelect(select, items, selectedValue, emptyLabel) {
-        if (!select) return '';
-        const documentRef = select.ownerDocument;
-        select.replaceChildren();
-        if (items.length === 0) {
-            const option = documentRef.createElement('option');
-            option.value = '';
-            option.textContent = emptyLabel;
-            select.appendChild(option);
-            select.value = '';
-            return '';
-        }
-        items.forEach(item => {
-            const option = documentRef.createElement('option');
-            option.value = item.value;
-            option.textContent = item.label;
-            select.appendChild(option);
-        });
-        const hasRequested = items.some(item => item.value === selectedValue);
-        select.value = hasRequested ? selectedValue : items[0].value;
-        return select.value;
-    }
-
-    function entryOptionKey(entry, index) {
-        return entry && entry.uid != null ? `uid:${String(entry.uid)}` : `index:${index}`;
-    }
-
-    function entryOptionLabel(entry) {
-        const parsed = parseGuideEntry(entry);
-        const stateLabel = entryIsDisabled(entry) ? ' · 已禁用' : '';
-        if (parsed.mainBlocks.length === 0) {
-            return `${entryName(entry)}（尚未划分阶段${stateLabel}）`;
-        }
-        if (parsed.format === 'dynamic-guide-ranges-v1') {
-            return `${entryName(entry)}（可视化 ${parsed.mainBlocks.length} 个阶段${stateLabel}）`;
-        }
-        return `${entryName(entry)}（${parsed.mainBlocks.length} 段主线，${parsed.addonBlocks.length} 段附加${stateLabel}）`;
-    }
-
-    function preferredEntryKey(entries, worldbookName, config, requestedKey) {
-        const indexed = entries.map((entry, index) => ({
-            entry,
-            key: entryOptionKey(entry, index),
-        }));
-        if (requestedKey && indexed.some(item => item.key === requestedKey)) return requestedKey;
-        if (config && config.worldbookName === worldbookName) {
-            const configured = indexed.find(item => (
-                sameUid(item.entry.uid, config.entryUid)
-                || entryName(item.entry) === config.entryName
-            ));
-            if (configured) return configured.key;
-        }
-        const likelyGuide = indexed.find(item => (
-            /动态指导|剧情指导|剧情流程/.test(entryName(item.entry))
-            || /【\s*(?:内容|剧情|阶段|指导)\s*[：:]/.test(entryDisplayContent(item.entry))
-        ));
-        return likelyGuide ? likelyGuide.key : (indexed[0] ? indexed[0].key : '');
-    }
-
-    async function refreshEntryOptions(worldbookName, config, requestedKey) {
-        const select = managerElement('entry-select');
-        managerState.entries = [];
-        managerState.entryMap = new Map();
-        managerState.selectedEntryKey = '';
-        if (!worldbookName) {
-            populateSelect(select, [], '', '请先选择世界书');
-            return;
-        }
-
-        const worldbook = await getWorldbook(worldbookName);
-        const entries = worldbookEntries(worldbook);
-        await applyLayoutBackupsToEntries(worldbookName, entries);
-        const items = entries.map((entry, index) => {
-            const key = entryOptionKey(entry, index);
-            managerState.entryMap.set(key, entry);
-            return { value: key, label: entryOptionLabel(entry) };
-        });
-        const preferred = preferredEntryKey(entries, worldbookName, config, requestedKey);
-        managerState.entries = entries;
-        managerState.selectedEntryKey = populateSelect(select, items, preferred, '这个世界书没有条目');
-    }
-
-    function currentContentPreview(context) {
-        if (!context || !context.configured) return '绑定一个指导条目后，这里会显示当前实际发送给 AI 的内容。';
-        if (!context.mainBlock) return '所有主线内容均已完成，当前不会再发送动态指导。';
-        const sections = [
-            `【当前主线：${context.mainBlock.title}】`,
-            context.mainBlock.prompt,
-        ];
-        context.addons.forEach(block => {
-            sections.push('', `【附加：${block.title}｜${block.type}】`, block.prompt);
-        });
-        return sections.join('\n');
-    }
-
-    function progressHelpText(context) {
-        if (!context || !context.configured) {
-            return '绑定后，每个聊天各记一份进度；新建聊天会从第一段开始。';
-        }
-        const total = context.parsed.mainBlocks.length;
-        const position = context.mainBlock
-            ? `第 ${context.state.mainIndex + 1} 段（共 ${total} 段）`
-            : `已完成全部 ${total} 段`;
-        return `这个聊天目前在${position}。进度只记在当前聊天里，新建聊天会从第一段开始。`;
-    }
-
-    function layoutStatusText(context) {
-        if (!context || !context.configured) return '—';
-        if (!getRangeLayout(context.source.entry)) return '旧版模板格式，没有可视化划分';
-        if (context.layoutRestored) return '世界书条目里丢失，已从角色备份恢复';
-        return `已保存在世界书条目里（${context.parsed.mainBlocks.length} 个阶段）`;
-    }
-
-    function renderManager(binding, config, context, contextError) {
-        managerState.binding = binding;
-        managerState.context = context;
-        const detectedBooks = binding.names.length > 0 ? binding.names.join('、') : '未检测到';
-        const detectionSources = binding.sources.length > 0 ? binding.sources.join('、') : '暂无可用来源';
-        setManagerText('character-value', binding.characterName);
-        setManagerText('worldbooks-value', detectedBooks);
-        setManagerText('detection-value', detectionSources);
-
-        if (context && context.configured) {
-            const progress = context.mainBlock
-                ? `${context.state.mainIndex + 1} / ${context.parsed.mainBlocks.length}`
-                : `${context.parsed.mainBlocks.length} / ${context.parsed.mainBlocks.length}（已完成）`;
-            setManagerText('binding-value', `${context.source.worldbookName} → ${entryName(context.source.entry)}`);
-            setManagerText('progress-value', progress);
-            setManagerText('progress-help', progressHelpText(context));
-            setManagerText('layout-value', layoutStatusText(context));
-            setManagerText('current-title', context.mainBlock ? context.mainBlock.title : '主线已完成');
-            setManagerText(
-                'addons-value',
-                context.addons.length > 0
-                    ? context.addons.map(block => `${block.title}（${block.type}）`).join('、')
-                    : '无',
-            );
-            setManagerText('preview', currentContentPreview(context));
-            setManagerText(
-                'warnings-value',
-                context.parsed.warnings.length > 0 ? context.parsed.warnings.join('\n') : '无',
-            );
-        } else {
-            const configuredLabel = config
-                ? `${config.worldbookName || '未知世界书'} → ${config.entryName || '未知条目'}`
-                : '尚未绑定';
-            setManagerText('binding-value', configuredLabel);
-            setManagerText('progress-value', '—');
-            setManagerText('progress-help', progressHelpText(null));
-            setManagerText('layout-value', '—');
-            setManagerText('current-title', contextError ? '读取失败' : '等待绑定');
-            setManagerText('addons-value', '无');
-            setManagerText('preview', contextError || currentContentPreview(null));
-            setManagerText('warnings-value', contextError || '无');
-        }
-        updateManagerControls();
-    }
-
-    function updateManagerControls() {
-        if (managerState.busy) return;
-        const context = managerState.context;
-        const configured = Boolean(context && context.configured);
-        const currentIndex = configured ? context.state.mainIndex : 0;
-        const total = configured ? context.parsed.mainBlocks.length : 0;
-        const worldbookSelect = managerElement('worldbook-select');
-        const entrySelect = managerElement('entry-select');
-        const refreshButton = managerElement('refresh');
-        const bindButton = managerElement('bind');
-        const editStagesButton = managerElement('edit-stages');
-        const previousButton = managerElement('previous');
-        const nextButton = managerElement('next');
-        const resetButton = managerElement('reset');
-        if (refreshButton) refreshButton.disabled = false;
-        if (worldbookSelect) worldbookSelect.disabled = !managerState.binding || managerState.binding.names.length === 0;
-        if (entrySelect) entrySelect.disabled = managerState.entries.length === 0;
-        if (bindButton) bindButton.disabled = !managerState.entryMap.has(managerState.selectedEntryKey);
-        if (editStagesButton) editStagesButton.disabled = !managerState.entryMap.has(managerState.selectedEntryKey);
-        if (previousButton) previousButton.disabled = !configured || currentIndex <= 0;
-        if (nextButton) nextButton.disabled = !configured || currentIndex >= total;
-        if (resetButton) resetButton.disabled = !configured || currentIndex === 0;
-    }
-
-    async function refreshManager(options) {
+    async function bindEntry(worldbookName, entry, options) {
         const settings = options || {};
-        setManagerBusy(true);
-        if (!settings.quiet) setManagerMessage('正在读取当前角色与世界书……', 'info');
-        try {
-            const [binding, config] = await Promise.all([
-                getCharacterWorldbookBinding(),
-                readCharacterConfig(),
-            ]);
-            const select = managerElement('worldbook-select');
-            const requestedWorldbook = settings.worldbookName
-                || managerState.selectedWorldbook
-                || (config && config.worldbookName)
-                || binding.primary
-                || binding.names[0]
-                || '';
-            const selectedWorldbook = populateSelect(
-                select,
-                binding.names.map(name => ({ value: name, label: name })),
-                requestedWorldbook,
-                '当前角色没有绑定世界书',
-            );
-            managerState.selectedWorldbook = selectedWorldbook;
-
-            let entryError = '';
-            try {
-                await refreshEntryOptions(
-                    selectedWorldbook,
-                    config,
-                    settings.entryKey || managerState.selectedEntryKey,
-                );
-            } catch (error) {
-                entryError = `读取世界书“${selectedWorldbook}”失败：${error.message || String(error)}`;
-                populateSelect(managerElement('entry-select'), [], '', '无法读取条目');
-            }
-
-            let context = null;
-            let contextError = '';
-            try {
-                context = await loadContext({ persistState: false });
-            } catch (error) {
-                contextError = error.message || String(error);
-            }
-            renderManager(binding, config, context, contextError);
-
-            if (entryError) {
-                setManagerMessage(entryError, 'error');
-            } else if (binding.names.length === 0) {
-                const extra = binding.groupChat
-                    ? ' 当前是群聊；请切换到单角色聊天后绑定指导页。'
-                    : ' 请确认世界书绑定在当前角色，而不是只设为全局世界书。';
-                setManagerMessage(`没有检测到当前角色绑定的世界书。${extra}`, 'warning');
-            } else if (contextError) {
-                setManagerMessage(`已检测到世界书，但当前指导配置读取失败：${contextError}`, 'error');
-            } else if (context && context.configured) {
-                if (!settings.quiet) setManagerMessage('状态已刷新。', 'success');
-            } else if (!settings.quiet) {
-                setManagerMessage('请选择世界书和指导条目，然后点击“绑定所选条目”。', 'info');
-            }
-        } catch (error) {
-            console.error(`[${SCRIPT_NAME}] 刷新管理页失败`, error);
-            setManagerMessage(error.message || String(error), 'error');
-        } finally {
-            setManagerBusy(false);
+        if (!worldbookName || !entry) throw new Error('请先选择世界书和大纲条目。');
+        const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
+        if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
+        if (hasLegacyLayout(fresh)) throw new Error('这个条目还是旧版划分，请先点“转换成新版格式”。');
+        const parsed = parseOutline(fresh.content);
+        if (parsed.stages.length === 0) {
+            throw new Error('这个条目还没有剧情阶段。先点“划分阶段”，把某个段落设为第一阶段的开头。');
         }
-    }
-
-    async function bindGuideEntry(worldbookName, selectedEntry, options) {
-        const settings = options || {};
-        if (!worldbookName || !selectedEntry) throw new Error('请先选择世界书和指导条目');
-        const worldbook = await getWorldbook(worldbookName);
-        let freshEntry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
-        if (!freshEntry) throw new Error('所选条目已经不存在，请刷新后重试');
-        freshEntry = (await ensureEntryLayout(worldbookName, freshEntry, { selfHeal: false })).entry;
-        const parsed = parseGuideEntry(freshEntry);
-        if (parsed.mainBlocks.length === 0) {
-            throw new Error(parsed.warnings.join('\n') || '所选条目没有可用的主线内容');
-        }
-
         if (settings.confirm !== false) {
             const accepted = hostWindow.confirm(
-                `绑定“${entryName(freshEntry)}”作为动态指导页？\n\n`
-                + `剧情阶段：${parsed.mainBlocks.length} 段\n`
-                + `常驻或附加内容：${parsed.addonBlocks.length} 段\n\n`
-                + '绑定后会禁用这个世界书原条目，避免完整大纲被直接发送给 AI。',
+                `绑定“${entryName(fresh)}”？\n\n`
+                + `共 ${parsed.stages.length} 个阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。\n`
+                + '绑定后会禁用这个条目，避免整份大纲直接发给 AI；当前聊天从第一段开始。',
             );
             if (!accepted) return false;
         }
-
-        await disableSourceEntry(worldbookName, freshEntry.uid, entryName(freshEntry));
-        freshEntry.enabled = false;
-        if ('disable' in freshEntry) freshEntry.disable = true;
-        const config = {
-            format: parsed.format,
+        await disableEntry(worldbookName, fresh.uid, entryName(fresh));
+        await writeConfig({
             worldbookName,
-            entryUid: freshEntry.uid,
-            entryName: entryName(freshEntry),
+            entryUid: fresh.uid,
+            entryName: entryName(fresh),
             boundAt: new Date().toISOString(),
-        };
-        await writeCharacterConfig(config);
-        const source = { worldbookName, entry: freshEntry };
-        const boundState = {
-            sourceKey: makeSourceKey(source),
-            mainIndex: 0,
-            mainName: parsed.mainBlocks[0].title,
+        });
+        await writeState({
+            stageIndex: 0,
+            stageName: parsed.stages[0].name,
             lastCompletionMessageId: null,
             lastCompletionFingerprint: '',
             updatedAt: new Date().toISOString(),
-        };
-        await writeChatState(boundState);
+        });
         await safeUninject();
-        notify(`已绑定“${entryName(freshEntry)}”，当前内容：${parsed.mainBlocks[0].title}`, 'success');
+        notify(`已绑定“${entryName(fresh)}”，当前阶段：${parsed.stages[0].name}`, 'success');
         return true;
     }
 
-    async function runManagerAction(pendingMessage, action, successMessage) {
-        setManagerBusy(true);
-        setManagerMessage(pendingMessage, 'info');
+    function messageIdFromArgs(args) {
+        for (const value of args) {
+            if (typeof value === 'number' && Number.isFinite(value)) return value;
+            if (value && typeof value === 'object' && Number.isFinite(value.message_id)) return value.message_id;
+        }
+        return null;
+    }
+
+    async function handleMessageReceived() {
+        if (!isCurrentInstance()) return;
+        const args = Array.from(arguments);
+        const getLastMessageId = api('getLastMessageId', true);
+        const getChatMessages = api('getChatMessages', true);
+        const requested = messageIdFromArgs(args);
+        const messageId = requested == null ? await Promise.resolve(getLastMessageId()) : requested;
+        const messages = await Promise.resolve(getChatMessages(messageId, { include_swipes: false }));
+        const message = Array.isArray(messages) ? messages[0] : null;
+        if (!message || message.role !== 'assistant' || typeof message.message !== 'string') return;
+
+        const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
+        if (markers.length === 0) return;
+        const context = await loadContext();
+        if (!context.configured) return;
+
+        const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
+        const setChatMessages = api('setChatMessages', false);
+        if (setChatMessages && cleaned !== message.message) {
+            await Promise.resolve(setChatMessages([{ message_id: messageId, message: cleaned }], { refresh: 'affected' }));
+        }
+        if (!context.stage) return;
+        const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
+        if (context.state.lastCompletionFingerprint === fingerprint) return;
+        if (!markers.some(match => match[1] === context.stage.id)) return;
+        await moveToIndex(context, context.state.stageIndex + 1, { messageId, fingerprint });
+    }
+
+    // ---------------------------------------------------------------
+    // 三、界面：状态与小工具
+    // ---------------------------------------------------------------
+
+    const ui = {
+        view: 'manager',
+        renderedView: '',
+        busy: false,
+        message: null,
+        previewOpen: false,
+        characterName: '当前角色',
+        boundNames: [],
+        worldbookNames: [],
+        selectedWorldbook: '',
+        entries: [],
+        entryError: '',
+        selectedEntryKey: '',
+        config: null,
+        context: null,
+        contextError: '',
+        editor: null,
+    };
+
+    function el(tag, attrs, ...children) {
+        const doc = hostDocument();
+        const node = doc.createElement(tag);
+        Object.entries(attrs || {}).forEach(([key, value]) => {
+            if (value == null || value === false) return;
+            if (key === 'class') node.className = value;
+            else if (key === 'text') node.textContent = value;
+            else if (key === 'style' && typeof value === 'object') {
+                Object.entries(value).forEach(([name, item]) => node.style.setProperty(name, item));
+            } else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2), value);
+            else if (value === true) node.setAttribute(key, '');
+            else node.setAttribute(key, String(value));
+        });
+        children.flat(Infinity).forEach(child => {
+            if (child == null || child === false) return;
+            node.append(typeof child === 'object' && child.nodeType ? child : doc.createTextNode(String(child)));
+        });
+        return node;
+    }
+
+    function btn(text, onclick, options) {
+        const settings = options || {};
+        const classes = ['dga-btn'];
+        if (settings.primary) classes.push('dga-primary');
+        if (settings.danger) classes.push('dga-danger');
+        if (settings.ghost) classes.push('dga-ghost');
+        return el('button', {
+            type: 'button',
+            class: classes.join(' '),
+            disabled: Boolean(ui.busy || settings.disabled),
+            onclick,
+        }, text);
+    }
+
+    function card(title, ...children) {
+        return el('section', { class: 'dga-card' }, title ? el('h3', { text: title }) : null, ...children);
+    }
+
+    function muted(text) {
+        return el('p', { class: 'dga-muted', text });
+    }
+
+    function row(...children) {
+        return el('div', { class: 'dga-row' }, ...children);
+    }
+
+    function field(label, control) {
+        return el('label', { class: 'dga-field' }, el('span', { text: label }), control);
+    }
+
+    function selectControl(options, value, onchange) {
+        const select = el('select', { onchange: event => onchange(event.target.value) });
+        options.forEach(option => select.append(el('option', { value: option.value, text: option.label })));
+        select.value = value;
+        if (select.value !== value && options.length > 0) select.value = options[0].value;
+        select.disabled = ui.busy || options.length === 0;
+        return select;
+    }
+
+    function messageBar(message) {
+        const item = message || ui.message;
+        return item ? el('div', { class: 'dga-msg', 'data-type': item.type || 'info', text: item.text }) : null;
+    }
+
+    function setMessage(text, type) {
+        ui.message = text ? { text, type: type || 'info' } : null;
+    }
+
+    function header(title, subtitle, onclose, closeLabel) {
+        return el('header', { class: 'dga-head' },
+            el('div', { class: 'dga-head-text' },
+                el('h2', { text: title }),
+                subtitle ? el('small', { text: subtitle }) : null),
+            el('button', {
+                type: 'button',
+                class: 'dga-btn dga-ghost dga-close',
+                'aria-label': closeLabel || '关闭',
+                onclick: onclose,
+            }, closeLabel || '×'),
+        );
+    }
+
+    function ensurePanel() {
+        const doc = hostDocument();
+        if (!doc || !doc.body) return null;
+        let panel = doc.getElementById(PANEL_ID);
+        if (panel) return panel;
+        if (!doc.getElementById(STYLE_ID)) {
+            const style = doc.createElement('style');
+            style.id = STYLE_ID;
+            style.textContent = styles();
+            (doc.head || doc.documentElement).appendChild(style);
+        }
+        panel = el('div', {
+            id: PANEL_ID,
+            hidden: true,
+            role: 'dialog',
+            'aria-modal': 'true',
+            onclick: event => {
+                if (event.target === panel) closePanel();
+            },
+            onkeydown: event => {
+                if (event.key !== 'Escape') return;
+                if (ui.view === 'editor' && ui.editor && ui.editor.sheet) closeSheet();
+                else closePanel();
+            },
+        });
+        panel.append(el('div', { class: 'dga-shell', tabindex: -1 }));
+        doc.body.appendChild(panel);
+        return panel;
+    }
+
+    function render() {
+        const panel = ensurePanel();
+        if (!panel) return;
+        const shell = panel.querySelector('.dga-shell');
+        const oldBody = shell.querySelector('.dga-body');
+        const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
+        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : renderManager()));
+        shell.classList.toggle('dga-busy', ui.busy);
+        const body = shell.querySelector('.dga-body');
+        if (body) body.scrollTop = scrollTop;
+        ui.renderedView = ui.view;
+    }
+
+    function closePanel() {
+        if (ui.view === 'editor' && ui.editor && ui.editor.dirty
+            && !hostWindow.confirm('还有没保存的修改，确定关闭？')) return;
+        const panel = ensurePanel();
+        if (panel) panel.hidden = true;
+        ui.editor = null;
+        ui.view = 'manager';
+    }
+
+    // 所有按钮动作都从这里走：置忙、执行、失败时把原因显示在页面上。
+    async function runAction(label, action, options) {
+        const settings = options || {};
+        if (ui.busy) return;
+        ui.busy = true;
+        ui.message = null;
+        render();
         try {
             const result = await action();
-            if (result === false) return;
-            await refreshManager({ quiet: true });
-            setManagerMessage(successMessage, 'success');
+            if (result !== false && settings.refresh !== false) await refresh();
+            if (result !== false && settings.success) setMessage(settings.success, 'success');
         } catch (error) {
-            console.error(`[${SCRIPT_NAME}] ${pendingMessage}`, error);
-            setManagerMessage(error.message || String(error), 'error');
-            notify(error.message || String(error), 'error');
+            console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
+            setMessage(error.message || String(error), 'error');
         } finally {
-            setManagerBusy(false);
+            ui.busy = false;
+            render();
         }
     }
 
+    async function refresh(options) {
+        const settings = options || {};
+        const card = await currentCharacter();
+        const [bound, all, config] = await Promise.all([boundWorldbookNames(card), allWorldbookNames(), readConfig()]);
+        ui.characterName = characterName(card);
+        ui.boundNames = bound;
+        ui.config = config;
+        ui.worldbookNames = bound.length > 0 ? bound : all;
+        const wanted = settings.worldbookName || ui.selectedWorldbook || (config && config.worldbookName) || '';
+        ui.selectedWorldbook = ui.worldbookNames.includes(wanted) ? wanted : (ui.worldbookNames[0] || '');
+        ui.entries = [];
+        ui.entryError = '';
+        if (ui.selectedWorldbook) {
+            try {
+                ui.entries = worldbookEntries(await getWorldbook(ui.selectedWorldbook));
+            } catch (error) {
+                ui.entryError = `读取世界书失败：${error.message || String(error)}`;
+            }
+        }
+        ui.selectedEntryKey = pickEntryKey(settings.entryKey || ui.selectedEntryKey, config);
+        try {
+            ui.context = await loadContext();
+            ui.contextError = '';
+        } catch (error) {
+            ui.context = null;
+            ui.contextError = error.message || String(error);
+        }
+    }
+
+    function pickEntryKey(requested, config) {
+        const keys = ui.entries.map((entry, index) => entryKey(entry, index));
+        if (requested && keys.includes(requested)) return requested;
+        if (config && config.worldbookName === ui.selectedWorldbook) {
+            const index = ui.entries.findIndex(entry => sameUid(entry.uid, config.entryUid) || entryName(entry) === config.entryName);
+            if (index >= 0) return keys[index];
+        }
+        const ready = ui.entries.findIndex(entry => hasLegacyLayout(entry) || parseOutline(entry.content).stages.length > 0);
+        if (ready >= 0) return keys[ready];
+        return keys[0] || '';
+    }
+
+    function selectedEntry() {
+        const index = ui.entries.findIndex((entry, position) => entryKey(entry, position) === ui.selectedEntryKey);
+        return index >= 0 ? ui.entries[index] : null;
+    }
+
+    function entryLabel(entry) {
+        const name = entryName(entry);
+        if (hasLegacyLayout(entry)) return `${name}（旧版划分，需转换）`;
+        const parsed = parseOutline(entry.content);
+        const disabled = entryIsDisabled(entry) ? ' · 已禁用' : '';
+        if (parsed.stages.length === 0) return `${name}（未分阶段${disabled}）`;
+        return `${name}（${parsed.stages.length} 段${parsed.addons.length ? `、${parsed.addons.length} 附加` : ''}${disabled}）`;
+    }
+
+    // ---------------------------------------------------------------
+    // 三、界面：管理页
+    // ---------------------------------------------------------------
+
+    function renderManager() {
+        const context = ui.context;
+        const configured = Boolean(context && context.configured);
+        const body = el('div', { class: 'dga-body' },
+            messageBar(),
+            configured ? progressCard(context) : null,
+            configured ? previewCard(context) : null,
+            setupCard(),
+            configured ? null : guideCard(),
+        );
+        return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
+    }
+
+    function progressCard(context) {
+        const total = context.parsed.stages.length;
+        const index = context.state.stageIndex;
+        const finished = total > 0 && index >= total;
+        const move = (label, target, confirmText) => runAction(label, async () => {
+            if (confirmText && !hostWindow.confirm(confirmText)) return false;
+            return moveToIndex(await requireContext(), target);
+        });
+        const emptyHint = context.legacy
+            ? '这是旧版（1.x）的划分，点下面的“转换成新版格式”'
+            : '点下面的“划分阶段”重新分段';
+        return card('现在进行到',
+            el('div', { class: 'dga-big', text: total === 0 ? '这个条目还没有阶段' : (finished ? `全部 ${total} 段已完成` : `第 ${index + 1} 段 · 共 ${total} 段`) }),
+            el('div', { class: 'dga-stage-name', text: total === 0 ? emptyHint : (finished ? '之后不再发送指导' : context.stage.name) }),
+            row(
+                btn('上一段', () => move('切换到上一段', index - 1), { disabled: total === 0 || index <= 0 }),
+                btn('下一段', () => move('切换到下一段', index + 1), { primary: true, disabled: total === 0 || index >= total }),
+            ),
+            btn('回到第一段', () => move('重置进度', 0, '把这个聊天的进度重置到第一段？'), { ghost: true, disabled: total === 0 || index === 0 }),
+            muted('进度只记在这个聊天里，新开的聊天会从第一段开始。'),
+            context.entryEnabled ? messageBar({
+                type: 'warning',
+                text: '来源条目现在是启用状态，整份大纲可能会直接发给 AI。下次生成前会自动禁用它；也可以现在点“重新绑定”立刻处理。',
+            }) : null,
+        );
+    }
+
+    function previewCard(context) {
+        const details = el('details', {
+            class: 'dga-fold',
+            open: ui.previewOpen,
+            ontoggle: event => { ui.previewOpen = event.target.open; },
+        }, el('summary', { text: '现在发给 AI 的内容' }));
+        const parts = [];
+        if (context.stage) {
+            parts.push(`【${context.stage.name}】\n${context.stage.prompt}`);
+            context.addons.forEach(item => parts.push(`【附加：${item.name}】\n${item.prompt}`));
+            parts.push(context.stage.completion
+                ? `【进入下一段的条件（由 AI 判断）】\n${context.stage.completion}`
+                : '【进入下一段】\n没有写完成条件，只能手动点“下一段”。');
+        } else {
+            parts.push('现在不发送任何指导。');
+        }
+        details.append(el('pre', { class: 'dga-pre', text: parts.join('\n\n') }));
+        if (context.parsed.warnings.length > 0) {
+            details.append(messageBar({ type: 'warning', text: context.parsed.warnings.join('\n') }));
+        }
+        return card(null, details);
+    }
+
+    function setupCard() {
+        const context = ui.context;
+        const configured = Boolean(context && context.configured);
+        const selected = selectedEntry();
+        const legacy = Boolean(selected && hasLegacyLayout(selected));
+        const parsed = selected && !legacy ? parseOutline(selected.content) : null;
+        const isBoundEntry = Boolean(configured && selected && ui.selectedWorldbook === context.worldbookName
+            && sameUid(selected.uid, context.entry.uid));
+        const children = [];
+
+        if (configured) {
+            children.push(el('p', { class: 'dga-status', text: `已绑定：${context.worldbookName} → ${entryName(context.entry)}` }));
+        } else if (ui.contextError) {
+            children.push(messageBar({ type: 'error', text: ui.contextError }));
+        }
+
+        if (ui.worldbookNames.length === 0) {
+            children.push(messageBar({ type: 'warning', text: '没有找到任何世界书。请先给角色绑定一个世界书，并把大纲写进一个条目里。' }));
+        } else {
+            if (ui.boundNames.length === 0) children.push(muted('没检测到这个角色绑定的世界书，下面列出的是全部世界书。'));
+            children.push(field('世界书', selectControl(
+                ui.worldbookNames.map(name => ({ value: name, label: name })),
+                ui.selectedWorldbook,
+                value => runAction('切换世界书', async () => {
+                    ui.selectedWorldbook = value;
+                    ui.selectedEntryKey = '';
+                }),
+            )));
+            const entryOptions = ui.entries.length > 0
+                ? ui.entries.map((entry, index) => ({ value: entryKey(entry, index), label: entryLabel(entry) }))
+                : [{ value: '', label: ui.entryError || '这个世界书里没有条目' }];
+            children.push(field('大纲条目', selectControl(entryOptions, ui.selectedEntryKey, value => {
+                ui.selectedEntryKey = value;
+                render();
+            })));
+        }
+
+        if (selected && legacy) {
+            children.push(
+                messageBar({ type: 'warning', text: '这个条目带有旧版（1.x）的阶段划分。新版直接把阶段写在正文里，需要先转换一次。' }),
+                btn('转换成新版格式', () => runAction('转换旧版划分', convertSelectedLegacy), { primary: true }),
+            );
+        } else if (selected && parsed) {
+            children.push(muted(parsed.stages.length > 0
+                ? `这个条目有 ${parsed.stages.length} 个阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。`
+                : '这个条目还没有分阶段。'));
+        }
+
+        children.push(row(
+            btn('划分阶段', () => runAction('打开编辑器', openEditor, { refresh: false }), {
+                primary: !configured && Boolean(parsed) && parsed.stages.length === 0,
+                disabled: !selected || legacy,
+            }),
+            btn(isBoundEntry ? '重新绑定' : '绑定这个条目', () => runAction('绑定条目', () => bindEntry(ui.selectedWorldbook, selected)), {
+                primary: Boolean(parsed) && parsed.stages.length > 0 && !isBoundEntry,
+                disabled: !selected || legacy || !parsed || parsed.stages.length === 0,
+            }),
+        ));
+        children.push(muted('绑定后会禁用这个条目，避免整份大纲直接发给 AI。重新绑定会让当前聊天回到第一段。'));
+        children.push(btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }));
+        return card(configured ? '大纲条目' : '先选一个大纲条目', ...children);
+    }
+
+    function guideCard() {
+        return card('怎么用',
+            el('ol', { class: 'dga-steps' },
+                el('li', {}, '在角色绑定的世界书里新建一个条目，把完整大纲写进去，用空行分开各段。'),
+                el('li', {}, '在上面选中这个条目，点“划分阶段”：点一个段落，把它设为某一阶段的开头。'),
+                el('li', {}, '点“保存并绑定”。之后每次聊天，AI 只会收到当前这一段的内容。'),
+            ),
+            muted('也可以直接在正文里写“## 阶段名”这样的标题行分段，脚本能直接认出来。'),
+        );
+    }
+
+    async function convertSelectedLegacy() {
+        const entry = selectedEntry();
+        const layout = entry ? readLegacyLayout(entry) : null;
+        if (!layout) throw new Error('这个条目没有旧版划分。');
+        const content = convertLegacyLayout(entry.content, layout);
+        await writeEntryContent(ui.selectedWorldbook, entry.uid, entryName(entry), content);
+        setMessage('已转换成新版格式。建议点“划分阶段”检查一遍，再重新绑定。', 'success');
+    }
+
+    // ---------------------------------------------------------------
+    // 三、界面：划分阶段编辑器
+    //
+    // 正文按段落一块块列出来。点一个段落 → 把它设成某个标题的开头；
+    // 点一个标题 → 改名、改类型、改条件或删掉。正文文字本身不会被改。
+    // ---------------------------------------------------------------
+
+    async function openEditor() {
+        const entry = selectedEntry();
+        if (!entry || !ui.selectedWorldbook) throw new Error('请先选择一个条目。');
+        const fresh = findEntry(await getWorldbook(ui.selectedWorldbook), entry.uid, entryName(entry));
+        if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
+        const lines = normalizeText(fresh.content).split('\n');
+        ui.editor = {
+            worldbookName: ui.selectedWorldbook,
+            entry: fresh,
+            lines,
+            parsed: parseOutline(lines.join('\n')),
+            dirty: false,
+            sheet: null,
+        };
+        ui.view = 'editor';
+    }
+
+    function closeEditor(force) {
+        if (!force && ui.editor && ui.editor.dirty && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
+        ui.editor = null;
+        ui.view = 'manager';
+        render();
+    }
+
+    function renderEditor() {
+        const editor = ui.editor;
+        const parsed = editor.parsed;
+        const hasHeadings = parsed.blocks.length > 0;
+        const docChildren = [];
+        if (parsed.items.length === 0) {
+            docChildren.push(muted('这个条目是空的。先在世界书里把大纲写好，再来分段。'));
+        }
+        let hintShown = false;
+        parsed.items.forEach(item => {
+            if (item.kind === 'heading') {
+                docChildren.push(headingCard(item.block));
+                return;
+            }
+            if (!item.block && hasHeadings && !hintShown) {
+                docChildren.push(el('p', { class: 'dga-hint', text: '↓ 第一个标题之前的文字不会发给 AI' }));
+                hintShown = true;
+            }
+            docChildren.push(paragraphCard(item));
+        });
+
+        const body = el('div', { class: 'dga-body' },
+            messageBar(),
+            el('p', { class: 'dga-help', text: '点一个段落，可以把它设成某个阶段的开头；点已有的标题，可以改名、设置进入下一段的条件，或者删掉它。正文文字不会被改动，只会增减标题行。' }),
+            !hasHeadings && parsed.items.length > 0
+                ? btn('按空行自动分段（每块的第一行当标题）', () => {
+                    editor.lines = autoSplitByBlankLines(editor.lines);
+                    afterEdit();
+                }, { primary: true })
+                : null,
+            el('div', { class: 'dga-doc' }, ...docChildren),
+            hasHeadings ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` }) : null,
+        );
+        const foot = el('footer', { class: 'dga-foot' },
+            btn('保存', () => runAction('保存', () => saveEditor(false), { refresh: false }), { disabled: !editor.dirty }),
+            btn('保存并绑定', () => runAction('保存并绑定', () => saveEditor(true), { refresh: false }), {
+                primary: true,
+                disabled: parsed.stages.length === 0,
+            }),
+        );
+        const parts = [
+            header('划分阶段', `${entryName(editor.entry)}${editor.dirty ? ' · 未保存' : ''}`, () => closeEditor(false), '返回'),
+            body,
+            foot,
+        ];
+        if (editor.sheet) parts.push(renderSheet(editor.sheet));
+        return parts;
+    }
+
+    function headingSubtitle(block) {
+        if (block.kind === 'stage') return block.completion ? `进入下一段：${block.completion}` : '手动点“下一段”推进';
+        if (block.kind === 'addon') {
+            const stages = ui.editor.parsed.stages;
+            if (stages.length === 0) return '还没有剧情阶段';
+            return block.fromIndex === block.toIndex
+                ? `只在第 ${block.fromIndex + 1} 段有效`
+                : `第 ${block.fromIndex + 1} 段到第 ${block.toIndex + 1} 段有效`;
+        }
+        if (block.kind === 'always') return '每一段都发送';
+        return '只给自己看，不发送';
+    }
+
+    function pressable(attrs, handler) {
+        return {
+            ...attrs,
+            role: 'button',
+            tabindex: 0,
+            onclick: handler,
+            onkeydown: event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    handler();
+                }
+            },
+        };
+    }
+
+    function headingCard(block) {
+        const tag = block.kind === 'stage' ? `第 ${block.stageIndex + 1} 段` : KIND_LABELS[block.kind];
+        return el('div', pressable({ class: 'dga-heading', style: { '--dga-c': block.color } }, () => openSheet({ mode: 'edit', block })),
+            el('span', { class: 'dga-tag', text: tag }),
+            el('div', { class: 'dga-heading-text' },
+                el('b', { text: block.name }),
+                el('small', { text: headingSubtitle(block) })),
+            el('span', { class: 'dga-chev', text: '›' }),
+        );
+    }
+
+    function paragraphCard(item) {
+        return el('div', pressable({ class: `dga-para${item.block ? '' : ' dga-dim'}` }, () => openSheet({ mode: 'new', item })),
+            item.lines.join('\n'));
+    }
+
+    function openSheet(spec) {
+        if (ui.busy) return;
+        const editor = ui.editor;
+        const stages = editor.parsed.stages;
+        const nameAt = index => (stages[index] ? stages[index].name : '');
+        if (spec.mode === 'new') {
+            const item = spec.item;
+            const first = item.lines[0].trim();
+            const titleLike = item.lines.length > 1 && first.length <= 24 && !/[。！？!?，,；;…”"）)]$/.test(first);
+            const anchor = item.block
+                ? (item.block.kind === 'stage' ? item.block.stageIndex : item.block.anchorStage)
+                : 0;
+            editor.sheet = {
+                mode: 'new',
+                atLine: item.start,
+                name: titleLike ? first : '',
+                kind: 'stage',
+                completion: '',
+                from: nameAt(anchor),
+                to: nameAt(anchor),
+                canConsumeFirstLine: titleLike,
+                consumeFirstLine: titleLike,
+                error: '',
+            };
+        } else {
+            const block = spec.block;
+            const isAddon = block.kind === 'addon';
+            editor.sheet = {
+                mode: 'edit',
+                block,
+                name: block.name,
+                kind: block.kind,
+                completion: block.completion || '',
+                from: nameAt(isAddon ? block.fromIndex : block.anchorStage),
+                to: nameAt(isAddon ? block.toIndex : block.anchorStage),
+                canConsumeFirstLine: false,
+                consumeFirstLine: false,
+                error: '',
+            };
+        }
+        render();
+    }
+
+    function closeSheet() {
+        if (ui.editor) ui.editor.sheet = null;
+        render();
+    }
+
+    function afterEdit() {
+        const editor = ui.editor;
+        editor.parsed = parseOutline(editor.lines.join('\n'));
+        editor.dirty = true;
+        editor.sheet = null;
+        render();
+    }
+
+    function renderSheet(sheet) {
+        const editor = ui.editor;
+        const stages = editor.parsed.stages.filter(stage => !(sheet.mode === 'edit' && stage === sheet.block));
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg',
+            onclick: event => {
+                if (event.target === backdrop) closeSheet();
+            },
+        });
+        const box = el('div', { class: 'dga-sheet', role: 'dialog' });
+        box.append(el('h3', { text: sheet.mode === 'new' ? '从这一段开始一个新标题' : '修改这个标题' }));
+        if (sheet.error) box.append(messageBar({ type: 'error', text: sheet.error }));
+
+        const nameInput = el('input', {
+            type: 'text',
+            maxlength: 60,
+            placeholder: '例如：雨夜初遇',
+            oninput: event => { sheet.name = event.target.value; },
+        });
+        nameInput.value = sheet.name;
+        box.append(field('名称', nameInput));
+
+        if (sheet.canConsumeFirstLine) {
+            const checkbox = el('input', { type: 'checkbox', onchange: event => { sheet.consumeFirstLine = event.target.checked; } });
+            checkbox.checked = sheet.consumeFirstLine;
+            box.append(el('label', { class: 'dga-check' }, checkbox, el('span', { text: '这一段的第一行就是标题，把它变成标题行' })));
+        }
+
+        box.append(field('这是什么', el('div', { class: 'dga-seg' },
+            ...['stage', 'addon', 'always', 'note'].map(kind => el('button', {
+                type: 'button',
+                class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
+                onclick: () => {
+                    sheet.kind = kind;
+                    render();
+                },
+            }, KIND_LABELS[kind])),
+        )));
+
+        if (sheet.kind === 'stage') {
+            const completion = el('textarea', {
+                rows: 2,
+                placeholder: '例如：两人完成第一次正式交谈。留空就只能手动点“下一段”。',
+                oninput: event => { sheet.completion = event.target.value; },
+            });
+            completion.value = sheet.completion;
+            box.append(field('什么时候进入下一段（AI 自己判断）', completion));
+        }
+        if (sheet.kind === 'addon') {
+            if (stages.length === 0) {
+                box.append(muted('还没有剧情阶段。先把上面的段落设成阶段，再来设置附加内容的有效范围。'));
+            } else {
+                const options = stages.map(stage => ({ value: stage.name, label: `第 ${stage.stageIndex + 1} 段 · ${stage.name}` }));
+                if (!options.some(option => option.value === sheet.from)) sheet.from = options[0].value;
+                if (!options.some(option => option.value === sheet.to)) sheet.to = sheet.from;
+                box.append(field('从哪一段开始有效', selectControl(options, sheet.from, value => {
+                    sheet.from = value;
+                    render();
+                })));
+                box.append(field('到哪一段为止（含这一段）', selectControl(options, sheet.to, value => {
+                    sheet.to = value;
+                    render();
+                })));
+            }
+            box.append(muted('附加内容不占进度，只在指定的几段里一起发给 AI，适合物品、地点规则、秘密。'));
+        }
+        if (sheet.kind === 'always') box.append(muted('这部分会在每一段都发给 AI。'));
+        if (sheet.kind === 'note') box.append(muted('这部分只给作者自己看，不会发给 AI。'));
+
+        const actions = [
+            btn(sheet.mode === 'new' ? '添加标题' : '保存修改', applySheet, { primary: true }),
+            btn('取消', closeSheet),
+        ];
+        if (sheet.mode === 'edit') actions.push(btn('删除这个标题', deleteSheetHeading, { danger: true }));
+        box.append(el('div', { class: 'dga-sheet-actions' }, ...actions));
+        backdrop.append(box);
+        return backdrop;
+    }
+
+    function applySheet() {
+        const editor = ui.editor;
+        const sheet = editor && editor.sheet;
+        if (!sheet) return;
+        const name = String(sheet.name || '').trim();
+        if (!name) {
+            sheet.error = '请先填写名称。';
+            render();
+            return;
+        }
+        if (/[#【】\[\]]/.test(name)) {
+            sheet.error = '名称里不要用 #、【】、[] 这些符号。';
+            render();
+            return;
+        }
+        const spec = {
+            name,
+            kind: sheet.kind,
+            completion: sheet.completion,
+            from: sheet.kind === 'addon' ? sheet.from : '',
+            to: sheet.kind === 'addon' ? sheet.to : '',
+        };
+        if (sheet.mode === 'new') {
+            editor.lines = insertHeading(editor.lines, sheet.atLine, spec, sheet.canConsumeFirstLine && sheet.consumeFirstLine);
+        } else {
+            editor.lines = replaceHeading(editor.lines, sheet.block, spec);
+        }
+        afterEdit();
+    }
+
+    function deleteSheetHeading() {
+        const editor = ui.editor;
+        const sheet = editor && editor.sheet;
+        if (!sheet || sheet.mode !== 'edit') return;
+        if (!hostWindow.confirm(`删除标题“${sheet.block.name}”？下面的文字会并入上一段。`)) return;
+        editor.lines = deleteHeading(editor.lines, sheet.block);
+        afterEdit();
+    }
+
+    async function saveEditor(bindAfter) {
+        const editor = ui.editor;
+        const content = editor.lines.join('\n');
+        const parsed = parseOutline(content);
+        if (bindAfter && parsed.stages.length === 0) {
+            throw new Error('还没有剧情阶段，不能绑定。先点一个段落，把它设为第一阶段的开头。');
+        }
+        const saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
+        editor.entry = saved;
+        editor.lines = normalizeText(saved.content).split('\n');
+        editor.parsed = parseOutline(saved.content);
+        editor.dirty = false;
+        if (bindAfter) {
+            await bindEntry(editor.worldbookName, saved, { confirm: false });
+            ui.view = 'manager';
+            ui.editor = null;
+            await refresh({ worldbookName: editor.worldbookName, entryKey: entryKey(saved, 0) });
+            setMessage('已保存并绑定。当前聊天从第一段开始。', 'success');
+            return;
+        }
+        setMessage('已保存。正文只增减了标题行。', 'success');
+    }
+
+    // ---------------------------------------------------------------
+    // 三、界面：样式
+    // ---------------------------------------------------------------
+
+    function styles() {
+        const P = `#${PANEL_ID}`;
+        return `
+${P} { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(6, 8, 14, 0.62); backdrop-filter: blur(4px); color: var(--SmartThemeBodyColor, #ececf1); font-size: 15px; line-height: 1.55; box-sizing: border-box; }
+${P}[hidden] { display: none; }
+${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
+${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: 720px; max-height: 100%; background: var(--SmartThemeBlurTintColor, #1b1d24); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 18px; box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5); overflow: hidden; outline: none; }
+${P} .dga-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
+${P} .dga-head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+${P} .dga-head h2 { margin: 0; font-size: 1.12rem; }
+${P} .dga-head small { opacity: 0.65; font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+${P} .dga-close { flex: 0 0 auto; min-width: 44px; padding: 8px 12px; }
+${P} .dga-body { flex: 1 1 auto; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; padding: 14px 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+${P} .dga-foot { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px solid rgba(255, 255, 255, 0.1); background: rgba(0, 0, 0, 0.12); }
+${P} .dga-foot .dga-btn { flex: 1 1 0; }
+${P} .dga-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 14px; background: rgba(255, 255, 255, 0.045); border: 1px solid rgba(255, 255, 255, 0.08); }
+${P} .dga-card h3 { margin: 0; font-size: 0.9rem; font-weight: 600; opacity: 0.75; }
+${P} .dga-big { font-size: 1.45rem; font-weight: 700; line-height: 1.25; }
+${P} .dga-stage-name { font-size: 1.05rem; font-weight: 600; color: var(--SmartThemeQuoteColor, #b8a7ff); overflow-wrap: anywhere; }
+${P} .dga-muted, ${P} .dga-help { margin: 0; font-size: 0.88rem; opacity: 0.7; }
+${P} .dga-status { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+${P} .dga-row { display: flex; gap: 8px; flex-wrap: wrap; }
+${P} .dga-row > .dga-btn { flex: 1 1 30%; }
+${P} .dga-btn { min-height: 44px; padding: 10px 14px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.07); color: inherit; font: inherit; font-weight: 600; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-btn:hover { background: rgba(255, 255, 255, 0.12); }
+${P} .dga-btn:disabled { opacity: 0.4; cursor: default; }
+${P} .dga-btn.dga-primary { background: var(--SmartThemeQuoteColor, #7c6cf0); border-color: transparent; color: #fff; }
+${P} .dga-btn.dga-danger { color: #ff9b9b; border-color: rgba(255, 120, 120, 0.35); }
+${P} .dga-btn.dga-ghost { background: transparent; }
+${P} .dga-field { display: flex; flex-direction: column; gap: 5px; font-size: 0.88rem; }
+${P} .dga-field > span { opacity: 0.8; }
+${P} select, ${P} input[type="text"], ${P} textarea { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 11px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(0, 0, 0, 0.26); color: inherit; font: inherit; }
+${P} textarea { min-height: 72px; resize: vertical; }
+${P} .dga-check { display: flex; align-items: center; gap: 10px; font-size: 0.9rem; }
+${P} .dga-check input { width: 20px; height: 20px; }
+${P} .dga-msg { padding: 10px 12px; border-radius: 11px; font-size: 0.9rem; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(110, 140, 255, 0.14); border: 1px solid rgba(110, 140, 255, 0.32); }
+${P} .dga-msg[data-type="success"] { background: rgba(60, 190, 120, 0.14); border-color: rgba(60, 190, 120, 0.35); }
+${P} .dga-msg[data-type="warning"] { background: rgba(245, 170, 50, 0.14); border-color: rgba(245, 170, 50, 0.38); }
+${P} .dga-msg[data-type="error"] { background: rgba(240, 80, 80, 0.14); border-color: rgba(240, 80, 80, 0.4); }
+${P} .dga-pre { margin: 0; padding: 10px 12px; border-radius: 11px; background: rgba(0, 0, 0, 0.28); font: inherit; font-size: 0.88rem; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }
+${P} .dga-fold > summary { cursor: pointer; font-weight: 600; list-style: none; padding: 2px 0; }
+${P} .dga-fold > summary::-webkit-details-marker { display: none; }
+${P} .dga-fold > summary::after { content: ' ▾'; opacity: 0.6; }
+${P} .dga-fold[open] > summary::after { content: ' ▴'; }
+${P} .dga-fold > *:not(summary) { margin-top: 10px; }
+${P} .dga-steps { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 6px; }
+${P} .dga-doc { display: flex; flex-direction: column; gap: 8px; }
+${P} .dga-para { padding: 11px 13px; border-radius: 12px; border: 1px dashed rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.03); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.93rem; cursor: pointer; }
+${P} .dga-para:hover, ${P} .dga-para:focus-visible, ${P} .dga-heading:hover, ${P} .dga-heading:focus-visible { outline: 2px solid var(--SmartThemeQuoteColor, #7c6cf0); outline-offset: 1px; }
+${P} .dga-para.dga-dim { opacity: 0.5; }
+${P} .dga-heading { display: flex; align-items: center; gap: 10px; margin-top: 8px; padding: 10px 12px; border-radius: 12px; border-left: 5px solid var(--dga-c, #8b5cf6); background: color-mix(in srgb, var(--dga-c, #8b5cf6) 18%, transparent); cursor: pointer; }
+${P} .dga-heading-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+${P} .dga-heading b { font-size: 1rem; overflow-wrap: anywhere; }
+${P} .dga-heading small { opacity: 0.75; font-size: 0.8rem; overflow-wrap: anywhere; }
+${P} .dga-tag { flex: 0 0 auto; padding: 2px 9px; border-radius: 999px; background: var(--dga-c, #8b5cf6); color: #fff; font-size: 0.75rem; font-weight: 700; white-space: nowrap; }
+${P} .dga-chev { opacity: 0.5; font-size: 1.3rem; }
+${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 0.82rem; opacity: 0.6; }
+${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+${P} .dga-seg-btn { min-height: 40px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit; cursor: pointer; }
+${P} .dga-seg-btn.is-on { background: var(--SmartThemeQuoteColor, #7c6cf0); border-color: transparent; color: #fff; font-weight: 700; }
+${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
+${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: 18px 18px 0 0; background: var(--SmartThemeBlurTintColor, #1b1d24); border-top: 1px solid rgba(255, 255, 255, 0.14); display: flex; flex-direction: column; gap: 12px; }
+${P} .dga-sheet h3 { margin: 0; font-size: 1.05rem; }
+${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
+${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-events: none; }
+@media (max-width: 680px) {
+    ${P} { padding: 0; }
+    ${P} .dga-shell { max-width: none; height: 100%; max-height: none; border-radius: 0; border: 0; }
+}
+@media (min-width: 681px) {
+    ${P} .dga-sheet-bg { align-items: center; padding: 20px; }
+    ${P} .dga-sheet { max-width: 520px; border-radius: 18px; border: 1px solid rgba(255, 255, 255, 0.14); }
+    ${P} .dga-seg { grid-template-columns: repeat(4, 1fr); }
+}`;
+    }
+
+    // ---------------------------------------------------------------
+    // 三、界面：入口、菜单、事件
+    // ---------------------------------------------------------------
+
     function closeExtensionsMenu() {
-        const documentRef = getHostDocument();
-        if (!documentRef) return;
-        const menu = documentRef.getElementById('extensionsMenu');
-        const button = documentRef.getElementById('extensionsMenuButton');
+        const doc = hostDocument();
+        if (!doc) return;
+        const menu = doc.getElementById('extensionsMenu');
+        const button = doc.getElementById('extensionsMenuButton');
         if (!menu || !button) return;
         try {
-            const styles = hostWindow.getComputedStyle(menu);
-            if (styles.display !== 'none' && styles.visibility !== 'hidden') button.click();
+            const style = hostWindow.getComputedStyle(menu);
+            if (style.display !== 'none' && style.visibility !== 'hidden') button.click();
         } catch (error) {
             button.click();
         }
     }
 
-    function closeManager() {
-        const documentRef = getHostDocument();
-        const editor = documentRef && documentRef.getElementById(EDITOR_ID);
-        if (editor) editor.hidden = true;
-        const panel = managerElement('panel');
-        if (panel) panel.hidden = true;
-    }
-
-    function managerStyles() {
-        return `
-#${PANEL_ID} {
-    position: fixed;
-    inset: 0;
-    z-index: 100000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 18px;
-    background: rgba(8, 10, 16, 0.68);
-    backdrop-filter: blur(5px);
-    color: var(--SmartThemeBodyColor, #ececf1);
-}
-#${PANEL_ID}[hidden] { display: none !important; }
-#${PANEL_ID} * { box-sizing: border-box; }
-#${PANEL_ID} .dga-shell {
-    width: min(880px, 100%);
-    max-height: min(88vh, 920px);
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 22%, transparent);
-    border-radius: 16px;
-    background: var(--SmartThemeBlurTintColor, rgba(28, 30, 38, 0.98));
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
-}
-#${PANEL_ID} .dga-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 14px;
-    padding: 16px 18px;
-    border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 15%, transparent);
-}
-#${PANEL_ID} .dga-title { margin: 0; font-size: 1.15rem; }
-#${PANEL_ID} .dga-subtitle { margin: 4px 0 0; opacity: 0.7; font-size: 0.86rem; }
-#${PANEL_ID} .dga-close {
-    min-width: 38px;
-    min-height: 38px;
-    border: 0;
-    border-radius: 10px;
-    color: inherit;
-    background: rgba(255, 255, 255, 0.08);
-    cursor: pointer;
-    font-size: 1.4rem;
-}
-#${PANEL_ID} .dga-body { padding: 16px 18px 20px; overflow-y: auto; }
-#${PANEL_ID} .dga-summary {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
-}
-#${PANEL_ID} .dga-card, #${PANEL_ID} .dga-section {
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 13%, transparent);
-    border-radius: 12px;
-    background: rgba(255, 255, 255, 0.045);
-}
-#${PANEL_ID} .dga-card { padding: 11px 12px; }
-#${PANEL_ID} .dga-card span { display: block; opacity: 0.68; font-size: 0.78rem; margin-bottom: 5px; }
-#${PANEL_ID} .dga-card strong { display: block; overflow-wrap: anywhere; }
-#${PANEL_ID} .dga-section { margin-top: 12px; padding: 14px; }
-#${PANEL_ID} .dga-section-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 10px;
-}
-#${PANEL_ID} .dga-section h3 { margin: 0; font-size: 0.98rem; }
-#${PANEL_ID} .dga-help { margin: 0 0 12px; opacity: 0.72; font-size: 0.84rem; line-height: 1.55; }
-#${PANEL_ID} .dga-fields { display: grid; grid-template-columns: 1fr 1.35fr; gap: 10px; }
-#${PANEL_ID} label { display: grid; gap: 6px; font-size: 0.82rem; opacity: 0.88; }
-#${PANEL_ID} select, #${PANEL_ID} button.dga-button {
-    width: 100%;
-    min-height: 40px;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
-    border-radius: 9px;
-    color: inherit;
-    background: var(--SmartThemeBotMesBlurTintColor, rgba(20, 22, 28, 0.85));
-}
-#${PANEL_ID} select { padding: 8px 10px; }
-#${PANEL_ID} button.dga-button { padding: 8px 13px; cursor: pointer; font-weight: 650; }
-#${PANEL_ID} button.dga-primary {
-    background: var(--SmartThemeQuoteColor, #7b62d9);
-    color: #fff;
-    border-color: transparent;
-}
-#${PANEL_ID} button:disabled, #${PANEL_ID} select:disabled { opacity: 0.45; cursor: not-allowed; }
-#${PANEL_ID} .dga-actions { display: flex; gap: 9px; margin-top: 11px; }
-#${PANEL_ID} .dga-actions .dga-button { flex: 1; }
-#${PANEL_ID} .dga-preview {
-    margin: 10px 0 0;
-    max-height: 230px;
-    overflow: auto;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    padding: 12px;
-    border-radius: 9px;
-    background: rgba(0, 0, 0, 0.18);
-    font: inherit;
-    font-size: 0.86rem;
-    line-height: 1.58;
-}
-#${PANEL_ID} .dga-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; font-size: 0.84rem; }
-#${PANEL_ID} .dga-meta b { opacity: 0.72; font-weight: 500; }
-#${PANEL_ID} .dga-message { margin-top: 12px; padding: 10px 12px; border-radius: 9px; font-size: 0.86rem; line-height: 1.5; }
-#${PANEL_ID} .dga-message[data-type="info"] { background: rgba(80, 140, 220, 0.15); }
-#${PANEL_ID} .dga-message[data-type="success"] { background: rgba(70, 180, 115, 0.16); }
-#${PANEL_ID} .dga-message[data-type="warning"] { background: rgba(230, 165, 60, 0.16); }
-#${PANEL_ID} .dga-message[data-type="error"] { background: rgba(220, 75, 85, 0.17); }
-#${PANEL_ID}.dga-busy .dga-shell { cursor: progress; }
-#${EDITOR_ID} {
-    position: fixed;
-    inset: 0;
-    z-index: 100001;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 16px;
-    background: rgba(8, 10, 16, 0.76);
-    backdrop-filter: blur(6px);
-    color: var(--SmartThemeBodyColor, #ececf1);
-}
-#${EDITOR_ID}[hidden] { display: none !important; }
-#${EDITOR_ID} [hidden] { display: none !important; }
-#${EDITOR_ID} * { box-sizing: border-box; }
-#${EDITOR_ID} .dga-editor-shell {
-    width: min(1180px, 100%);
-    height: min(92vh, 940px);
-    min-height: 560px;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 22%, transparent);
-    border-radius: 16px;
-    background: var(--SmartThemeBlurTintColor, rgba(28, 30, 38, 0.99));
-    box-shadow: 0 24px 76px rgba(0, 0, 0, 0.5);
-}
-#${EDITOR_ID} .dga-editor-header,
-#${EDITOR_ID} .dga-editor-footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 14px 16px;
-    border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
-}
-#${EDITOR_ID} .dga-editor-footer {
-    justify-content: flex-end;
-    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
-    border-bottom: 0;
-}
-#${EDITOR_ID} .dga-editor-title { margin: 0; font-size: 1.12rem; }
-#${EDITOR_ID} .dga-editor-source {
-    margin: 4px 0 0;
-    max-width: min(70vw, 760px);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    opacity: 0.7;
-    font-size: 0.82rem;
-}
-#${EDITOR_ID} .dga-editor-dirty {
-    margin-left: 7px;
-    color: #f6c453;
-    font-size: 0.78rem;
-}
-#${EDITOR_ID} .dga-editor-main {
-    flex: 1;
-    min-height: 0;
-    display: grid;
-    grid-template-columns: minmax(245px, 290px) minmax(0, 1fr);
-}
-#${EDITOR_ID} .dga-editor-sidebar {
-    min-width: 0;
-    overflow-y: auto;
-    padding: 14px;
-    border-right: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
-    background: rgba(0, 0, 0, 0.08);
-}
-#${EDITOR_ID} .dga-editor-workspace {
-    min-width: 0;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 14px;
-}
-#${EDITOR_ID} .dga-editor-section-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 9px;
-}
-#${EDITOR_ID} h3 { margin: 0; font-size: 0.96rem; }
-#${EDITOR_ID} .dga-editor-help {
-    margin: 7px 0 10px;
-    opacity: 0.72;
-    font-size: 0.8rem;
-    line-height: 1.5;
-}
-#${EDITOR_ID} .dga-stage-list { display: grid; gap: 7px; }
-#${EDITOR_ID} .dga-stage-item {
-    width: 100%;
-    display: grid;
-    gap: 4px;
-    padding: 10px 11px 10px 14px;
-    border: 1px solid color-mix(in srgb, var(--dga-stage-color) 46%, transparent);
-    border-radius: 10px;
-    color: inherit;
-    background: color-mix(in srgb, var(--dga-stage-color) 10%, transparent);
-    box-shadow: inset 4px 0 0 var(--dga-stage-color);
-    text-align: left;
-    cursor: pointer;
-}
-#${EDITOR_ID} .dga-stage-item.is-active {
-    border-color: var(--dga-stage-color);
-    background: color-mix(in srgb, var(--dga-stage-color) 23%, transparent);
-}
-#${EDITOR_ID} .dga-stage-item strong { overflow-wrap: anywhere; }
-#${EDITOR_ID} .dga-stage-item span { opacity: 0.68; font-size: 0.76rem; }
-#${EDITOR_ID} .dga-completion-field {
-    display: grid;
-    gap: 6px;
-    margin-top: 12px;
-    padding: 10px 11px;
-    border: 1px solid rgba(246, 196, 83, 0.38);
-    border-radius: 10px;
-    background: rgba(246, 196, 83, 0.08);
-    font-size: 0.8rem;
-}
-#${EDITOR_ID} .dga-field-title { font-weight: 650; line-height: 1.4; }
-#${EDITOR_ID} .dga-field-title b { color: #f6c453; font-weight: 650; }
-#${EDITOR_ID} .dga-completion-field textarea { min-height: 50px; }
-#${EDITOR_ID} .dga-field-hint { opacity: 0.62; font-size: 0.74rem; line-height: 1.4; }
-#${EDITOR_ID} .dga-editor-settings {
-    display: block;
-    margin-top: 14px;
-    padding-top: 14px;
-    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 13%, transparent);
-}
-#${EDITOR_ID} .dga-editor-settings > summary { display: none; }
-#${EDITOR_ID} .dga-editor-settings-body { display: grid; gap: 10px; }
-#${EDITOR_ID} .dga-editor-settings:not([open]) > .dga-editor-settings-body { display: none; }
-#${EDITOR_ID} label { display: grid; gap: 6px; font-size: 0.8rem; opacity: 0.9; }
-#${EDITOR_ID} input[type="text"],
-#${EDITOR_ID} textarea {
-    width: 100%;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
-    border-radius: 8px;
-    padding: 8px 9px;
-    color: inherit;
-    background: var(--SmartThemeBotMesBlurTintColor, rgba(20, 22, 28, 0.85));
-    font: inherit;
-}
-#${EDITOR_ID} textarea { min-height: 76px; resize: vertical; line-height: 1.45; }
-#${EDITOR_ID} input[type="color"] {
-    width: 100%;
-    height: 38px;
-    padding: 3px;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
-    border-radius: 8px;
-    background: transparent;
-    cursor: pointer;
-}
-#${EDITOR_ID} .dga-editor-actions,
-#${EDITOR_ID} .dga-selection-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 7px;
-}
-#${EDITOR_ID} .dga-button {
-    min-height: 38px;
-    padding: 8px 12px;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 18%, transparent);
-    border-radius: 8px;
-    color: inherit;
-    background: var(--SmartThemeBotMesBlurTintColor, rgba(20, 22, 28, 0.85));
-    cursor: pointer;
-    font-weight: 620;
-}
-#${EDITOR_ID} .dga-button.dga-primary {
-    border-color: transparent;
-    color: #fff;
-    background: var(--SmartThemeQuoteColor, #7b62d9);
-}
-#${EDITOR_ID} .dga-button.dga-danger { color: #ff9ba3; }
-#${EDITOR_ID} .dga-close {
-    min-width: 38px;
-    min-height: 38px;
-    border: 0;
-    border-radius: 10px;
-    color: inherit;
-    background: rgba(255, 255, 255, 0.08);
-    cursor: pointer;
-    font-size: 1.35rem;
-}
-#${EDITOR_ID} button:disabled { opacity: 0.44; cursor: not-allowed; }
-#${EDITOR_ID} .dga-selection-bar {
-    display: grid;
-    gap: 8px;
-    padding: 10px 11px;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 13%, transparent);
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.045);
-}
-#${EDITOR_ID} .dga-selection-preview {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 0.82rem;
-    opacity: 0.78;
-}
-#${EDITOR_ID} .dga-text-surface {
-    flex: 1;
-    min-height: 260px;
-    overflow: auto;
-    padding: 18px;
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 16%, transparent);
-    border-radius: 12px;
-    outline: none;
-    background: rgba(0, 0, 0, 0.19);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    user-select: text;
-    cursor: text;
-    font-family: inherit;
-    font-size: 0.94rem;
-    line-height: 1.75;
-}
-#${EDITOR_ID} .dga-text-surface:focus {
-    border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 72%, transparent);
-}
-#${EDITOR_ID} .dga-text-mark {
-    padding: 1px 0;
-    border-bottom: 2px solid var(--dga-mark-color);
-    border-radius: 3px;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
-    cursor: pointer;
-}
-#${EDITOR_ID} .dga-text-mark.is-active { box-shadow: 0 0 0 1px var(--dga-mark-color); }
-#${EDITOR_ID} .dga-text-mark.is-selected { outline: 2px solid #fff; outline-offset: 2px; }
-#${EDITOR_ID} .dga-text-mark.is-pending {
-    background: color-mix(in srgb, var(--dga-mark-color, #8b5cf6) 18%, transparent);
-    border-bottom-style: dashed;
-    border-bottom-width: 2px;
-    cursor: default;
-}
-#${EDITOR_ID} .dga-hide-pending .dga-text-mark.is-pending {
-    background: color-mix(in srgb, var(--dga-mark-color, #8b5cf6) 10%, transparent);
-    border-bottom-color: color-mix(in srgb, var(--dga-mark-color, #8b5cf6) 48%, transparent);
-}
-#${EDITOR_ID} .dga-tap-caret {
-    display: inline-block;
-    position: relative;
-    width: 3px;
-    height: 1.1em;
-    margin: 0 -1px;
-    vertical-align: -0.2em;
-    background: var(--dga-mark-color, #8b5cf6);
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
-}
-#${EDITOR_ID} .dga-tap-caret-tail {
-    background: transparent;
-    border-left: 3px dashed var(--dga-mark-color, #8b5cf6);
-    box-shadow: none;
-}
-#${EDITOR_ID} .dga-tap-caret::after {
-    position: absolute;
-    left: 50%;
-    top: -1.55em;
-    transform: translateX(-50%);
-    padding: 1px 5px;
-    border-radius: 7px;
-    background: var(--dga-mark-color, #8b5cf6);
-    color: #fff;
-    font-size: 0.6rem;
-    font-weight: 700;
-    line-height: 1.35;
-    letter-spacing: 0.02em;
-    white-space: nowrap;
-    pointer-events: none;
-    content: '开头';
-}
-#${EDITOR_ID} .dga-tap-caret-tail::after {
-    background: transparent;
-    border: 1px dashed var(--dga-mark-color, #8b5cf6);
-    color: var(--dga-mark-color, #8b5cf6);
-    content: '结尾';
-}
-#${EDITOR_ID} .dga-mode-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 7px;
-    margin: 0 0 9px;
-}
-#${EDITOR_ID} .dga-mode-label { font-size: 0.78rem; opacity: 0.7; }
-#${EDITOR_ID} .dga-mode-button { padding: 5px 11px; font-size: 0.8rem; }
-#${EDITOR_ID} .dga-mode-button.is-active {
-    border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 78%, transparent);
-    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 32%, transparent);
-}
-#${EDITOR_ID} .dga-tap-state {
-    display: flex;
-    align-items: center;
-    min-height: 34px;
-    margin: 0 0 9px;
-    padding: 7px 10px;
-    border: 1px dashed color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 26%, transparent);
-    border-radius: 9px;
-    font-size: 0.8rem;
-    font-weight: 620;
-    line-height: 1.35;
-}
-#${EDITOR_ID} .dga-tap-state::before {
-    flex: 0 0 auto;
-    width: 8px;
-    height: 8px;
-    margin-right: 7px;
-    border-radius: 50%;
-    background: currentColor;
-    content: '';
-}
-#${EDITOR_ID} .dga-tap-state[data-step="head"] {
-    border-color: rgba(96, 165, 250, 0.65);
-    color: #93c5fd;
-    background: rgba(59, 130, 246, 0.12);
-}
-#${EDITOR_ID} .dga-tap-state[data-step="tail"] {
-    border-color: rgba(251, 191, 36, 0.7);
-    color: #fcd34d;
-    background: rgba(245, 158, 11, 0.14);
-}
-#${EDITOR_ID} .dga-tap-state[data-step="ready"] {
-    border-color: rgba(52, 211, 153, 0.65);
-    color: #6ee7b7;
-    background: rgba(16, 185, 129, 0.13);
-}
-#${EDITOR_ID} .dga-text-surface.dga-tap-mode {
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-touch-callout: none;
-    cursor: pointer;
-}
-#${EDITOR_ID} .dga-editor-message {
-    padding: 9px 11px;
-    border-radius: 9px;
-    font-size: 0.82rem;
-    line-height: 1.45;
-}
-#${EDITOR_ID} .dga-editor-message[data-type="info"] { background: rgba(80, 140, 220, 0.15); }
-#${EDITOR_ID} .dga-editor-message[data-type="success"] { background: rgba(70, 180, 115, 0.16); }
-#${EDITOR_ID} .dga-editor-message[data-type="warning"] { background: rgba(230, 165, 60, 0.16); }
-#${EDITOR_ID} .dga-editor-message[data-type="error"] { background: rgba(220, 75, 85, 0.17); }
-#${EDITOR_ID}.dga-busy .dga-editor-shell { cursor: progress; }
-/*
- * 触屏、窄屏、矮屏统一改成“上下滚动”的编辑器布局。
- * 之前窄屏下侧栏占掉 42vh，右侧提示词区域被挤出可视范围，
- * 手机上根本拉不到文字，也没法拖选。
- */
-@media (max-width: 900px), (max-height: 640px), (pointer: coarse) {
-    #${EDITOR_ID} { padding: 0; align-items: stretch; }
-    #${EDITOR_ID} .dga-editor-shell {
-        width: 100%;
-        height: 100vh;
-        height: 100dvh;
-        min-height: 0;
-        border-radius: 0;
-    }
-    #${EDITOR_ID} .dga-editor-header { padding: 9px 12px; gap: 8px; }
-    #${EDITOR_ID} .dga-editor-title { font-size: 1rem; }
-    #${EDITOR_ID} .dga-editor-source { max-width: 60vw; font-size: 0.76rem; }
-    #${EDITOR_ID} .dga-editor-main {
-        display: flex;
-        flex-direction: column;
-        overflow-y: auto;
-        overscroll-behavior: contain;
-        -webkit-overflow-scrolling: touch;
-    }
-    #${EDITOR_ID} .dga-editor-sidebar {
-        flex: 0 0 auto;
-        max-height: none;
-        overflow: visible;
-        padding: 10px 12px 12px;
-        border-right: 0;
-        border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
-    }
-    #${EDITOR_ID} .dga-stage-list {
-        display: flex;
-        gap: 8px;
-        overflow-x: auto;
-        padding: 2px 2px 6px;
-        -webkit-overflow-scrolling: touch;
-    }
-    #${EDITOR_ID} .dga-stage-item { flex: 0 0 auto; width: auto; min-width: 132px; max-width: 62vw; }
-    #${EDITOR_ID} .dga-editor-settings { margin-top: 10px; padding-top: 10px; }
-    #${EDITOR_ID} .dga-editor-settings > summary {
-        display: block;
-        padding: 6px 0;
-        list-style: none;
-        cursor: pointer;
-        font-size: 0.86rem;
-        font-weight: 650;
-    }
-    #${EDITOR_ID} .dga-editor-settings > summary::-webkit-details-marker { display: none; }
-    #${EDITOR_ID} .dga-editor-settings > summary::after { content: ' ▾'; opacity: 0.6; }
-    #${EDITOR_ID} .dga-editor-settings[open] > summary::after { content: ' ▴'; }
-    #${EDITOR_ID} .dga-editor-settings-body { padding-top: 8px; }
-    #${EDITOR_ID} .dga-editor-workspace { flex: 0 0 auto; padding: 10px 12px 12px; gap: 8px; }
-    #${EDITOR_ID} .dga-editor-workspace h3 { font-size: 0.92rem; }
-    #${EDITOR_ID} .dga-editor-help { margin: 6px 0 8px; font-size: 0.78rem; }
-    #${EDITOR_ID} .dga-selection-bar {
-        position: sticky;
-        top: 0;
-        z-index: 3;
-        background: var(--SmartThemeBlurTintColor, rgba(28, 30, 38, 0.98));
-    }
-    #${EDITOR_ID} .dga-selection-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-    #${EDITOR_ID} .dga-selection-actions .dga-button:first-child { grid-column: 1 / -1; }
-    #${EDITOR_ID} .dga-text-surface {
-        flex: 0 0 auto;
-        min-height: 52vh;
-        padding: 20px 13px 13px;
-        font-size: 0.9rem;
-        -webkit-user-select: text;
-        user-select: text;
-        -webkit-touch-callout: default;
-    }
-    #${EDITOR_ID} .dga-editor-footer { flex: 0 0 auto; flex-wrap: wrap; gap: 8px; padding: 9px 12px; }
-    #${EDITOR_ID} .dga-editor-footer .dga-button { flex: 1 1 42%; }
-    #${EDITOR_ID} .dga-button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-}
-@media (max-width: 680px) {
-    #${PANEL_ID} { padding: 0; align-items: stretch; }
-    #${PANEL_ID} .dga-shell { width: 100%; max-height: 100vh; min-height: 100vh; border-radius: 0; }
-    #${PANEL_ID} .dga-summary, #${PANEL_ID} .dga-fields, #${PANEL_ID} .dga-meta { grid-template-columns: 1fr; }
-    #${PANEL_ID} .dga-actions { flex-wrap: wrap; }
-    #${PANEL_ID} .dga-actions .dga-button { flex: 1 1 42%; }
-}`;
-    }
-
-    function runStageEditorAction(label, action) {
-        Promise.resolve()
-            .then(action)
-            .catch(error => {
-                console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
-                setEditorMessage(error.message || String(error), 'error');
-                notify(error.message || String(error), 'error');
-            });
-    }
-
-    function installStageEditorUi(force) {
-        const documentRef = getHostDocument();
-        if (!documentRef || !documentRef.body) return null;
-        if (force) {
-            const oldEditor = documentRef.getElementById(EDITOR_ID);
-            if (oldEditor) oldEditor.remove();
-        }
-        const existing = documentRef.getElementById(EDITOR_ID);
-        if (existing) return existing;
-
-        const editor = documentRef.createElement('div');
-        editor.id = EDITOR_ID;
-        editor.hidden = true;
-        editor.setAttribute('role', 'dialog');
-        editor.setAttribute('aria-modal', 'true');
-        editor.setAttribute('aria-labelledby', `${UI_PREFIX}-editor-title`);
-        editor.innerHTML = `
-<div class="dga-editor-shell" tabindex="-1">
-    <header class="dga-editor-header">
-        <div>
-            <h2 class="dga-editor-title" id="${UI_PREFIX}-editor-title">划分提示词阶段</h2>
-            <p class="dga-editor-source"><span id="${UI_PREFIX}-editor-source-name">尚未选择条目</span><span class="dga-editor-dirty" id="${UI_PREFIX}-editor-dirty" hidden>● 未保存</span></p>
-        </div>
-        <button class="dga-close" id="${UI_PREFIX}-editor-close" type="button" aria-label="返回管理页">×</button>
-    </header>
-    <div class="dga-editor-main">
-        <aside class="dga-editor-sidebar">
-            <div class="dga-editor-section-head">
-                <h3>剧情阶段</h3>
-                <button class="dga-button" id="${UI_PREFIX}-editor-new-stage" type="button">＋ 新建</button>
-            </div>
-            <p class="dga-editor-help">每个颜色是一段故事指导。可让同一阶段包含多处不连续文字；“常驻提示”会在全部阶段发送。</p>
-            <div class="dga-stage-list" id="${UI_PREFIX}-editor-stage-list"></div>
-
-            <label class="dga-completion-field" id="${UI_PREFIX}-editor-completion-wrap">
-                <span class="dga-field-title">什么时候进入下一阶段 <b id="${UI_PREFIX}-editor-completion-stage">阶段 1</b></span>
-                <textarea id="${UI_PREFIX}-editor-stage-completion" rows="2" placeholder="例如：两人完成第一次正式交谈。留空时也可以手动点“下一段”。"></textarea>
-                <span class="dga-field-hint">AI 判断满足这里的条件后，下一段才会替换当前内容。</span>
-            </label>
-
-            <details class="dga-editor-settings" id="${UI_PREFIX}-editor-settings" open>
-                <summary class="dga-editor-settings-summary" id="${UI_PREFIX}-editor-settings-title">阶段名称、颜色与顺序</summary>
-                <div class="dga-editor-settings-body">
-                    <label id="${UI_PREFIX}-editor-stage-name-wrap">阶段名称
-                        <input id="${UI_PREFIX}-editor-stage-name" type="text" maxlength="80" placeholder="例如：雨夜初遇">
-                    </label>
-                    <label>标记颜色
-                        <input id="${UI_PREFIX}-editor-stage-color" type="color" value="#8b5cf6">
-                    </label>
-                    <div class="dga-editor-actions" id="${UI_PREFIX}-editor-order-actions">
-                        <button class="dga-button" id="${UI_PREFIX}-editor-move-up" type="button">上移</button>
-                        <button class="dga-button" id="${UI_PREFIX}-editor-move-down" type="button">下移</button>
-                    </div>
-                    <button class="dga-button dga-danger" id="${UI_PREFIX}-editor-delete-stage" type="button">删除这个阶段</button>
-                </div>
-            </details>
-        </aside>
-
-        <section class="dga-editor-workspace">
-            <div>
-                <h3>世界书提示词原文</h3>
-                <p class="dga-editor-help" id="${UI_PREFIX}-editor-workspace-help">像涂色一样拖选文字，再分配给阶段。这里只决定哪些提示词在何时发送，世界书正文不会被改写。</p>
-                <div class="dga-mode-row">
-                    <span class="dga-mode-label">选择方式</span>
-                    <button class="dga-button dga-mode-button" id="${UI_PREFIX}-editor-mode-tap" type="button">点选头尾</button>
-                    <button class="dga-button dga-mode-button" id="${UI_PREFIX}-editor-mode-drag" type="button">拖选文字</button>
-                </div>
-                <div class="dga-tap-state" id="${UI_PREFIX}-editor-tap-state" data-step="head" aria-live="polite" hidden></div>
-            </div>
-            <div class="dga-selection-bar">
-                <div class="dga-selection-preview"><b>当前选择：</b><span id="${UI_PREFIX}-editor-selection-text">尚未选择文字</span></div>
-                <div class="dga-selection-actions">
-                    <button class="dga-button dga-primary" id="${UI_PREFIX}-editor-assign" type="button" disabled>分配给当前阶段</button>
-                    <button class="dga-button" id="${UI_PREFIX}-editor-assign-always" type="button" disabled>设为常驻提示</button>
-                    <button class="dga-button" id="${UI_PREFIX}-editor-clear-range" type="button" disabled>清除所选标记</button>
-                </div>
-            </div>
-            <div class="dga-text-surface" id="${UI_PREFIX}-editor-surface" tabindex="0" aria-label="可拖选的世界书提示词原文"></div>
-            <div class="dga-editor-message" id="${UI_PREFIX}-editor-message" data-type="info" hidden></div>
-        </section>
-    </div>
-    <footer class="dga-editor-footer">
-        <button class="dga-button" id="${UI_PREFIX}-editor-save" type="button">保存划分</button>
-        <button class="dga-button dga-primary" id="${UI_PREFIX}-editor-save-bind" type="button">保存并绑定</button>
-    </footer>
-</div>`;
-        documentRef.body.appendChild(editor);
-
-        editorElement('close').onclick = () => closeStageEditor(false);
-        editor.onclick = event => {
-            if (event.target === editor) closeStageEditor(false);
-        };
-        editor.onkeydown = event => {
-            if (event.key === 'Escape') closeStageEditor(false);
-        };
-
-        editorElement('new-stage').onclick = addStage;
-        editorElement('move-up').onclick = () => moveActiveStage(-1);
-        editorElement('move-down').onclick = () => moveActiveStage(1);
-        editorElement('delete-stage').onclick = deleteActiveStage;
-        editorElement('assign').onclick = () => assignPendingRange(stageEditorState.activeOwnerId);
-        editorElement('assign-always').onclick = () => assignPendingRange('always');
-        editorElement('clear-range').onclick = clearSelectedEditorRange;
-        editorElement('save').onclick = () => runStageEditorAction(
-            '保存阶段划分',
-            () => saveStageEditorLayout(false),
-        );
-        editorElement('save-bind').onclick = () => runStageEditorAction(
-            '保存并绑定阶段划分',
-            () => saveStageEditorLayout(true),
-        );
-
-        const nameInput = editorElement('stage-name');
-        nameInput.oninput = event => {
-            const stage = activeStage();
-            if (!stage) return;
-            stage.name = event.target.value;
-            markStageEditorDirty();
-            renderStageEditorSidebar();
-            const title = editorElement('settings-title');
-            if (title) title.textContent = `${stage.name || '未命名阶段'} · 名称、颜色与顺序`;
-            const completionStage = editorElement('completion-stage');
-            if (completionStage) completionStage.textContent = `当前：${stage.name || '未命名阶段'}`;
-            updateStageEditorControls();
-        };
-        nameInput.onblur = event => {
-            const stage = activeStage();
-            if (!stage || String(event.target.value || '').trim()) return;
-            const index = stageEditorState.stages.findIndex(item => item.id === stage.id);
-            stage.name = `阶段 ${index + 1}`;
-            event.target.value = stage.name;
-            renderStageEditorSidebar();
-            renderStageEditorSettings();
-            updateStageEditorControls();
-        };
-        editorElement('stage-completion').oninput = event => {
-            const stage = activeStage();
-            if (!stage) return;
-            stage.completion = event.target.value;
-            markStageEditorDirty();
-        };
-        editorElement('stage-color').oninput = event => {
-            const color = normalizeColor(event.target.value, '#64748b');
-            if (stageEditorState.activeOwnerId === 'always') {
-                stageEditorState.alwaysColor = color;
-            } else {
-                const stage = activeStage();
-                if (!stage) return;
-                stage.color = color;
-            }
-            markStageEditorDirty();
-            renderStageEditorSidebar();
-            renderStageEditorText();
-        };
-
-        const surface = editorElement('surface');
-        const beginCaptureGesture = () => {
-            if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
-            stageEditorState.captureGestureOpen = true;
-            stageEditorState.captureBaseRanges = stageEditorState.pendingRanges.map(range => ({ ...range }));
-            stageEditorState.lastCaptureAt = 0;
-            syncPendingPreviewVisibility();
-        };
-        const finishCaptureGesture = () => {
-            stageEditorState.captureGestureOpen = false;
-            stageEditorState.captureBaseRanges = null;
-            stageEditorState.lastCaptureAt = 0;
-            syncPendingPreviewVisibility();
-        };
-        const captureAndFinishGestureSoon = () => {
-            hostWindow.setTimeout(() => {
-                if (!stageEditorState.gestureScrolled) captureStageEditorSelection();
-                stageEditorState.gestureScrolled = false;
-                finishCaptureGesture();
-            }, 0);
-        };
-        surface.addEventListener('mousedown', beginCaptureGesture);
-        surface.addEventListener('mouseup', () => {
-            captureStageEditorSelection();
-            finishCaptureGesture();
-        });
-        surface.addEventListener('keyup', captureStageEditorSelection);
-        surface.addEventListener('touchend', captureAndFinishGestureSoon, { passive: true });
-        surface.addEventListener('touchcancel', captureAndFinishGestureSoon, { passive: true });
-        surface.addEventListener('click', event => {
-            if (stageEditorState.tapMode) {
-                placeTapMarker(event);
-                return;
-            }
-            if (selectionOffsetsInSurface()) {
-                captureStageEditorSelection();
-                return;
-            }
-            selectMarkedRangeFromEvent(event);
-        });
-
-        editorElement('mode-tap').onclick = () => setStageEditorTapMode(true);
-        editorElement('mode-drag').onclick = () => setStageEditorTapMode(false);
-
-        /*
-         * 手机上一个常见坑：选好文字以后再往下滑，浏览器会把“滑动”当成
-         * 拖动选区，一路扩展到全文开头。这里在滑动发生时立刻收起原生选区，
-         * 并把手势开始前记下的范围还原回来，滚动照常进行。
-         */
-        surface.addEventListener('touchstart', () => {
-            stageEditorState.touchActive = true;
-            stageEditorState.scrollLocked = false;
-            stageEditorState.gestureScrolled = false;
-            stageEditorState.touchSnapshot = {
-                pendingRanges: stageEditorState.pendingRanges.map(range => ({ ...range })),
-                tapHead: stageEditorState.tapHead,
-                tapTail: stageEditorState.tapTail,
-            };
-            beginCaptureGesture();
-        }, { passive: true });
-        /*
-         * 点选模式下手指一开始移动，就把系统自己拉出来的选区丢掉。
-         * 否则手机浏览器会边滑边把选区往上一路扩到全文开头。
-         */
-        surface.addEventListener('touchmove', () => {
-            if (!stageEditorState.tapMode) return;
-            if (selectionOffsetsInSurface()) clearNativeSelection();
-        }, { passive: true });
-        const endEditorTouch = () => {
-            stageEditorState.touchActive = false;
-            stageEditorState.touchSnapshot = null;
-            if (!stageEditorState.scrollLocked) return;
-            stageEditorState.scrollLocked = false;
-            renderStageEditorText();
-            updateStageEditorControls();
-        };
-        surface.addEventListener('touchend', endEditorTouch, { passive: true });
-        surface.addEventListener('touchcancel', endEditorTouch, { passive: true });
-        const onEditorScroll = () => {
-            if (!stageEditorState.touchActive || stageEditorState.scrollLocked) return;
-            const hasLiveSelection = Boolean(selectionOffsetsInSurface());
-            const hasPendingWork = stageEditorState.tapMode
-                && (stageEditorState.tapHead != null || pendingRangeList().length > 0);
-            if (!hasLiveSelection && !hasPendingWork) return;
-            stageEditorState.scrollLocked = true;
-            stageEditorState.gestureScrolled = true;
-            stageEditorState.ignoreSelectionUntil = Date.now() + 600;
-            stageEditorState.lastScrollLockAt = Date.now();
-            const snapshot = stageEditorState.touchSnapshot;
-            stageEditorState.pendingRanges = snapshot && Array.isArray(snapshot.pendingRanges)
-                ? snapshot.pendingRanges.map(range => ({ ...range }))
-                : [];
-            stageEditorState.tapHead = snapshot ? snapshot.tapHead : null;
-            stageEditorState.tapTail = snapshot ? snapshot.tapTail : null;
-            finishCaptureGesture();
-            clearNativeSelection();
-            const kept = pendingRangeList().length;
-            if (kept > 0) {
-                setEditorMessage(`滑动时已收起系统选区，之前准备的 ${kept} 段仍然保留。`, 'info');
-            }
-            updateStageEditorControls();
-        };
-        const editorScroller = editor.querySelector('.dga-editor-main');
-        if (editorScroller) editorScroller.addEventListener('scroll', onEditorScroll, { passive: true });
-        surface.addEventListener('scroll', onEditorScroll, { passive: true });
-
-        // 手机上拖动系统选择手柄时只会触发 selectionchange，
-        // 必须靠它才能拿到最终选区，否则“分配”按钮会一直是灰的。
-        if (stageEditorSelectionBinding) {
-            try {
-                stageEditorSelectionBinding.document.removeEventListener(
-                    'selectionchange',
-                    stageEditorSelectionBinding.handler,
-                );
-            } catch (error) {
-                console.warn(`[${SCRIPT_NAME}] 清理旧的选区监听失败`, error);
-            }
-            stageEditorSelectionBinding = null;
-        }
-        const selectionHandler = () => {
-            const liveEditor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
-            if (!liveEditor || liveEditor.hidden || stageEditorState.busy) return;
-            if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
-            if (!selectionOffsetsInSurface()) return;
-            /*
-             * 刚因为滑动收起过系统选区时，浏览器可能还会补发几次 selectionchange。
-             * 这段时间内不直接采纳，而是推迟到保护期结束后再看一眼：如果那时
-             * 选区还在，说明是用户新选的，照常加入待分配。
-             */
-            const waitFor = Math.max(120, stageEditorState.ignoreSelectionUntil - Date.now() + 120);
-            if (stageEditorState.selectionTimer) hostWindow.clearTimeout(stageEditorState.selectionTimer);
-            stageEditorState.selectionTimer = hostWindow.setTimeout(() => {
-                stageEditorState.selectionTimer = null;
-                if (stageEditorState.busy) return;
-                if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
-                if (Date.now() < stageEditorState.ignoreSelectionUntil) return;
-                const currentEditor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
-                if (!currentEditor || currentEditor.hidden) return;
-                if (!selectionOffsetsInSurface()) return;
-                captureStageEditorSelection();
-            }, waitFor);
-        };
-        editor.ownerDocument.addEventListener('selectionchange', selectionHandler);
-        stageEditorSelectionBinding = { document: editor.ownerDocument, handler: selectionHandler };
-
-        // 触屏设备先把设置面板收起来，让提示词正文尽快出现在屏幕上。
-        const settingsDetails = editorElement('settings');
-        if (settingsDetails && typeof hostWindow.matchMedia === 'function') {
-            try {
-                if (hostWindow.matchMedia('(max-width: 900px), (max-height: 640px), (pointer: coarse)').matches) {
-                    settingsDetails.removeAttribute('open');
-                }
-            } catch (error) {
-                console.warn(`[${SCRIPT_NAME}] 判断触屏布局失败`, error);
-            }
-        }
-
-        updateStageEditorControls();
-        return editor;
-    }
-
-    function installManagerUi(force) {
-        const documentRef = getHostDocument();
-        if (!documentRef || !documentRef.body) return null;
-        if (force) {
-            const oldPanel = documentRef.getElementById(PANEL_ID);
-            const oldEditor = documentRef.getElementById(EDITOR_ID);
-            const oldStyle = documentRef.getElementById(STYLE_ID);
-            if (oldPanel) oldPanel.remove();
-            if (oldEditor) oldEditor.remove();
-            if (oldStyle) oldStyle.remove();
-        }
-        const existing = documentRef.getElementById(PANEL_ID);
-        if (existing) {
-            installStageEditorUi(false);
-            return existing;
-        }
-
-        const style = documentRef.createElement('style');
-        style.id = STYLE_ID;
-        style.textContent = managerStyles();
-        (documentRef.head || documentRef.documentElement).appendChild(style);
-
-        const panel = documentRef.createElement('div');
-        panel.id = PANEL_ID;
-        panel.hidden = true;
-        panel.setAttribute('role', 'dialog');
-        panel.setAttribute('aria-modal', 'true');
-        panel.setAttribute('aria-labelledby', `${UI_PREFIX}-dialog-title`);
-        panel.innerHTML = `
-<div class="dga-shell" tabindex="-1">
-    <header class="dga-header">
-        <div>
-            <h2 class="dga-title" id="${UI_PREFIX}-dialog-title">动态指导助手</h2>
-            <p class="dga-subtitle">管理角色绑定、当前剧情与聊天进度 · v${VERSION}</p>
-        </div>
-        <button class="dga-close" id="${UI_PREFIX}-close" type="button" aria-label="关闭">×</button>
-    </header>
-    <div class="dga-body">
-        <section class="dga-summary" aria-label="当前状态">
-            <div class="dga-card"><span>当前角色</span><strong id="${UI_PREFIX}-character-value">读取中</strong></div>
-            <div class="dga-card"><span>检测到的角色世界书</span><strong id="${UI_PREFIX}-worldbooks-value">读取中</strong></div>
-            <div class="dga-card"><span>已绑定指导页</span><strong id="${UI_PREFIX}-binding-value">读取中</strong></div>
-            <div class="dga-card"><span>当前聊天进度</span><strong id="${UI_PREFIX}-progress-value">读取中</strong></div>
-        </section>
-
-        <section class="dga-section">
-            <div class="dga-section-head">
-                <h3>绑定指导页</h3>
-                <button class="dga-button" id="${UI_PREFIX}-refresh" type="button">刷新</button>
-            </div>
-            <p class="dga-help">这里仅列出当前角色绑定的世界书。绑定后，来源条目会自动禁用，避免整页剧情被原生世界书直接发送给 AI。</p>
-            <div class="dga-fields">
-                <label>角色世界书
-                    <select id="${UI_PREFIX}-worldbook-select"><option>读取中</option></select>
-                </label>
-                <label>剧情或指导条目
-                    <select id="${UI_PREFIX}-entry-select"><option>读取中</option></select>
-                </label>
-            </div>
-            <div class="dga-actions">
-                <button class="dga-button dga-primary" id="${UI_PREFIX}-edit-stages" type="button">划分提示词阶段</button>
-                <button class="dga-button dga-primary" id="${UI_PREFIX}-bind" type="button">绑定所选条目</button>
-            </div>
-        </section>
-
-        <section class="dga-section">
-            <div class="dga-section-head"><h3 id="${UI_PREFIX}-current-title">当前发送内容</h3></div>
-            <div class="dga-meta">
-                <div><b>同时有效的附加内容：</b><span id="${UI_PREFIX}-addons-value">无</span></div>
-                <div><b>阶段划分：</b><span id="${UI_PREFIX}-layout-value">读取中</span></div>
-                <div><b>绑定识别来源：</b><span id="${UI_PREFIX}-detection-value">读取中</span></div>
-                <div><b>解析提醒：</b><span id="${UI_PREFIX}-warnings-value">无</span></div>
-            </div>
-            <pre class="dga-preview" id="${UI_PREFIX}-preview">读取中</pre>
-        </section>
-
-        <section class="dga-section">
-            <div class="dga-section-head"><h3>当前聊天进度</h3></div>
-            <p class="dga-help" id="${UI_PREFIX}-progress-help">进度只记在当前聊天里，新建聊天会从第一段开始；绑定和阶段划分保存在角色上，不会因为新建聊天消失。</p>
-            <div class="dga-actions">
-                <button class="dga-button" id="${UI_PREFIX}-previous" type="button">上一段</button>
-                <button class="dga-button dga-primary" id="${UI_PREFIX}-next" type="button">下一段</button>
-                <button class="dga-button" id="${UI_PREFIX}-reset" type="button">重置到第一段</button>
-            </div>
-        </section>
-        <div class="dga-message" id="${UI_PREFIX}-message" data-type="info" hidden></div>
-    </div>
-</div>`;
-        documentRef.body.appendChild(panel);
-        installStageEditorUi(false);
-
-        managerElement('close').onclick = closeManager;
-        panel.onclick = event => {
-            if (event.target === panel) closeManager();
-        };
-        panel.onkeydown = event => {
-            if (event.key === 'Escape') closeManager();
-        };
-        managerElement('refresh').onclick = () => refreshManager();
-        managerElement('worldbook-select').onchange = event => {
-            managerState.selectedWorldbook = event.target.value;
-            managerState.selectedEntryKey = '';
-            refreshManager({ worldbookName: event.target.value, entryKey: '', quiet: true });
-        };
-        managerElement('entry-select').onchange = event => {
-            managerState.selectedEntryKey = event.target.value;
-            updateManagerControls();
-        };
-        managerElement('edit-stages').onclick = () => {
-            setManagerBusy(true);
-            setManagerMessage('正在打开提示词阶段标注器……', 'info');
-            Promise.resolve()
-                .then(openStageEditor)
-                .catch(error => {
-                    console.error(`[${SCRIPT_NAME}] 打开阶段标注器失败`, error);
-                    setManagerMessage(error.message || String(error), 'error');
-                    notify(error.message || String(error), 'error');
-                })
-                .finally(() => setManagerBusy(false));
-        };
-        managerElement('bind').onclick = () => {
-            const entry = managerState.entryMap.get(managerState.selectedEntryKey);
-            runManagerAction(
-                '正在绑定所选指导条目……',
-                () => bindGuideEntry(managerState.selectedWorldbook, entry),
-                '绑定完成，当前聊天已从第一段开始。',
-            );
-        };
-        managerElement('previous').onclick = () => runManagerAction(
-            '正在切换到上一段……',
-            async () => {
-                const context = await loadContext();
-                return moveToIndex(context.state.mainIndex - 1);
-            },
-            '已切换到上一段。',
-        );
-        managerElement('next').onclick = () => runManagerAction(
-            '正在切换到下一段……',
-            async () => {
-                const context = await loadContext();
-                return moveToIndex(context.state.mainIndex + 1);
-            },
-            '已切换到下一段。',
-        );
-        managerElement('reset').onclick = () => runManagerAction(
-            '正在重置当前聊天进度……',
-            async () => {
-                if (!hostWindow.confirm('把当前聊天的动态指导进度重置到第一段？')) return false;
-                return moveToIndex(0);
-            },
-            '当前聊天已重置到第一段。',
-        );
-        return panel;
-    }
-
     async function openManager() {
-        const panel = installManagerUi(false);
-        if (!panel) throw new Error('管理页面尚未准备好，请稍后重试');
+        const panel = ensurePanel();
+        if (!panel) throw new Error('页面还没准备好，请稍后再试。');
         closeExtensionsMenu();
-        const documentRef = getHostDocument();
-        const editor = documentRef && documentRef.getElementById(EDITOR_ID);
-        if (editor) editor.hidden = true;
         panel.hidden = false;
+        ui.view = 'manager';
+        ui.editor = null;
+        await runAction('读取状态', async () => {});
         const shell = panel.querySelector('.dga-shell');
         if (shell) shell.focus();
-        await refreshManager();
     }
 
     function registerMenuEntry(retry) {
         if (!isCurrentInstance()) return;
-        const documentRef = getHostDocument();
-        const menu = documentRef && documentRef.getElementById('extensionsMenu');
-        if (!documentRef || !documentRef.body || !menu) {
+        const doc = hostDocument();
+        if (!doc) return;
+        const menu = doc.getElementById('extensionsMenu');
+        if (!doc.body || !menu) {
             if ((retry || 0) < 30) {
                 hostWindow.setTimeout(() => registerMenuEntry((retry || 0) + 1), 1000);
             } else {
-                reportOnce('魔法棒入口', '找不到酒馆左下角魔法棒菜单，未能添加“动态指导助手”入口。');
+                reportOnce('menu', '找不到酒馆左下角的魔法棒菜单，没能添加“动态指导助手”入口。');
             }
             return;
         }
-
-        let container = documentRef.getElementById(MENU_CONTAINER_ID);
+        let container = doc.getElementById(MENU_CONTAINER_ID);
         if (!container) {
-            container = documentRef.createElement('div');
+            container = doc.createElement('div');
             container.id = MENU_CONTAINER_ID;
             container.className = 'extension_container interactable';
             container.tabIndex = 0;
             menu.appendChild(container);
         }
-        let item = documentRef.getElementById(MENU_ITEM_ID);
+        let item = doc.getElementById(MENU_ITEM_ID);
         if (!item) {
-            item = documentRef.createElement('div');
+            item = doc.createElement('div');
             item.id = MENU_ITEM_ID;
             item.className = 'list-group-item flex-container flexGap5 interactable';
             item.title = '打开动态指导助手';
@@ -3943,23 +1883,23 @@
         item.onclick = event => {
             event.preventDefault();
             event.stopPropagation();
-            runEventTask('打开管理页面', openManager);
+            runEventTask('打开管理页', openManager);
         };
     }
 
-    async function bindGuide() {
-        return openManager();
-    }
-
-    async function showStatus() {
-        return openManager();
+    function runEventTask(label, task) {
+        Promise.resolve()
+            .then(() => (isCurrentInstance() ? task() : undefined))
+            .catch(error => {
+                console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
+                reportOnce(label, `${label}失败：${error.message || String(error)}`);
+            });
     }
 
     async function next() {
         try {
-            const context = await loadContext();
-            if (!context.configured) throw new Error('尚未绑定动态指导页');
-            await moveToIndex(context.state.mainIndex + 1);
+            const context = await requireContext();
+            await moveToIndex(context, context.state.stageIndex + 1);
         } catch (error) {
             notify(error.message || String(error), 'error');
         }
@@ -3967,9 +1907,8 @@
 
     async function previous() {
         try {
-            const context = await loadContext();
-            if (!context.configured) throw new Error('尚未绑定动态指导页');
-            await moveToIndex(context.state.mainIndex - 1);
+            const context = await requireContext();
+            await moveToIndex(context, context.state.stageIndex - 1);
         } catch (error) {
             notify(error.message || String(error), 'error');
         }
@@ -3977,161 +1916,67 @@
 
     async function reset() {
         try {
-            const context = await loadContext();
-            if (!context.configured) throw new Error('尚未绑定动态指导页');
-            if (!hostWindow.confirm('把当前聊天的动态指导进度重置到第一段？')) return;
-            await moveToIndex(0);
+            const context = await requireContext();
+            if (!hostWindow.confirm('把这个聊天的进度重置到第一段？')) return;
+            await moveToIndex(context, 0);
         } catch (error) {
             notify(error.message || String(error), 'error');
         }
     }
 
-    function messageIdFromEvent(args) {
-        for (const value of args) {
-            if (typeof value === 'number' && Number.isFinite(value)) return value;
-            if (value && typeof value === 'object' && Number.isFinite(value.message_id)) {
-                return value.message_id;
-            }
-        }
-        return null;
-    }
-
-    async function handleMessageReceived() {
-        if (!isCurrentInstance()) return;
-        const args = Array.from(arguments);
-        const getLastMessageId = resolveFunction('getLastMessageId', true);
-        const getChatMessages = resolveFunction('getChatMessages', true);
-        const requestedId = messageIdFromEvent(args);
-        const messageId = requestedId == null ? getLastMessageId() : requestedId;
-        const messages = await Promise.resolve(getChatMessages(messageId, { include_swipes: false }));
-        const message = Array.isArray(messages) ? messages[0] : null;
-        if (!message || message.role !== 'assistant' || typeof message.message !== 'string') return;
-
-        const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
-        if (markers.length === 0) return;
-
-        const context = await loadContext();
-        if (!context.configured || !context.mainBlock) return;
-        const hasCurrentMarker = markers.some(match => match[1] === context.mainBlock.id);
-        const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
-        const completionFingerprint = `${messageId}:${context.mainBlock.id}:${hashText(cleaned)}`;
-        const alreadyHandled = context.state.lastCompletionFingerprint === completionFingerprint;
-        const setChatMessages = resolveFunction('setChatMessages', false);
-        if (setChatMessages && cleaned !== message.message) {
-            await Promise.resolve(setChatMessages(
-                [{ message_id: messageId, message: cleaned }],
-                { refresh: 'affected' },
-            ));
-        }
-
-        if (hasCurrentMarker && !alreadyHandled) {
-            await moveToIndex(context.state.mainIndex + 1, {
-                messageId,
-                completionFingerprint,
-            });
-        }
-    }
-
-    function runEventTask(label, task) {
-        Promise.resolve()
-            .then(() => {
-                if (!isCurrentInstance()) return;
-                return task();
-            })
-            .catch(error => {
-                console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
-                reportOnce(label, `${label}失败：${error.message || String(error)}`);
-            });
-    }
-
-    async function removeLegacyScriptButtons() {
-        const legacyNames = new Set([
-            '绑定指导页',
-            '查看当前内容',
-            '下一段',
-            '上一段',
-            '重置进度',
-        ]);
-        const updateScriptButtonsWith = resolveFunction('updateScriptButtonsWith', false);
-        if (updateScriptButtonsWith) {
-            await Promise.resolve(updateScriptButtonsWith(buttons => (
-                Array.isArray(buttons) ? buttons.filter(button => !legacyNames.has(button && button.name)) : []
-            )));
-            return;
-        }
-        const getScriptButtons = resolveFunction('getScriptButtons', false);
-        const replaceScriptButtons = resolveFunction('replaceScriptButtons', false);
-        if (getScriptButtons && replaceScriptButtons) {
-            const buttons = await Promise.resolve(getScriptButtons());
-            await Promise.resolve(replaceScriptButtons(
-                Array.isArray(buttons) ? buttons.filter(button => !legacyNames.has(button && button.name)) : [],
-            ));
-        }
-    }
-
     const publicApi = {
         version: VERSION,
-        parseGuideText,
-        parseGuideEntry,
-        getRangeLayout,
-        resolveRangeLayout,
-        createAnchoredRange,
-        getActiveAddons,
+        parseOutline,
+        activeAddons,
         formatInjection,
-        bindGuide,
-        showStatus,
+        reconcileState,
+        insertHeading,
+        replaceHeading,
+        deleteHeading,
+        autoSplitByBlankLines,
+        readLegacyLayout,
+        convertLegacyLayout,
         openManager,
-        refreshManager,
-        getCharacterWorldbookBinding,
+        refresh: () => runAction('刷新', async () => {}),
         next,
         previous,
         reset,
-        getCurrentSnapshot: () => loadContext({ persistState: false }),
+        getCurrentSnapshot: loadContext,
     };
     currentWindow.DynamicGuideAssistantCore = publicApi;
 
     if (!helper) {
-        console.warn(`[${SCRIPT_NAME}] 未检测到 JS-Slash-Runner / TavernHelper；仅开放纯解析器。`);
+        console.warn(`[${SCRIPT_NAME}] 未检测到酒馆助手；只开放解析函数。`);
         return;
     }
 
-    installManagerUi(true);
+    ensurePanel();
     registerMenuEntry(0);
-    runEventTask('清理旧版脚本按钮', removeLegacyScriptButtons);
 
-    const eventOn = resolveFunction('eventOn', false);
-    const tavernEvents = resolveValue('tavern_events');
-    if (!eventOn) {
-        reportOnce('事件监听', '当前酒馆助手缺少事件接口，管理页面可用，但无法自动注入内容。');
+    const eventOn = api('eventOn', false);
+    const events = apiValue('tavern_events');
+    if (!eventOn || !events) {
+        reportOnce('events', '当前酒馆助手缺少事件接口，管理页可以用，但无法自动注入内容。');
         return;
     }
-    if (!tavernEvents) {
-        reportOnce('事件监听', '当前酒馆助手缺少酒馆事件表，管理页面可用，但无法自动注入内容。');
-        return;
-    }
-
-    if (tavernEvents.GENERATION_AFTER_COMMANDS) {
-        eventOn(tavernEvents.GENERATION_AFTER_COMMANDS, () => {
-            runEventTask('注入当前内容', injectCurrentGuide);
+    if (events.GENERATION_AFTER_COMMANDS) {
+        eventOn(events.GENERATION_AFTER_COMMANDS, function (type, params, dryRun) {
+            if (dryRun === true) return;
+            runEventTask('注入当前阶段', () => injectCurrentGuide(type));
         });
-    } else {
-        reportOnce('生成事件', '找不到 GENERATION_AFTER_COMMANDS 事件，无法自动注入内容。');
     }
-
-    if (tavernEvents.MESSAGE_RECEIVED) {
-        eventOn(tavernEvents.MESSAGE_RECEIVED, function () {
+    if (events.MESSAGE_RECEIVED) {
+        eventOn(events.MESSAGE_RECEIVED, function () {
             const args = arguments;
             runEventTask('处理完成标记', () => handleMessageReceived.apply(null, args));
         });
     }
-
-    if (tavernEvents.CHAT_CHANGED) {
-        eventOn(tavernEvents.CHAT_CHANGED, () => {
-            runEventTask('切换聊天', async () => {
-                await safeUninject();
-                const panel = managerElement('panel');
-                if (panel && !panel.hidden) await refreshManager({ quiet: true });
-            });
-        });
+    if (events.CHAT_CHANGED) {
+        eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
+            await safeUninject();
+            const doc = hostDocument();
+            const panel = doc && doc.getElementById(PANEL_ID);
+            if (panel && !panel.hidden) await runAction('刷新', async () => {});
+        }));
     }
 })();
