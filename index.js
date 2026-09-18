@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3';
+    const VERSION = '1.3.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1264,7 +1264,10 @@
         unresolvedCount: 0,
         dirty: false,
         busy: false,
+        selectionTimer: null,
     };
+
+    let stageEditorSelectionBinding = null;
 
     function editorElement(suffix) {
         const documentRef = getHostDocument();
@@ -1414,6 +1417,8 @@
         stageEditorState.stages.push(stage);
         markStageEditorDirty();
         setActiveOwner(stage.id);
+        const settings = editorElement('settings');
+        if (settings) settings.setAttribute('open', '');
         const nameInput = editorElement('stage-name');
         if (nameInput) {
             nameInput.focus();
@@ -2412,12 +2417,14 @@
 #${EDITOR_ID} .dga-stage-item strong { overflow-wrap: anywhere; }
 #${EDITOR_ID} .dga-stage-item span { opacity: 0.68; font-size: 0.76rem; }
 #${EDITOR_ID} .dga-editor-settings {
-    display: grid;
-    gap: 10px;
+    display: block;
     margin-top: 14px;
     padding-top: 14px;
     border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 13%, transparent);
 }
+#${EDITOR_ID} .dga-editor-settings > summary { display: none; }
+#${EDITOR_ID} .dga-editor-settings-body { display: grid; gap: 10px; }
+#${EDITOR_ID} .dga-editor-settings:not([open]) > .dga-editor-settings-body { display: none; }
 #${EDITOR_ID} label { display: grid; gap: 6px; font-size: 0.8rem; opacity: 0.9; }
 #${EDITOR_ID} input[type="text"],
 #${EDITOR_ID} textarea {
@@ -2529,25 +2536,89 @@
 #${EDITOR_ID} .dga-editor-message[data-type="warning"] { background: rgba(230, 165, 60, 0.16); }
 #${EDITOR_ID} .dga-editor-message[data-type="error"] { background: rgba(220, 75, 85, 0.17); }
 #${EDITOR_ID}.dga-busy .dga-editor-shell { cursor: progress; }
+/*
+ * 触屏、窄屏、矮屏统一改成“上下滚动”的编辑器布局。
+ * 之前窄屏下侧栏占掉 42vh，右侧提示词区域被挤出可视范围，
+ * 手机上根本拉不到文字，也没法拖选。
+ */
+@media (max-width: 900px), (max-height: 640px), (pointer: coarse) {
+    #${EDITOR_ID} { padding: 0; align-items: stretch; }
+    #${EDITOR_ID} .dga-editor-shell {
+        width: 100%;
+        height: 100vh;
+        height: 100dvh;
+        min-height: 0;
+        border-radius: 0;
+    }
+    #${EDITOR_ID} .dga-editor-header { padding: 9px 12px; gap: 8px; }
+    #${EDITOR_ID} .dga-editor-title { font-size: 1rem; }
+    #${EDITOR_ID} .dga-editor-source { max-width: 60vw; font-size: 0.76rem; }
+    #${EDITOR_ID} .dga-editor-main {
+        display: flex;
+        flex-direction: column;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+    }
+    #${EDITOR_ID} .dga-editor-sidebar {
+        flex: 0 0 auto;
+        max-height: none;
+        overflow: visible;
+        padding: 10px 12px 12px;
+        border-right: 0;
+        border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
+    }
+    #${EDITOR_ID} .dga-stage-list {
+        display: flex;
+        gap: 8px;
+        overflow-x: auto;
+        padding: 2px 2px 6px;
+        -webkit-overflow-scrolling: touch;
+    }
+    #${EDITOR_ID} .dga-stage-item { flex: 0 0 auto; width: auto; min-width: 132px; max-width: 62vw; }
+    #${EDITOR_ID} .dga-editor-settings { margin-top: 10px; padding-top: 10px; }
+    #${EDITOR_ID} .dga-editor-settings > summary {
+        display: block;
+        padding: 6px 0;
+        list-style: none;
+        cursor: pointer;
+        font-size: 0.86rem;
+        font-weight: 650;
+    }
+    #${EDITOR_ID} .dga-editor-settings > summary::-webkit-details-marker { display: none; }
+    #${EDITOR_ID} .dga-editor-settings > summary::after { content: ' ▾'; opacity: 0.6; }
+    #${EDITOR_ID} .dga-editor-settings[open] > summary::after { content: ' ▴'; }
+    #${EDITOR_ID} .dga-editor-settings-body { padding-top: 8px; }
+    #${EDITOR_ID} .dga-editor-workspace { flex: 0 0 auto; padding: 10px 12px 12px; gap: 8px; }
+    #${EDITOR_ID} .dga-editor-workspace h3 { font-size: 0.92rem; }
+    #${EDITOR_ID} .dga-editor-help { margin: 6px 0 8px; font-size: 0.78rem; }
+    #${EDITOR_ID} .dga-selection-bar {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        background: var(--SmartThemeBlurTintColor, rgba(28, 30, 38, 0.98));
+    }
+    #${EDITOR_ID} .dga-selection-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+    #${EDITOR_ID} .dga-selection-actions .dga-button:first-child { grid-column: 1 / -1; }
+    #${EDITOR_ID} .dga-text-surface {
+        flex: 0 0 auto;
+        min-height: 52vh;
+        padding: 13px;
+        font-size: 0.9rem;
+        -webkit-user-select: text;
+        user-select: text;
+        -webkit-touch-callout: default;
+    }
+    #${EDITOR_ID} .dga-editor-footer { flex: 0 0 auto; flex-wrap: wrap; gap: 8px; padding: 9px 12px; }
+    #${EDITOR_ID} .dga-editor-footer .dga-button { flex: 1 1 42%; }
+    #${EDITOR_ID} .dga-button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+}
 @media (max-width: 680px) {
     #${PANEL_ID} { padding: 0; align-items: stretch; }
     #${PANEL_ID} .dga-shell { width: 100%; max-height: 100vh; min-height: 100vh; border-radius: 0; }
     #${PANEL_ID} .dga-summary, #${PANEL_ID} .dga-fields, #${PANEL_ID} .dga-meta { grid-template-columns: 1fr; }
     #${PANEL_ID} .dga-actions { flex-wrap: wrap; }
     #${PANEL_ID} .dga-actions .dga-button { flex: 1 1 42%; }
-    #${EDITOR_ID} { padding: 0; align-items: stretch; }
-    #${EDITOR_ID} .dga-editor-shell { width: 100%; height: 100vh; min-height: 100vh; border-radius: 0; }
-    #${EDITOR_ID} .dga-editor-main { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
-    #${EDITOR_ID} .dga-editor-sidebar {
-        max-height: 42vh;
-        border-right: 0;
-        border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 14%, transparent);
-    }
-    #${EDITOR_ID} .dga-editor-workspace { padding: 10px; }
-    #${EDITOR_ID} .dga-editor-footer { flex-wrap: wrap; padding: 10px; }
-    #${EDITOR_ID} .dga-editor-footer .dga-button { flex: 1 1 42%; }
-    #${EDITOR_ID} .dga-selection-actions .dga-button { flex: 1 1 45%; }
-    #${EDITOR_ID} .dga-text-surface { padding: 13px; font-size: 0.9rem; }
 }`;
     }
 
@@ -2595,23 +2666,25 @@
             <p class="dga-editor-help">每个颜色是一段故事指导。可让同一阶段包含多处不连续文字；“常驻提示”会在全部阶段发送。</p>
             <div class="dga-stage-list" id="${UI_PREFIX}-editor-stage-list"></div>
 
-            <div class="dga-editor-settings">
-                <h3 id="${UI_PREFIX}-editor-settings-title">阶段设置</h3>
-                <label id="${UI_PREFIX}-editor-stage-name-wrap">阶段名称
-                    <input id="${UI_PREFIX}-editor-stage-name" type="text" maxlength="80" placeholder="例如：雨夜初遇">
-                </label>
-                <label>标记颜色
-                    <input id="${UI_PREFIX}-editor-stage-color" type="color" value="#8b5cf6">
-                </label>
-                <label id="${UI_PREFIX}-editor-completion-wrap">什么时候进入下一阶段
-                    <textarea id="${UI_PREFIX}-editor-stage-completion" placeholder="例如：两人完成第一次正式交谈。留空时也可以手动点“下一段”。"></textarea>
-                </label>
-                <div class="dga-editor-actions" id="${UI_PREFIX}-editor-order-actions">
-                    <button class="dga-button" id="${UI_PREFIX}-editor-move-up" type="button">上移</button>
-                    <button class="dga-button" id="${UI_PREFIX}-editor-move-down" type="button">下移</button>
+            <details class="dga-editor-settings" id="${UI_PREFIX}-editor-settings" open>
+                <summary class="dga-editor-settings-summary" id="${UI_PREFIX}-editor-settings-title">阶段设置</summary>
+                <div class="dga-editor-settings-body">
+                    <label id="${UI_PREFIX}-editor-stage-name-wrap">阶段名称
+                        <input id="${UI_PREFIX}-editor-stage-name" type="text" maxlength="80" placeholder="例如：雨夜初遇">
+                    </label>
+                    <label>标记颜色
+                        <input id="${UI_PREFIX}-editor-stage-color" type="color" value="#8b5cf6">
+                    </label>
+                    <label id="${UI_PREFIX}-editor-completion-wrap">什么时候进入下一阶段
+                        <textarea id="${UI_PREFIX}-editor-stage-completion" placeholder="例如：两人完成第一次正式交谈。留空时也可以手动点“下一段”。"></textarea>
+                    </label>
+                    <div class="dga-editor-actions" id="${UI_PREFIX}-editor-order-actions">
+                        <button class="dga-button" id="${UI_PREFIX}-editor-move-up" type="button">上移</button>
+                        <button class="dga-button" id="${UI_PREFIX}-editor-move-down" type="button">下移</button>
+                    </div>
+                    <button class="dga-button dga-danger" id="${UI_PREFIX}-editor-delete-stage" type="button">删除这个阶段</button>
                 </div>
-                <button class="dga-button dga-danger" id="${UI_PREFIX}-editor-delete-stage" type="button">删除这个阶段</button>
-            </div>
+            </details>
         </aside>
 
         <section class="dga-editor-workspace">
@@ -2708,6 +2781,7 @@
         surface.addEventListener('mouseup', captureStageEditorSelection);
         surface.addEventListener('keyup', captureStageEditorSelection);
         surface.addEventListener('touchend', captureSoon, { passive: true });
+        surface.addEventListener('touchcancel', captureSoon, { passive: true });
         surface.addEventListener('click', event => {
             if (selectionOffsetsInSurface()) {
                 captureStageEditorSelection();
@@ -2715,6 +2789,49 @@
             }
             selectMarkedRangeFromEvent(event);
         });
+
+        // 手机上拖动系统选择手柄时只会触发 selectionchange，
+        // 必须靠它才能拿到最终选区，否则“分配”按钮会一直是灰的。
+        if (stageEditorSelectionBinding) {
+            try {
+                stageEditorSelectionBinding.document.removeEventListener(
+                    'selectionchange',
+                    stageEditorSelectionBinding.handler,
+                );
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] 清理旧的选区监听失败`, error);
+            }
+            stageEditorSelectionBinding = null;
+        }
+        const selectionHandler = () => {
+            const liveEditor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
+            if (!liveEditor || liveEditor.hidden || stageEditorState.busy) return;
+            if (!selectionOffsetsInSurface()) return;
+            if (stageEditorState.selectionTimer) hostWindow.clearTimeout(stageEditorState.selectionTimer);
+            stageEditorState.selectionTimer = hostWindow.setTimeout(() => {
+                stageEditorState.selectionTimer = null;
+                if (stageEditorState.busy) return;
+                const currentEditor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
+                if (!currentEditor || currentEditor.hidden) return;
+                if (!selectionOffsetsInSurface()) return;
+                captureStageEditorSelection();
+            }, 120);
+        };
+        editor.ownerDocument.addEventListener('selectionchange', selectionHandler);
+        stageEditorSelectionBinding = { document: editor.ownerDocument, handler: selectionHandler };
+
+        // 触屏设备先把设置面板收起来，让提示词正文尽快出现在屏幕上。
+        const settingsDetails = editorElement('settings');
+        if (settingsDetails && typeof hostWindow.matchMedia === 'function') {
+            try {
+                if (hostWindow.matchMedia('(max-width: 900px), (max-height: 640px), (pointer: coarse)').matches) {
+                    settingsDetails.removeAttribute('open');
+                }
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] 判断触屏布局失败`, error);
+            }
+        }
+
         updateStageEditorControls();
         return editor;
     }
