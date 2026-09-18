@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3.2';
+    const VERSION = '1.3.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1259,7 +1259,10 @@
         alwaysColor: '#64748b',
         alwaysRanges: [],
         activeOwnerId: '',
-        pendingRange: null,
+        pendingRanges: [],
+        captureBaseRanges: null,
+        captureGestureOpen: false,
+        lastCaptureAt: 0,
         selectedMarkedRange: null,
         tapMode: false,
         tapHead: null,
@@ -1416,13 +1419,87 @@
     }
 
     function editorPendingSegments() {
-        const pending = stageEditorState.pendingRange;
-        if (!pending || pending.end <= pending.start) return [];
-        let remaining = normalizedIntervals([pending]);
+        const pending = normalizedIntervals(stageEditorState.pendingRanges);
+        if (pending.length === 0) return [];
+        let remaining = pending;
         allEditorMarks().forEach(mark => {
             remaining = remaining.flatMap(range => subtractInterval([range], mark.start, mark.end));
         });
         return remaining;
+    }
+
+    function rangeWithQuote(range) {
+        const start = clampOffset(range.start, stageEditorState.text.length);
+        const end = clampOffset(range.end, stageEditorState.text.length);
+        return {
+            start,
+            end,
+            quote: stageEditorState.text.slice(start, end),
+        };
+    }
+
+    function setPendingRanges(ranges) {
+        stageEditorState.pendingRanges = normalizedIntervals(ranges).map(rangeWithQuote);
+    }
+
+    function addPendingRanges(ranges) {
+        setPendingRanges([...stageEditorState.pendingRanges, ...(Array.isArray(ranges) ? ranges : [ranges])]);
+    }
+
+    function lastPendingRange() {
+        const list = normalizedIntervals(stageEditorState.pendingRanges);
+        return list.length > 0 ? rangeWithQuote(list[list.length - 1]) : null;
+    }
+
+    function pendingRangeList() {
+        return normalizedIntervals(stageEditorState.pendingRanges);
+    }
+
+    function updateSelectionPreview() {
+        const selectionText = editorElement('selection-text');
+        if (!selectionText) return;
+        const ranges = pendingRangeList();
+        const waitingForTail = stageEditorState.tapMode
+            && stageEditorState.tapHead != null
+            && stageEditorState.tapTail == null;
+        if (ranges.length === 0) {
+            selectionText.textContent = waitingForTail
+                ? '已放下开头，下一步：点这一段的结尾'
+                : '尚未选择文字';
+            return;
+        }
+        const last = ranges[ranges.length - 1];
+        const preview = stageEditorState.text.slice(last.start, last.end).replace(/\s+/g, ' ').trim();
+        const clipped = preview.length > 46 ? `${preview.slice(0, 46)}…` : preview;
+        selectionText.textContent = ranges.length > 1
+            ? `已准备 ${ranges.length} 段，最近一段：${clipped}`
+            : clipped;
+    }
+
+    function updateTapMarkerStatus() {
+        const status = editorElement('tap-state');
+        if (!status) return;
+        if (!stageEditorState.tapMode) {
+            status.hidden = true;
+            return;
+        }
+        const ranges = pendingRangeList();
+        const waitingForTail = stageEditorState.tapHead != null && stageEditorState.tapTail == null;
+        status.hidden = false;
+        if (waitingForTail) {
+            status.dataset.step = 'tail';
+            status.textContent = '已放下开头 · 下一步：点这一段的结尾';
+            return;
+        }
+        if (ranges.length === 0) {
+            status.dataset.step = 'head';
+            status.textContent = '下一步：点这一段的开头';
+            return;
+        }
+        status.dataset.step = 'ready';
+        status.textContent = ranges.length === 1
+            ? '已准备 1 段 · 可以继续点下一段，或直接分配'
+            : `已准备 ${ranges.length} 段 · 可以继续点选，或直接分配`;
     }
 
     function canPlaceTapMarkers() {
@@ -1454,9 +1531,10 @@
         const help = editorElement('workspace-help');
         if (help) {
             help.textContent = stageEditorState.tapMode
-                ? '先在要开始的字上点一下，再在这一段的结尾点一下，中间会自动选中。想重新选就再点第三个位置。'
-                : '像涂色一样拖选文字，再分配给阶段。这里只决定哪些提示词在何时发送，世界书正文不会被改写。';
+                ? '点一下某段的开头，再点一下结尾，就会加入“待分配”；可以继续点下一段，最后一起分配。'
+                : '像涂色一样拖选文字。已经准备的范围会保留，可以继续拖选更多段落，最后一起分配。';
         }
+        updateTapMarkerStatus();
     }
 
     function setStageEditorTapMode(enabled, options) {
@@ -1466,16 +1544,22 @@
         stageEditorState.tapHead = null;
         stageEditorState.tapTail = null;
         stageEditorState.selectedMarkedRange = null;
-        stageEditorState.pendingRange = null;
+        stageEditorState.captureGestureOpen = false;
+        stageEditorState.captureBaseRanges = null;
         if (next) clearNativeSelection();
         updateStageEditorModeUi();
         renderStageEditorText();
         updateStageEditorControls();
         if (quiet) return;
+        const prepared = pendingRangeList().length;
         setEditorMessage(
             next
-                ? '已切换到点选模式：点一下开头，再点一下结尾，就能选中中间这一段。'
-                : '已切换到拖选模式：直接用手指拖选文字。',
+                ? (prepared > 0
+                    ? `已切换到点选模式：之前准备的 ${prepared} 段仍保留，可以继续点选。`
+                    : '已切换到点选模式：点一下开头，再点一下结尾，就能加入待分配范围。')
+                : (prepared > 0
+                    ? `已切换到拖选模式：之前准备的 ${prepared} 段仍保留，可以继续拖选。`
+                    : '已切换到拖选模式：直接用手指拖选文字。'),
             'info',
         );
     }
@@ -1745,16 +1829,17 @@
         if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
         const result = selectionOffsetsInSurface();
         if (!result) return;
-        stageEditorState.pendingRange = result;
+        const base = stageEditorState.captureGestureOpen && Array.isArray(stageEditorState.captureBaseRanges)
+            ? stageEditorState.captureBaseRanges
+            : stageEditorState.pendingRanges;
+        setPendingRanges([...base, result]);
         stageEditorState.selectedMarkedRange = null;
         stageEditorState.tapHead = null;
         stageEditorState.tapTail = null;
-        const preview = result.quote.replace(/\s+/g, ' ').trim();
-        const selectionText = editorElement('selection-text');
-        if (selectionText) {
-            selectionText.textContent = preview.length > 70 ? `${preview.slice(0, 70)}…` : preview;
-        }
-        setEditorMessage(`已选择 ${result.end - result.start} 个字符，可分配给当前阶段或常驻提示。`, 'info');
+        stageEditorState.lastCaptureAt = Date.now();
+        const count = pendingRangeList().length;
+        updateSelectionPreview();
+        setEditorMessage(`已加入待分配范围（共 ${count} 段），可以继续拖选更多文字，或直接分配。`, 'info');
         updateStageEditorControls();
         syncPendingPreviewVisibility();
     }
@@ -1796,9 +1881,15 @@
         if (!waitingForTail) {
             stageEditorState.tapHead = offset;
             stageEditorState.tapTail = null;
-            stageEditorState.pendingRange = null;
             stageEditorState.selectedMarkedRange = null;
-            setEditorMessage('起点放好了，再去这一段的结尾点一下。', 'info');
+            clearNativeSelection();
+            const prepared = pendingRangeList().length;
+            setEditorMessage(
+                prepared > 0
+                    ? `已放下新一段的开头（之前准备的 ${prepared} 段仍保留），再去这一段的结尾点一下。`
+                    : '起点放好了，再去这一段的结尾点一下。',
+                'info',
+            );
         } else {
             const start = Math.min(stageEditorState.tapHead, offset);
             const end = Math.max(stageEditorState.tapHead, offset);
@@ -1806,18 +1897,12 @@
                 setEditorMessage('起点和结尾在同一处，请换一个位置再点。', 'warning');
                 return;
             }
-            stageEditorState.tapTail = offset;
-            stageEditorState.pendingRange = {
-                start,
-                end,
-                quote: stageEditorState.text.slice(start, end),
-            };
-            const preview = stageEditorState.pendingRange.quote.replace(/\s+/g, ' ').trim();
-            const selectionText = editorElement('selection-text');
-            if (selectionText) {
-                selectionText.textContent = preview.length > 70 ? `${preview.slice(0, 70)}…` : preview;
-            }
-            setEditorMessage(`已选好这一段（${end - start} 个字符），可以分配给当前阶段，或者点第三个位置重新选。`, 'info');
+            addPendingRanges([{ start, end }]);
+            stageEditorState.tapHead = null;
+            stageEditorState.tapTail = null;
+            const count = pendingRangeList().length;
+            updateSelectionPreview();
+            setEditorMessage(`这一段已加入待分配（共 ${count} 段），可以继续点下一段，或直接分配。`, 'success');
         }
         renderStageEditorText();
         updateStageEditorControls();
@@ -1834,7 +1919,6 @@
         const end = Number(span.dataset.end);
         if (!ownerId || !Number.isFinite(start) || !Number.isFinite(end)) return;
         stageEditorState.activeOwnerId = ownerId;
-        stageEditorState.pendingRange = null;
         stageEditorState.selectedMarkedRange = { ownerId, start, end };
         stageEditorState.tapHead = null;
         stageEditorState.tapTail = null;
@@ -1846,12 +1930,12 @@
     }
 
     function assignPendingRange(ownerId) {
-        const range = stageEditorState.pendingRange;
-        if (!range || range.end <= range.start) {
+        const ranges = pendingRangeList();
+        if (ranges.length === 0) {
             setEditorMessage(
                 stageEditorState.tapMode
-                    ? '请先在这里点一下开头，再点一下结尾。'
-                    : '请先在提示词原文中拖选文字。',
+                    ? '请先点一下某段的开头，再点一下结尾，把内容加入待分配。'
+                    : '请先在提示词原文中拖选文字，加入待分配。',
                 'warning',
             );
             return;
@@ -1860,9 +1944,9 @@
             setEditorMessage('请先新建或选择一个剧情阶段。', 'warning');
             return;
         }
-        assignRangeToOwner(ownerId, range.start, range.end);
+        ranges.forEach(range => assignRangeToOwner(ownerId, range.start, range.end));
         stageEditorState.activeOwnerId = ownerId;
-        stageEditorState.pendingRange = null;
+        stageEditorState.pendingRanges = [];
         stageEditorState.selectedMarkedRange = null;
         stageEditorState.tapHead = null;
         stageEditorState.tapTail = null;
@@ -1871,47 +1955,71 @@
         renderStageEditorSidebar();
         renderStageEditorSettings();
         renderStageEditorText();
-        setEditorMessage(`已把选中文字分配给“${ownerName(ownerId)}”。`, 'success');
+        setEditorMessage(
+            ranges.length === 1
+                ? `已把选中文字分配给“${ownerName(ownerId)}”。`
+                : `已把 ${ranges.length} 段待分配文字一起分配给“${ownerName(ownerId)}”。`,
+            'success',
+        );
         updateStageEditorControls();
     }
 
     function clearSelectedEditorRange() {
-        const range = stageEditorState.pendingRange || stageEditorState.selectedMarkedRange;
-        if (!range) {
-            setEditorMessage('请先拖选文字，或点击一处已有的彩色标记。', 'warning');
+        const pending = pendingRangeList();
+        const marked = stageEditorState.selectedMarkedRange;
+        if (pending.length === 0 && !marked) {
+            setEditorMessage('当前没有待分配范围，也没有点选已有标记。', 'warning');
             return;
         }
-        clearRangeFromAllOwners(range.start, range.end);
-        stageEditorState.pendingRange = null;
-        stageEditorState.selectedMarkedRange = null;
-        stageEditorState.tapHead = null;
-        stageEditorState.tapTail = null;
+        const messages = [];
+        if (pending.length > 0) {
+            stageEditorState.pendingRanges = [];
+            stageEditorState.tapHead = null;
+            stageEditorState.tapTail = null;
+            messages.push(`已清除 ${pending.length} 段待分配范围`);
+        }
+        if (marked) {
+            clearRangeFromAllOwners(marked.start, marked.end);
+            stageEditorState.selectedMarkedRange = null;
+            markStageEditorDirty();
+            messages.push(`已把“${ownerName(marked.ownerId)}”的一处标记恢复为未分配`);
+        }
         clearNativeSelection();
-        markStageEditorDirty();
         renderStageEditorSidebar();
         renderStageEditorText();
-        setEditorMessage('所选范围已恢复为未分配。', 'success');
+        setEditorMessage(`${messages.join('；')}。`, 'success');
         updateStageEditorControls();
     }
 
     function updateStageEditorControls() {
-        if (stageEditorState.busy) return;
-        const hasPending = Boolean(stageEditorState.pendingRange);
+        const pendingCount = pendingRangeList().length;
+        const hasPending = pendingCount > 0;
         const hasMarked = Boolean(stageEditorState.selectedMarkedRange);
         const hasActive = stageEditorState.activeOwnerId === 'always' || Boolean(activeStage());
         const assignButton = editorElement('assign');
         const assignAlwaysButton = editorElement('assign-always');
         const clearButton = editorElement('clear-range');
+        updateSelectionPreview();
+        updateTapMarkerStatus();
+        if (stageEditorState.busy) return;
         if (assignButton) {
             assignButton.disabled = !hasPending || !hasActive;
             assignButton.textContent = stageEditorState.activeOwnerId === 'always'
-                ? '分配给常驻提示'
-                : `分配给${activeStage() ? `“${activeStage().name || '未命名阶段'}”` : '当前阶段'}`;
+                ? (pendingCount > 1 ? `分配给常驻提示（${pendingCount} 段）` : '分配给常驻提示')
+                : `分配给${activeStage() ? `“${activeStage().name || '未命名阶段'}”` : '当前阶段'}${pendingCount > 1 ? `（${pendingCount} 段）` : ''}`;
         }
-        if (assignAlwaysButton) assignAlwaysButton.disabled = !hasPending;
-        if (clearButton) clearButton.disabled = !hasPending && !hasMarked;
-        const selectionText = editorElement('selection-text');
-        if (selectionText && !hasPending) selectionText.textContent = '尚未选择文字';
+        if (assignAlwaysButton) {
+            assignAlwaysButton.disabled = !hasPending;
+            assignAlwaysButton.textContent = pendingCount > 1
+                ? `设为常驻提示（${pendingCount} 段）`
+                : '设为常驻提示';
+        }
+        if (clearButton) {
+            clearButton.disabled = !hasPending && !hasMarked;
+            clearButton.textContent = hasPending
+                ? `清除待分配（${pendingCount} 段）`
+                : '清除所选标记';
+        }
     }
 
     function buildRangeLayoutFromEditor() {
@@ -1952,7 +2060,9 @@
         stageEditorState.worldbookName = worldbookName;
         stageEditorState.entry = entry;
         stageEditorState.text = text;
-        stageEditorState.pendingRange = null;
+        stageEditorState.pendingRanges = [];
+        stageEditorState.captureBaseRanges = null;
+        stageEditorState.captureGestureOpen = false;
         stageEditorState.selectedMarkedRange = null;
         stageEditorState.tapHead = null;
         stageEditorState.tapTail = null;
@@ -2066,7 +2176,9 @@
         stageEditorState.scrollLocked = false;
         stageEditorState.touchActive = false;
         stageEditorState.touchSnapshot = null;
-        stageEditorState.pendingRange = null;
+        stageEditorState.pendingRanges = [];
+        stageEditorState.captureBaseRanges = null;
+        stageEditorState.captureGestureOpen = false;
         stageEditorState.selectedMarkedRange = null;
         stageEditorState.tapHead = null;
         stageEditorState.tapTail = null;
@@ -2807,6 +2919,42 @@
     border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 78%, transparent);
     background: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 32%, transparent);
 }
+#${EDITOR_ID} .dga-tap-state {
+    display: flex;
+    align-items: center;
+    min-height: 34px;
+    margin: 0 0 9px;
+    padding: 7px 10px;
+    border: 1px dashed color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 26%, transparent);
+    border-radius: 9px;
+    font-size: 0.8rem;
+    font-weight: 620;
+    line-height: 1.35;
+}
+#${EDITOR_ID} .dga-tap-state::before {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
+    margin-right: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    content: '';
+}
+#${EDITOR_ID} .dga-tap-state[data-step="head"] {
+    border-color: rgba(96, 165, 250, 0.65);
+    color: #93c5fd;
+    background: rgba(59, 130, 246, 0.12);
+}
+#${EDITOR_ID} .dga-tap-state[data-step="tail"] {
+    border-color: rgba(251, 191, 36, 0.7);
+    color: #fcd34d;
+    background: rgba(245, 158, 11, 0.14);
+}
+#${EDITOR_ID} .dga-tap-state[data-step="ready"] {
+    border-color: rgba(52, 211, 153, 0.65);
+    color: #6ee7b7;
+    background: rgba(16, 185, 129, 0.13);
+}
 #${EDITOR_ID} .dga-text-surface.dga-tap-mode {
     user-select: none;
     -webkit-user-select: none;
@@ -2984,6 +3132,7 @@
                     <button class="dga-button dga-mode-button" id="${UI_PREFIX}-editor-mode-tap" type="button">点选头尾</button>
                     <button class="dga-button dga-mode-button" id="${UI_PREFIX}-editor-mode-drag" type="button">拖选文字</button>
                 </div>
+                <div class="dga-tap-state" id="${UI_PREFIX}-editor-tap-state" data-step="head" aria-live="polite" hidden></div>
             </div>
             <div class="dga-selection-bar">
                 <div class="dga-selection-preview"><b>当前选择：</b><span id="${UI_PREFIX}-editor-selection-text">尚未选择文字</span></div>
@@ -3070,11 +3219,31 @@
         };
 
         const surface = editorElement('surface');
-        const captureSoon = () => hostWindow.setTimeout(captureStageEditorSelection, 0);
-        surface.addEventListener('mouseup', captureStageEditorSelection);
+        const beginCaptureGesture = () => {
+            if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
+            stageEditorState.captureGestureOpen = true;
+            stageEditorState.captureBaseRanges = stageEditorState.pendingRanges.map(range => ({ ...range }));
+            stageEditorState.lastCaptureAt = 0;
+        };
+        const finishCaptureGesture = () => {
+            stageEditorState.captureGestureOpen = false;
+            stageEditorState.captureBaseRanges = null;
+            stageEditorState.lastCaptureAt = 0;
+        };
+        const captureAndFinishGestureSoon = () => {
+            hostWindow.setTimeout(() => {
+                captureStageEditorSelection();
+                finishCaptureGesture();
+            }, 0);
+        };
+        surface.addEventListener('mousedown', beginCaptureGesture);
+        surface.addEventListener('mouseup', () => {
+            captureStageEditorSelection();
+            finishCaptureGesture();
+        });
         surface.addEventListener('keyup', captureStageEditorSelection);
-        surface.addEventListener('touchend', captureSoon, { passive: true });
-        surface.addEventListener('touchcancel', captureSoon, { passive: true });
+        surface.addEventListener('touchend', captureAndFinishGestureSoon, { passive: true });
+        surface.addEventListener('touchcancel', captureAndFinishGestureSoon, { passive: true });
         surface.addEventListener('click', event => {
             if (stageEditorState.tapMode) {
                 placeTapMarker(event);
@@ -3098,9 +3267,12 @@
         surface.addEventListener('touchstart', () => {
             stageEditorState.touchActive = true;
             stageEditorState.scrollLocked = false;
-            stageEditorState.touchSnapshot = stageEditorState.pendingRange
-                ? { ...stageEditorState.pendingRange }
-                : null;
+            stageEditorState.touchSnapshot = {
+                pendingRanges: stageEditorState.pendingRanges.map(range => ({ ...range })),
+                tapHead: stageEditorState.tapHead,
+                tapTail: stageEditorState.tapTail,
+            };
+            beginCaptureGesture();
         }, { passive: true });
         const endEditorTouch = () => {
             stageEditorState.touchActive = false;
@@ -3117,9 +3289,13 @@
             if (stageEditorState.tapMode) return;
             if (!selectionOffsetsInSurface()) return;
             stageEditorState.scrollLocked = true;
-            stageEditorState.pendingRange = stageEditorState.touchSnapshot
-                ? { ...stageEditorState.touchSnapshot }
-                : null;
+            const snapshot = stageEditorState.touchSnapshot;
+            stageEditorState.pendingRanges = snapshot && Array.isArray(snapshot.pendingRanges)
+                ? snapshot.pendingRanges.map(range => ({ ...range }))
+                : [];
+            stageEditorState.tapHead = snapshot ? snapshot.tapHead : null;
+            stageEditorState.tapTail = snapshot ? snapshot.tapTail : null;
+            finishCaptureGesture();
             clearNativeSelection();
             updateStageEditorControls();
         };
