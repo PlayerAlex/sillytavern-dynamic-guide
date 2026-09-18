@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3.1';
+    const VERSION = '1.3.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1261,6 +1261,12 @@
         activeOwnerId: '',
         pendingRange: null,
         selectedMarkedRange: null,
+        tapMode: false,
+        tapHead: null,
+        tapTail: null,
+        touchActive: false,
+        scrollLocked: false,
+        touchSnapshot: null,
         unresolvedCount: 0,
         dirty: false,
         busy: false,
@@ -1394,6 +1400,84 @@
         } catch (error) {
             console.warn(`[${SCRIPT_NAME}] 清理文字选择失败`, error);
         }
+    }
+
+    /*
+     * 手机上如果一直保留系统原生选区，用户再往下滑动时浏览器会把选区
+     * 一路扩展到顶部。统一改成“自己画高亮”：有原生选区时先隐藏自绘高亮，
+     * 收起原生选区后再把自绘高亮显示出来。
+     */
+    function syncPendingPreviewVisibility() {
+        const surface = editorElement('surface');
+        if (!surface) return;
+        surface.classList.toggle('dga-tap-mode', Boolean(stageEditorState.tapMode));
+        const liveSelection = Boolean(selectionOffsetsInSurface());
+        surface.classList.toggle('dga-hide-pending', liveSelection);
+    }
+
+    function editorPendingSegments() {
+        const pending = stageEditorState.pendingRange;
+        if (!pending || pending.end <= pending.start) return [];
+        let remaining = normalizedIntervals([pending]);
+        allEditorMarks().forEach(mark => {
+            remaining = remaining.flatMap(range => subtractInterval([range], mark.start, mark.end));
+        });
+        return remaining;
+    }
+
+    function canPlaceTapMarkers() {
+        const surface = editorElement('surface');
+        const documentRef = surface && surface.ownerDocument;
+        if (!documentRef) return false;
+        return typeof documentRef.caretRangeFromPoint === 'function'
+            || typeof documentRef.caretPositionFromPoint === 'function';
+    }
+
+    function shouldDefaultToTapMode() {
+        if (!canPlaceTapMarkers()) return false;
+        if (typeof hostWindow.matchMedia !== 'function') return false;
+        try {
+            return hostWindow.matchMedia('(pointer: coarse)').matches;
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 判断触屏输入失败`, error);
+            return false;
+        }
+    }
+
+    function updateStageEditorModeUi() {
+        const surface = editorElement('surface');
+        if (surface) surface.classList.toggle('dga-tap-mode', Boolean(stageEditorState.tapMode));
+        const tapButton = editorElement('mode-tap');
+        if (tapButton) tapButton.classList.toggle('is-active', Boolean(stageEditorState.tapMode));
+        const dragButton = editorElement('mode-drag');
+        if (dragButton) dragButton.classList.toggle('is-active', !stageEditorState.tapMode);
+        const help = editorElement('workspace-help');
+        if (help) {
+            help.textContent = stageEditorState.tapMode
+                ? '先在要开始的字上点一下，再在这一段的结尾点一下，中间会自动选中。想重新选就再点第三个位置。'
+                : '像涂色一样拖选文字，再分配给阶段。这里只决定哪些提示词在何时发送，世界书正文不会被改写。';
+        }
+    }
+
+    function setStageEditorTapMode(enabled, options) {
+        const next = Boolean(enabled);
+        const quiet = Boolean(options && options.quiet);
+        stageEditorState.tapMode = next;
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
+        stageEditorState.selectedMarkedRange = null;
+        stageEditorState.pendingRange = null;
+        if (next) clearNativeSelection();
+        updateStageEditorModeUi();
+        renderStageEditorText();
+        updateStageEditorControls();
+        if (quiet) return;
+        setEditorMessage(
+            next
+                ? '已切换到点选模式：点一下开头，再点一下结尾，就能选中中间这一段。'
+                : '已切换到拖选模式：直接用手指拖选文字。',
+            'info',
+        );
     }
 
     function setActiveOwner(ownerId) {
@@ -1548,12 +1632,52 @@
         surface.replaceChildren();
         const text = stageEditorState.text;
         const marks = allEditorMarks();
-        let cursor = 0;
+        const pendingSegments = editorPendingSegments();
+        const caretColor = normalizeColor(ownerColor(stageEditorState.activeOwnerId), '#8b5cf6');
+        const carets = [];
+        if (stageEditorState.tapMode) {
+            if (stageEditorState.tapHead != null) {
+                carets.push({ offset: clampOffset(stageEditorState.tapHead, text.length), edge: 'head' });
+            }
+            if (stageEditorState.tapTail != null) {
+                carets.push({ offset: clampOffset(stageEditorState.tapTail, text.length), edge: 'tail' });
+            }
+        }
+
+        const boundaries = new Set([0, text.length]);
         marks.forEach(mark => {
-            const start = Math.max(cursor, mark.start);
-            const end = Math.max(start, mark.end);
-            if (start > cursor) surface.appendChild(documentRef.createTextNode(text.slice(cursor, start)));
-            if (end > start) {
+            boundaries.add(mark.start);
+            boundaries.add(mark.end);
+        });
+        pendingSegments.forEach(range => {
+            boundaries.add(range.start);
+            boundaries.add(range.end);
+        });
+        carets.forEach(caret => boundaries.add(caret.offset));
+        const points = [...boundaries]
+            .filter(point => point >= 0 && point <= text.length)
+            .sort((left, right) => left - right);
+
+        const appendCaret = caret => {
+            const element = documentRef.createElement('span');
+            element.className = `dga-tap-caret dga-tap-caret-${caret.edge}`;
+            element.dataset.edge = caret.edge;
+            element.dataset.offset = String(caret.offset);
+            element.style.setProperty('--dga-mark-color', caretColor);
+            element.title = caret.edge === 'head' ? '这一段的开头' : '这一段的结尾';
+            surface.appendChild(element);
+        };
+
+        points.forEach((point, index) => {
+            carets
+                .filter(caret => caret.offset === point)
+                .forEach(appendCaret);
+            const next = points[index + 1];
+            if (next == null || next <= point) return;
+            const content = text.slice(point, next);
+            const mark = marks.find(item => item.start <= point && item.end >= next);
+            const pending = pendingSegments.find(item => item.start <= point && item.end >= next);
+            if (mark) {
                 const span = documentRef.createElement('span');
                 span.className = 'dga-text-mark';
                 if (mark.ownerId === stageEditorState.activeOwnerId) span.classList.add('is-active');
@@ -1568,16 +1692,33 @@
                 span.dataset.start = String(mark.start);
                 span.dataset.end = String(mark.end);
                 span.style.setProperty('--dga-mark-color', normalizeColor(mark.color, '#64748b'));
-                span.style.backgroundColor = colorToRgba(mark.color, mark.ownerId === stageEditorState.activeOwnerId ? 0.38 : 0.22);
+                span.style.backgroundColor = colorToRgba(
+                    mark.color,
+                    mark.ownerId === stageEditorState.activeOwnerId ? 0.38 : 0.22,
+                );
                 span.title = mark.name;
-                span.textContent = text.slice(start, end);
+                span.textContent = content;
                 surface.appendChild(span);
+                return;
             }
-            cursor = Math.max(cursor, end);
+            if (pending) {
+                const span = documentRef.createElement('span');
+                span.className = 'dga-text-mark is-pending';
+                span.dataset.pending = '1';
+                span.dataset.start = String(pending.start);
+                span.dataset.end = String(pending.end);
+                span.style.setProperty('--dga-mark-color', caretColor);
+                span.title = '当前选择，还没分配';
+                span.textContent = content;
+                surface.appendChild(span);
+                return;
+            }
+            if (content) surface.appendChild(documentRef.createTextNode(content));
         });
-        if (cursor < text.length) surface.appendChild(documentRef.createTextNode(text.slice(cursor)));
+
         if (!text) surface.textContent = '这个世界书条目没有提示词内容。';
         surface.scrollTop = oldScrollTop;
+        syncPendingPreviewVisibility();
     }
 
     function selectionOffsetsInSurface() {
@@ -1601,16 +1742,84 @@
     }
 
     function captureStageEditorSelection() {
+        if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
         const result = selectionOffsetsInSurface();
         if (!result) return;
         stageEditorState.pendingRange = result;
         stageEditorState.selectedMarkedRange = null;
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
         const preview = result.quote.replace(/\s+/g, ' ').trim();
         const selectionText = editorElement('selection-text');
         if (selectionText) {
             selectionText.textContent = preview.length > 70 ? `${preview.slice(0, 70)}…` : preview;
         }
         setEditorMessage(`已选择 ${result.end - result.start} 个字符，可分配给当前阶段或常驻提示。`, 'info');
+        updateStageEditorControls();
+        syncPendingPreviewVisibility();
+    }
+
+    function offsetFromPoint(clientX, clientY) {
+        const surface = editorElement('surface');
+        const documentRef = surface && surface.ownerDocument;
+        if (!surface || !documentRef) return null;
+        let caretRange = null;
+        try {
+            if (typeof documentRef.caretRangeFromPoint === 'function') {
+                caretRange = documentRef.caretRangeFromPoint(clientX, clientY);
+            } else if (typeof documentRef.caretPositionFromPoint === 'function') {
+                const position = documentRef.caretPositionFromPoint(clientX, clientY);
+                if (position && position.offsetNode) {
+                    caretRange = documentRef.createRange();
+                    caretRange.setStart(position.offsetNode, position.offset);
+                    caretRange.collapse(true);
+                }
+            }
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 读取点击位置失败`, error);
+            return null;
+        }
+        if (!caretRange || !surface.contains(caretRange.startContainer)) return null;
+        const before = documentRef.createRange();
+        before.selectNodeContents(surface);
+        before.setEnd(caretRange.startContainer, caretRange.startOffset);
+        return clampOffset(before.toString().length, stageEditorState.text.length);
+    }
+
+    function placeTapMarker(event) {
+        const offset = offsetFromPoint(event.clientX, event.clientY);
+        if (offset == null) {
+            setEditorMessage('没找到这里的文字位置，请点在这一段文字上。', 'warning');
+            return;
+        }
+        const waitingForTail = stageEditorState.tapHead != null && stageEditorState.tapTail == null;
+        if (!waitingForTail) {
+            stageEditorState.tapHead = offset;
+            stageEditorState.tapTail = null;
+            stageEditorState.pendingRange = null;
+            stageEditorState.selectedMarkedRange = null;
+            setEditorMessage('起点放好了，再去这一段的结尾点一下。', 'info');
+        } else {
+            const start = Math.min(stageEditorState.tapHead, offset);
+            const end = Math.max(stageEditorState.tapHead, offset);
+            if (end - start < 1) {
+                setEditorMessage('起点和结尾在同一处，请换一个位置再点。', 'warning');
+                return;
+            }
+            stageEditorState.tapTail = offset;
+            stageEditorState.pendingRange = {
+                start,
+                end,
+                quote: stageEditorState.text.slice(start, end),
+            };
+            const preview = stageEditorState.pendingRange.quote.replace(/\s+/g, ' ').trim();
+            const selectionText = editorElement('selection-text');
+            if (selectionText) {
+                selectionText.textContent = preview.length > 70 ? `${preview.slice(0, 70)}…` : preview;
+            }
+            setEditorMessage(`已选好这一段（${end - start} 个字符），可以分配给当前阶段，或者点第三个位置重新选。`, 'info');
+        }
+        renderStageEditorText();
         updateStageEditorControls();
     }
 
@@ -1619,6 +1828,7 @@
             ? event.target.closest('.dga-text-mark')
             : null;
         if (!span) return;
+        if (span.dataset.pending) return;
         const ownerId = span.dataset.ownerId;
         const start = Number(span.dataset.start);
         const end = Number(span.dataset.end);
@@ -1626,6 +1836,8 @@
         stageEditorState.activeOwnerId = ownerId;
         stageEditorState.pendingRange = null;
         stageEditorState.selectedMarkedRange = { ownerId, start, end };
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
         renderStageEditorSidebar();
         renderStageEditorSettings();
         renderStageEditorText();
@@ -1636,7 +1848,12 @@
     function assignPendingRange(ownerId) {
         const range = stageEditorState.pendingRange;
         if (!range || range.end <= range.start) {
-            setEditorMessage('请先在右侧提示词原文中拖选文字。', 'warning');
+            setEditorMessage(
+                stageEditorState.tapMode
+                    ? '请先在这里点一下开头，再点一下结尾。'
+                    : '请先在提示词原文中拖选文字。',
+                'warning',
+            );
             return;
         }
         if (ownerId !== 'always' && !stageEditorState.stages.some(stage => stage.id === ownerId)) {
@@ -1647,6 +1864,8 @@
         stageEditorState.activeOwnerId = ownerId;
         stageEditorState.pendingRange = null;
         stageEditorState.selectedMarkedRange = null;
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
         clearNativeSelection();
         markStageEditorDirty();
         renderStageEditorSidebar();
@@ -1665,6 +1884,8 @@
         clearRangeFromAllOwners(range.start, range.end);
         stageEditorState.pendingRange = null;
         stageEditorState.selectedMarkedRange = null;
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
         clearNativeSelection();
         markStageEditorDirty();
         renderStageEditorSidebar();
@@ -1733,6 +1954,12 @@
         stageEditorState.text = text;
         stageEditorState.pendingRange = null;
         stageEditorState.selectedMarkedRange = null;
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
+        stageEditorState.tapMode = shouldDefaultToTapMode();
+        stageEditorState.scrollLocked = false;
+        stageEditorState.touchActive = false;
+        stageEditorState.touchSnapshot = null;
         stageEditorState.unresolvedCount = 0;
         stageEditorState.dirty = false;
 
@@ -1772,6 +1999,7 @@
         if (sourceName) sourceName.textContent = `[${worldbookName}] ${entryName(entry)}`;
         renderStageEditorSidebar();
         renderStageEditorSettings();
+        updateStageEditorModeUi();
         renderStageEditorText();
         updateStageEditorControls();
         if (stageEditorState.unresolvedCount > 0) {
@@ -1780,9 +2008,19 @@
                 'warning',
             );
         } else if (layout) {
-            setEditorMessage('阶段划分已载入。拖选原文，可以继续调整。', 'info');
+            setEditorMessage(
+                stageEditorState.tapMode
+                    ? '阶段划分已载入。点一下开头、再点一下结尾，就能继续调整。'
+                    : '阶段划分已载入。拖选原文，可以继续调整。',
+                'info',
+            );
         } else {
-            setEditorMessage('拖选右侧提示词，然后把文字分配给“阶段 1”或常驻提示。', 'info');
+            setEditorMessage(
+                stageEditorState.tapMode
+                    ? '点一下这一段的开头，再点一下结尾，中间会自动选中，然后分配给“阶段 1”。'
+                    : '拖选提示词原文，然后把文字分配给“阶段 1”或常驻提示。',
+                'info',
+            );
         }
     }
 
@@ -1825,6 +2063,13 @@
             const accepted = hostWindow.confirm('阶段划分还有未保存的修改，仍然关闭吗？');
             if (!accepted) return;
         }
+        stageEditorState.scrollLocked = false;
+        stageEditorState.touchActive = false;
+        stageEditorState.touchSnapshot = null;
+        stageEditorState.pendingRange = null;
+        stageEditorState.selectedMarkedRange = null;
+        stageEditorState.tapHead = null;
+        stageEditorState.tapTail = null;
         const documentRef = getHostDocument();
         const editor = documentRef && documentRef.getElementById(EDITOR_ID);
         if (editor) editor.hidden = true;
@@ -2525,6 +2770,49 @@
 }
 #${EDITOR_ID} .dga-text-mark.is-active { box-shadow: 0 0 0 1px var(--dga-mark-color); }
 #${EDITOR_ID} .dga-text-mark.is-selected { outline: 2px solid #fff; outline-offset: 2px; }
+#${EDITOR_ID} .dga-text-mark.is-pending {
+    background: color-mix(in srgb, var(--dga-mark-color, #8b5cf6) 18%, transparent);
+    border-bottom-style: dashed;
+    border-bottom-width: 2px;
+    cursor: default;
+}
+#${EDITOR_ID} .dga-hide-pending .dga-text-mark.is-pending {
+    background: transparent;
+    border-bottom-color: transparent;
+}
+#${EDITOR_ID} .dga-tap-caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.1em;
+    margin: 0 -1px;
+    vertical-align: -0.2em;
+    background: var(--dga-mark-color, #8b5cf6);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+#${EDITOR_ID} .dga-tap-caret-tail {
+    background: transparent;
+    border-left: 2px dashed var(--dga-mark-color, #8b5cf6);
+    box-shadow: none;
+}
+#${EDITOR_ID} .dga-mode-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 7px;
+    margin: 0 0 9px;
+}
+#${EDITOR_ID} .dga-mode-label { font-size: 0.78rem; opacity: 0.7; }
+#${EDITOR_ID} .dga-mode-button { padding: 5px 11px; font-size: 0.8rem; }
+#${EDITOR_ID} .dga-mode-button.is-active {
+    border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 78%, transparent);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #7b62d9) 32%, transparent);
+}
+#${EDITOR_ID} .dga-text-surface.dga-tap-mode {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    cursor: pointer;
+}
 #${EDITOR_ID} .dga-editor-message {
     padding: 9px 11px;
     border-radius: 9px;
@@ -2690,7 +2978,12 @@
         <section class="dga-editor-workspace">
             <div>
                 <h3>世界书提示词原文</h3>
-                <p class="dga-editor-help">像涂色一样拖选文字，再分配给左侧阶段。这里只决定哪些提示词在何时发送，世界书正文不会被改写。</p>
+                <p class="dga-editor-help" id="${UI_PREFIX}-editor-workspace-help">像涂色一样拖选文字，再分配给阶段。这里只决定哪些提示词在何时发送，世界书正文不会被改写。</p>
+                <div class="dga-mode-row">
+                    <span class="dga-mode-label">选择方式</span>
+                    <button class="dga-button dga-mode-button" id="${UI_PREFIX}-editor-mode-tap" type="button">点选头尾</button>
+                    <button class="dga-button dga-mode-button" id="${UI_PREFIX}-editor-mode-drag" type="button">拖选文字</button>
+                </div>
             </div>
             <div class="dga-selection-bar">
                 <div class="dga-selection-preview"><b>当前选择：</b><span id="${UI_PREFIX}-editor-selection-text">尚未选择文字</span></div>
@@ -2783,12 +3076,56 @@
         surface.addEventListener('touchend', captureSoon, { passive: true });
         surface.addEventListener('touchcancel', captureSoon, { passive: true });
         surface.addEventListener('click', event => {
+            if (stageEditorState.tapMode) {
+                placeTapMarker(event);
+                return;
+            }
             if (selectionOffsetsInSurface()) {
                 captureStageEditorSelection();
                 return;
             }
             selectMarkedRangeFromEvent(event);
         });
+
+        editorElement('mode-tap').onclick = () => setStageEditorTapMode(true);
+        editorElement('mode-drag').onclick = () => setStageEditorTapMode(false);
+
+        /*
+         * 手机上一个常见坑：选好文字以后再往下滑，浏览器会把“滑动”当成
+         * 拖动选区，一路扩展到全文开头。这里在滑动发生时立刻收起原生选区，
+         * 并把手势开始前记下的范围还原回来，滚动照常进行。
+         */
+        surface.addEventListener('touchstart', () => {
+            stageEditorState.touchActive = true;
+            stageEditorState.scrollLocked = false;
+            stageEditorState.touchSnapshot = stageEditorState.pendingRange
+                ? { ...stageEditorState.pendingRange }
+                : null;
+        }, { passive: true });
+        const endEditorTouch = () => {
+            stageEditorState.touchActive = false;
+            stageEditorState.touchSnapshot = null;
+            if (!stageEditorState.scrollLocked) return;
+            stageEditorState.scrollLocked = false;
+            renderStageEditorText();
+            updateStageEditorControls();
+        };
+        surface.addEventListener('touchend', endEditorTouch, { passive: true });
+        surface.addEventListener('touchcancel', endEditorTouch, { passive: true });
+        const onEditorScroll = () => {
+            if (!stageEditorState.touchActive || stageEditorState.scrollLocked) return;
+            if (stageEditorState.tapMode) return;
+            if (!selectionOffsetsInSurface()) return;
+            stageEditorState.scrollLocked = true;
+            stageEditorState.pendingRange = stageEditorState.touchSnapshot
+                ? { ...stageEditorState.touchSnapshot }
+                : null;
+            clearNativeSelection();
+            updateStageEditorControls();
+        };
+        const editorScroller = editor.querySelector('.dga-editor-main');
+        if (editorScroller) editorScroller.addEventListener('scroll', onEditorScroll, { passive: true });
+        surface.addEventListener('scroll', onEditorScroll, { passive: true });
 
         // 手机上拖动系统选择手柄时只会触发 selectionchange，
         // 必须靠它才能拿到最终选区，否则“分配”按钮会一直是灰的。
