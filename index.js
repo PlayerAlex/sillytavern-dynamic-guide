@@ -2,7 +2,7 @@
     'use strict';
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '1.3.5';
+    const VERSION = '1.3.6';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -15,6 +15,10 @@
     const STYLE_ID = `${UI_PREFIX}-style`;
     const LAYOUT_META_KEY = 'dynamicGuideAssistant';
     const LAYOUT_VERSION = 1;
+    const LAYOUT_EMBED_BEGIN = '<!-- DGA_LAYOUT_V1:BEGIN -->';
+    const LAYOUT_EMBED_END = '<!-- DGA_LAYOUT_V1:END -->';
+    const LAYOUT_EMBED_RE = /(?:\r?\n)?<!--\s*DGA_LAYOUT_V1:BEGIN\s*-->[\s\S]*?<!--\s*DGA_LAYOUT_V1:END\s*-->(?:\r?\n)?/gi;
+    const LAYOUT_EMBED_CAPTURE_RE = /<!--\s*DGA_LAYOUT_V1:BEGIN\s*-->([\s\S]*?)<!--\s*DGA_LAYOUT_V1:END\s*-->/i;
     const DEFAULT_STAGE_COLORS = [
         '#8b5cf6',
         '#3b82f6',
@@ -58,6 +62,91 @@
         return String(text == null ? '' : text)
             .replace(/^\uFEFF/, '')
             .replace(/\r\n?/g, '\n');
+    }
+
+    function utf8ToBase64(text) {
+        const source = String(text == null ? '' : text);
+        const encode = hostWindow.TextEncoder || currentWindow.TextEncoder || globalThis.TextEncoder;
+        const btoaFn = hostWindow.btoa || currentWindow.btoa || globalThis.btoa;
+        if (encode && btoaFn) {
+            const bytes = new encode().encode(source);
+            let binary = '';
+            for (let index = 0; index < bytes.length; index += 1) {
+                binary += String.fromCharCode(bytes[index]);
+            }
+            return btoaFn(binary);
+        }
+        if (typeof Buffer !== 'undefined') return Buffer.from(source, 'utf8').toString('base64');
+        throw new Error('当前环境无法编码阶段划分');
+    }
+
+    function base64ToUtf8(value) {
+        const source = String(value || '').replace(/\s+/g, '');
+        if (!source) return '';
+        const atobFn = hostWindow.atob || currentWindow.atob || globalThis.atob;
+        const decode = hostWindow.TextDecoder || currentWindow.TextDecoder || globalThis.TextDecoder;
+        if (atobFn && decode) {
+            const binary = atobFn(source);
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+                bytes[index] = binary.charCodeAt(index);
+            }
+            return new decode('utf-8').decode(bytes);
+        }
+        if (typeof Buffer !== 'undefined') return Buffer.from(source, 'base64').toString('utf8');
+        throw new Error('当前环境无法解码阶段划分');
+    }
+
+    function isUsableLayoutShape(layout) {
+        return Boolean(
+            layout
+            && typeof layout === 'object'
+            && layout.mode === 'ranges'
+            && Array.isArray(layout.stages)
+            && layout.stages.length > 0,
+        );
+    }
+
+    function layoutEmbedBlock(layout) {
+        const encoded = utf8ToBase64(JSON.stringify(layout));
+        const lines = encoded.match(/.{1,96}/g) || [encoded];
+        return [
+            LAYOUT_EMBED_BEGIN,
+            '<!-- 动态指导助手：以下标记用于保存阶段划分，普通阅读请忽略。 -->',
+            ...lines,
+            LAYOUT_EMBED_END,
+        ].join('\n');
+    }
+
+    function extractEmbeddedLayout(content) {
+        const match = normalizeText(content).match(LAYOUT_EMBED_CAPTURE_RE);
+        if (!match) return null;
+        try {
+            // 标记块里夹着一行给人看的 HTML 注释，解码前先去掉，只留 Base64 正文。
+            const encoded = match[1].replace(/<!--[\s\S]*?-->/g, '');
+            const parsed = JSON.parse(base64ToUtf8(encoded));
+            return isUsableLayoutShape(parsed) ? parsed : null;
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 读取条目正文里的阶段划分失败`, error);
+            return null;
+        }
+    }
+
+    function stripLayoutMarker(content) {
+        return normalizeText(content)
+            .replace(LAYOUT_EMBED_RE, '')
+            .replace(/\n{3,}$/g, '\n')
+            .replace(/\s+$/g, '');
+    }
+
+    function entryDisplayContent(entry) {
+        return stripLayoutMarker(entry && entry.content);
+    }
+
+    function contentWithLayoutMarker(content, layout) {
+        const base = stripLayoutMarker(content);
+        const marker = layoutEmbedBlock(layout);
+        return base ? `${base}\n\n${marker}` : marker;
     }
 
     function normalizeFieldKey(key) {
@@ -287,8 +376,8 @@
         const layout = metadata && metadata.layout && typeof metadata.layout === 'object'
             ? metadata.layout
             : null;
-        if (!layout || layout.mode !== 'ranges') return null;
-        return layout;
+        if (isUsableLayoutShape(layout)) return layout;
+        return extractEmbeddedLayout(entry && entry.content);
     }
 
     function makeStageId() {
@@ -438,9 +527,9 @@
 
     function parseGuideEntry(entry) {
         const layout = getRangeLayout(entry);
-        if (!layout) return parseGuideText(entry && entry.content);
+        const text = entryDisplayContent(entry);
+        if (!layout) return parseGuideText(text);
 
-        const text = normalizeText(entry && entry.content);
         const resolved = resolveRangeLayout(text, layout);
         const warnings = [];
         const blocks = [];
@@ -665,6 +754,7 @@
     }
 
     const reportedErrors = new Set();
+    const healedLayoutKeys = new Set();
     function reportOnce(key, message) {
         if (reportedErrors.has(key)) return;
         reportedErrors.add(key);
@@ -750,44 +840,6 @@
                 ? variables[VARIABLE_ROOT]
                 : {};
             variables[VARIABLE_ROOT] = { ...root, config };
-            return variables;
-        });
-    }
-
-    function progressIdentity(source) {
-        if (!source || !source.entry) return '';
-        return `${cleanWorldbookName(source.worldbookName)}::${source.entry.uid}`;
-    }
-
-    async function readRememberedProgress(source) {
-        const identity = progressIdentity(source);
-        if (!identity) return null;
-        const variables = await readVariables('character');
-        const root = variables[VARIABLE_ROOT];
-        const progress = root && typeof root === 'object' ? root.progress : null;
-        if (!progress || typeof progress !== 'object') return null;
-        const record = progress[identity];
-        return record && typeof record === 'object' ? record : null;
-    }
-
-    async function writeRememberedProgress(source, state) {
-        const identity = progressIdentity(source);
-        if (!identity) return null;
-        const record = {
-            sourceKey: state.sourceKey,
-            mainIndex: state.mainIndex,
-            mainName: state.mainName || '',
-            updatedAt: state.updatedAt || new Date().toISOString(),
-        };
-        return updateVariables('character', variables => {
-            const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
-                ? variables[VARIABLE_ROOT]
-                : {};
-            const progress = root.progress && typeof root.progress === 'object'
-                ? { ...root.progress }
-                : {};
-            progress[identity] = record;
-            variables[VARIABLE_ROOT] = { ...root, progress };
             return variables;
         });
     }
@@ -1087,6 +1139,7 @@
     async function writeRangeLayout(worldbookName, selectedEntry, layout) {
         if (!worldbookName || !selectedEntry) throw new Error('没有可保存的世界书条目');
         const updateWorldbookWith = resolveFunction('updateWorldbookWith', true);
+        await writeLayoutBackup(worldbookName, selectedEntry, layout);
         let found = false;
         await Promise.resolve(updateWorldbookWith(worldbookName, worldbook => {
             const entry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
@@ -1103,6 +1156,12 @@
                     layout,
                 },
             };
+            /*
+             * 世界书条目的 extra 只有本机认得。为了让阶段划分跟着角色卡、跟着
+             * 条目一起被别人导入，正文末尾再放一段 Base64 隐藏标记。所有读取
+             * 路径都用 entryDisplayContent() 去掉它，绝不会发给 AI。
+             */
+            entry.content = contentWithLayoutMarker(entryDisplayContent(entry), layout);
             return worldbook;
         }));
         if (!found) throw new Error(`无法在世界书“${worldbookName}”中找到要保存的指导条目`);
@@ -1113,9 +1172,164 @@
         );
         const savedLayout = getRangeLayout(verified);
         if (!verified || !savedLayout || savedLayout.sourceHash !== layout.sourceHash) {
-            throw new Error('阶段划分未能写入世界书条目的隐藏扩展数据');
+            throw new Error('阶段划分没能写进世界书条目。已保存在这个角色的备份里，重新打开标注器可以恢复。');
+        }
+        if (!extractEmbeddedLayout(verified.content)) {
+            reportOnce(
+                '阶段划分未写入正文标记',
+                '这个世界书条目没能写入可随角色卡分享的隐藏标记，阶段划分目前只保存在本机。',
+            );
         }
         return verified;
+    }
+
+    function layoutBackupKey(worldbookName, entry) {
+        if (!entry) return '';
+        return `${cleanWorldbookName(worldbookName)}::${entry.uid}`;
+    }
+
+    function isUsableLayout(layout) {
+        return isUsableLayoutShape(layout);
+    }
+
+    async function readLayoutBackupsFrom(type) {
+        try {
+            const variables = await readVariables(type);
+            const root = variables[VARIABLE_ROOT];
+            const layouts = root && typeof root === 'object' ? root.layouts : null;
+            return layouts && typeof layouts === 'object' ? layouts : {};
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 读取 ${type} 变量里的阶段划分备份失败`, error);
+            return {};
+        }
+    }
+
+    async function readLayoutBackups() {
+        const [characterLayouts, globalLayouts] = await Promise.all([
+            readLayoutBackupsFrom('character'),
+            readLayoutBackupsFrom('global'),
+        ]);
+        return { ...characterLayouts, ...globalLayouts };
+    }
+
+    async function writeLayoutBackup(worldbookName, entry, layout) {
+        const key = layoutBackupKey(worldbookName, entry);
+        if (!key || !isUsableLayout(layout)) return null;
+        const record = {
+            worldbookName: cleanWorldbookName(worldbookName),
+            entryUid: entry.uid == null ? null : entry.uid,
+            entryName: entryName(entry),
+            contentHash: hashText(entryDisplayContent(entry)),
+            layout,
+            updatedAt: new Date().toISOString(),
+        };
+        const results = await Promise.all(['character', 'global'].map(async type => {
+            try {
+                return await updateVariables(type, variables => {
+                    const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
+                        ? variables[VARIABLE_ROOT]
+                        : {};
+                    const layouts = root.layouts && typeof root.layouts === 'object'
+                        ? { ...root.layouts }
+                        : {};
+                    layouts[key] = record;
+                    variables[VARIABLE_ROOT] = { ...root, layouts };
+                    return variables;
+                });
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] 阶段划分备份写入 ${type} 变量失败`, error);
+                return null;
+            }
+        }));
+        return results.find(Boolean) || null;
+    }
+
+    function backupRecordFor(backups, worldbookName, entry) {
+        if (!entry || !backups || typeof backups !== 'object') return null;
+        const worldbook = cleanWorldbookName(worldbookName);
+        const records = Object.keys(backups)
+            .map(key => backups[key])
+            .filter(record => (
+                record
+                && typeof record === 'object'
+                && isUsableLayout(record.layout)
+                && cleanWorldbookName(record.worldbookName) === worldbook
+            ));
+        if (records.length === 0) return null;
+        const exact = records.find(record => sameUid(record.entryUid, entry.uid));
+        if (exact) return exact;
+        const byName = records.find(record => record.entryName === entryName(entry));
+        if (byName) return byName;
+        const contentHash = hashText(entryDisplayContent(entry));
+        return records.find(record => record.contentHash === contentHash) || null;
+    }
+
+    function layoutStillFitsEntry(entry, layout) {
+        const resolved = resolveRangeLayout(entryDisplayContent(entry), layout);
+        return resolved.stages.some(stage => stage.ranges.length > 0)
+            || resolved.always.ranges.length > 0;
+    }
+
+    function applyLayoutBackup(entry, record) {
+        if (!entry || !record || !isUsableLayout(record.layout)) return false;
+        if (!layoutStillFitsEntry(entry, record.layout)) return false;
+        const extra = entry.extra && typeof entry.extra === 'object' ? entry.extra : {};
+        const metadata = extra[LAYOUT_META_KEY] && typeof extra[LAYOUT_META_KEY] === 'object'
+            ? extra[LAYOUT_META_KEY]
+            : {};
+        entry.extra = {
+            ...extra,
+            [LAYOUT_META_KEY]: {
+                ...metadata,
+                layout: record.layout,
+                restoredAt: new Date().toISOString(),
+            },
+        };
+        return true;
+    }
+
+    async function applyLayoutBackupsToEntries(worldbookName, entries) {
+        const targets = (Array.isArray(entries) ? entries : []).filter(entry => entry && !getRangeLayout(entry));
+        if (targets.length === 0) return false;
+        let backups = {};
+        try {
+            backups = await readLayoutBackups();
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 读取阶段划分备份失败`, error);
+            return false;
+        }
+        let restored = false;
+        targets.forEach(entry => {
+            const record = backupRecordFor(backups, worldbookName, entry);
+            if (record && applyLayoutBackup(entry, record)) restored = true;
+        });
+        return restored;
+    }
+
+    async function ensureEntryLayout(worldbookName, entry, options) {
+        const settings = options || {};
+        if (!entry || getRangeLayout(entry)) return { entry, restored: false };
+        let backups = {};
+        try {
+            backups = await readLayoutBackups();
+        } catch (error) {
+            console.warn(`[${SCRIPT_NAME}] 读取阶段划分备份失败`, error);
+            return { entry, restored: false };
+        }
+        const record = backupRecordFor(backups, worldbookName, entry);
+        if (!record || !applyLayoutBackup(entry, record)) return { entry, restored: false };
+        if (settings.selfHeal) {
+            const healKey = `${layoutBackupKey(worldbookName, entry)}::${hashText(JSON.stringify(record.layout))}`;
+            if (!healedLayoutKeys.has(healKey)) {
+                healedLayoutKeys.add(healKey);
+                try {
+                    await writeRangeLayout(worldbookName, entry, record.layout);
+                } catch (error) {
+                    console.warn(`[${SCRIPT_NAME}] 阶段划分回写世界书失败，已改用角色备份继续`, error);
+                }
+            }
+        }
+        return { entry, restored: true };
     }
 
     async function locateConfiguredEntry(config) {
@@ -1130,7 +1344,15 @@
             try {
                 const worldbook = await getWorldbook(worldbookName);
                 const entry = findEntry(worldbook, config.entryUid, config.entryName);
-                if (entry) return { worldbookName, worldbook, entry };
+                if (entry) {
+                    const ensured = await ensureEntryLayout(worldbookName, entry, { selfHeal: true });
+                    return {
+                        worldbookName,
+                        worldbook,
+                        entry: ensured.entry,
+                        layoutRestored: ensured.restored,
+                    };
+                }
             } catch (error) {
                 console.warn(`[${SCRIPT_NAME}] 读取世界书“${worldbookName}”失败`, error);
             }
@@ -1141,7 +1363,7 @@
     function makeSourceKey(source) {
         const layout = getRangeLayout(source.entry);
         const layoutHash = layout ? hashText(JSON.stringify(layout)) : 'template';
-        return `${source.worldbookName}::${source.entry.uid}::${hashText(source.entry.content)}::${layoutHash}`;
+        return `${source.worldbookName}::${source.entry.uid}::${hashText(entryDisplayContent(source.entry))}::${layoutHash}`;
     }
 
     function reconcileState(rawState, parsed, sourceKey) {
@@ -1184,6 +1406,12 @@
         if (!source) {
             throw new Error('找不到已绑定的动态指导条目。请重新点击“绑定指导页”。');
         }
+        if (source.layoutRestored) {
+            reportOnce(
+                '阶段划分已恢复',
+                '世界书条目里没有找到阶段划分，已从角色备份恢复。打开“划分提示词阶段”确认后会写回世界书。',
+            );
+        }
         if (!entryIsDisabled(source.entry)) {
             await disableSourceEntry(source.worldbookName, source.entry.uid, entryName(source.entry));
             source.entry.enabled = false;
@@ -1196,10 +1424,7 @@
         }
 
         const sourceKey = makeSourceKey(source);
-        const chatState = await readChatState();
-        const hasChatState = Boolean(chatState && typeof chatState === 'object' && Object.keys(chatState).length > 0);
-        const remembered = hasChatState ? null : await readRememberedProgress(source);
-        const oldState = hasChatState ? chatState : remembered;
+        const oldState = await readChatState();
         const state = reconcileState(oldState, parsed, sourceKey);
         if (settings.persistState !== false && statesDiffer(oldState, state)) {
             state.updatedAt = new Date().toISOString();
@@ -1216,7 +1441,7 @@
             state,
             mainBlock,
             addons,
-            inherited: Boolean(remembered),
+            layoutRestored: Boolean(source.layoutRestored),
         };
     }
 
@@ -1270,7 +1495,6 @@
 
         const nextState = stateForIndex(context, targetIndex, settings);
         await writeChatState(nextState);
-        await writeRememberedProgress(context.source, nextState);
         await safeUninject();
 
         const nextBlock = context.parsed.mainBlocks[nextState.mainIndex];
@@ -1313,6 +1537,9 @@
         touchActive: false,
         scrollLocked: false,
         touchSnapshot: null,
+        gestureScrolled: false,
+        ignoreSelectionUntil: 0,
+        lastScrollLockAt: 0,
         unresolvedCount: 0,
         dirty: false,
         busy: false,
@@ -1457,8 +1684,13 @@
         const surface = editorElement('surface');
         if (!surface) return;
         surface.classList.toggle('dga-tap-mode', Boolean(stageEditorState.tapMode));
-        const liveSelection = Boolean(selectionOffsetsInSurface());
-        surface.classList.toggle('dga-hide-pending', liveSelection);
+        /*
+         * 只在“手指正在拖选”的过程中把待分配高亮压暗，避免和系统蓝色选区
+         * 叠在一起看不清。手指一松开就恢复高亮，这样用户不会以为之前选好
+         * 的段落消失了。
+         */
+        const dragging = Boolean(stageEditorState.captureGestureOpen) && !stageEditorState.tapMode;
+        surface.classList.toggle('dga-hide-pending', dragging);
     }
 
     function editorPendingSegments() {
@@ -1925,6 +2157,7 @@
     }
 
     function placeTapMarker(event) {
+        if (Date.now() - stageEditorState.lastScrollLockAt < 450) return;
         const offset = offsetFromPoint(event.clientX, event.clientY);
         if (offset == null) {
             setEditorMessage('没找到这里的文字位置，请点在这一段文字上。', 'warning');
@@ -2109,7 +2342,7 @@
     }
 
     function loadEntryIntoStageEditor(worldbookName, entry) {
-        const text = normalizeText(entry && entry.content);
+        const text = entryDisplayContent(entry);
         const layout = getRangeLayout(entry);
         stageEditorState.worldbookName = worldbookName;
         stageEditorState.entry = entry;
@@ -2251,12 +2484,19 @@
         const worldbook = await getWorldbook(managerState.selectedWorldbook);
         const freshEntry = findEntry(worldbook, entry.uid, entryName(entry));
         if (!freshEntry) throw new Error('所选世界书条目已经不存在，请刷新后重试');
+        const ensured = await ensureEntryLayout(managerState.selectedWorldbook, freshEntry, { selfHeal: false });
         const editor = installStageEditorUi(false);
         if (!editor) throw new Error('阶段标注器尚未准备好，请稍后重试');
         const panel = managerElement('panel');
         if (panel) panel.hidden = true;
         editor.hidden = false;
-        loadEntryIntoStageEditor(managerState.selectedWorldbook, freshEntry);
+        loadEntryIntoStageEditor(managerState.selectedWorldbook, ensured.entry);
+        if (ensured.restored) {
+            setEditorMessage(
+                '世界书条目里没有找到阶段划分，已从角色备份恢复。确认无误后点“保存划分”写回世界书。',
+                'warning',
+            );
+        }
         const surface = editorElement('surface');
         if (surface) surface.focus();
     }
@@ -2349,7 +2589,7 @@
         }
         const likelyGuide = indexed.find(item => (
             /动态指导|剧情指导|剧情流程/.test(entryName(item.entry))
-            || /【\s*(?:内容|剧情|阶段|指导)\s*[：:]/.test(String(item.entry.content || ''))
+            || /【\s*(?:内容|剧情|阶段|指导)\s*[：:]/.test(entryDisplayContent(item.entry))
         ));
         return likelyGuide ? likelyGuide.key : (indexed[0] ? indexed[0].key : '');
     }
@@ -2366,6 +2606,7 @@
 
         const worldbook = await getWorldbook(worldbookName);
         const entries = worldbookEntries(worldbook);
+        await applyLayoutBackupsToEntries(worldbookName, entries);
         const items = entries.map((entry, index) => {
             const key = entryOptionKey(entry, index);
             managerState.entryMap.set(key, entry);
@@ -2391,16 +2632,20 @@
 
     function progressHelpText(context) {
         if (!context || !context.configured) {
-            return '绑定并推进剧情后，进度会记在这个角色上；之后新建聊天可以直接继续，不用重头开始。';
+            return '绑定后，每个聊天各记一份进度；新建聊天会从第一段开始。';
         }
         const total = context.parsed.mainBlocks.length;
         const position = context.mainBlock
             ? `第 ${context.state.mainIndex + 1} 段（共 ${total} 段）`
             : `已完成全部 ${total} 段`;
-        const lead = context.inherited
-            ? `这是一个新聊天，已从上次进度继续：${position}。`
-            : `这个角色记住的进度：${position}。`;
-        return `${lead}新建聊天仍会从这里继续；点“重置到第一段”可以让之后的聊天也从头开始。`;
+        return `这个聊天目前在${position}。进度只记在当前聊天里，新建聊天会从第一段开始。`;
+    }
+
+    function layoutStatusText(context) {
+        if (!context || !context.configured) return '—';
+        if (!getRangeLayout(context.source.entry)) return '旧版模板格式，没有可视化划分';
+        if (context.layoutRestored) return '世界书条目里丢失，已从角色备份恢复';
+        return `已保存在世界书条目里（${context.parsed.mainBlocks.length} 个阶段）`;
     }
 
     function renderManager(binding, config, context, contextError) {
@@ -2419,6 +2664,7 @@
             setManagerText('binding-value', `${context.source.worldbookName} → ${entryName(context.source.entry)}`);
             setManagerText('progress-value', progress);
             setManagerText('progress-help', progressHelpText(context));
+            setManagerText('layout-value', layoutStatusText(context));
             setManagerText('current-title', context.mainBlock ? context.mainBlock.title : '主线已完成');
             setManagerText(
                 'addons-value',
@@ -2438,6 +2684,7 @@
             setManagerText('binding-value', configuredLabel);
             setManagerText('progress-value', '—');
             setManagerText('progress-help', progressHelpText(null));
+            setManagerText('layout-value', '—');
             setManagerText('current-title', contextError ? '读取失败' : '等待绑定');
             setManagerText('addons-value', '无');
             setManagerText('preview', contextError || currentContentPreview(null));
@@ -2541,8 +2788,9 @@
         const settings = options || {};
         if (!worldbookName || !selectedEntry) throw new Error('请先选择世界书和指导条目');
         const worldbook = await getWorldbook(worldbookName);
-        const freshEntry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
+        let freshEntry = findEntry(worldbook, selectedEntry.uid, entryName(selectedEntry));
         if (!freshEntry) throw new Error('所选条目已经不存在，请刷新后重试');
+        freshEntry = (await ensureEntryLayout(worldbookName, freshEntry, { selfHeal: false })).entry;
         const parsed = parseGuideEntry(freshEntry);
         if (parsed.mainBlocks.length === 0) {
             throw new Error(parsed.warnings.join('\n') || '所选条目没有可用的主线内容');
@@ -2579,7 +2827,6 @@
             updatedAt: new Date().toISOString(),
         };
         await writeChatState(boundState);
-        await writeRememberedProgress(source, boundState);
         await safeUninject();
         notify(`已绑定“${entryName(freshEntry)}”，当前内容：${parsed.mainBlocks[0].title}`, 'success');
         return true;
@@ -2981,7 +3228,8 @@
 }
 #${EDITOR_ID} .dga-tap-caret {
     display: inline-block;
-    width: 2px;
+    position: relative;
+    width: 3px;
     height: 1.1em;
     margin: 0 -1px;
     vertical-align: -0.2em;
@@ -2990,8 +3238,31 @@
 }
 #${EDITOR_ID} .dga-tap-caret-tail {
     background: transparent;
-    border-left: 2px dashed var(--dga-mark-color, #8b5cf6);
+    border-left: 3px dashed var(--dga-mark-color, #8b5cf6);
     box-shadow: none;
+}
+#${EDITOR_ID} .dga-tap-caret::after {
+    position: absolute;
+    left: 50%;
+    top: -1.55em;
+    transform: translateX(-50%);
+    padding: 1px 5px;
+    border-radius: 7px;
+    background: var(--dga-mark-color, #8b5cf6);
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 700;
+    line-height: 1.35;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    pointer-events: none;
+    content: '开头';
+}
+#${EDITOR_ID} .dga-tap-caret-tail::after {
+    background: transparent;
+    border: 1px dashed var(--dga-mark-color, #8b5cf6);
+    color: var(--dga-mark-color, #8b5cf6);
+    content: '结尾';
 }
 #${EDITOR_ID} .dga-mode-row {
     display: flex;
@@ -3126,7 +3397,7 @@
     #${EDITOR_ID} .dga-text-surface {
         flex: 0 0 auto;
         min-height: 52vh;
-        padding: 13px;
+        padding: 20px 13px 13px;
         font-size: 0.9rem;
         -webkit-user-select: text;
         user-select: text;
@@ -3316,15 +3587,18 @@
             stageEditorState.captureGestureOpen = true;
             stageEditorState.captureBaseRanges = stageEditorState.pendingRanges.map(range => ({ ...range }));
             stageEditorState.lastCaptureAt = 0;
+            syncPendingPreviewVisibility();
         };
         const finishCaptureGesture = () => {
             stageEditorState.captureGestureOpen = false;
             stageEditorState.captureBaseRanges = null;
             stageEditorState.lastCaptureAt = 0;
+            syncPendingPreviewVisibility();
         };
         const captureAndFinishGestureSoon = () => {
             hostWindow.setTimeout(() => {
-                captureStageEditorSelection();
+                if (!stageEditorState.gestureScrolled) captureStageEditorSelection();
+                stageEditorState.gestureScrolled = false;
                 finishCaptureGesture();
             }, 0);
         };
@@ -3359,12 +3633,21 @@
         surface.addEventListener('touchstart', () => {
             stageEditorState.touchActive = true;
             stageEditorState.scrollLocked = false;
+            stageEditorState.gestureScrolled = false;
             stageEditorState.touchSnapshot = {
                 pendingRanges: stageEditorState.pendingRanges.map(range => ({ ...range })),
                 tapHead: stageEditorState.tapHead,
                 tapTail: stageEditorState.tapTail,
             };
             beginCaptureGesture();
+        }, { passive: true });
+        /*
+         * 点选模式下手指一开始移动，就把系统自己拉出来的选区丢掉。
+         * 否则手机浏览器会边滑边把选区往上一路扩到全文开头。
+         */
+        surface.addEventListener('touchmove', () => {
+            if (!stageEditorState.tapMode) return;
+            if (selectionOffsetsInSurface()) clearNativeSelection();
         }, { passive: true });
         const endEditorTouch = () => {
             stageEditorState.touchActive = false;
@@ -3378,9 +3661,14 @@
         surface.addEventListener('touchcancel', endEditorTouch, { passive: true });
         const onEditorScroll = () => {
             if (!stageEditorState.touchActive || stageEditorState.scrollLocked) return;
-            if (stageEditorState.tapMode) return;
-            if (!selectionOffsetsInSurface()) return;
+            const hasLiveSelection = Boolean(selectionOffsetsInSurface());
+            const hasPendingWork = stageEditorState.tapMode
+                && (stageEditorState.tapHead != null || pendingRangeList().length > 0);
+            if (!hasLiveSelection && !hasPendingWork) return;
             stageEditorState.scrollLocked = true;
+            stageEditorState.gestureScrolled = true;
+            stageEditorState.ignoreSelectionUntil = Date.now() + 600;
+            stageEditorState.lastScrollLockAt = Date.now();
             const snapshot = stageEditorState.touchSnapshot;
             stageEditorState.pendingRanges = snapshot && Array.isArray(snapshot.pendingRanges)
                 ? snapshot.pendingRanges.map(range => ({ ...range }))
@@ -3389,6 +3677,10 @@
             stageEditorState.tapTail = snapshot ? snapshot.tapTail : null;
             finishCaptureGesture();
             clearNativeSelection();
+            const kept = pendingRangeList().length;
+            if (kept > 0) {
+                setEditorMessage(`滑动时已收起系统选区，之前准备的 ${kept} 段仍然保留。`, 'info');
+            }
             updateStageEditorControls();
         };
         const editorScroller = editor.querySelector('.dga-editor-main');
@@ -3411,16 +3703,25 @@
         const selectionHandler = () => {
             const liveEditor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
             if (!liveEditor || liveEditor.hidden || stageEditorState.busy) return;
+            if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
             if (!selectionOffsetsInSurface()) return;
+            /*
+             * 刚因为滑动收起过系统选区时，浏览器可能还会补发几次 selectionchange。
+             * 这段时间内不直接采纳，而是推迟到保护期结束后再看一眼：如果那时
+             * 选区还在，说明是用户新选的，照常加入待分配。
+             */
+            const waitFor = Math.max(120, stageEditorState.ignoreSelectionUntil - Date.now() + 120);
             if (stageEditorState.selectionTimer) hostWindow.clearTimeout(stageEditorState.selectionTimer);
             stageEditorState.selectionTimer = hostWindow.setTimeout(() => {
                 stageEditorState.selectionTimer = null;
                 if (stageEditorState.busy) return;
+                if (stageEditorState.tapMode || stageEditorState.scrollLocked) return;
+                if (Date.now() < stageEditorState.ignoreSelectionUntil) return;
                 const currentEditor = getHostDocument() && getHostDocument().getElementById(EDITOR_ID);
                 if (!currentEditor || currentEditor.hidden) return;
                 if (!selectionOffsetsInSurface()) return;
                 captureStageEditorSelection();
-            }, 120);
+            }, waitFor);
         };
         editor.ownerDocument.addEventListener('selectionchange', selectionHandler);
         stageEditorSelectionBinding = { document: editor.ownerDocument, handler: selectionHandler };
@@ -3510,6 +3811,7 @@
             <div class="dga-section-head"><h3 id="${UI_PREFIX}-current-title">当前发送内容</h3></div>
             <div class="dga-meta">
                 <div><b>同时有效的附加内容：</b><span id="${UI_PREFIX}-addons-value">无</span></div>
+                <div><b>阶段划分：</b><span id="${UI_PREFIX}-layout-value">读取中</span></div>
                 <div><b>绑定识别来源：</b><span id="${UI_PREFIX}-detection-value">读取中</span></div>
                 <div><b>解析提醒：</b><span id="${UI_PREFIX}-warnings-value">无</span></div>
             </div>
@@ -3518,7 +3820,7 @@
 
         <section class="dga-section">
             <div class="dga-section-head"><h3>当前聊天进度</h3></div>
-            <p class="dga-help" id="${UI_PREFIX}-progress-help">绑定并推进剧情后，进度会记在这个角色上；之后新建聊天可以直接继续。</p>
+            <p class="dga-help" id="${UI_PREFIX}-progress-help">进度只记在当前聊天里，新建聊天会从第一段开始；绑定和阶段划分保存在角色上，不会因为新建聊天消失。</p>
             <div class="dga-actions">
                 <button class="dga-button" id="${UI_PREFIX}-previous" type="button">上一段</button>
                 <button class="dga-button dga-primary" id="${UI_PREFIX}-next" type="button">下一段</button>
@@ -3585,12 +3887,12 @@
             '已切换到下一段。',
         );
         managerElement('reset').onclick = () => runManagerAction(
-            '正在重置剧情进度……',
+            '正在重置当前聊天进度……',
             async () => {
-                if (!hostWindow.confirm('把动态指导进度重置到第一段？\n\n当前聊天和之后新建的聊天都会从第一段重新开始。')) return false;
+                if (!hostWindow.confirm('把当前聊天的动态指导进度重置到第一段？')) return false;
                 return moveToIndex(0);
             },
-            '已重置到第一段，新聊天也会从第一段开始。',
+            '当前聊天已重置到第一段。',
         );
         return panel;
     }
@@ -3677,7 +3979,7 @@
         try {
             const context = await loadContext();
             if (!context.configured) throw new Error('尚未绑定动态指导页');
-            if (!hostWindow.confirm('把动态指导进度重置到第一段？\n\n当前聊天和之后新建的聊天都会从第一段重新开始。')) return;
+            if (!hostWindow.confirm('把当前聊天的动态指导进度重置到第一段？')) return;
             await moveToIndex(0);
         } catch (error) {
             notify(error.message || String(error), 'error');
@@ -3827,19 +4129,6 @@
         eventOn(tavernEvents.CHAT_CHANGED, () => {
             runEventTask('切换聊天', async () => {
                 await safeUninject();
-                try {
-                    const context = await loadContext();
-                    if (context.configured && context.inherited) {
-                        notify(
-                            context.mainBlock
-                                ? `新聊天已继续上次进度：${context.mainBlock.title}`
-                                : '新聊天已继续上次进度：主线已完成',
-                            'success',
-                        );
-                    }
-                } catch (error) {
-                    console.warn(`[${SCRIPT_NAME}] 读取进度失败`, error);
-                }
                 const panel = managerElement('panel');
                 if (panel && !panel.hidden) await refreshManager({ quiet: true });
             });
