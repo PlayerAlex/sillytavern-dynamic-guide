@@ -3,16 +3,16 @@
   "enabled": true,
   "name": "动态指导助手（在线版）",
   "id": "912c8dc1-cf5c-4c9f-a8a1-2bf8b2d4cf79",
-  "content": "import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.0.0/index.js';\n",
-  "info": "动态指导助手 v2.0 在线加载版。通过左下角魔法棒菜单打开管理页，用“## 阶段名”划分正文，也可在“划分阶段”中点段落设置开头。“完成：条件”用于自动推进，留空时手动点“下一段”。[附加] 用“从：阶段名”“到：阶段名”设置生效范围（包含起止阶段）；[常驻] 随有效阶段发送，[备注] 不发送。保存会把结构直接写入世界书正文，随角色卡分享。旧版选区需先转换成新版格式；进度只记在当前聊天里，新聊天从第一段开始。本在线版固定加载 v2.0.0，首次使用需要联网。",
+  "content": "import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.0.1/index.js';\n",
+  "info": "动态指导助手 v2.0.1 在线加载版。通过左下角魔法棒菜单打开全屏管理页，用“## 阶段名”划分正文，也可在“划分阶段”中点段落设置开头。“完成：条件”用于自动推进，留空时手动点“下一段”。[附加] 用“从：阶段名”“到：阶段名”设置生效范围（包含起止阶段）；[常驻] 随有效阶段发送，[备注] 不发送。保存会把结构直接写入世界书正文，随角色卡分享。注入内容会跟随进度即时更新，生成事件也会等待读取和注入完成后再继续请求；旧版选区需先转换成新版格式。进度只记在当前聊天里，新聊天从第一段开始。本在线版固定加载 v2.0.1，首次使用需要联网。",
   "button": {
     "enabled": false,
     "buttons": []
   },
   "data": {
-    "version": "2.0",
+    "version": "2.0.1",
     "format": "dynamic-guide-v2",
     "loader": "jsdelivr",
-    "source": "PlayerAlex/sillytavern-dynamic-guide@v2.0.0"
+    "source": "PlayerAlex/sillytavern-dynamic-guide@v2.0.1"
   }
 }

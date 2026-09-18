@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.0
+     * 动态指导助手 v2.0.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
@@ -20,15 +20,15 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.0';
+    const VERSION = '2.0.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
     const PANEL_ID = `${UI_PREFIX}-panel`;
     const STYLE_ID = `${UI_PREFIX}-style`;
-    const MENU_CONTAINER_ID = `${UI_PREFIX}-menu-container`;
     const MENU_ITEM_ID = `${UI_PREFIX}-menu-item`;
+    const LEGACY_MENU_CONTAINER_ID = `${UI_PREFIX}-menu-container`;
     const COMPLETE_MARKER_RE = /<!--\s*DGA_COMPLETE:([a-z0-9_-]+)\s*-->/gi;
 
     const STAGE_COLORS = ['#8b5cf6', '#3b82f6', '#14b8a6', '#f59e0b', '#ef4444', '#ec4899', '#84cc16', '#06b6d4'];
@@ -570,36 +570,86 @@
     // ---------------------------------------------------------------
 
     const currentWindow = typeof window !== 'undefined' ? window : globalThis;
-    let hostWindow = currentWindow;
-    try {
-        if (currentWindow.frameElement && currentWindow.parent) hostWindow = currentWindow.parent;
-    } catch (error) {
-        hostWindow = currentWindow;
+    const windowCandidates = [];
+    const addWindowCandidate = candidate => {
+        if (candidate && !windowCandidates.includes(candidate)) windowCandidates.push(candidate);
+    };
+    try { addWindowCandidate(currentWindow.top); } catch (error) {}
+    try { addWindowCandidate(currentWindow.parent); } catch (error) {}
+    addWindowCandidate(currentWindow);
+
+    function getWandMenu(doc) {
+        if (!doc) return null;
+        return doc.getElementById('extensionsMenu')
+            || doc.getElementById('extensions_menu')
+            || doc.querySelector('.extensions_block .list-group');
     }
-    const helper = currentWindow.TavernHelper || hostWindow.TavernHelper || null;
+
+    function windowWithWandMenu() {
+        return windowCandidates.find(candidate => {
+            try {
+                return Boolean(candidate.document && getWandMenu(candidate.document));
+            } catch (error) {
+                return false;
+            }
+        }) || null;
+    }
+
+    let hostWindow = windowWithWandMenu() || currentWindow;
+    const helper = windowCandidates
+        .map(candidate => {
+            try { return candidate.TavernHelper; } catch (error) { return null; }
+        })
+        .find(Boolean) || null;
     const instanceToken = `dga-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    currentWindow[INSTANCE_KEY] = instanceToken;
+    const instanceWindow = windowCandidates.find(candidate => {
+        try {
+            candidate[INSTANCE_KEY] = instanceToken;
+            return candidate[INSTANCE_KEY] === instanceToken;
+        } catch (error) {
+            return false;
+        }
+    }) || currentWindow;
+    try {
+        instanceWindow[INSTANCE_KEY] = instanceToken;
+    } catch (error) {
+        console.warn(`[${SCRIPT_NAME}] 无法在共享窗口保存实例标记`, error);
+    }
 
     function isCurrentInstance() {
-        return currentWindow[INSTANCE_KEY] === instanceToken;
+        try {
+            return instanceWindow[INSTANCE_KEY] === instanceToken;
+        } catch (error) {
+            return true;
+        }
     }
 
     function api(name, required) {
-        for (const source of [helper, currentWindow, hostWindow]) {
-            if (source && typeof source[name] === 'function') return source[name].bind(source);
+        for (const source of [helper, ...windowCandidates]) {
+            try {
+                if (source && typeof source[name] === 'function') return source[name].bind(source);
+            } catch (error) {
+                // 跨域顶层 WindowProxy 不允许读取属性，继续尝试同源窗口。
+            }
         }
         if (required) throw new Error(`当前酒馆助手缺少 ${name} 接口`);
         return null;
     }
 
     function apiValue(name) {
-        for (const source of [helper, currentWindow, hostWindow]) {
-            if (source && source[name] !== undefined) return source[name];
+        for (const source of [helper, ...windowCandidates]) {
+            try {
+                if (source && source[name] !== undefined) return source[name];
+            } catch (error) {
+                // 同上：跨域候选不是运行接口来源。
+            }
         }
         return undefined;
     }
 
     function hostDocument() {
+        const menuWindow = windowWithWandMenu();
+        if (menuWindow) hostWindow = menuWindow;
         try {
             return hostWindow.document || currentWindow.document || null;
         } catch (error) {
@@ -850,7 +900,7 @@
     // 只读。绑定、推进、保存这些会写数据的动作都在各自的函数里。
     async function loadContext() {
         const config = await readConfig();
-        if (!config) return { configured: false, config: null };
+        if (!config) return rememberContext({ configured: false, config: null });
         const located = await locateEntry(config);
         if (!located) {
             throw new Error(`找不到绑定的条目“${config.entryName || ''}”。请在下面重新选择并绑定。`);
@@ -858,7 +908,7 @@
         const parsed = parseOutline(located.entry.content);
         const rawState = await readState();
         const state = reconcileState(rawState, parsed);
-        return {
+        return rememberContext({
             configured: true,
             config,
             worldbookName: located.worldbookName,
@@ -870,7 +920,7 @@
             addons: activeAddons(parsed, state.stageIndex),
             entryEnabled: !entryIsDisabled(located.entry),
             legacy: hasLegacyLayout(located.entry),
-        };
+        });
     }
 
     async function requireContext() {
@@ -892,10 +942,79 @@
         if (uninjectPrompts) await Promise.resolve(uninjectPrompts([INJECTION_ID]));
     }
 
+    // 注入内容必须始终等于“现在该发的那一段”。酒馆或酒馆助手是否等待事件监听器
+    // 返回的 Promise 因版本而异，所以这里不依赖生成事件：状态一变就同步更新注入，
+    // 生成事件里再用缓存同步兜底一次，然后异步读回权威内容纠正。
+    const injectionCache = { context: null, text: undefined };
+
+    function currentMessageId() {
+        const getLastMessageId = api('getLastMessageId', false);
+        if (!getLastMessageId) return null;
+        try {
+            const value = getLastMessageId();
+            return value == null ? null : value;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function injectionTextFor(context, generationType) {
+        if (!context || !context.configured) return null;
+        if (context.legacy || context.parsed.stages.length === 0) return null;
+        let index = context.state.stageIndex;
+        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段注入
+        if ((generationType === 'swipe' || generationType === 'regenerate')
+            && index > 0
+            && context.state.lastCompletionMessageId != null) {
+            const lastId = currentMessageId();
+            if (lastId != null && String(lastId) === String(context.state.lastCompletionMessageId)) index -= 1;
+        }
+        const stage = context.parsed.stages[index];
+        if (!stage) return null;
+        return formatInjection(stage, activeAddons(context.parsed, index));
+    }
+
+    function applyInjection(text) {
+        if (text != null && injectionCache.text === text) return;
+        const uninjectPrompts = api('uninjectPrompts', false);
+        if (text == null) {
+            // undefined 表示“还不知道有没有注入过”，这时要清一次；null 表示已经清干净了。
+            if (uninjectPrompts && injectionCache.text !== null) uninjectPrompts([INJECTION_ID]);
+            injectionCache.text = null;
+            return;
+        }
+        const injectPrompts = api('injectPrompts', true);
+        injectPrompts([{
+            id: INJECTION_ID,
+            position: 'in_chat',
+            depth: 0,
+            role: 'system',
+            content: text,
+            should_scan: false,
+        }]);
+        injectionCache.text = text;
+    }
+
+    function rememberContext(context) {
+        injectionCache.context = context;
+        return context;
+    }
+
+    // 用缓存里的上下文同步对齐注入内容：不读世界书，也不等任何 Promise。
+    function syncInjection(generationType) {
+        const context = injectionCache.context;
+        if (!context) return;
+        applyInjection(injectionTextFor(context, generationType));
+    }
+
     async function injectCurrentGuide(generationType) {
+        // 先按缓存同步注入：即使酒馆没有等待这个事件，这次请求也已经带上当前阶段。
+        syncInjection(generationType);
         const context = await loadContext();
-        await safeUninject();
-        if (!context.configured) return;
+        if (!context.configured) {
+            applyInjection(null);
+            return;
+        }
         if (context.entryEnabled) {
             // 来源条目又被启用了：为了不让整份大纲直接发给 AI，生成前重新禁用它。
             // 旧格式尚未转换或正文暂时没有阶段时，也必须保持来源禁用。
@@ -904,42 +1023,18 @@
         }
         if (context.legacy) {
             reportOnce('legacy-layout', '绑定的条目仍使用旧版划分。请先打开动态指导助手，点“转换成新版格式”；转换前不会注入指导。');
+            applyInjection(null);
             return;
         }
         if (context.parsed.stages.length === 0) {
             reportOnce('no-stages', '绑定的条目还没有分阶段，这次不会注入指导。');
+            applyInjection(null);
             return;
         }
         if (statesDiffer(context.rawState, context.state)) {
             await writeState({ ...context.state, updatedAt: new Date().toISOString() });
         }
-
-        let index = context.state.stageIndex;
-        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段注入
-        if ((generationType === 'swipe' || generationType === 'regenerate')
-            && index > 0
-            && context.state.lastCompletionMessageId != null) {
-            const getLastMessageId = api('getLastMessageId', false);
-            let lastId = null;
-            try {
-                lastId = getLastMessageId ? await Promise.resolve(getLastMessageId()) : null;
-            } catch (error) {
-                lastId = null;
-            }
-            if (lastId != null && String(lastId) === String(context.state.lastCompletionMessageId)) index -= 1;
-        }
-
-        const stage = context.parsed.stages[index];
-        if (!stage) return;
-        const injectPrompts = api('injectPrompts', true);
-        await Promise.resolve(injectPrompts([{
-            id: INJECTION_ID,
-            position: 'in_chat',
-            depth: 0,
-            role: 'system',
-            content: formatInjection(stage, activeAddons(context.parsed, index)),
-            should_scan: false,
-        }], { once: true }));
+        applyInjection(injectionTextFor(context, generationType));
     }
 
     async function moveToIndex(context, target, options) {
@@ -956,7 +1051,14 @@
             updatedAt: new Date().toISOString(),
         };
         await writeState(next);
-        await safeUninject();
+        // 进度一变就把注入内容换成新阶段，下一次生成不需要等任何异步读取。
+        rememberContext({
+            ...context,
+            state: next,
+            stage: context.parsed.stages[index] || null,
+            addons: activeAddons(context.parsed, index),
+        });
+        syncInjection('normal');
         if (settings.notify !== false) {
             notify(next.stageName ? `当前阶段：${next.stageName}` : '全部阶段已完成，之后不再注入指导。', 'success');
         }
@@ -988,14 +1090,28 @@
             entryName: entryName(fresh),
             boundAt: new Date().toISOString(),
         });
-        await writeState({
+        const state = {
             stageIndex: 0,
             stageName: parsed.stages[0].name,
             lastCompletionMessageId: null,
             lastCompletionFingerprint: '',
             updatedAt: new Date().toISOString(),
+        };
+        await writeState(state);
+        rememberContext({
+            configured: true,
+            config: { worldbookName, entryUid: fresh.uid, entryName: entryName(fresh) },
+            worldbookName,
+            entry: fresh,
+            parsed,
+            rawState: state,
+            state,
+            stage: parsed.stages[0],
+            addons: activeAddons(parsed, 0),
+            entryEnabled: false,
+            legacy: false,
         });
-        await safeUninject();
+        syncInjection('normal');
         notify(`已绑定“${entryName(fresh)}”，当前阶段：${parsed.stages[0].name}`, 'success');
         return true;
     }
@@ -1141,17 +1257,22 @@
         );
     }
 
+    function ensureStyle(doc) {
+        const target = doc || hostDocument();
+        if (!target || !(target.head || target.documentElement)) return;
+        if (target.getElementById(STYLE_ID)) return;
+        const style = target.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = styles();
+        (target.head || target.documentElement).appendChild(style);
+    }
+
     function ensurePanel() {
         const doc = hostDocument();
         if (!doc || !doc.body) return null;
+        ensureStyle(doc);
         let panel = doc.getElementById(PANEL_ID);
         if (panel) return panel;
-        if (!doc.getElementById(STYLE_ID)) {
-            const style = doc.createElement('style');
-            style.id = STYLE_ID;
-            style.textContent = styles();
-            (doc.head || doc.documentElement).appendChild(style);
-        }
         panel = el('div', {
             id: PANEL_ID,
             hidden: true,
@@ -1809,6 +1930,7 @@ ${P} .dga-sheet h3 { margin: 0; font-size: 1.05rem; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
 ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-events: none; }
+#${MENU_ITEM_ID} { width: 100%; min-height: 44px; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 @media (max-width: 680px) {
     ${P} { padding: 0; }
     ${P} .dga-shell { max-width: none; height: 100%; max-height: none; border-radius: 0; border: 0; }
@@ -1827,11 +1949,12 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
     function closeExtensionsMenu() {
         const doc = hostDocument();
         if (!doc) return;
-        const menu = doc.getElementById('extensionsMenu');
+        const menu = getWandMenu(doc);
         const button = doc.getElementById('extensionsMenuButton');
         if (!menu || !button) return;
         try {
-            const style = hostWindow.getComputedStyle(menu);
+            const view = doc.defaultView || hostWindow;
+            const style = view.getComputedStyle(menu);
             if (style.display !== 'none' && style.visibility !== 'hidden') button.click();
         } catch (error) {
             button.click();
@@ -1841,20 +1964,64 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
     async function openManager() {
         const panel = ensurePanel();
         if (!panel) throw new Error('页面还没准备好，请稍后再试。');
-        closeExtensionsMenu();
-        panel.hidden = false;
+        fitPanelForTouch(panel);
         ui.view = 'manager';
         ui.editor = null;
+        render();
+        panel.hidden = false;
+        // 面板先同步显示，再收起酒馆菜单。这样手机触摸结束时即使菜单重绘，
+        // 也不会把“打开管理页”留到下一轮任务才执行。
+        closeExtensionsMenu();
         await runAction('读取状态', async () => {});
         const shell = panel.querySelector('.dga-shell');
         if (shell) shell.focus();
+    }
+
+    // 手机端保证整屏显示：即使主题或客户端漏掉 viewport 设置，也不出现缩在中间的小窗。
+    function fitPanelForTouch(panel) {
+        const view = (panel.ownerDocument && panel.ownerDocument.defaultView) || hostWindow;
+        let coarse = false;
+        try {
+            coarse = Boolean(view.matchMedia && view.matchMedia('(pointer: coarse)').matches);
+        } catch (error) {
+            coarse = false;
+        }
+        const width = view.innerWidth || 0;
+        const height = view.innerHeight || 0;
+        const narrow = width > 0 && Math.min(width, height) <= 900;
+        if (!coarse && !narrow) return;
+        panel.style.setProperty('padding', '0');
+        const shell = panel.querySelector('.dga-shell');
+        if (!shell) return;
+        shell.style.setProperty('max-width', 'none');
+        shell.style.setProperty('height', '100%');
+        shell.style.setProperty('max-height', 'none');
+        shell.style.setProperty('border-radius', '0');
+    }
+
+    function removeNode(node) {
+        if (!node) return;
+        if (typeof node.remove === 'function') node.remove();
+        else if (node.parentNode) node.parentNode.removeChild(node);
+    }
+
+    function removeStaleUi() {
+        windowCandidates.forEach(candidate => {
+            let doc;
+            try { doc = candidate.document; } catch (error) { return; }
+            if (!doc) return;
+            removeNode(doc.getElementById(MENU_ITEM_ID));
+            removeNode(doc.getElementById(LEGACY_MENU_CONTAINER_ID));
+            removeNode(doc.getElementById(PANEL_ID));
+            removeNode(doc.getElementById(STYLE_ID));
+        });
     }
 
     function registerMenuEntry(retry) {
         if (!isCurrentInstance()) return;
         const doc = hostDocument();
         if (!doc) return;
-        const menu = doc.getElementById('extensionsMenu');
+        const menu = getWandMenu(doc);
         if (!doc.body || !menu) {
             if ((retry || 0) < 30) {
                 hostWindow.setTimeout(() => registerMenuEntry((retry || 0) + 1), 1000);
@@ -1863,37 +2030,50 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
             }
             return;
         }
-        let container = doc.getElementById(MENU_CONTAINER_ID);
-        if (!container) {
-            container = doc.createElement('div');
-            container.id = MENU_CONTAINER_ID;
-            container.className = 'extension_container interactable';
-            container.tabIndex = 0;
-            menu.appendChild(container);
-        }
-        let item = doc.getElementById(MENU_ITEM_ID);
-        if (!item) {
-            item = doc.createElement('div');
-            item.id = MENU_ITEM_ID;
-            item.className = 'list-group-item flex-container flexGap5 interactable';
-            item.title = '打开动态指导助手';
-            item.innerHTML = '<div class="fa-fw fa-solid fa-book-open extensionsMenuExtensionButton"></div><span>动态指导助手</span>';
-            container.replaceChildren(item);
-        }
-        item.onclick = event => {
-            event.preventDefault();
-            event.stopPropagation();
+        ensureStyle(doc);
+        removeNode(doc.getElementById(MENU_ITEM_ID));
+        removeNode(doc.getElementById(LEGACY_MENU_CONTAINER_ID));
+        const item = doc.createElement('a');
+        item.id = MENU_ITEM_ID;
+        item.className = 'list-group-item flex-container flexGap5 interactable';
+        item.href = 'javascript:void(0)';
+        item.title = '打开动态指导助手';
+        const icon = doc.createElement('span');
+        icon.className = 'fa-fw fa-solid fa-book-open extensionsMenuExtensionButton';
+        const label = doc.createElement('span');
+        label.textContent = '动态指导助手';
+        item.append(icon, label);
+        let lastOpen = 0;
+        const openFromMenu = event => {
+            if (event) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            const now = Date.now();
+            if (now - lastOpen < 600) return;
+            lastOpen = now;
             runEventTask('打开管理页', openManager);
         };
+        item.onclick = openFromMenu;
+        item.addEventListener('pointerup', openFromMenu);
+        // 旧 Android WebView 没有 PointerEvent 时，接一次触摸结束兜底。
+        item.addEventListener('touchend', openFromMenu, { passive: false });
+        menu.appendChild(item);
     }
 
     function runEventTask(label, task) {
-        Promise.resolve()
-            .then(() => (isCurrentInstance() ? task() : undefined))
-            .catch(error => {
+        if (!isCurrentInstance()) return Promise.resolve();
+        try {
+            // 先同步调用 task，让菜单点击可以立即把面板显示出来。
+            return Promise.resolve(task()).catch(error => {
                 console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
                 reportOnce(label, `${label}失败：${error.message || String(error)}`);
             });
+        } catch (error) {
+            console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
+            reportOnce(label, `${label}失败：${error.message || String(error)}`);
+            return Promise.resolve();
+        }
     }
 
     async function next() {
@@ -1950,8 +2130,10 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
         return;
     }
 
-    ensurePanel();
+    removeStaleUi();
     registerMenuEntry(0);
+    // 页面一打开就把当前阶段准备好：第一次生成同样不用等异步读取。
+    runEventTask('准备注入', () => injectCurrentGuide('startup'));
 
     const eventOn = api('eventOn', false);
     const events = apiValue('tavern_events');
@@ -1962,18 +2144,24 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
     if (events.GENERATION_AFTER_COMMANDS) {
         eventOn(events.GENERATION_AFTER_COMMANDS, function (type, params, dryRun) {
             if (dryRun === true) return;
-            runEventTask('注入当前阶段', () => injectCurrentGuide(type));
+            // SillyTavern 会等待这个事件监听器返回的 Promise。必须把注入任务返回，
+            // 否则世界书读取尚未完成，请求就已经继续组装，当前阶段会从提示词中消失。
+            return runEventTask('注入当前阶段', () => injectCurrentGuide(type));
         });
     }
     if (events.MESSAGE_RECEIVED) {
         eventOn(events.MESSAGE_RECEIVED, function () {
             const args = arguments;
-            runEventTask('处理完成标记', () => handleMessageReceived.apply(null, args));
+            return runEventTask('处理完成标记', () => handleMessageReceived.apply(null, args));
         });
     }
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
+            // 换聊天后进度不同：先丢掉缓存和旧注入，再按读到的状态重新注入。
+            injectionCache.context = null;
             await safeUninject();
+            injectionCache.text = null;
+            await injectCurrentGuide('normal');
             const doc = hostDocument();
             const panel = doc && doc.getElementById(PANEL_ID);
             if (panel && !panel.hidden) await runAction('刷新', async () => {});
