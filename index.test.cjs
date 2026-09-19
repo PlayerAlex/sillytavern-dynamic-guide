@@ -983,3 +983,87 @@ test('选区模式界面：拖选前言分配给第一阶段，正文立刻重�
     assert.match(subtitle.textContent, /未保存/, '分配是结构性修改，头部要提示未保存');
     assert.deepEqual(errors, []);
 });
+
+
+// ---------------------------------------------------------------
+// v2.3 顺序编辑：整块上移/下移；常驻写在阶段之前 = 注入排在阶段内容之前
+// ---------------------------------------------------------------
+
+test('整块上移下移：交换阶段顺序，附加的“从：第一幕”按名字跟随', () => {
+    const content = '前言文字\n\n## 第一幕\n正文一\n\n## 第二幕\n正文二\n\n## 道具 [附加]\n从：第一幕\n道具正文\n\n## 风格 [常驻]\n风格正文';
+    let parsed = core.parseOutline(content);
+    let lines = core.moveBlock(parsed.lines, parsed.stages[0], 1);
+    assert.ok(!lines.join('\n').includes('\n\n\n'), '搬移后不出现连续两个空行');
+    parsed = core.parseOutline(lines.join('\n'));
+    assert.deepEqual(plain(parsed.stages.map(item => item.name)), ['第二幕', '第一幕']);
+    assert.deepEqual(plain(parsed.stages.map(item => item.prompt)), ['正文二', '正文一']);
+    const addon = parsed.addons.find(item => item.kind === 'addon');
+    assert.equal(addon.fromIndex, 1, '阶段引用按名字解析，换位后自动跟随');
+    assert.deepEqual(core.moveBlock(parsed.lines, parsed.blocks[0], -1), parsed.lines, '第一个块不能再上移');
+    assert.deepEqual(core.moveBlock(parsed.lines, parsed.blocks[parsed.blocks.length - 1], 1), parsed.lines, '最后一个块不能再下移');
+});
+
+test('常驻挪到所有阶段之前，注入里就排在当前阶段内容之前', () => {
+    const content = '前言文字\n\n## 第一幕\n正文一\n\n## 风格 [常驻]\n风格正文';
+    let parsed = core.parseOutline(content);
+    assert.equal(parsed.blocks.find(item => item.kind === 'always').aboveStages, false);
+    // 常驻上移一次到前言之后、第一幕之前
+    const lines = core.moveBlock(parsed.lines, parsed.blocks.find(item => item.kind === 'always'), -1);
+    assert.ok(lines.join('\n').startsWith('前言文字'), '前言保持在最前，搬移只在标题块之间进行');
+    parsed = core.parseOutline(lines.join('\n'));
+    const always = parsed.blocks.find(item => item.kind === 'always');
+    assert.equal(always.aboveStages, true, '常驻在所有阶段之前要标记为“在上面”');
+    const injected = core.formatInjection(parsed.stages[0], core.activeAddons(parsed, 0));
+    assert.ok(injected.indexOf('风格正文') < injected.indexOf('正文一'), '注入里常驻排在阶段内容之前');
+    assert.match(injected, /## 常驻提示[\s\S]*## 当前阶段/);
+    // 写在后面的常驻保持在附加内容区
+    const bottom = core.parseOutline(content);
+    const injectedBottom = core.formatInjection(bottom.stages[0], core.activeAddons(bottom, 0));
+    assert.ok(injectedBottom.indexOf('风格正文') > injectedBottom.indexOf('正文一'));
+    assert.match(injectedBottom, /## 同时有效的附加内容[\s\S]*风格正文/);
+});
+
+test('选区模式重建保留常驻的前后位置，开关可以切换', () => {
+    const top = core.parseOutline('## 风格 [常驻]\n风格正文\n\n## 第一幕\n正文一\n\n## 第二幕\n正文二');
+    const pickTop = core.pickLoad(top);
+    assert.equal(pickTop.alwaysTop, true);
+    const rebuiltTop = core.parseOutline(core.pickBuild(pickTop));
+    assert.equal(rebuiltTop.blocks.find(item => item.kind === 'always').aboveStages, true, '重建后常驻仍在阶段之前');
+
+    const bottom = core.parseOutline('## 第一幕\n正文一\n\n## 风格 [常驻]\n风格正文');
+    const pickBottom = core.pickLoad(bottom);
+    assert.equal(pickBottom.alwaysTop, false);
+    assert.equal(core.parseOutline(core.pickBuild(pickBottom)).blocks.find(item => item.kind === 'always').aboveStages, false);
+    pickBottom.alwaysTop = true;
+    const flipped = core.parseOutline(core.pickBuild(pickBottom));
+    assert.equal(flipped.blocks.find(item => item.kind === 'always').aboveStages, true, '开关切到上面后重建排在阶段之前');
+});
+
+test('看分段界面：标题卡的下移按钮交换阶段顺序且不打开弹层', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    const uiCore = sandbox.DynamicGuideAssistantCore;
+    await new Promise(setImmediate);
+    await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await uiCore.refresh();
+    const panel = documentRef.getElementById(PANEL_ID);
+    const findAll = (node, cls, out) => {
+        if (String(node.className || '').split(/\s+/).includes(cls)) out.push(node);
+        (node.children || []).forEach(child => findAll(child, cls, out));
+        return out;
+    };
+    let cards = findAll(panel, 'dga-heading', []);
+    assert.equal(cards.length, 2);
+    assert.match(cards[0].textContent, /第一幕/);
+    const down = findButton(cards[0], '↓');
+    assert.ok(down, '第一张标题卡要有下移按钮');
+    down.listeners.click[0]({ stopPropagation() {} });
+    cards = findAll(panel, 'dga-heading', []);
+    assert.match(cards[0].textContent, /第二幕/, '第二幕被换到上面');
+    assert.match(cards[1].textContent, /第一幕/);
+    assert.equal(panel.querySelector('.dga-sheet'), null, '点搬移按钮不能打开标题弹层');
+    assert.match(panel.querySelector('.dga-head-text').children[1].textContent, /未保存/);
+    assert.deepEqual(errors, []);
+});

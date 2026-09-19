@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.2
+     * 动态指导助手 v2.3
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
@@ -24,7 +24,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.2';
+    const VERSION = '2.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -265,6 +265,14 @@
             }
         });
 
+        // 常驻块写在所有阶段之前时，注入里也排在当前阶段内容之前（“在上面”）；
+        // 写在阶段之间或最后则排在附加内容区（“在下面”）。
+        blocks.forEach(item => {
+            if (item.kind === 'always') {
+                item.aboveStages = stages.length > 0 && item.headingLine < stages[0].headingLine;
+            }
+        });
+
         blocks.forEach(item => {
             if (item.kind !== 'merged') return;
             const stage = stages[item.mergeInto];
@@ -321,16 +329,21 @@
 
     function formatInjection(stage, addons) {
         if (!stage) return '';
+        // 写在所有阶段之前的常驻排在最前面，其余附加/常驻按正文顺序放在阶段之后。
+        const above = addons.filter(item => item.kind === 'always' && item.aboveStages);
+        const below = addons.filter(item => !above.includes(item));
         const lines = [
             '[动态指导助手：当前有效内容]',
             '以下是作者为当前进度准备的内部创作指导。自然地遵守它，不要向用户提及指导系统、阶段、完成判定或隐藏标记。',
-            '',
-            `## 当前阶段：${stage.name}`,
-            stage.prompt,
         ];
-        if (addons.length > 0) {
+        if (above.length > 0) {
+            lines.push('', '## 常驻提示');
+            above.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
+        }
+        lines.push('', `## 当前阶段：${stage.name}`, stage.prompt);
+        if (below.length > 0) {
             lines.push('', '## 同时有效的附加内容');
-            addons.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
+            below.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
         }
         if (stage.completion) {
             lines.push(
@@ -446,6 +459,28 @@
     function deleteHeading(lines, block) {
         const remove = new Set([block.headingLine, ...block.labelLines]);
         return collapseBlankRuns(lines.filter((line, index) => !remove.has(index)));
+    }
+
+    // 整块搬移：标题 + 标签 + 正文一起上移/下移一个块，块内结构不动。
+    // 第一个块不能再上移（前面是前言区），最后一个块不能再下移。
+    function moveBlock(lines, block, delta) {
+        const parsed = parseOutline(lines.join('\n'));
+        const at = parsed.blocks.findIndex(item => item.headingLine === block.headingLine);
+        const swap = at + delta;
+        if (at < 0 || swap < 0 || swap >= parsed.blocks.length) return lines.slice();
+        const fresh = parsed.blocks[at];
+        const other = parsed.blocks[swap];
+        const removed = fresh.end - fresh.headingLine;
+        const chunk = lines.slice(fresh.headingLine, fresh.end);
+        while (chunk.length > 1 && !chunk[chunk.length - 1].trim()) chunk.pop();
+        const rest = lines.slice(0, fresh.headingLine).concat(lines.slice(fresh.end));
+        // 下移时 other.end 是原坐标，要减去被抽走的行数
+        const insertAt = delta > 0 ? other.end - removed : other.headingLine;
+        const before = rest.slice(0, insertAt);
+        const after = rest.slice(insertAt);
+        if (before.length > 0 && before[before.length - 1].trim()) before.push('');
+        if (after.length > 0 && after[0].trim()) chunk.push('');
+        return collapseBlankRuns(before.concat(chunk, after));
     }
 
     // 还没有任何标题时的快捷方式：每个空行隔开的块算一段，短的第一行当标题。
@@ -695,12 +730,15 @@
             if (piece.owner) piece.owner.ranges.push({ start, end: text.length });
         });
 
+        const firstAlways = parsed.blocks.find(block => block.kind === 'always');
         return {
             text,
             stages,
             addons,
             always,
             note,
+            // 常驻写在所有阶段之前 = 注入时排在阶段内容之前；重建要保留这个位置
+            alwaysTop: Boolean(firstAlways && firstAlways.aboveStages),
             activeOwnerId: stages.length > 0 ? stages[0].id : 'always',
             pendingRanges: [],
             selectedMark: null,
@@ -760,8 +798,14 @@
         if (cursor < text.length) gaps.push(text.slice(cursor));
         const prefix = gaps.map(gap => gap.trim()).filter(Boolean).join('\n\n');
 
+        const alwaysBody = bodyOf(pick.always && pick.always.ranges);
+        const alwaysSection = alwaysBody ? `## 常驻提示 [常驻]\n${alwaysBody}` : '';
+        const noteBody = bodyOf(pick.note && pick.note.ranges);
+        const noteSection = noteBody ? `## 备注 [备注]\n${noteBody}` : '';
         const sections = [];
         if (prefix) sections.push(escapeBodyText(prefix));
+        // 常驻“在上面”时写在所有阶段之前，否则留在附加之后
+        if (alwaysSection && pick.alwaysTop) sections.push(alwaysSection);
         sortedStages(pick).forEach((stage, index) => {
             const head = [`## ${pickSafeName(stage.name, `阶段 ${index + 1}`)}`];
             if (oneLine(stage.completion)) head.push(`完成：${oneLine(stage.completion)}`);
@@ -773,10 +817,8 @@
             if (oneLine(addon.to)) head.push(`到：${oneLine(addon.to)}`);
             sections.push([...head, bodyOf(addon.ranges)].filter(Boolean).join('\n'));
         });
-        const alwaysBody = bodyOf(pick.always && pick.always.ranges);
-        if (alwaysBody) sections.push(`## 常驻提示 [常驻]\n${alwaysBody}`);
-        const noteBody = bodyOf(pick.note && pick.note.ranges);
-        if (noteBody) sections.push(`## 备注 [备注]\n${noteBody}`);
+        if (alwaysSection && !pick.alwaysTop) sections.push(alwaysSection);
+        if (noteSection) sections.push(noteSection);
         return sections.join('\n\n');
     }
 
@@ -2244,7 +2286,7 @@
             const stage = ui.editor.parsed.stages[block.mergeInto];
             return stage ? `并入「${stage.name}」，和它一起发送` : '找不到要并入的阶段，已按独立阶段处理';
         }
-        if (block.kind === 'always') return '每一段都发送';
+        if (block.kind === 'always') return block.aboveStages ? '每一段都发送 · 排在阶段内容之前' : '每一段都发送 · 排在阶段内容之后';
         return '只给自己看，不发送';
     }
 
@@ -2264,12 +2306,30 @@
     }
 
     function headingCard(block) {
+        const editor = ui.editor;
+        const blocks = editor.parsed.blocks;
+        const at = blocks.findIndex(item => item.headingLine === block.headingLine);
         const tag = block.kind === 'stage' ? `第 ${block.stageIndex + 1} 段` : KIND_LABELS[block.kind];
+        // 整块上移/下移：标题、标签、正文一起动；常驻挪到所有阶段之前 = 注入时排在阶段内容之前
+        const moveBtn = (label, delta, disabled, title) => el('button', {
+            type: 'button',
+            class: 'dga-move',
+            title,
+            disabled: Boolean(disabled),
+            onclick: event => {
+                event.stopPropagation();
+                editor.lines = moveBlock(editor.lines, block, delta);
+                afterEdit();
+            },
+        }, label);
         return el('div', pressable({ class: 'dga-heading', style: { '--dga-c': block.color } }, () => openSheet({ mode: 'edit', block })),
             el('span', { class: 'dga-tag', text: tag }),
             el('div', { class: 'dga-heading-text' },
                 el('b', { text: block.name }),
                 el('small', { text: headingSubtitle(block) })),
+            el('span', { class: 'dga-move-wrap' },
+                moveBtn('↑', -1, at <= 0, '上移一块'),
+                moveBtn('↓', 1, at < 0 || at >= blocks.length - 1, '下移一块')),
             el('span', { class: 'dga-chev', text: '›' }),
         );
     }
@@ -2947,7 +3007,13 @@
         const owner = pickOwner(pick, pick.activeOwnerId);
         if (!owner) return null;
         if (owner.kind === 'always') {
-            return el('div', { class: 'dga-pick-settings' }, muted('常驻提示：每一段都会发给 AI。把文字分配到这里即可。'));
+            return el('div', { class: 'dga-pick-settings' },
+                muted('常驻提示：每一段都会发给 AI。把文字分配到这里即可。'),
+                btn(pick.alwaysTop ? '位置：排在阶段内容之前（点我改到之后）' : '位置：排在阶段内容之后（点我改到之前）', () => {
+                    pick.alwaysTop = !pick.alwaysTop;
+                    pick.stale = true;
+                    render();
+                }, { ghost: true }));
         }
         if (owner.kind === 'note') {
             return el('div', { class: 'dga-pick-settings' }, muted('备注：只给自己看，不会发给 AI。把文字分配到这里即可。'));
@@ -3099,6 +3165,10 @@ ${P} .dga-heading b { font-size: 1rem; overflow-wrap: anywhere; }
 ${P} .dga-heading small { opacity: 0.75; font-size: 0.8rem; overflow-wrap: anywhere; }
 ${P} .dga-tag { flex: 0 0 auto; padding: 2px 9px; border-radius: 999px; background: var(--dga-c, #8b5cf6); color: #fff; font-size: 0.75rem; font-weight: 700; white-space: nowrap; }
 ${P} .dga-chev { opacity: 0.5; font-size: 1.3rem; }
+${P} .dga-move-wrap { display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto; }
+${P} .dga-move { width: 32px; min-height: 26px; padding: 0; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.18); background: rgba(255, 255, 255, 0.06); color: inherit; font: inherit; font-size: 0.82rem; line-height: 1; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-move:hover { background: rgba(255, 255, 255, 0.14); }
+${P} .dga-move:disabled { opacity: 0.25; cursor: default; }
 ${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 0.82rem; opacity: 0.6; }
 ${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 ${P} .dga-seg-btn { min-height: 40px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit; cursor: pointer; }
@@ -3317,6 +3387,7 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
         insertHeading,
         replaceHeading,
         deleteHeading,
+        moveBlock,
         autoSplitByBlankLines,
         readLegacyLayout,
         convertLegacyLayout,
