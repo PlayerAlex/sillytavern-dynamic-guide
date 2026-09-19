@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.3
+     * 动态指导助手 v2.3.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
@@ -24,7 +24,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.3';
+    const VERSION = '2.3.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1312,15 +1312,15 @@
             || left.lastCompletionFingerprint !== right.lastCompletionFingerprint;
     }
 
-    // 注入内容必须始终等于“现在该发的那一段”。酒馆或酒馆助手是否等待事件监听器
-    // 返回的 Promise 因版本而异，所以这里不依赖生成事件：状态一变就同步更新注入，
-    // 生成事件里再用缓存同步兜底一次，然后异步读回权威内容纠正。
-    // byKey 按绑定分开记：text 为 undefined 表示“还不知道有没有注入过”，null 表示已清干净。
+    // 注入纪律与 1.3.6 相同：每次生成都“先撤后注”，且注入只对下一次请求生效（once: true）。
+    // 绝不能做“内容没变就跳过”的去重——酒馆助手 4.8.17 起会在脚本重载等时机自动清掉
+    // 持久注入，提示词查看器的预组装也会消耗注入；去重跳过会让指导悄悄消失而脚本
+    // 毫不知情（v2.0–v2.3 “注入没了” 的根源就在这里）。cache 只用于清理时记账。
     const injectionCache = { all: null, byKey: {} };
     let clearedBaseInjection = false;
 
     function cacheFor(key) {
-        if (!injectionCache.byKey[key]) injectionCache.byKey[key] = { text: undefined, key: null, channel: null };
+        if (!injectionCache.byKey[key]) injectionCache.byKey[key] = { text: undefined, channel: null };
         return injectionCache.byKey[key];
     }
 
@@ -1432,13 +1432,12 @@
         return formatInjection(stage, activeAddons(context.parsed, index));
     }
 
+    // 每次调用都真实地重新注入：先撤掉旧注入再按 id 注入新内容，once 模式下
+    // 注入只对下一次请求生效，生成事件里会再次撤注，因此不会累积重复。
     function applyInjection(text, placement, key) {
         const id = injectionIdFor(key);
         const cache = cacheFor(key);
         const spot = placement || { channel: 'in_chat', depth: 0, role: 'system', followed: false };
-        const where = spot.channel === 'anchor' ? spot.slot : `${spot.depth}|${spot.role}`;
-        const cacheKey = text == null ? null : `${spot.channel}|${where}|${text}`;
-        if (text != null && cache.key === cacheKey) return;
         const uninjectPrompts = api('uninjectPrompts', false);
         if (text == null) {
             if (cache.text !== null) {
@@ -1446,15 +1445,13 @@
                 clearAnchorInjection(id);
             }
             cache.text = null;
-            cache.key = null;
             cache.channel = null;
             return;
         }
+        if (uninjectPrompts) uninjectPrompts([id]);
         if (spot.channel === 'anchor') {
             const channel = extensionPromptChannel();
             if (channel) {
-                // 通道切换时清掉另一边的旧注入，避免同一段指导出现两次
-                if (uninjectPrompts && cache.channel === 'in_chat') uninjectPrompts([id]);
                 channel.set(id, text,
                     spot.slot === 'before' ? channel.types.BEFORE_PROMPT : channel.types.IN_PROMPT, 0, false, 0);
             } else {
@@ -1467,7 +1464,7 @@
                     role: 'system',
                     content: text,
                     should_scan: false,
-                }]);
+                }], { once: true });
             }
         } else {
             if (cache.channel === 'anchor') clearAnchorInjection(id);
@@ -1478,10 +1475,9 @@
                 role: spot.role,
                 content: text,
                 should_scan: false,
-            }]);
+            }], { once: true });
         }
         cache.text = text;
-        cache.key = cacheKey;
         cache.channel = spot.channel;
     }
 
@@ -3426,7 +3422,7 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
     }
     if (events.GENERATION_AFTER_COMMANDS) {
         eventOn(events.GENERATION_AFTER_COMMANDS, function (type, params, dryRun) {
-            if (dryRun === true) return;
+            // 不跳过 dryRun：提示词查看器等预组装也必须能看到当前指导（1.3.6 就不区分）。
             // SillyTavern 会等待这个事件监听器返回的 Promise。必须把注入任务返回，
             // 否则世界书读取尚未完成，请求就已经继续组装，当前阶段会从提示词中消失。
             return runEventTask('注入当前阶段', () => injectCurrentGuide(type));

@@ -103,6 +103,8 @@ function helperFor(entry) {
     const state = {
         events: new Map(),
         injected: [],
+        injectionOptions: [],
+        active: new Map(),
         removed: [],
         variables: {
             character: { $dynamicGuideAssistant: { config: { worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' } } },
@@ -117,8 +119,15 @@ function helperFor(entry) {
         updateVariablesWith: (updater, { type }) => { state.variables[type] = updater(state.variables[type]); },
         getWorldbook: () => state.entries,
         updateWorldbookWith: (_name, updater) => { state.entries = updater(state.entries); },
-        injectPrompts: prompts => state.injected.push(...prompts),
-        uninjectPrompts: ids => state.removed.push(...ids),
+        injectPrompts: (prompts, options) => prompts.forEach(prompt => {
+            state.injected.push(prompt);
+            state.injectionOptions.push(options || null);
+            state.active.set(prompt.id, prompt);
+        }),
+        uninjectPrompts: ids => ids.forEach(id => {
+            state.removed.push(id);
+            state.active.delete(id);
+        }),
     };
     return { state, helper };
 }
@@ -128,6 +137,8 @@ function runtime(entry) {
     return {
         ...load(helper),
         injected: state.injected,
+        injectionOptions: state.injectionOptions,
+        active: state.active,
         removed: state.removed,
         generate: async () => state.events.get('generate')('normal', {}, false),
     };
@@ -154,9 +165,10 @@ test('新格式仍正常注入且重新禁用意外启用的来源条目', async
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n当前正文\n\n## 第二幕\n未来秘密', enabled: true };
     const run = runtime(entry);
     await run.generate();
-    assert.equal(run.injected.length, 1);
-    assert.match(run.injected[0].content, /当前正文/);
-    assert.doesNotMatch(run.injected[0].content, /未来秘密/);
+    assert.equal(run.active.size, 1, '当前应只有一条活跃注入');
+    const live = [...run.active.values()][0];
+    assert.match(live.content, /当前正文/);
+    assert.doesNotMatch(live.content, /未来秘密/);
     assert.equal(entry.enabled, false);
     assert.deepEqual(run.errors, []);
 });
@@ -178,8 +190,8 @@ test('生成事件等待异步读取和注入完成后才允许请求继续', as
     releaseWorldbook();
     await generation;
     assert.equal(finished, true);
-    assert.equal(state.injected.length, 1);
-    assert.match(state.injected[0].content, /必须出现的当前正文/);
+    assert.equal(state.active.size, 1);
+    assert.match([...state.active.values()][0].content, /必须出现的当前正文/);
     assert.deepEqual(run.errors, []);
 });
 
@@ -212,6 +224,37 @@ test('swipe 重新生成时同步注入的是推进前的阶段', async () => {
     assert.match(state.injected[0].content, /第一段正文/);
     assert.doesNotMatch(state.injected[0].content, /第二段正文/);
     await generation;
+    assert.deepEqual(run.errors, []);
+});
+
+// v2.3.1 回归：v2.0–v2.3 的“内容没变就跳过注入”去重，会让被外部清掉的注入永远补不回来
+test('注入被外部清掉后，下一次生成事件会无条件重新注入', async () => {
+    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n当前正文', enabled: false };
+    const run = runtime(entry);
+    await new Promise(setImmediate);
+    assert.equal(run.active.size, 1, '打开页面就该有一条活跃注入');
+    const id = [...run.active.keys()][0];
+    // 模拟酒馆助手在脚本重载等时机自动清掉持久注入：脚本对此毫不知情
+    run.active.clear();
+    await run.generate();
+    assert.equal(run.active.size, 1, '生成事件必须重新注入，不能因病缓存跳过');
+    assert.match([...run.active.values()][0].content, /当前正文/);
+    assert.ok(run.removed.includes(id), '重新注入前要先按 id 撤掉旧注入');
+    assert.ok(
+        run.injectionOptions.some(options => options && options.once === true),
+        '注入必须带 once: true，只对下一次请求生效，与 1.3.6 一致',
+    );
+    assert.deepEqual(run.errors, []);
+});
+
+test('dryRun 预组装（提示词查看器）也会注入当前指导', async () => {
+    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n当前正文', enabled: false };
+    const { state, helper } = helperFor(entry);
+    const run = load(helper);
+    await new Promise(setImmediate);
+    state.active.clear();
+    await state.events.get('generate')('normal', {}, true);
+    assert.equal(state.active.size, 1, 'dryRun 也要注入，提示词查看器才能看到当前阶段');
     assert.deepEqual(run.errors, []);
 });
 
@@ -657,6 +700,8 @@ function multiWorld(books, options) {
     const state = {
         events: new Map(),
         injected: [],
+        injectionOptions: [],
+        active: new Map(),
         removed: [],
         variables: {
             character: { $dynamicGuideAssistant: { config: settings.config || { version: 2, bindings: [] } } },
@@ -674,8 +719,15 @@ function multiWorld(books, options) {
         getWorldbookNames: () => Object.keys(state.books),
         getWorldbook: name => state.books[name],
         updateWorldbookWith: (name, updater) => { state.books[name] = updater(state.books[name]); },
-        injectPrompts: prompts => state.injected.push(...prompts),
-        uninjectPrompts: ids => state.removed.push(...ids),
+        injectPrompts: (prompts, options) => prompts.forEach(prompt => {
+            state.injected.push(prompt);
+            state.injectionOptions.push(options || null);
+            state.active.set(prompt.id, prompt);
+        }),
+        uninjectPrompts: ids => ids.forEach(id => {
+            state.removed.push(id);
+            state.active.delete(id);
+        }),
         getLastMessageId: () => state.lastMessageId,
         getChatMessages: id => state.messages.filter(message => message.message_id === id),
         setChatMessages: updates => {
@@ -733,10 +785,10 @@ test('两条绑定各自注入回自己的位置', async () => {
     assert.notEqual(a.id, b.id, '两条注入的 id 不能互相覆盖');
     assert.match(a.id, /^dynamic-guide-assistant-current-/);
     await run.core.next();
-    const aNext = state.injected[state.injected.length - 1];
+    const aNext = state.injected.filter(item => item.id === a.id).pop();
     assert.match(aNext.content, /甲二正文/);
-    assert.equal(aNext.id, a.id);
-    assert.equal(state.injected.filter(item => item.id === b.id).length, 1, 'B 的注入不重复也不受影响');
+    assert.doesNotMatch(aNext.content, /甲一正文/);
+    assert.match(state.active.get(b.id).content, /乙一正文/, 'B 的注入内容不受影响');
     assert.deepEqual(run.errors, []);
 });
 
