@@ -969,27 +969,60 @@
     async function safeUninject() {
         const uninjectPrompts = api('uninjectPrompts', false);
         if (uninjectPrompts) await Promise.resolve(uninjectPrompts([INJECTION_ID]));
+        clearAnchorInjection();
     }
 
     // 注入内容必须始终等于“现在该发的那一段”。酒馆或酒馆助手是否等待事件监听器
     // 返回的 Promise 因版本而异，所以这里不依赖生成事件：状态一变就同步更新注入，
     // 生成事件里再用缓存同步兜底一次，然后异步读回权威内容纠正。
-    const injectionCache = { context: null, text: undefined, key: null };
+    const injectionCache = { context: null, text: undefined, key: null, channel: null };
 
-    // 把指导放回来源条目原来在提示词里的位置：条目是“按深度插入”时，跟随它的
-    // 深度和角色；其它位置（角色定义前/后等）没法用注入复制，仍然放在聊天末尾。
+    // 把指导放回来源条目原来在提示词里的位置：条目是“按深度插入”时跟随它的深度和角色；
+    // “角色定义前/后”改用酒馆原生扩展提示锚点（酒馆助手的注入只能插在聊天里，做不到这两个位置）；
+    // 示例消息、作者注释等其余位置没有可复制的注入通道，仍然放在聊天末尾。
     function injectionPlacement(entry) {
         const position = (entry && entry.position) || {};
-        if (position.type !== 'at_depth') return { depth: 0, role: 'system', followed: false };
-        const depth = Math.max(0, Number(position.depth) || 0);
-        const role = position.role === 'user' || position.role === 'assistant' ? position.role : 'system';
-        return { depth, role, followed: true };
+        if (position.type === 'at_depth') {
+            const depth = Math.max(0, Number(position.depth) || 0);
+            const role = position.role === 'user' || position.role === 'assistant' ? position.role : 'system';
+            return { channel: 'in_chat', depth, role, followed: true };
+        }
+        if (position.type === 'before_character_definition') return { channel: 'anchor', slot: 'before', followed: true };
+        if (position.type === 'after_character_definition') return { channel: 'anchor', slot: 'after', followed: true };
+        return { channel: 'in_chat', depth: 0, role: 'system', followed: false };
     }
 
     function injectionPlacementText(placement) {
-        return placement && placement.followed
-            ? `跟随大纲条目：深度 ${placement.depth} · ${placement.role}`
-            : '聊天末尾（深度 0）';
+        if (!placement || !placement.followed) return '聊天末尾（深度 0）';
+        if (placement.channel === 'anchor') {
+            return placement.slot === 'before' ? '跟随大纲条目：角色定义前' : '跟随大纲条目：角色定义后';
+        }
+        return `跟随大纲条目：深度 ${placement.depth} · ${placement.role}`;
+    }
+
+    // 酒馆原生扩展提示接口：角色定义前/后锚点只能靠它。
+    // 数值常量与酒馆源码 script.js 里的 extension_prompt_types 一致：
+    // NONE=-1, IN_PROMPT=0（角色定义后）, IN_CHAT=1, BEFORE_PROMPT=2（角色定义前）。
+    function extensionPromptChannel() {
+        for (const candidate of windowCandidates) {
+            try {
+                const tavern = candidate && candidate.SillyTavern;
+                const context = tavern && typeof tavern.getContext === 'function' ? tavern.getContext() : null;
+                if (context && typeof context.setExtensionPrompt === 'function') {
+                    const types = context.extension_prompt_types
+                        || { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
+                    return { set: context.setExtensionPrompt.bind(context), types };
+                }
+            } catch (error) {
+                // 跨域候选 WindowProxy 读属性会抛错，继续找同源窗口
+            }
+        }
+        return null;
+    }
+
+    function clearAnchorInjection() {
+        const channel = extensionPromptChannel();
+        if (channel) channel.set(INJECTION_ID, '', channel.types.NONE, 0);
     }
 
     function currentMessageId() {
@@ -1020,29 +1053,55 @@
     }
 
     function applyInjection(text, placement) {
-        const spot = placement || { depth: 0, role: 'system', followed: false };
-        const key = text == null ? null : `${spot.depth}|${spot.role}|${text}`;
+        const spot = placement || { channel: 'in_chat', depth: 0, role: 'system', followed: false };
+        const where = spot.channel === 'anchor' ? spot.slot : `${spot.depth}|${spot.role}`;
+        const key = text == null ? null : `${spot.channel}|${where}|${text}`;
         if (text != null && injectionCache.key === key) return;
         const uninjectPrompts = api('uninjectPrompts', false);
         if (text == null) {
             // undefined 表示“还不知道有没有注入过”，这时要清一次；null 表示已经清干净了。
-            if (uninjectPrompts && injectionCache.text !== null) uninjectPrompts([INJECTION_ID]);
+            if (injectionCache.text !== null) {
+                if (uninjectPrompts) uninjectPrompts([INJECTION_ID]);
+                clearAnchorInjection();
+            }
             injectionCache.text = null;
             injectionCache.key = null;
+            injectionCache.channel = null;
             return;
         }
-        const injectPrompts = api('injectPrompts', true);
-        injectPrompts([{
-            id: INJECTION_ID,
-            position: 'in_chat',
-            depth: spot.depth,
-            role: spot.role,
-            content: text,
-            should_scan: false,
-        }]);
+        if (spot.channel === 'anchor') {
+            const channel = extensionPromptChannel();
+            if (channel) {
+                // 通道切换时清掉另一边的旧注入，避免同一段指导出现两次
+                if (uninjectPrompts && injectionCache.channel === 'in_chat') uninjectPrompts([INJECTION_ID]);
+                channel.set(INJECTION_ID, text,
+                    spot.slot === 'before' ? channel.types.BEFORE_PROMPT : channel.types.IN_PROMPT, 0, false, 0);
+            } else {
+                // 拿不到原生扩展提示接口时退化为聊天末尾，并说明原因
+                reportOnce('anchor-unavailable', '当前环境没有酒馆原生扩展提示接口，指导改放在聊天末尾（深度 0）。');
+                api('injectPrompts', true)([{
+                    id: INJECTION_ID,
+                    position: 'in_chat',
+                    depth: 0,
+                    role: 'system',
+                    content: text,
+                    should_scan: false,
+                }]);
+            }
+        } else {
+            if (injectionCache.channel === 'anchor') clearAnchorInjection();
+            api('injectPrompts', true)([{
+                id: INJECTION_ID,
+                position: 'in_chat',
+                depth: spot.depth,
+                role: spot.role,
+                content: text,
+                should_scan: false,
+            }]);
+        }
         injectionCache.text = text;
         injectionCache.key = key;
-        injectionCache.placement = spot;
+        injectionCache.channel = spot.channel;
     }
 
     function rememberContext(context) {
@@ -2285,9 +2344,11 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
             // 换聊天后进度不同：先丢掉缓存和旧注入，再按读到的状态重新注入。
+            // 注入按聊天文件隔离，即使新聊天阶段内容相同也要重新注入，所以 key 也要清掉。
             injectionCache.context = null;
             await safeUninject();
             injectionCache.text = null;
+            injectionCache.key = null;
             await injectCurrentGuide('normal');
             const doc = hostDocument();
             const panel = doc && doc.getElementById(PANEL_ID);

@@ -8,7 +8,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
 
-function load(helper) {
+function load(helper, extra) {
     const logs = [];
     const errors = [];
     const sandbox = {
@@ -16,6 +16,7 @@ function load(helper) {
         console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
         TavernHelper: helper,
     };
+    Object.assign(sandbox, extra || {});
     vm.runInNewContext(source, sandbox, { filename: 'index.js' });
     return { core: sandbox.DynamicGuideAssistantCore, logs, errors };
 }
@@ -110,7 +111,7 @@ function helperFor(entry) {
         entries: [entry],
     };
     const helper = {
-        tavern_events: { GENERATION_AFTER_COMMANDS: 'generate' },
+        tavern_events: { GENERATION_AFTER_COMMANDS: 'generate', CHAT_CHANGED: 'chat_changed' },
         eventOn: (event, listener) => state.events.set(event, listener),
         getVariables: ({ type }) => state.variables[type],
         updateVariablesWith: (updater, { type }) => { state.variables[type] = updater(state.variables[type]); },
@@ -513,7 +514,7 @@ test('注入位置跟随大纲条目的深度与角色', async () => {
     assert.deepEqual(run.errors, []);
 });
 
-test('条目不在“按深度插入”位置时，指导仍注入到聊天末尾', async () => {
+test('没有原生扩展提示接口时，角色定义前的条目退化为聊天末尾', async () => {
     const entry = {
         uid: 1,
         name: '大纲',
@@ -526,6 +527,92 @@ test('条目不在“按深度插入”位置时，指导仍注入到聊天末�
     assert.equal(run.injected.length, 1);
     assert.equal(run.injected[0].depth, 0);
     assert.equal(run.injected[0].role, 'system');
+    assert.deepEqual(run.errors, []);
+});
+
+// 原生扩展提示的数值常量来自酒馆源码 extension_prompt_types：NONE=-1, IN_PROMPT=0, IN_CHAT=1, BEFORE_PROMPT=2
+test('角色定义前的条目通过原生扩展提示锚点注入，切换聊天时清理', async () => {
+    const calls = [];
+    const sillyTavern = {
+        getContext: () => ({
+            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
+        }),
+    };
+    const entry = {
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n前置正文',
+        enabled: false,
+        position: { type: 'before_character_definition', depth: 0, role: 'system', order: 100 },
+    };
+    const { state, helper } = helperFor(entry);
+    const run = load(helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    assert.equal(state.injected.length, 0, '锚点位置不走 injectPrompts');
+    assert.equal(calls.length, 1, '打开页面就该写原生扩展提示');
+    assert.equal(calls[0].id, 'dynamic-guide-assistant-current');
+    assert.equal(calls[0].position, 2, '角色定义前对应 BEFORE_PROMPT=2');
+    assert.match(calls[0].text, /前置正文/);
+    await state.events.get('chat_changed')();
+    assert.ok(calls.some(call => call.text === '' && call.position === -1), '切换聊天时要写空内容到 NONE 位置清理');
+    assert.equal(calls[calls.length - 1].position, 2, '清理后按新聊天状态重新注入');
+    assert.deepEqual(run.errors, []);
+});
+
+test('角色定义后的条目用 IN_PROMPT 锚点，不识别的位置仍放聊天末尾', async () => {
+    const calls = [];
+    const sillyTavern = {
+        getContext: () => ({
+            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
+        }),
+    };
+    const afterEntry = {
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n后置正文',
+        enabled: false,
+        position: { type: 'after_character_definition', depth: 0, role: 'system', order: 100 },
+    };
+    const runAfter = runtime(afterEntry);
+    await new Promise(setImmediate);
+    // runtime() 的沙箱里没有 SillyTavern，这条只验证深度回退；锚点验证见上面的测试
+    assert.equal(runAfter.injected.length, 1);
+    assert.equal(runAfter.injected[0].depth, 0);
+    const withSilly = load(helperFor({
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n后置正文',
+        enabled: false,
+        position: { type: 'after_character_definition', depth: 0, role: 'system', order: 100 },
+    }).helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].position, 0, '角色定义后对应 IN_PROMPT=0');
+    assert.match(calls[0].text, /后置正文/);
+    assert.deepEqual(withSilly.errors, []);
+});
+
+test('示例消息等其余位置的条目即使有原生接口也仍放聊天末尾', async () => {
+    const calls = [];
+    const sillyTavern = {
+        getContext: () => ({
+            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
+        }),
+    };
+    const entry = {
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n正文',
+        enabled: false,
+        position: { type: 'before_example_messages', depth: 6, role: 'user', order: 100 },
+    };
+    const { state, helper } = helperFor(entry);
+    const run = load(helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    assert.equal(state.injected.length, 1);
+    assert.equal(state.injected[0].depth, 0);
+    assert.equal(state.injected[0].role, 'system');
+    assert.equal(calls.length, 0, '没有可复制通道的位置不能用扩展提示锚点');
     assert.deepEqual(run.errors, []);
 });
 
