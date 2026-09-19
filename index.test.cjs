@@ -800,3 +800,186 @@ test('移出绑定会重新打开条目、删掉进度并清掉它的注入', as
     assert.equal(state.injected.filter(item => item.id === idA).length, 1, '移出后不会再注入这条绑定');
     assert.deepEqual(run.errors, []);
 });
+
+
+// ---------------------------------------------------------------
+// v2.2 选区划分：正文铺成连续文字，拖选后分配给分段，结构立刻重建
+// ---------------------------------------------------------------
+
+test('选区模式：载入→重建往返幂等，保留前缀、转义、并入和附加范围', () => {
+    const content = '前言一\n前言二\n\n## 第一幕\n完成：交谈结束。\n\\## 小标题\n第一幕正文\n\n## 第二幕\n第二幕正文\n\n## 补充\n合并到：第一幕\n补充正文\n\n## 道具 [附加]\n从：第一幕\n到：第二幕\n道具正文\n\n## 风格 [常驻]\n风格正文\n\n## 秘密 [备注]\n备注正文';
+    const first = core.pickBuild(core.pickLoad(core.parseOutline(content)));
+    const second = core.pickBuild(core.pickLoad(core.parseOutline(first)));
+    assert.equal(second, first, '第一次重建后再次载入重建必须逐字相同');
+    assert.ok(first.startsWith('前言一\n前言二'), '没有归属的文字保留在最前面');
+    const parsed = core.parseOutline(first);
+    assert.deepEqual(plain(parsed.stages.map(item => [item.name, item.prompt])), [
+        ['第一幕', '## 小标题\n第一幕正文\n\n补充正文'],
+        ['第二幕', '第二幕正文'],
+    ]);
+    assert.equal(parsed.stages[0].completion, '交谈结束。');
+    assert.deepEqual(plain(parsed.addons.map(item => [item.name, item.prompt])), [['道具', '道具正文'], ['常驻提示', '风格正文']]);
+    const addon = parsed.addons.find(item => item.kind === 'addon');
+    assert.equal(addon.fromIndex, 0);
+    assert.equal(addon.toIndex, 1);
+    assert.equal(parsed.blocks.find(item => item.kind === 'always').prompt, '风格正文');
+    assert.equal(parsed.blocks.find(item => item.kind === 'note').prompt, '备注正文');
+    parsed.stages.forEach(stage => assert.doesNotMatch(stage.prompt, /前言/));
+});
+
+test('选区模式：给未分段正文分配区间，重建出正确的标题结构', () => {
+    const parsed = core.parseOutline('开头铺垫\n\n冲突爆发\n\n结局收尾');
+    const pick = core.pickLoad(parsed);
+    assert.equal(pick.stages.length, 0);
+    const at = quote => {
+        const start = pick.text.indexOf(quote);
+        return { start, end: start + quote.length };
+    };
+    pick.stages.push(
+        { id: 's1', kind: 'stage', name: '第一幕', completion: '', ranges: [], color: '#111111' },
+        { id: 's2', kind: 'stage', name: '第二幕', completion: '冲突结束。', ranges: [], color: '#222222' },
+    );
+    assert.ok(core.pickAssign(pick, 's1', [at('开头铺垫')]));
+    assert.ok(core.pickAssign(pick, 's2', [at('冲突爆发')]));
+    const built = core.pickBuild(pick);
+    assert.ok(built.startsWith('结局收尾'), '没分配的文字收在最前面当前言，不发给 AI');
+    assert.ok(built.indexOf('结局收尾') < built.indexOf('## 第一幕'));
+    const next = core.parseOutline(built);
+    assert.deepEqual(plain(next.stages.map(item => [item.name, item.prompt])), [['第一幕', '开头铺垫'], ['第二幕', '冲突爆发']]);
+    assert.equal(next.stages[1].completion, '冲突结束。');
+    next.stages.forEach(stage => assert.doesNotMatch(stage.prompt, /结局收尾/));
+});
+
+test('选区模式：把别人已分配的文字重新选一遍就改归新属主', () => {
+    const parsed = core.parseOutline('## 第一幕\naaa bbb ccc\n\n## 第二幕\nddd');
+    const pick = core.pickLoad(parsed);
+    const [firstStage, secondStage] = pick.stages;
+    const range = { start: pick.text.indexOf('bbb'), end: pick.text.indexOf('ddd') };
+    assert.ok(core.pickAssign(pick, secondStage.id, [range]));
+    assert.deepEqual(plain(firstStage.ranges), [{ start: 0, end: pick.text.indexOf('bbb') }], '被挖走的部分要从原属主手里减掉');
+    const rebuilt = core.parseOutline(core.pickBuild(pick));
+    assert.equal(rebuilt.stages[0].prompt, 'aaa');
+    assert.equal(rebuilt.stages[1].prompt, 'bbb ccc\n\nddd');
+});
+
+test('选区模式：移除选中段后，文字回到最前面的未分配区', () => {
+    const parsed = core.parseOutline('## 第一幕\n保留部分 丢弃部分');
+    const pick = core.pickLoad(parsed);
+    const stage = pick.stages[0];
+    const range = { start: pick.text.indexOf('丢弃'), end: pick.text.length };
+    assert.ok(core.pickRemove(pick, stage.id, range));
+    const built = core.pickBuild(pick);
+    assert.ok(built.startsWith('丢弃部分'));
+    const rebuilt = core.parseOutline(built);
+    assert.equal(rebuilt.stages[0].prompt, '保留部分');
+    assert.equal(core.pickRemove(pick, 'note', range), false, '没有这段的属主不该报成功');
+});
+
+// 选区模式的 UI 冒烟：用 mock 的 Range/Selection 走一遍真实事件路径。
+function collectTextNodes(node, out) {
+    (node.children || []).forEach(child => {
+        if (child.nodeType === 3) out.push(child);
+        else collectTextNodes(child, out);
+    });
+    return out;
+}
+
+function findButton(node, prefix) {
+    if (node.tagName === 'BUTTON' && String(node.textContent || '').includes(prefix)) return node;
+    for (const child of node.children || []) {
+        const found = findButton(child, prefix);
+        if (found) return found;
+    }
+    return null;
+}
+
+test('选区模式界面：拖选前言分配给第一阶段，正文立刻重建并标脏', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    // mock Range：toString() 量出从正文开头到端点的字数，也就是选区偏移
+    documentRef.createRange = () => {
+        const rangeRef = {
+            selectNodeContents(node) { this.root = node; },
+            setEnd(node, offset) { this.endNode = node; this.endOffset = offset; },
+            toString() {
+                let out = '';
+                let done = false;
+                const walk = node => {
+                    if (done || !node) return;
+                    if (node === rangeRef.endNode) {
+                        if (node.nodeType === 3) out += node.textContent.slice(0, rangeRef.endOffset);
+                        else (node.children || []).slice(0, rangeRef.endOffset).forEach(child => { out += child.textContent; });
+                        done = true;
+                        return;
+                    }
+                    if (node.nodeType === 3) { out += node.textContent; return; }
+                    (node.children || []).forEach(walk);
+                };
+                walk(rangeRef.root);
+                return out;
+            },
+        };
+        return rangeRef;
+    };
+    const selection = {
+        rangeCount: 0,
+        isCollapsed: true,
+        native: null,
+        getRangeAt() { return this.native; },
+        removeAllRanges() { this.rangeCount = 0; this.isCollapsed = true; this.native = null; },
+        select(startNode, startOffset, endNode, endOffset) {
+            this.native = { startContainer: startNode, startOffset, endContainer: endNode, endOffset };
+            this.rangeCount = 1;
+            this.isCollapsed = false;
+        },
+    };
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '前言介绍\n\n## 第一幕\n第一幕正文', enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const logs = [];
+    const errors = [];
+    const sandbox = {
+        Buffer,
+        console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
+        TavernHelper: helper,
+        document: documentRef,
+        getComputedStyle: () => ({ display: 'none', visibility: 'hidden' }),
+        setTimeout: () => 0,
+        clearTimeout: () => {},
+        innerWidth: 390,
+        innerHeight: 844,
+        matchMedia: () => ({ matches: false }),
+        getSelection: () => selection,
+    };
+    vm.runInNewContext(source, sandbox, { filename: 'index.js' });
+    const uiCore = sandbox.DynamicGuideAssistantCore;
+    await new Promise(setImmediate);
+
+    await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await uiCore.refresh();
+    const panel = documentRef.getElementById(PANEL_ID);
+    const pickTab = panel.querySelector('.dga-mode-pick');
+    assert.ok(pickTab, '编辑器要有“选区划分”模式按钮');
+    pickTab.listeners.click[0]();
+
+    let surface = panel.querySelector('.dga-pick-surface');
+    assert.ok(surface, '选区模式要把正文铺成连续文字');
+    assert.match(surface.textContent, /前言介绍\n\n第一幕正文/);
+    const texts = collectTextNodes(surface, []);
+    assert.equal(texts[0].textContent, '前言介绍\n\n', '前言和分隔符在第一个文本节点里（未分配，没有底色）');
+
+    selection.select(texts[0], 0, texts[0], 4);
+    surface.listeners.mousedown[0]();
+    surface.listeners.mouseup[0]();
+    assert.match(panel.querySelector('.dga-pick-bar-text').textContent, /已准备 1 段/, '拖选后选区栏要显示待分配数量');
+    assert.equal(selection.rangeCount, 0, '捕获后系统选区要清掉，改由我们的底色显示');
+
+    const assign = findButton(panel, '分配给');
+    assert.ok(assign, '选区栏要有分配按钮');
+    assign.listeners.click[0]();
+    surface = panel.querySelector('.dga-pick-surface');
+    const firstSpan = surface.children[0];
+    assert.ok(firstSpan.classList && firstSpan.classList.contains('dga-text-mark'), '分配后前言要包进第一幕的底色');
+    assert.match(firstSpan.textContent, /前言介绍/);
+    const subtitle = panel.querySelector('.dga-head-text').children[1];
+    assert.match(subtitle.textContent, /未保存/, '分配是结构性修改，头部要提示未保存');
+    assert.deepEqual(errors, []);
+});
