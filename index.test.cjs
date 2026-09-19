@@ -111,7 +111,7 @@ function helperFor(entry) {
         entries: [entry],
     };
     const helper = {
-        tavern_events: { GENERATION_AFTER_COMMANDS: 'generate', CHAT_CHANGED: 'chat_changed' },
+        tavern_events: { GENERATION_AFTER_COMMANDS: 'generate', CHAT_CHANGED: 'chat_changed', MESSAGE_RECEIVED: 'message_received' },
         eventOn: (event, listener) => state.events.set(event, listener),
         getVariables: ({ type }) => state.variables[type],
         updateVariablesWith: (updater, { type }) => { state.variables[type] = updater(state.variables[type]); },
@@ -143,7 +143,8 @@ for (const storage of ['extra', 'embedded']) {
         const run = runtime(entry);
         await run.generate();
         assert.equal(run.injected.length, 0);
-        assert.deepEqual(run.removed, ['dynamic-guide-assistant-current']);
+        assert.ok(run.removed.includes('dynamic-guide-assistant-current'), '要清掉旧版无后缀注入');
+        assert.ok(run.removed.some(id => id.startsWith('dynamic-guide-assistant-current-')), '要清掉这条绑定自己的注入');
         assert.match(run.logs.join('\n'), /转换成新版格式/);
         assert.deepEqual(run.errors, []);
     });
@@ -549,10 +550,11 @@ test('角色定义前的条目通过原生扩展提示锚点注入，切换聊�
     const run = load(helper, { SillyTavern: sillyTavern });
     await new Promise(setImmediate);
     assert.equal(state.injected.length, 0, '锚点位置不走 injectPrompts');
-    assert.equal(calls.length, 1, '打开页面就该写原生扩展提示');
-    assert.equal(calls[0].id, 'dynamic-guide-assistant-current');
-    assert.equal(calls[0].position, 2, '角色定义前对应 BEFORE_PROMPT=2');
-    assert.match(calls[0].text, /前置正文/);
+    const anchored = calls.filter(call => call.text);
+    assert.equal(anchored.length, 1, '打开页面就该写原生扩展提示');
+    assert.match(anchored[0].id, /^dynamic-guide-assistant-current-/, '注入 id 带绑定指纹后缀');
+    assert.equal(anchored[0].position, 2, '角色定义前对应 BEFORE_PROMPT=2');
+    assert.match(anchored[0].text, /前置正文/);
     await state.events.get('chat_changed')();
     assert.ok(calls.some(call => call.text === '' && call.position === -1), '切换聊天时要写空内容到 NONE 位置清理');
     assert.equal(calls[calls.length - 1].position, 2, '清理后按新聊天状态重新注入');
@@ -586,9 +588,10 @@ test('角色定义后的条目用 IN_PROMPT 锚点，不识别的位置仍放聊
         position: { type: 'after_character_definition', depth: 0, role: 'system', order: 100 },
     }).helper, { SillyTavern: sillyTavern });
     await new Promise(setImmediate);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].position, 0, '角色定义后对应 IN_PROMPT=0');
-    assert.match(calls[0].text, /后置正文/);
+    const anchored = calls.filter(call => call.text);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].position, 0, '角色定义后对应 IN_PROMPT=0');
+    assert.match(anchored[0].text, /后置正文/);
     assert.deepEqual(withSilly.errors, []);
 });
 
@@ -612,7 +615,7 @@ test('示例消息等其余位置的条目即使有原生接口也仍放聊天�
     assert.equal(state.injected.length, 1);
     assert.equal(state.injected[0].depth, 0);
     assert.equal(state.injected[0].role, 'system');
-    assert.equal(calls.length, 0, '没有可复制通道的位置不能用扩展提示锚点');
+    assert.equal(calls.filter(call => call.text).length, 0, '没有可复制通道的位置不能写入扩展提示锚点');
     assert.deepEqual(run.errors, []);
 });
 
@@ -643,4 +646,157 @@ test('面板高度写死成视口高度，不再靠 inset 定位', () => {
     assert.match(css, /height:\s*100dvh/, '手机要用 100dvh 撑满');
     assert.match(css, /max-height:\s*100dvh/);
     assert.doesNotMatch(css, /position:\s*fixed;\s*inset:\s*0/, '单独用 inset 定位会在手机上算出 0 高度');
+});
+
+// ---------------------------------------------------------------
+// v2.1 多绑定：每条绑定各自注入、各自推进、可以单独移出
+// ---------------------------------------------------------------
+
+function multiWorld(books, options) {
+    const settings = options || {};
+    const state = {
+        events: new Map(),
+        injected: [],
+        removed: [],
+        variables: {
+            character: { $dynamicGuideAssistant: { config: settings.config || { version: 2, bindings: [] } } },
+            chat: settings.chatState ? { $dynamicGuideAssistant: { state: settings.chatState } } : {},
+        },
+        books,
+        messages: settings.messages || [],
+        lastMessageId: settings.lastMessageId == null ? null : settings.lastMessageId,
+    };
+    const helper = {
+        tavern_events: { GENERATION_AFTER_COMMANDS: 'generate', CHAT_CHANGED: 'chat_changed', MESSAGE_RECEIVED: 'message_received' },
+        eventOn: (event, listener) => state.events.set(event, listener),
+        getVariables: ({ type }) => state.variables[type],
+        updateVariablesWith: (updater, { type }) => { state.variables[type] = updater(state.variables[type]); },
+        getWorldbookNames: () => Object.keys(state.books),
+        getWorldbook: name => state.books[name],
+        updateWorldbookWith: (name, updater) => { state.books[name] = updater(state.books[name]); },
+        injectPrompts: prompts => state.injected.push(...prompts),
+        uninjectPrompts: ids => state.removed.push(...ids),
+        getLastMessageId: () => state.lastMessageId,
+        getChatMessages: id => state.messages.filter(message => message.message_id === id),
+        setChatMessages: updates => {
+            updates.forEach(update => {
+                const message = state.messages.find(item => item.message_id === update.message_id);
+                if (message) message.message = update.message;
+            });
+        },
+    };
+    return { state, helper };
+}
+
+const keyOf = (worldbookName, uid) => `${worldbookName}#uid:${uid}`;
+
+test('2.0 的旧配置和旧进度自动迁移成多绑定结构', async () => {
+    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n第一段正文\n\n## 第二幕\n第二段正文', enabled: false };
+    const { state, helper } = helperFor(entry);
+    state.variables.chat.$dynamicGuideAssistant = {
+        state: { stageIndex: 1, stageName: '第二幕', lastCompletionMessageId: null, lastCompletionFingerprint: '' },
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.equal(state.injected.length, 1);
+    assert.match(state.injected[0].content, /第二段正文/, '旧进度要落到第一个绑定名下');
+    assert.doesNotMatch(state.injected[0].content, /第一段正文/);
+    const chatState = state.variables.chat.$dynamicGuideAssistant.state;
+    assert.equal(chatState.version, 2, '旧进度读出后立刻写回新结构');
+    assert.equal(chatState.bindings[keyOf('测试世界书', 1)].stageIndex, 1);
+    assert.deepEqual(run.errors, []);
+});
+
+test('两条绑定各自注入回自己的位置', async () => {
+    const books = {
+        书A: [{ uid: 1, name: '大纲A', content: '## 甲一\n甲一正文\n\n## 甲二\n甲二正文', enabled: false, position: { type: 'at_depth', depth: 4, role: 'assistant' } }],
+        书B: [{ uid: 2, name: '大纲B', content: '## 乙一\n乙一正文', enabled: false }],
+    };
+    const config = {
+        version: 2,
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null },
+            { worldbookName: '书B', entryUid: 2, entryName: '大纲B', boundAt: null },
+        ],
+    };
+    const { state, helper } = multiWorld(books, { config });
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.equal(state.injected.length, 2, '每条绑定各注入一条');
+    const a = state.injected.find(item => item.depth === 4);
+    const b = state.injected.find(item => item.depth === 0);
+    assert.ok(a && b);
+    assert.equal(a.role, 'assistant');
+    assert.match(a.content, /甲一正文/);
+    assert.doesNotMatch(a.content, /甲二正文/);
+    assert.match(b.content, /乙一正文/);
+    assert.notEqual(a.id, b.id, '两条注入的 id 不能互相覆盖');
+    assert.match(a.id, /^dynamic-guide-assistant-current-/);
+    await run.core.next();
+    const aNext = state.injected[state.injected.length - 1];
+    assert.match(aNext.content, /甲二正文/);
+    assert.equal(aNext.id, a.id);
+    assert.equal(state.injected.filter(item => item.id === b.id).length, 1, 'B 的注入不重复也不受影响');
+    assert.deepEqual(run.errors, []);
+});
+
+test('一条消息里的完成标记只推进匹配的那条绑定', async () => {
+    const contentA = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const contentB = '## 乙一\n乙一正文\n\n## 乙二\n乙二正文';
+    const books = {
+        书A: [{ uid: 1, name: '大纲A', content: contentA, enabled: false }],
+        书B: [{ uid: 2, name: '大纲B', content: contentB, enabled: false }],
+    };
+    const config = {
+        version: 2,
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null },
+            { worldbookName: '书B', entryUid: 2, entryName: '大纲B', boundAt: null },
+        ],
+    };
+    const stageB = core.parseOutline(contentB).stages[0];
+    const message = { message_id: 5, role: 'assistant', message: `这一轮的回复 <!-- DGA_COMPLETE:${stageB.id} -->` };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    const chatState = state.variables.chat.$dynamicGuideAssistant.state;
+    assert.equal(chatState.bindings[keyOf('书A', 1)].stageIndex, 0, 'A 不该被推进');
+    assert.equal(chatState.bindings[keyOf('书B', 2)].stageIndex, 1, 'B 要被推进');
+    assert.equal(message.message.includes('DGA_COMPLETE'), false, '标记要从消息里清掉');
+    const lastB = state.injected.filter(item => /乙/.test(item.content)).pop();
+    assert.match(lastB.content, /乙二正文/);
+    assert.doesNotMatch(lastB.content, /乙一正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('移出绑定会重新打开条目、删掉进度并清掉它的注入', async () => {
+    const books = {
+        书A: [{ uid: 1, name: '大纲A', content: '## 甲一\n甲一正文', enabled: false }],
+        书B: [{ uid: 2, name: '大纲B', content: '## 乙一\n乙一正文', enabled: false }],
+    };
+    const config = {
+        version: 2,
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null },
+            { worldbookName: '书B', entryUid: 2, entryName: '大纲B', boundAt: null },
+        ],
+    };
+    const { state, helper } = multiWorld(books, { config });
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.equal(state.injected.length, 2);
+    const idA = state.injected.find(item => /甲一正文/.test(item.content)).id;
+    await run.core.unbind(keyOf('书A', 1), { confirm: false });
+    assert.equal(books.书A[0].enabled, true, '条目要重新打开');
+    assert.equal(books.书B[0].enabled, false, '其他绑定不受影响');
+    const remaining = state.variables.character.$dynamicGuideAssistant.config.bindings;
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].worldbookName, '书B');
+    const chatState = state.variables.chat.$dynamicGuideAssistant.state;
+    assert.equal(chatState.bindings[keyOf('书A', 1)], undefined, '进度要删掉');
+    assert.ok(state.removed.includes(idA), '这条绑定的注入要清掉');
+    await state.events.get('generate')('normal', {}, false);
+    assert.equal(state.injected.filter(item => item.id === idA).length, 1, '移出后不会再注入这条绑定');
+    assert.deepEqual(run.errors, []);
 });

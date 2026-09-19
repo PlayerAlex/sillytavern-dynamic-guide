@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.0.3
+     * 动态指导助手 v2.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
@@ -10,9 +10,12 @@
      *   二、适配层：读写酒馆助手的变量、世界书、注入和事件。
      *   三、界面：管理页和“划分阶段”编辑器。
      *
+     * 可以同时绑定好几个大纲条目：每个条目被关闭后，只有当前阶段的切片
+     * 会注入回它原来的位置，相当于暂时让其余内容不被 AI 看到。
+     *
      * 数据只存两处：
      *   - 阶段结构就是世界书条目正文本身，用标题行（## 名称）分段。
-     *   - 进度存在当前聊天的聊天变量里；绑定了哪个条目存在角色变量里。
+     *   - 绑定列表存在角色变量里；每个绑定的进度按绑定分开存在聊天变量里。
      * ================================================================ */
 
     // ---------------------------------------------------------------
@@ -20,7 +23,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.0.3';
+    const VERSION = '2.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -704,7 +707,10 @@
     }
 
     // ---------------------------------------------------------------
-    // 二、适配层：变量（角色变量存绑定，聊天变量存进度）
+    // 二、适配层：变量（角色变量存绑定列表，聊天变量按绑定分别存进度）
+    //
+    // 一条绑定 = 一个被关闭的大纲条目。可以同时有好几条绑定，
+    // 每条绑定的注入和进度都靠 bindingKey 区分开。
     // ---------------------------------------------------------------
 
     async function readVariables(type) {
@@ -738,10 +744,87 @@
         });
     }
 
-    const readConfig = () => readRootField('character', 'config');
+    const readRawConfig = () => readRootField('character', 'config');
     const writeConfig = config => writeRootField('character', 'config', config);
-    const readState = () => readRootField('chat', 'state');
-    const writeState = state => writeRootField('chat', 'state', state);
+    const readRawState = () => readRootField('chat', 'state');
+
+    function bindingKey(binding) {
+        const target = binding && binding.entryUid != null
+            ? `uid:${String(binding.entryUid)}`
+            : `name:${String((binding && binding.entryName) || '')}`;
+        return `${String((binding && binding.worldbookName) || '')}#${target}`;
+    }
+
+    // 每个绑定一条注入，id 带绑定指纹后缀，互不覆盖；旧版无后缀的注入由清理逻辑兜底。
+    function injectionIdFor(key) {
+        return `${INJECTION_ID}-${hashText(key).slice(0, 6)}`;
+    }
+
+    // 2.0 的 config 是扁平的单个绑定；2.1 变成 { version: 2, bindings: […] }。
+    function normalizeConfig(raw) {
+        const empty = { version: 2, bindings: [] };
+        if (!raw || typeof raw !== 'object') return empty;
+        const list = Array.isArray(raw.bindings)
+            ? raw.bindings
+            : (raw.worldbookName ? [raw] : []);
+        const seen = new Set();
+        const bindings = [];
+        list.forEach(item => {
+            if (!item || typeof item !== 'object' || !item.worldbookName) return;
+            const binding = {
+                worldbookName: String(item.worldbookName),
+                entryUid: item.entryUid == null ? null : item.entryUid,
+                entryName: String(item.entryName || ''),
+                boundAt: item.boundAt || null,
+            };
+            const key = bindingKey(binding);
+            if (seen.has(key)) return;
+            seen.add(key);
+            bindings.push(binding);
+        });
+        return { version: 2, bindings };
+    }
+
+    async function readConfig() {
+        return normalizeConfig(await readRawConfig());
+    }
+
+    // 2.0 的 state 是扁平的单个进度；2.1 变成 { version: 2, bindings: { key: 进度 } }。
+    // 旧进度并入第一个绑定名下；读出来发现是旧结构就顺手写回新版。
+    async function readState(config) {
+        const raw = await readRawState();
+        if (raw && typeof raw === 'object' && raw.version === 2 && raw.bindings && typeof raw.bindings === 'object') {
+            return raw.bindings;
+        }
+        const map = {};
+        if (raw && typeof raw === 'object'
+            && (Number.isInteger(raw.stageIndex) || Number.isInteger(raw.mainIndex))
+            && config.bindings.length > 0) {
+            map[bindingKey(config.bindings[0])] = raw;
+            await writeRootField('chat', 'state', { version: 2, bindings: map });
+        } else if (raw != null) {
+            await writeRootField('chat', 'state', { version: 2, bindings: {} });
+        }
+        return map;
+    }
+
+    // state 传 null 表示删掉这条绑定的进度（移出绑定时用）。
+    async function writeStateFor(key, state) {
+        await updateVariables('chat', variables => {
+            const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
+                ? variables[VARIABLE_ROOT]
+                : {};
+            const old = root.state && typeof root.state === 'object'
+                && root.state.version === 2 && root.state.bindings && typeof root.state.bindings === 'object'
+                ? root.state.bindings
+                : {};
+            const bindings = { ...old };
+            if (state == null) delete bindings[key];
+            else bindings[key] = state;
+            variables[VARIABLE_ROOT] = { ...root, state: { version: 2, bindings } };
+            return variables;
+        });
+    }
 
     // ---------------------------------------------------------------
     // 二、适配层：角色与世界书
@@ -926,35 +1009,49 @@
         return null;
     }
 
-    // 只读。绑定、推进、保存这些会写数据的动作都在各自的函数里。
-    async function loadContext() {
+    // 只读。添加、推进、保存这些会写数据的动作都在各自的函数里。
+    // 每条绑定各读各的：单个条目出问题（broken）不影响其他绑定。
+    async function loadContexts() {
         const config = await readConfig();
-        if (!config) return rememberContext({ configured: false, config: null });
-        const located = await locateEntry(config);
-        if (!located) {
-            throw new Error(`找不到绑定的条目“${config.entryName || ''}”。请在下面重新选择并绑定。`);
+        if (config.bindings.length === 0) return rememberContexts({ configured: false, config, contexts: [] });
+        const stateMap = await readState(config);
+        const contexts = [];
+        for (const binding of config.bindings) {
+            const key = bindingKey(binding);
+            try {
+                const located = await locateEntry(binding);
+                if (!located) {
+                    throw new Error(`找不到绑定的条目“${binding.entryName || ''}”。请在下面把它移出后重新添加。`);
+                }
+                const parsed = parseOutline(located.entry.content);
+                const rawState = stateMap[key] || null;
+                const state = reconcileState(rawState, parsed);
+                contexts.push({
+                    key,
+                    binding,
+                    configured: true,
+                    worldbookName: located.worldbookName,
+                    entry: located.entry,
+                    parsed,
+                    rawState,
+                    state,
+                    stage: parsed.stages[state.stageIndex] || null,
+                    addons: activeAddons(parsed, state.stageIndex),
+                    entryEnabled: !entryIsDisabled(located.entry),
+                    legacy: hasLegacyLayout(located.entry),
+                });
+            } catch (error) {
+                contexts.push({ key, binding, configured: true, broken: true, error: error.message || String(error) });
+            }
         }
-        const parsed = parseOutline(located.entry.content);
-        const rawState = await readState();
-        const state = reconcileState(rawState, parsed);
-        return rememberContext({
-            configured: true,
-            config,
-            worldbookName: located.worldbookName,
-            entry: located.entry,
-            parsed,
-            rawState,
-            state,
-            stage: parsed.stages[state.stageIndex] || null,
-            addons: activeAddons(parsed, state.stageIndex),
-            entryEnabled: !entryIsDisabled(located.entry),
-            legacy: hasLegacyLayout(located.entry),
-        });
+        return rememberContexts({ configured: true, config, contexts });
     }
 
+    // 快捷指令（next/previous/reset）只操作第一条能用的绑定。
     async function requireContext() {
-        const context = await loadContext();
-        if (!context.configured) throw new Error('还没有绑定大纲条目。');
+        const all = await loadContexts();
+        const context = all.contexts.find(item => !item.broken);
+        if (!context) throw new Error('还没有添加指导条目。');
         return context;
     }
 
@@ -966,16 +1063,50 @@
             || left.lastCompletionFingerprint !== right.lastCompletionFingerprint;
     }
 
-    async function safeUninject() {
-        const uninjectPrompts = api('uninjectPrompts', false);
-        if (uninjectPrompts) await Promise.resolve(uninjectPrompts([INJECTION_ID]));
-        clearAnchorInjection();
-    }
-
     // 注入内容必须始终等于“现在该发的那一段”。酒馆或酒馆助手是否等待事件监听器
     // 返回的 Promise 因版本而异，所以这里不依赖生成事件：状态一变就同步更新注入，
     // 生成事件里再用缓存同步兜底一次，然后异步读回权威内容纠正。
-    const injectionCache = { context: null, text: undefined, key: null, channel: null };
+    // byKey 按绑定分开记：text 为 undefined 表示“还不知道有没有注入过”，null 表示已清干净。
+    const injectionCache = { all: null, byKey: {} };
+    let clearedBaseInjection = false;
+
+    function cacheFor(key) {
+        if (!injectionCache.byKey[key]) injectionCache.byKey[key] = { text: undefined, key: null, channel: null };
+        return injectionCache.byKey[key];
+    }
+
+    async function clearAllInjections() {
+        const uninjectPrompts = api('uninjectPrompts', false);
+        const channel = extensionPromptChannel();
+        const ids = [INJECTION_ID];
+        Object.keys(injectionCache.byKey).forEach(key => {
+            if (injectionCache.byKey[key].text != null) ids.push(injectionIdFor(key));
+        });
+        if (uninjectPrompts) await Promise.resolve(uninjectPrompts(ids));
+        if (channel) ids.forEach(id => channel.set(id, '', channel.types.NONE, 0));
+        injectionCache.byKey = {};
+        clearedBaseInjection = true;
+    }
+
+    // 清掉已经不在绑定列表里的注入；旧版无后缀 id 每页只清一次。
+    function clearStaleInjections(activeIds) {
+        const uninjectPrompts = api('uninjectPrompts', false);
+        Object.keys(injectionCache.byKey).forEach(key => {
+            const cache = injectionCache.byKey[key];
+            const id = injectionIdFor(key);
+            if (activeIds.includes(id)) return;
+            if (cache.text != null) {
+                if (uninjectPrompts) uninjectPrompts([id]);
+                clearAnchorInjection(id);
+            }
+            delete injectionCache.byKey[key];
+        });
+        if (!clearedBaseInjection) {
+            clearedBaseInjection = true;
+            if (uninjectPrompts) uninjectPrompts([INJECTION_ID]);
+            clearAnchorInjection(INJECTION_ID);
+        }
+    }
 
     // 把指导放回来源条目原来在提示词里的位置：条目是“按深度插入”时跟随它的深度和角色；
     // “角色定义前/后”改用酒馆原生扩展提示锚点（酒馆助手的注入只能插在聊天里，做不到这两个位置）；
@@ -1020,9 +1151,9 @@
         return null;
     }
 
-    function clearAnchorInjection() {
+    function clearAnchorInjection(id) {
         const channel = extensionPromptChannel();
-        if (channel) channel.set(INJECTION_ID, '', channel.types.NONE, 0);
+        if (channel) channel.set(id || INJECTION_ID, '', channel.types.NONE, 0);
     }
 
     function currentMessageId() {
@@ -1052,35 +1183,36 @@
         return formatInjection(stage, activeAddons(context.parsed, index));
     }
 
-    function applyInjection(text, placement) {
+    function applyInjection(text, placement, key) {
+        const id = injectionIdFor(key);
+        const cache = cacheFor(key);
         const spot = placement || { channel: 'in_chat', depth: 0, role: 'system', followed: false };
         const where = spot.channel === 'anchor' ? spot.slot : `${spot.depth}|${spot.role}`;
-        const key = text == null ? null : `${spot.channel}|${where}|${text}`;
-        if (text != null && injectionCache.key === key) return;
+        const cacheKey = text == null ? null : `${spot.channel}|${where}|${text}`;
+        if (text != null && cache.key === cacheKey) return;
         const uninjectPrompts = api('uninjectPrompts', false);
         if (text == null) {
-            // undefined 表示“还不知道有没有注入过”，这时要清一次；null 表示已经清干净了。
-            if (injectionCache.text !== null) {
-                if (uninjectPrompts) uninjectPrompts([INJECTION_ID]);
-                clearAnchorInjection();
+            if (cache.text !== null) {
+                if (uninjectPrompts) uninjectPrompts([id]);
+                clearAnchorInjection(id);
             }
-            injectionCache.text = null;
-            injectionCache.key = null;
-            injectionCache.channel = null;
+            cache.text = null;
+            cache.key = null;
+            cache.channel = null;
             return;
         }
         if (spot.channel === 'anchor') {
             const channel = extensionPromptChannel();
             if (channel) {
                 // 通道切换时清掉另一边的旧注入，避免同一段指导出现两次
-                if (uninjectPrompts && injectionCache.channel === 'in_chat') uninjectPrompts([INJECTION_ID]);
-                channel.set(INJECTION_ID, text,
+                if (uninjectPrompts && cache.channel === 'in_chat') uninjectPrompts([id]);
+                channel.set(id, text,
                     spot.slot === 'before' ? channel.types.BEFORE_PROMPT : channel.types.IN_PROMPT, 0, false, 0);
             } else {
                 // 拿不到原生扩展提示接口时退化为聊天末尾，并说明原因
-                reportOnce('anchor-unavailable', '当前环境没有酒馆原生扩展提示接口，指导改放在聊天末尾（深度 0）。');
+                reportOnce(`anchor-unavailable-${key}`, '当前环境没有酒馆原生扩展提示接口，指导改放在聊天末尾（深度 0）。');
                 api('injectPrompts', true)([{
-                    id: INJECTION_ID,
+                    id,
                     position: 'in_chat',
                     depth: 0,
                     role: 'system',
@@ -1089,9 +1221,9 @@
                 }]);
             }
         } else {
-            if (injectionCache.channel === 'anchor') clearAnchorInjection();
+            if (cache.channel === 'anchor') clearAnchorInjection(id);
             api('injectPrompts', true)([{
-                id: INJECTION_ID,
+                id,
                 position: 'in_chat',
                 depth: spot.depth,
                 role: spot.role,
@@ -1099,51 +1231,59 @@
                 should_scan: false,
             }]);
         }
-        injectionCache.text = text;
-        injectionCache.key = key;
-        injectionCache.channel = spot.channel;
+        cache.text = text;
+        cache.key = cacheKey;
+        cache.channel = spot.channel;
     }
 
-    function rememberContext(context) {
-        injectionCache.context = context;
-        return context;
+    function rememberContexts(all) {
+        injectionCache.all = all;
+        return all;
     }
 
     // 用缓存里的上下文同步对齐注入内容：不读世界书，也不等任何 Promise。
     function syncInjection(generationType) {
-        const context = injectionCache.context;
-        if (!context) return;
-        applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry));
+        const all = injectionCache.all;
+        if (!all) return;
+        all.contexts.forEach(context => {
+            if (context.broken) return;
+            applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry), context.key);
+        });
     }
 
     async function injectCurrentGuide(generationType) {
         // 先按缓存同步注入：即使酒馆没有等待这个事件，这次请求也已经带上当前阶段。
         syncInjection(generationType);
-        const context = await loadContext();
-        if (!context.configured) {
-            applyInjection(null);
-            return;
+        const all = await loadContexts();
+        const activeIds = [];
+        for (const context of all.contexts) {
+            if (context.broken) {
+                reportOnce(`broken-${context.key}`, context.error);
+                continue;
+            }
+            activeIds.push(injectionIdFor(context.key));
+            if (context.entryEnabled) {
+                // 来源条目又被打开了：为了不让整份大纲直接发给 AI，生成前重新关闭它。
+                // 旧格式尚未转换或正文暂时没有阶段时，也必须保持来源关闭。
+                await disableEntry(context.worldbookName, context.entry.uid, entryName(context.entry));
+                reportOnce(`re-disabled-${context.key}`, `“${entryName(context.entry)}”被重新打开过，已再次关闭，避免整份大纲直接发给 AI。`);
+            }
+            if (context.legacy) {
+                reportOnce(`legacy-layout-${context.key}`, `“${entryName(context.entry)}”仍使用旧版划分。请先打开动态指导助手，点“转换成新版格式”；转换前不会注入指导。`);
+                applyInjection(null, null, context.key);
+                continue;
+            }
+            if (context.parsed.stages.length === 0) {
+                reportOnce(`no-stages-${context.key}`, `“${entryName(context.entry)}”还没有分阶段，这次不会注入指导。`);
+                applyInjection(null, null, context.key);
+                continue;
+            }
+            if (statesDiffer(context.rawState, context.state)) {
+                await writeStateFor(context.key, { ...context.state, updatedAt: new Date().toISOString() });
+            }
+            applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry), context.key);
         }
-        if (context.entryEnabled) {
-            // 来源条目又被启用了：为了不让整份大纲直接发给 AI，生成前重新禁用它。
-            // 旧格式尚未转换或正文暂时没有阶段时，也必须保持来源禁用。
-            await disableEntry(context.worldbookName, context.entry.uid, entryName(context.entry));
-            reportOnce('re-disabled', '来源条目被重新启用过，已再次禁用，避免整份大纲直接发给 AI。');
-        }
-        if (context.legacy) {
-            reportOnce('legacy-layout', '绑定的条目仍使用旧版划分。请先打开动态指导助手，点“转换成新版格式”；转换前不会注入指导。');
-            applyInjection(null);
-            return;
-        }
-        if (context.parsed.stages.length === 0) {
-            reportOnce('no-stages', '绑定的条目还没有分阶段，这次不会注入指导。');
-            applyInjection(null);
-            return;
-        }
-        if (statesDiffer(context.rawState, context.state)) {
-            await writeState({ ...context.state, updatedAt: new Date().toISOString() });
-        }
-        applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry));
+        clearStaleInjections(activeIds);
     }
 
     async function moveToIndex(context, target, options) {
@@ -1159,22 +1299,30 @@
             lastCompletionFingerprint: settings.fingerprint || context.state.lastCompletionFingerprint,
             updatedAt: new Date().toISOString(),
         };
-        await writeState(next);
+        await writeStateFor(context.key, next);
         // 进度一变就把注入内容换成新阶段，下一次生成不需要等任何异步读取。
-        rememberContext({
-            ...context,
-            state: next,
-            stage: context.parsed.stages[index] || null,
-            addons: activeAddons(context.parsed, index),
-        });
+        if (injectionCache.all) {
+            const at = injectionCache.all.contexts.findIndex(item => item.key === context.key);
+            if (at >= 0) {
+                injectionCache.all.contexts[at] = {
+                    ...injectionCache.all.contexts[at],
+                    state: next,
+                    stage: context.parsed.stages[index] || null,
+                    addons: activeAddons(context.parsed, index),
+                };
+            }
+        }
         syncInjection('normal');
         if (settings.notify !== false) {
-            notify(next.stageName ? `当前阶段：${next.stageName}` : '全部阶段已完成，之后不再注入指导。', 'success');
+            const label = entryName(context.entry);
+            notify(next.stageName
+                ? `「${label}」当前阶段：${next.stageName}`
+                : `「${label}」全部阶段已完成，之后不再注入指导。`, 'success');
         }
         return next;
     }
 
-    async function bindEntry(worldbookName, entry, options) {
+    async function addBinding(worldbookName, entry, options) {
         const settings = options || {};
         if (!worldbookName || !entry) throw new Error('请先选择世界书和大纲条目。');
         const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
@@ -1184,44 +1332,84 @@
         if (parsed.stages.length === 0) {
             throw new Error('这个条目还没有剧情阶段。先点“划分阶段”，把某个段落设为第一阶段的开头。');
         }
-        if (settings.confirm !== false) {
-            const accepted = hostWindow.confirm(
-                `绑定“${entryName(fresh)}”？\n\n`
-                + `共 ${parsed.stages.length} 个阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。\n`
-                + '绑定后会禁用这个条目，避免整份大纲直接发给 AI；当前聊天从第一段开始。',
-            );
-            if (!accepted) return false;
-        }
-        await disableEntry(worldbookName, fresh.uid, entryName(fresh));
-        await writeConfig({
+        const config = await readConfig();
+        const candidate = {
             worldbookName,
             entryUid: fresh.uid,
             entryName: entryName(fresh),
             boundAt: new Date().toISOString(),
-        });
-        const state = {
+        };
+        const key = bindingKey(candidate);
+        const existing = config.bindings.some(item => bindingKey(item) === key);
+        if (settings.confirm !== false) {
+            const accepted = hostWindow.confirm(
+                `${existing ? '重新添加' : '添加'}“${entryName(fresh)}”为指导条目？\n\n`
+                + `共 ${parsed.stages.length} 个阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。\n`
+                + '添加后会关闭这个条目，避免整份大纲直接发给 AI；当前聊天从第一段开始。',
+            );
+            if (!accepted) return false;
+        }
+        await disableEntry(worldbookName, fresh.uid, entryName(fresh));
+        const bindings = existing
+            ? config.bindings.map(item => (bindingKey(item) === key ? { ...item, ...candidate } : item))
+            : [...config.bindings, candidate];
+        await writeConfig({ version: 2, bindings });
+        await writeStateFor(key, {
             stageIndex: 0,
             stageName: parsed.stages[0].name,
             lastCompletionMessageId: null,
             lastCompletionFingerprint: '',
             updatedAt: new Date().toISOString(),
-        };
-        await writeState(state);
-        rememberContext({
-            configured: true,
-            config: { worldbookName, entryUid: fresh.uid, entryName: entryName(fresh) },
-            worldbookName,
-            entry: fresh,
-            parsed,
-            rawState: state,
-            state,
-            stage: parsed.stages[0],
-            addons: activeAddons(parsed, 0),
-            entryEnabled: false,
-            legacy: false,
         });
-        syncInjection('normal');
-        notify(`已绑定“${entryName(fresh)}”，当前阶段：${parsed.stages[0].name}`, 'success');
+        // 立刻按最新绑定列表重新注入，不用等下一次事件。
+        await injectCurrentGuide('normal');
+        notify(`已添加“${entryName(fresh)}”，当前阶段：${parsed.stages[0].name}`, 'success');
+        return true;
+    }
+
+    async function unbindEntry(key, options) {
+        const settings = options || {};
+        const config = await readConfig();
+        const binding = config.bindings.find(item => bindingKey(item) === key);
+        if (!binding) throw new Error('没有找到这条绑定。');
+        const located = await locateEntry(binding);
+        if (settings.confirm !== false) {
+            const accepted = hostWindow.confirm(
+                `移出“${binding.entryName || '这个条目'}”？\n\n`
+                + '移出后会重新打开这个条目（恢复成普通的世界书条目），并删掉它在当前聊天的进度。',
+            );
+            if (!accepted) return false;
+        }
+        // 先恢复条目，再删绑定；即使中途失败也不会留下“条目关着却没人管”的状态。
+        if (located) {
+            await updateWorldbook(located.worldbookName, worldbook => {
+                const target = findEntry(worldbook, binding.entryUid, binding.entryName);
+                if (!target) return worldbook;
+                target.enabled = true;
+                if ('disable' in target) target.disable = false;
+                return worldbook;
+            });
+        }
+        await writeConfig({ version: 2, bindings: config.bindings.filter(item => bindingKey(item) !== key) });
+        await writeStateFor(key, null);
+        // 直接清掉这条注入，并把它从缓存里摘掉。
+        applyInjection(null, null, key);
+        delete injectionCache.byKey[key];
+        if (injectionCache.all) {
+            const contexts = injectionCache.all.contexts.filter(item => item.key !== key);
+            injectionCache.all = { ...injectionCache.all, contexts, configured: contexts.length > 0 };
+        }
+        notify(`已移出“${binding.entryName || '条目'}”，条目已重新打开。`, 'success');
+        return true;
+    }
+
+    async function disableEntryNow(key) {
+        const all = await loadContexts();
+        const context = all.contexts.find(item => item.key === key && !item.broken);
+        if (!context) throw new Error('这条绑定现在不可用。');
+        await disableEntry(context.worldbookName, context.entry.uid, entryName(context.entry));
+        context.entryEnabled = false;
+        notify(`已关闭“${entryName(context.entry)}”。`, 'success');
         return true;
     }
 
@@ -1246,19 +1434,22 @@
 
         const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
         if (markers.length === 0) return;
-        const context = await loadContext();
-        if (!context.configured) return;
+        const all = await loadContexts();
+        if (!all.configured) return;
 
         const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
         const setChatMessages = api('setChatMessages', false);
         if (setChatMessages && cleaned !== message.message) {
             await Promise.resolve(setChatMessages([{ message_id: messageId, message: cleaned }], { refresh: 'affected' }));
         }
-        if (!context.stage) return;
-        const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
-        if (context.state.lastCompletionFingerprint === fingerprint) return;
-        if (!markers.some(match => match[1] === context.stage.id)) return;
-        await moveToIndex(context, context.state.stageIndex + 1, { messageId, fingerprint });
+        // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
+        for (const context of all.contexts) {
+            if (context.broken || !context.stage) continue;
+            const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
+            if (context.state.lastCompletionFingerprint === fingerprint) continue;
+            if (!markers.some(match => match[1] === context.stage.id)) continue;
+            await moveToIndex(context, context.state.stageIndex + 1, { messageId, fingerprint });
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1270,7 +1461,7 @@
         renderedView: '',
         busy: false,
         message: null,
-        previewOpen: false,
+        openPreviews: {},
         characterName: '当前角色',
         boundNames: [],
         worldbookNames: [],
@@ -1278,8 +1469,7 @@
         entries: [],
         entryError: '',
         selectedEntryKey: '',
-        config: null,
-        context: null,
+        snapshot: null,
         contextError: '',
         editor: null,
     };
@@ -1446,12 +1636,19 @@
     async function refresh(options) {
         const settings = options || {};
         const card = await currentCharacter();
-        const [bound, all, config] = await Promise.all([boundWorldbookNames(card), allWorldbookNames(), readConfig()]);
+        const [bound, all] = await Promise.all([boundWorldbookNames(card), allWorldbookNames()]);
         ui.characterName = characterName(card);
         ui.boundNames = bound;
-        ui.config = config;
         ui.worldbookNames = bound.length > 0 ? bound : all;
-        const wanted = settings.worldbookName || ui.selectedWorldbook || (config && config.worldbookName) || '';
+        try {
+            ui.snapshot = await loadContexts();
+            ui.contextError = '';
+        } catch (error) {
+            ui.snapshot = null;
+            ui.contextError = error.message || String(error);
+        }
+        const firstBinding = ui.snapshot && ui.snapshot.config.bindings[0];
+        const wanted = settings.worldbookName || ui.selectedWorldbook || (firstBinding && firstBinding.worldbookName) || '';
         ui.selectedWorldbook = ui.worldbookNames.includes(wanted) ? wanted : (ui.worldbookNames[0] || '');
         ui.entries = [];
         ui.entryError = '';
@@ -1462,23 +1659,12 @@
                 ui.entryError = `读取世界书失败：${error.message || String(error)}`;
             }
         }
-        ui.selectedEntryKey = pickEntryKey(settings.entryKey || ui.selectedEntryKey, config);
-        try {
-            ui.context = await loadContext();
-            ui.contextError = '';
-        } catch (error) {
-            ui.context = null;
-            ui.contextError = error.message || String(error);
-        }
+        ui.selectedEntryKey = pickEntryKey(settings.entryKey || ui.selectedEntryKey);
     }
 
-    function pickEntryKey(requested, config) {
+    function pickEntryKey(requested) {
         const keys = ui.entries.map((entry, index) => entryKey(entry, index));
         if (requested && keys.includes(requested)) return requested;
-        if (config && config.worldbookName === ui.selectedWorldbook) {
-            const index = ui.entries.findIndex(entry => sameUid(entry.uid, config.entryUid) || entryName(entry) === config.entryName);
-            if (index >= 0) return keys[index];
-        }
         const ready = ui.entries.findIndex(entry => hasLegacyLayout(entry) || parseOutline(entry.content).stages.length > 0);
         if (ready >= 0) return keys[ready];
         return keys[0] || '';
@@ -1489,13 +1675,24 @@
         return index >= 0 ? ui.entries[index] : null;
     }
 
+    function bindingForEntry(worldbookName, entry) {
+        const bindings = ui.snapshot ? ui.snapshot.config.bindings : [];
+        const name = entryName(entry);
+        return bindings.find(item => item.worldbookName === worldbookName
+            && (sameUid(item.entryUid, entry.uid) || item.entryName === name)) || null;
+    }
+
     function entryLabel(entry) {
         const name = entryName(entry);
         if (hasLegacyLayout(entry)) return `${name}（旧版划分，需转换）`;
         const parsed = parseOutline(entry.content);
-        const disabled = entryIsDisabled(entry) ? ' · 已禁用' : '';
-        if (parsed.stages.length === 0) return `${name}（未分阶段${disabled}）`;
-        return `${name}（${parsed.stages.length} 段${parsed.addons.length ? `、${parsed.addons.length} 附加` : ''}${disabled}）`;
+        const marks = [];
+        marks.push(parsed.stages.length > 0
+            ? `${parsed.stages.length} 段${parsed.addons.length ? `、${parsed.addons.length} 附加` : ''}`
+            : '未分阶段');
+        if (bindingForEntry(ui.selectedWorldbook, entry)) marks.push('已添加');
+        else if (entryIsDisabled(entry)) marks.push('已关闭');
+        return `${name}（${marks.join(' · ')}）`;
     }
 
     // ---------------------------------------------------------------
@@ -1503,53 +1700,48 @@
     // ---------------------------------------------------------------
 
     function renderManager() {
-        const context = ui.context;
-        const configured = Boolean(context && context.configured);
+        const snapshot = ui.snapshot;
+        const contexts = snapshot ? snapshot.contexts : [];
         const body = el('div', { class: 'dga-body' },
             messageBar(),
-            configured ? progressCard(context) : null,
-            configured ? previewCard(context) : null,
-            setupCard(),
-            configured ? null : guideCard(),
+            ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
+            ...contexts.map(boundCard),
+            contexts.length === 0 ? guideCard() : null,
+            addCard(),
         );
         return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
     }
 
-    function progressCard(context) {
+    // 一条绑定一张卡：条目名、走到哪一段、上一段/下一段，外加一排不常用的操作。
+    function boundCard(context) {
+        if (context.broken) {
+            return card(null,
+                el('div', { class: 'dga-bound-head' },
+                    el('div', { class: 'dga-heading-text' },
+                        el('b', { text: (context.binding && context.binding.entryName) || '未知条目' }),
+                        el('small', { text: (context.binding && context.binding.worldbookName) || '' }))),
+                messageBar({ type: 'error', text: context.error }),
+                btn('移出这条绑定', () => runAction('移出绑定', () => unbindEntry(context.key)), { danger: true }),
+            );
+        }
         const total = context.parsed.stages.length;
         const index = context.state.stageIndex;
         const finished = total > 0 && index >= total;
+        const usable = !context.legacy && total > 0;
         const move = (label, target, confirmText) => runAction(label, async () => {
             if (confirmText && !hostWindow.confirm(confirmText)) return false;
-            return moveToIndex(await requireContext(), target);
+            const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
+            if (!fresh || fresh.broken) throw new Error('这条绑定现在不可用。');
+            return moveToIndex(fresh, target);
         });
-        const emptyHint = context.legacy
-            ? '这是旧版（1.x）的划分，点下面的“转换成新版格式”'
-            : '点下面的“划分阶段”重新分段';
-        return card('现在进行到',
-            el('div', { class: 'dga-big', text: total === 0 ? '这个条目还没有阶段' : (finished ? `全部 ${total} 段已完成` : `第 ${index + 1} 段 · 共 ${total} 段`) }),
-            el('div', { class: 'dga-stage-name', text: total === 0 ? emptyHint : (finished ? '之后不再发送指导' : context.stage.name) }),
-            row(
-                btn('上一段', () => move('切换到上一段', index - 1), { disabled: total === 0 || index <= 0 }),
-                btn('下一段', () => move('切换到下一段', index + 1), { primary: true, disabled: total === 0 || index >= total }),
-            ),
-            btn('回到第一段', () => move('重置进度', 0, '把这个聊天的进度重置到第一段？'), { ghost: true, disabled: total === 0 || index === 0 }),
-            muted('进度只记在这个聊天里，新开的聊天会从第一段开始。'),
-            context.entryEnabled ? messageBar({
-                type: 'warning',
-                text: '来源条目现在是启用状态，整份大纲可能会直接发给 AI。下次生成前会自动禁用它；也可以现在点“重新绑定”立刻处理。',
-            }) : null,
-        );
-    }
 
-    function previewCard(context) {
         const details = el('details', {
             class: 'dga-fold',
-            open: ui.previewOpen,
-            ontoggle: event => { ui.previewOpen = event.target.open; },
+            open: Boolean(ui.openPreviews[context.key]),
+            ontoggle: event => { ui.openPreviews[context.key] = event.target.open; },
         }, el('summary', { text: '现在发给 AI 的内容' }));
         const parts = [];
-        if (context.stage) {
+        if (context.stage && usable) {
             parts.push(`【${context.stage.name}】\n${context.stage.prompt}`);
             context.addons.forEach(item => parts.push(`【附加：${item.name}】\n${item.prompt}`));
             parts.push(context.stage.completion
@@ -1563,24 +1755,56 @@
         if (context.parsed.warnings.length > 0) {
             details.append(messageBar({ type: 'warning', text: context.parsed.warnings.join('\n') }));
         }
-        return card(null, details);
+
+        const tag = context.legacy ? '旧版'
+            : (total === 0 ? '未分段' : (finished ? '已完成' : `第 ${index + 1} 段`));
+        return card(null,
+            el('div', { class: 'dga-bound-head' },
+                el('div', { class: 'dga-heading-text' },
+                    el('b', { text: entryName(context.entry) }),
+                    el('small', { text: context.worldbookName })),
+                el('span', {
+                    class: 'dga-tag',
+                    style: { '--dga-c': context.stage && usable ? context.stage.color : '#6b7280' },
+                    text: tag,
+                })),
+            context.legacy
+                ? messageBar({ type: 'warning', text: '这个条目还是旧版（1.x）的划分，转换前不会注入。在下面选中它，点“转换成新版格式”。' })
+                : null,
+            !context.legacy && total === 0
+                ? messageBar({ type: 'warning', text: '这个条目还没有分阶段，暂时不会注入。在下面选中它，点“划分阶段”。' })
+                : null,
+            usable ? el('div', {
+                class: 'dga-stage-name',
+                text: finished ? `全部 ${total} 段已完成，之后不再发送指导` : `第 ${index + 1} 段 · 共 ${total} 段 — ${context.stage.name}`,
+            }) : null,
+            context.entryEnabled ? messageBar({
+                type: 'warning',
+                text: '这个条目现在是打开状态，整份大纲可能会直接发给 AI。下次生成前会自动关闭它，也可以现在手动关。',
+            }) : null,
+            context.entryEnabled
+                ? btn('立即关闭条目', () => runAction('关闭条目', () => disableEntryNow(context.key)), { danger: true })
+                : null,
+            row(
+                btn('上一段', () => move('切换到上一段', index - 1), { disabled: !usable || index <= 0 }),
+                btn('下一段', () => move('切换到下一段', index + 1), { primary: true, disabled: !usable || index >= total }),
+            ),
+            details,
+            row(
+                btn('重新划分', () => runAction('打开编辑器', () => openEditorAt(context.worldbookName, context.entry), { refresh: false }), { ghost: true }),
+                btn('回到第一段', () => move('重置进度', 0, '把这个聊天的进度重置到第一段？'), { ghost: true, disabled: !usable || index === 0 }),
+                btn('移出', () => runAction('移出绑定', () => unbindEntry(context.key)), { ghost: true }),
+            ),
+        );
     }
 
-    function setupCard() {
-        const context = ui.context;
-        const configured = Boolean(context && context.configured);
+    // 添加区：两个下拉选条目，然后“划分阶段”或“添加为指导条目”。
+    function addCard() {
         const selected = selectedEntry();
         const legacy = Boolean(selected && hasLegacyLayout(selected));
         const parsed = selected && !legacy ? parseOutline(selected.content) : null;
-        const isBoundEntry = Boolean(configured && selected && ui.selectedWorldbook === context.worldbookName
-            && sameUid(selected.uid, context.entry.uid));
+        const selectedBinding = selected ? bindingForEntry(ui.selectedWorldbook, selected) : null;
         const children = [];
-
-        if (configured) {
-            children.push(el('p', { class: 'dga-status', text: `已绑定：${context.worldbookName} → ${entryName(context.entry)}` }));
-        } else if (ui.contextError) {
-            children.push(messageBar({ type: 'error', text: ui.contextError }));
-        }
 
         if (ui.worldbookNames.length === 0) {
             children.push(messageBar({ type: 'warning', text: '没有找到任何世界书。请先给角色绑定一个世界书，并把大纲写进一个条目里。' }));
@@ -1597,7 +1821,7 @@
             const entryOptions = ui.entries.length > 0
                 ? ui.entries.map((entry, index) => ({ value: entryKey(entry, index), label: entryLabel(entry) }))
                 : [{ value: '', label: ui.entryError || '这个世界书里没有条目' }];
-            children.push(field('大纲条目', selectControl(entryOptions, ui.selectedEntryKey, value => {
+            children.push(field('条目', selectControl(entryOptions, ui.selectedEntryKey, value => {
                 ui.selectedEntryKey = value;
                 render();
             })));
@@ -1615,28 +1839,29 @@
         }
 
         children.push(row(
-            btn('划分阶段', () => runAction('打开编辑器', openEditor, { refresh: false }), {
-                primary: !configured && Boolean(parsed) && parsed.stages.length === 0,
+            btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, selected), { refresh: false }), {
+                primary: !selectedBinding && Boolean(parsed) && parsed.stages.length === 0,
                 disabled: !selected || legacy,
             }),
-            btn(isBoundEntry ? '重新绑定' : '绑定这个条目', () => runAction('绑定条目', () => bindEntry(ui.selectedWorldbook, selected)), {
-                primary: Boolean(parsed) && parsed.stages.length > 0 && !isBoundEntry,
+            btn(selectedBinding ? '重新添加（进度归零）' : '添加为指导条目',
+                () => runAction('添加指导条目', () => addBinding(ui.selectedWorldbook, selected)), {
+                primary: Boolean(parsed) && parsed.stages.length > 0 && !selectedBinding,
                 disabled: !selected || legacy || !parsed || parsed.stages.length === 0,
             }),
         ));
-        children.push(muted('绑定后会禁用这个条目，避免整份大纲直接发给 AI。重新绑定会让当前聊天回到第一段。'));
+        children.push(muted('添加后会关闭这个条目，AI 只能看到当前阶段的切片；想看回全文时点卡片上的“移出”就会重新打开。'));
         children.push(btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }));
-        return card(configured ? '大纲条目' : '先选一个大纲条目', ...children);
+        return card('添加指导条目', ...children);
     }
 
     function guideCard() {
-        return card('怎么用',
+        return card('三步上手',
             el('ol', { class: 'dga-steps' },
                 el('li', {}, '在角色绑定的世界书里新建一个条目，把完整大纲写进去，用空行分开各段。'),
-                el('li', {}, '在上面选中这个条目，点“划分阶段”：点一个段落把它设成某一阶段的开头，也可以切到“编辑原文”直接改正文。'),
-                el('li', {}, '点“保存并绑定”。之后每次聊天，AI 只会收到当前这一段的内容。'),
+                el('li', {}, '在下面选中这个条目，点“划分阶段”：点一个段落把它设成某一阶段的开头，也可以切到“编辑原文”直接改正文。'),
+                el('li', {}, '点“保存并添加”。之后每次聊天，AI 只会收到当前这一段的内容。'),
             ),
-            muted('也可以直接在正文里写“## 阶段名”分段；写“合并到：阶段名”可以把这段并进已有阶段，一个阶段就能由几段不连续的文字组成。'),
+            muted('可以同时添加好几个条目，各自独立推进、各自注入回原来的位置。也可以直接在正文里写“## 阶段名”分段；写“合并到：阶段名”可以把这段并进已有阶段。'),
         );
     }
 
@@ -1656,20 +1881,23 @@
     // 点一个标题 → 改名、改类型、改条件或删掉。正文文字本身不会被改。
     // ---------------------------------------------------------------
 
-    async function openEditor() {
-        const entry = selectedEntry();
-        if (!entry || !ui.selectedWorldbook) throw new Error('请先选择一个条目。');
-        const fresh = findEntry(await getWorldbook(ui.selectedWorldbook), entry.uid, entryName(entry));
+    async function openEditorAt(worldbookName, entry) {
+        if (!worldbookName || !entry) throw new Error('请先选择一个条目。');
+        const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
         if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
         const lines = normalizeText(fresh.content).split('\n');
+        const config = ui.snapshot && ui.snapshot.config ? ui.snapshot.config : await readConfig();
+        const candidate = { worldbookName, entryUid: fresh.uid, entryName: entryName(fresh) };
+        const bound = config.bindings.some(item => bindingKey(item) === bindingKey(candidate));
         ui.editor = {
-            worldbookName: ui.selectedWorldbook,
+            worldbookName,
             entry: fresh,
             lines,
             parsed: parseOutline(lines.join('\n')),
             dirty: false,
             sheet: null,
             mode: 'doc',
+            bound,
         };
         ui.view = 'editor';
     }
@@ -1741,8 +1969,8 @@
             !raw && hasHeadings ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` }) : null,
         );
         const foot = el('footer', { class: 'dga-foot' },
-            btn('保存', () => runAction('保存', () => saveEditor(false), { refresh: false })),
-            btn('保存并绑定', () => runAction('保存并绑定', () => saveEditor(true), { refresh: false }), {
+            btn('保存', () => runAction('保存', () => saveEditor(false), { refresh: false }), { primary: editor.bound }),
+            editor.bound ? null : btn('保存并添加', () => runAction('保存并添加', () => saveEditor(true), { refresh: false }), {
                 primary: true,
                 disabled: !raw && parsed.stages.length === 0,
             }),
@@ -2016,7 +2244,7 @@
         const content = editor.lines.join('\n');
         const parsed = parseOutline(content);
         if (bindAfter && parsed.stages.length === 0) {
-            throw new Error('还没有剧情阶段，不能绑定。先点一个段落，把它设为第一阶段的开头。');
+            throw new Error('还没有剧情阶段，不能添加。先点一个段落，把它设为第一阶段的开头。');
         }
         const saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
         editor.entry = saved;
@@ -2024,14 +2252,16 @@
         editor.parsed = parseOutline(saved.content);
         editor.dirty = false;
         if (bindAfter) {
-            await bindEntry(editor.worldbookName, saved, { confirm: false });
+            await addBinding(editor.worldbookName, saved, { confirm: false });
             ui.view = 'manager';
             ui.editor = null;
             await refresh({ worldbookName: editor.worldbookName, entryKey: entryKey(saved, 0) });
-            setMessage('已保存并绑定。当前聊天从第一段开始。', 'success');
+            setMessage('已保存并添加。当前聊天从第一段开始。', 'success');
             return;
         }
-        setMessage('已保存。正文只增减了标题行。', 'success');
+        // 已添加的条目：保存后立刻按新正文重新注入，进度按阶段名自动对上。
+        if (editor.bound) await injectCurrentGuide('normal');
+        setMessage(editor.bound ? '已保存，进度按阶段名自动对上。' : '已保存。正文只增减了标题行。', 'success');
     }
 
     // ---------------------------------------------------------------
@@ -2058,7 +2288,8 @@ ${P} .dga-card h3 { margin: 0; font-size: 0.9rem; font-weight: 600; opacity: 0.7
 ${P} .dga-big { font-size: 1.45rem; font-weight: 700; line-height: 1.25; }
 ${P} .dga-stage-name { font-size: 1.05rem; font-weight: 600; color: var(--SmartThemeQuoteColor, #b8a7ff); overflow-wrap: anywhere; }
 ${P} .dga-muted, ${P} .dga-help { margin: 0; font-size: 0.88rem; opacity: 0.7; }
-${P} .dga-status { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+${P} .dga-bound-head { display: flex; align-items: center; gap: 10px; }
+${P} .dga-bound-head .dga-heading-text { flex: 1 1 auto; }
 ${P} .dga-row { display: flex; gap: 8px; flex-wrap: wrap; }
 ${P} .dga-row > .dga-btn { flex: 1 1 30%; }
 ${P} .dga-btn { min-height: 44px; padding: 10px 14px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.07); color: inherit; font: inherit; font-weight: 600; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
@@ -2262,23 +2493,18 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
         }
     }
 
-    async function next() {
+    // 快捷指令只操作第一条能用的绑定；多条绑定时请用管理页逐张卡片操作。
+    async function shiftStage(delta) {
         try {
             const context = await requireContext();
-            await moveToIndex(context, context.state.stageIndex + 1);
+            await moveToIndex(context, context.state.stageIndex + delta);
         } catch (error) {
             notify(error.message || String(error), 'error');
         }
     }
 
-    async function previous() {
-        try {
-            const context = await requireContext();
-            await moveToIndex(context, context.state.stageIndex - 1);
-        } catch (error) {
-            notify(error.message || String(error), 'error');
-        }
-    }
+    const next = () => shiftStage(1);
+    const previous = () => shiftStage(-1);
 
     async function reset() {
         try {
@@ -2307,7 +2533,9 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
         next,
         previous,
         reset,
-        getCurrentSnapshot: loadContext,
+        add: (worldbookName, entry, options) => addBinding(worldbookName, entry, options),
+        unbind: (key, options) => unbindEntry(key, options),
+        getCurrentSnapshot: loadContexts,
     };
     currentWindow.DynamicGuideAssistantCore = publicApi;
 
@@ -2344,11 +2572,9 @@ ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-event
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
             // 换聊天后进度不同：先丢掉缓存和旧注入，再按读到的状态重新注入。
-            // 注入按聊天文件隔离，即使新聊天阶段内容相同也要重新注入，所以 key 也要清掉。
-            injectionCache.context = null;
-            await safeUninject();
-            injectionCache.text = null;
-            injectionCache.key = null;
+            // 注入按聊天文件隔离，即使新聊天阶段内容相同也要重新注入，所以缓存也要清掉。
+            injectionCache.all = null;
+            await clearAllInjections();
             await injectCurrentGuide('normal');
             const doc = hostDocument();
             const panel = doc && doc.getElementById(PANEL_ID);
