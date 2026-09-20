@@ -33,6 +33,7 @@ test('v2 只发送当前阶段、范围内附加和常驻内容', () => {
     assert.match(injected, /当前正文/);
     assert.match(injected, /DGA_COMPLETE:/);
     assert.doesNotMatch(injected, /未来正文|不应发送/);
+    assert.doesNotMatch(injected, /动态指导助手：当前有效内容|以下是作者为当前进度/, '正文不能带插件头部');
     assert.equal(core.activeAddons(parsed, 2).length, 0);
 });
 
@@ -132,20 +133,24 @@ function helperFor(entry) {
     return { state, helper };
 }
 
+const isMirror = item => /（动态指导）/.test(String(item.name || item.comment || ''));
+
 function runtime(entry) {
     const { state, helper } = helperFor(entry);
     return {
         ...load(helper),
+        state,
         injected: state.injected,
         injectionOptions: state.injectionOptions,
         active: state.active,
         removed: state.removed,
+        mirror: () => state.entries.find(isMirror),
         generate: async () => state.events.get('generate')('normal', {}, false),
     };
 }
 
 for (const storage of ['extra', 'embedded']) {
-    test(`尚未转换的 ${storage} 旧布局停止注入并提示转换`, async () => {
+    test(`尚未转换的 ${storage} 旧布局不建镜像并提示转换`, async () => {
         const text = '## 旧原文里的秘密\n不应按新格式发送';
         const layout = { mode: 'ranges', stages: [{ name: '旧阶段', ranges: [range(text, '不应按新格式发送')] }] };
         const entry = { uid: 1, name: '大纲', content: text, enabled: false };
@@ -153,62 +158,67 @@ for (const storage of ['extra', 'embedded']) {
         else entry.content += `\n<!-- DGA_LAYOUT_V1:BEGIN -->${Buffer.from(JSON.stringify(layout)).toString('base64')}<!-- DGA_LAYOUT_V1:END -->`;
         const run = runtime(entry);
         await run.generate();
-        assert.equal(run.injected.length, 0);
+        assert.equal(run.mirror(), undefined, '旧布局不能创建镜像');
+        assert.equal(run.state.entries.length, 1, '世界书里不能多出条目');
         assert.ok(run.removed.includes('dynamic-guide-assistant-current'), '要清掉旧版无后缀注入');
-        assert.ok(run.removed.some(id => id.startsWith('dynamic-guide-assistant-current-')), '要清掉这条绑定自己的注入');
+        assert.ok(run.removed.some(id => id.startsWith('dynamic-guide-assistant-current-')), '要清掉这条绑定的旧注入');
         assert.match(run.logs.join('\n'), /转换成新版格式/);
         assert.deepEqual(run.errors, []);
     });
 }
 
-test('新格式仍正常注入且重新禁用意外启用的来源条目', async () => {
+test('新格式会创建镜像条目显示当前阶段，并重新禁用意外打开的来源条目', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n当前正文\n\n## 第二幕\n未来秘密', enabled: true };
     const run = runtime(entry);
     await run.generate();
-    assert.equal(run.active.size, 1, '当前应只有一条活跃注入');
-    const live = [...run.active.values()][0];
-    assert.match(live.content, /当前正文/);
-    assert.doesNotMatch(live.content, /未来秘密/);
-    assert.equal(entry.enabled, false);
+    const mirror = run.mirror();
+    assert.ok(mirror, '应当在同一本世界书里创建镜像条目');
+    assert.match(mirror.content, /当前正文/);
+    assert.doesNotMatch(mirror.content, /未来秘密/);
+    assert.doesNotMatch(mirror.content, /动态指导助手：当前有效内容|以下是作者/, '镜像内容不能带插件头部');
+    assert.equal(mirror.enabled, true, '镜像条目要是打开状态');
+    assert.equal(entry.enabled, false, '来源条目要被重新关闭');
     assert.deepEqual(run.errors, []);
 });
 
-test('生成事件等待异步读取和注入完成后才允许请求继续', async () => {
+test('生成事件等待异步读取和同步完成后才允许请求继续', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n必须出现的当前正文', enabled: false };
     const { state, helper } = helperFor(entry);
-    let releaseWorldbook;
-    helper.getWorldbook = () => new Promise(resolve => {
-        releaseWorldbook = () => resolve(state.entries);
-    });
+    const pending = [];
+    let released = false;
+    helper.getWorldbook = () => (released
+        ? Promise.resolve(state.entries)
+        : new Promise(resolve => pending.push(resolve)));
     const run = load(helper);
     const generation = state.events.get('generate')('normal', {}, false);
     let finished = false;
     Promise.resolve(generation).then(() => { finished = true; });
     await new Promise(setImmediate);
     assert.equal(finished, false, '世界书还没读完时，生成事件不能提前结束');
-    assert.equal(state.injected.length, 0);
-    releaseWorldbook();
+    assert.equal(state.entries.some(isMirror), false);
+    released = true;
+    pending.forEach(resolve => resolve(state.entries));
     await generation;
     assert.equal(finished, true);
-    assert.equal(state.active.size, 1);
-    assert.match([...state.active.values()][0].content, /必须出现的当前正文/);
+    const mirror = state.entries.find(isMirror);
+    assert.ok(mirror, '读完世界书后要把镜像建出来');
+    assert.match(mirror.content, /必须出现的当前正文/);
     assert.deepEqual(run.errors, []);
 });
 
-test('打开页面就注入当前阶段，进度一变立刻换成新阶段', async () => {
+test('打开页面就同步好镜像，进度一变立刻换成新阶段', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n第一段正文\n\n## 第二幕\n第二段正文', enabled: false };
     const run = runtime(entry);
     await new Promise(setImmediate);
-    assert.equal(run.injected.length, 1, '打开页面就该注入，不必等生成事件');
-    assert.match(run.injected[0].content, /第一段正文/);
+    assert.ok(run.mirror(), '打开页面就该有镜像，不必等生成事件');
+    assert.match(run.mirror().content, /第一段正文/);
     await run.core.next();
-    assert.equal(run.injected.length, 2, '进度推进后立刻更新注入内容');
-    assert.match(run.injected[1].content, /第二段正文/);
-    assert.doesNotMatch(run.injected[1].content, /第一段正文/);
+    assert.match(run.mirror().content, /第二段正文/, '进度推进后镜像立刻更新');
+    assert.doesNotMatch(run.mirror().content, /第一段正文/);
     assert.deepEqual(run.errors, []);
 });
 
-test('swipe 重新生成时同步注入的是推进前的阶段', async () => {
+test('swipe 重新生成时镜像显示的是推进前的阶段', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n第一段正文\n\n## 第二幕\n第二段正文', enabled: false };
     const { state, helper } = helperFor(entry);
     state.variables.chat.$dynamicGuideAssistant = {
@@ -217,122 +227,82 @@ test('swipe 重新生成时同步注入的是推进前的阶段', async () => {
     helper.getLastMessageId = () => 7;
     const run = load(helper);
     await new Promise(setImmediate);
-    assert.match(state.injected[state.injected.length - 1].content, /第二段正文/);
-    state.injected.length = 0;
-    const generation = state.events.get('generate')('swipe', {}, false);
-    assert.equal(state.injected.length, 1, '不等待生成事件也要先注入推进前的阶段');
-    assert.match(state.injected[0].content, /第一段正文/);
-    assert.doesNotMatch(state.injected[0].content, /第二段正文/);
-    await generation;
+    assert.match(state.entries.find(isMirror).content, /第二段正文/);
+    await state.events.get('generate')('swipe', {}, false);
+    const mirror = state.entries.find(isMirror);
+    assert.match(mirror.content, /第一段正文/, 'swipe 要回到推进前的阶段');
+    assert.doesNotMatch(mirror.content, /第二段正文/);
     assert.deepEqual(run.errors, []);
 });
 
-// v2.3.1 回归：v2.0–v2.3 的“内容没变就跳过注入”去重，会让被外部清掉的注入永远补不回来
-test('注入被外部清掉后，下一次生成事件会无条件重新注入', async () => {
+// v2.5 镜像回归：镜像条目可能被用户误删或被世界书操作冲掉，必须能自己补回来
+test('镜像被外部删掉后，下一次生成事件会重建', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n当前正文', enabled: false };
     const run = runtime(entry);
     await new Promise(setImmediate);
-    assert.equal(run.active.size, 1, '打开页面就该有一条活跃注入');
-    const id = [...run.active.keys()][0];
-    // 模拟酒馆助手在脚本重载等时机自动清掉持久注入：脚本对此毫不知情
-    run.active.clear();
+    assert.ok(run.mirror(), '打开页面就该有镜像');
+    run.state.entries.splice(run.state.entries.indexOf(run.mirror()), 1);
     await run.generate();
-    assert.equal(run.active.size, 1, '生成事件必须重新注入，不能因病缓存跳过');
-    assert.match([...run.active.values()][0].content, /当前正文/);
-    assert.ok(run.removed.includes(id), '重新注入前要先按 id 撤掉旧注入');
-    assert.ok(
-        run.injectionOptions.some(options => options && options.once === true),
-        '注入必须带 once: true，只对下一次请求生效，与 1.3.6 一致',
-    );
+    assert.ok(run.mirror(), '生成事件必须重建镜像');
+    assert.match(run.mirror().content, /当前正文/);
     assert.deepEqual(run.errors, []);
 });
 
-test('dryRun 预组装（提示词查看器）也会注入当前指导', async () => {
+test('dryRun 预组装（提示词查看器）同步后镜像保持可见', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n当前正文', enabled: false };
     const { state, helper } = helperFor(entry);
     const run = load(helper);
     await new Promise(setImmediate);
-    state.active.clear();
     await state.events.get('generate')('normal', {}, true);
-    assert.equal(state.active.size, 1, 'dryRun 也要注入，提示词查看器才能看到当前阶段');
+    const mirror = state.entries.find(isMirror);
+    assert.ok(mirror && mirror.enabled !== false, 'dryRun 也要能看到镜像内容');
+    assert.match(mirror.content, /当前正文/);
     assert.deepEqual(run.errors, []);
 });
 
-// v2.4 双通道：酒馆助手注入接口缺失或报错时，退回酒馆原生 setExtensionPrompt(IN_CHAT)
-test('酒馆助手没有注入接口时，改走原生 IN_CHAT 深度注入', async () => {
+// v2.5 迁移：≤2.4 走 injectPrompts / setExtensionPrompt 注入，升级后第一次启动要按旧 id 清干净
+test('升级后第一次启动会清掉旧版注入残留（助手和原生两条通道）', async () => {
     const calls = [];
     const sillyTavern = {
         getContext: () => ({
-            setExtensionPrompt: (id, text, position, depth, scan, role) => calls.push({ id, text, position, depth, role }),
+            setExtensionPrompt: (id, text, position) => calls.push({ id, text, position }),
         }),
     };
-    const entry = {
-        uid: 1,
-        name: '大纲',
-        content: '## 第一幕\n原生通道正文',
-        enabled: false,
-        position: { type: 'at_depth', depth: 4, role: 'assistant' },
-    };
-    const { state, helper } = helperFor(entry);
-    delete helper.injectPrompts;
-    delete helper.uninjectPrompts;
-    const run = load(helper, { SillyTavern: sillyTavern });
-    await new Promise(setImmediate);
-    assert.equal(state.injected.length, 0, '助手通道缺失时不走 injectPrompts');
-    const live = calls.filter(call => call.text);
-    assert.equal(live.length, 1, '原生通道要写一条注入');
-    assert.equal(live[0].position, 1, '原生聊天内注入对应 IN_CHAT=1');
-    assert.equal(live[0].depth, 4, '深度跟随条目');
-    assert.equal(live[0].role, 2, 'assistant 对应原生角色码 2');
-    assert.match(live[0].text, /原生通道正文/);
-    assert.deepEqual(run.errors, []);
-});
-
-test('注入接口调用抛错时也退回原生通道', async () => {
-    const calls = [];
-    const sillyTavern = {
-        getContext: () => ({
-            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
-        }),
-    };
-    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n回退正文', enabled: false };
-    const { helper } = helperFor(entry);
-    helper.injectPrompts = () => { throw new Error('模拟注入接口报错'); };
-    const run = load(helper, { SillyTavern: sillyTavern });
-    await new Promise(setImmediate);
-    const live = calls.filter(call => call.text);
-    assert.equal(live.length, 1, '接口报错后原生通道要接管');
-    assert.match(live[0].text, /回退正文/);
-    assert.match(run.logs.join('\n'), /改用酒馆原生注入/);
-    assert.deepEqual(run.errors, []);
-});
-
-test('诊断：链路完好时全部通过，缺注入接口时明确标出', async () => {
     const entry = { uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false };
-    const sillyTavern = {
-        getContext: () => ({
-            setExtensionPrompt: () => {},
-            extension_prompt_types: { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 },
-        }),
-    };
+    const { state, helper } = helperFor(entry);
+    const run = load(helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    assert.ok(state.removed.includes('dynamic-guide-assistant-current'), '要清掉旧版无后缀注入');
+    assert.ok(state.removed.some(id => id.startsWith('dynamic-guide-assistant-current-')), '要清掉各绑定的旧注入');
+    const cleared = calls.filter(call => call.text === '');
+    assert.ok(cleared.length >= 2, '原生通道也要按 id 写空内容清理');
+    assert.ok(cleared.every(call => call.position === -1), '清理写到 NONE=-1 位置');
+    assert.deepEqual(run.errors, []);
+});
+
+test('诊断：链路完好时全部通过，镜像行直接显示同步状态', async () => {
+    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false };
     const good = helperFor(entry);
     good.helper.getWorldbookNames = () => ['测试世界书'];
     good.helper.getCharWorldbookNames = () => ['测试世界书'];
     good.helper.getCharData = () => ({ name: '测试角色' });
     good.helper.getLastMessageId = () => 0;
-    const run = load(good.helper, { SillyTavern: sillyTavern });
+    const run = load(good.helper);
     await new Promise(setImmediate);
     const rows = plain(await run.core.diagnose());
     const failed = rows.filter(row => !row.ok);
     assert.deepEqual(failed.map(row => row.label), [], `全部应通过，未通过：${failed.map(row => row.label).join('、')}`);
+    const bindingRow = rows.find(row => row.label === '绑定「大纲」');
+    assert.match(bindingRow.detail, /位置：/);
+    const mirrorRow = rows.find(row => row.label === '镜像「大纲（动态指导）」');
+    assert.ok(mirrorRow, '要有镜像行');
+    assert.match(mirrorRow.detail, /与当前阶段一致/);
     const bad = helperFor(entry);
-    delete bad.helper.injectPrompts;
-    const runBad = load(bad.helper, { SillyTavern: sillyTavern });
+    delete bad.helper.getWorldbook;
+    const runBad = load(bad.helper);
     const badRows = plain(await runBad.core.diagnose());
-    const probe = badRows.find(row => row.label === '试注：酒馆助手通道');
-    assert.equal(probe.ok, false, '缺 injectPrompts 时试注要标出');
-    assert.match(probe.detail, /缺失/);
-    assert.deepEqual(runBad.errors, []);
+    assert.equal(badRows.find(row => row.label === '接口 getWorldbook').ok, false, '缺 getWorldbook 要标出');
+    assert.equal(badRows.find(row => row.label === '绑定「大纲」').ok, false, '读不了世界书时绑定行要标出');
 });
 
 // 手机端回归：魔法棒菜单的触摸事件必须同步显示整屏管理页。
@@ -619,123 +589,58 @@ test('编辑器写出的“并入”标题能解析，阶段改名时引用同�
     assert.equal(after.blocks.find(item => item.kind === 'merged').labels.merge, '开场');
 });
 
-test('注入位置跟随大纲条目的深度与角色', async () => {
+test('镜像条目完整跟随原条目的位置、深度与顺序', async () => {
     const entry = {
         uid: 1,
         name: '大纲',
         content: '## 第一幕\n正文',
         enabled: false,
+        constant: true,
+        order: 100,
         position: { type: 'at_depth', depth: 4, role: 'assistant', order: 100 },
     };
     const run = runtime(entry);
     await new Promise(setImmediate);
-    assert.equal(run.injected.length, 1);
-    assert.equal(run.injected[0].depth, 4);
-    assert.equal(run.injected[0].role, 'assistant');
+    const mirror = run.mirror();
+    assert.ok(mirror, '要创建镜像');
+    assert.deepEqual(plain(mirror.position), { type: 'at_depth', depth: 4, role: 'assistant', order: 100 });
+    assert.equal(mirror.constant, true, '关键词等设置也要克隆');
+    assert.equal(mirror.order, 100);
+    assert.equal(mirror.enabled, true);
     assert.deepEqual(run.errors, []);
 });
 
-test('没有原生扩展提示接口时，角色定义前的条目退化为聊天末尾', async () => {
-    const entry = {
-        uid: 1,
-        name: '大纲',
-        content: '## 第一幕\n正文',
-        enabled: false,
-        position: { type: 'before_character_definition', depth: 4, role: 'user', order: 100 },
-    };
-    const run = runtime(entry);
-    await new Promise(setImmediate);
-    assert.equal(run.injected.length, 1);
-    assert.equal(run.injected[0].depth, 0);
-    assert.equal(run.injected[0].role, 'system');
-    assert.deepEqual(run.errors, []);
-});
-
-// 原生扩展提示的数值常量来自酒馆源码 extension_prompt_types：NONE=-1, IN_PROMPT=0, IN_CHAT=1, BEFORE_PROMPT=2
-test('角色定义前的条目通过原生扩展提示锚点注入，切换聊天时清理', async () => {
-    const calls = [];
-    const sillyTavern = {
-        getContext: () => ({
-            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
-        }),
-    };
+test('角色定义前的条目：镜像保持同一位置，不需要任何原生扩展提示接口', async () => {
     const entry = {
         uid: 1,
         name: '大纲',
         content: '## 第一幕\n前置正文',
         enabled: false,
-        position: { type: 'before_character_definition', depth: 0, role: 'system', order: 100 },
+        position: { type: 'before_character_definition', order: 100 },
     };
-    const { state, helper } = helperFor(entry);
-    const run = load(helper, { SillyTavern: sillyTavern });
+    // runtime() 的沙箱里没有 SillyTavern：镜像走世界书，根本不依赖原生锚点
+    const run = runtime(entry);
     await new Promise(setImmediate);
-    assert.equal(state.injected.length, 0, '锚点位置不走 injectPrompts');
-    const anchored = calls.filter(call => call.text);
-    assert.equal(anchored.length, 1, '打开页面就该写原生扩展提示');
-    assert.match(anchored[0].id, /^dynamic-guide-assistant-current-/, '注入 id 带绑定指纹后缀');
-    assert.equal(anchored[0].position, 2, '角色定义前对应 BEFORE_PROMPT=2');
-    assert.match(anchored[0].text, /前置正文/);
-    await state.events.get('chat_changed')();
-    assert.ok(calls.some(call => call.text === '' && call.position === -1), '切换聊天时要写空内容到 NONE 位置清理');
-    assert.equal(calls[calls.length - 1].position, 2, '清理后按新聊天状态重新注入');
+    const mirror = run.mirror();
+    assert.ok(mirror, '要创建镜像');
+    assert.deepEqual(plain(mirror.position), { type: 'before_character_definition', order: 100 });
+    assert.match(mirror.content, /前置正文/);
     assert.deepEqual(run.errors, []);
 });
 
-test('角色定义后的条目用 IN_PROMPT 锚点，不识别的位置仍放聊天末尾', async () => {
-    const calls = [];
-    const sillyTavern = {
-        getContext: () => ({
-            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
-        }),
-    };
-    const afterEntry = {
-        uid: 1,
-        name: '大纲',
-        content: '## 第一幕\n后置正文',
-        enabled: false,
-        position: { type: 'after_character_definition', depth: 0, role: 'system', order: 100 },
-    };
-    const runAfter = runtime(afterEntry);
-    await new Promise(setImmediate);
-    // runtime() 的沙箱里没有 SillyTavern，这条只验证深度回退；锚点验证见上面的测试
-    assert.equal(runAfter.injected.length, 1);
-    assert.equal(runAfter.injected[0].depth, 0);
-    const withSilly = load(helperFor({
-        uid: 1,
-        name: '大纲',
-        content: '## 第一幕\n后置正文',
-        enabled: false,
-        position: { type: 'after_character_definition', depth: 0, role: 'system', order: 100 },
-    }).helper, { SillyTavern: sillyTavern });
-    await new Promise(setImmediate);
-    const anchored = calls.filter(call => call.text);
-    assert.equal(anchored.length, 1);
-    assert.equal(anchored[0].position, 0, '角色定义后对应 IN_PROMPT=0');
-    assert.match(anchored[0].text, /后置正文/);
-    assert.deepEqual(withSilly.errors, []);
-});
-
-test('示例消息等其余位置的条目即使有原生接口也仍放聊天末尾', async () => {
-    const calls = [];
-    const sillyTavern = {
-        getContext: () => ({
-            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
-        }),
-    };
+test('原条目调整位置后，下一次同步镜像会跟着挪', async () => {
     const entry = {
         uid: 1,
         name: '大纲',
         content: '## 第一幕\n正文',
         enabled: false,
-        position: { type: 'before_example_messages', depth: 6, role: 'user', order: 100 },
+        position: { type: 'before_character_definition', order: 100 },
     };
-    const { state, helper } = helperFor(entry);
-    const run = load(helper, { SillyTavern: sillyTavern });
+    const run = runtime(entry);
     await new Promise(setImmediate);
-    assert.equal(state.injected.length, 1);
-    assert.equal(state.injected[0].depth, 0);
-    assert.equal(state.injected[0].role, 'system');
-    assert.equal(calls.filter(call => call.text).length, 0, '没有可复制通道的位置不能写入扩展提示锚点');
+    entry.position = { type: 'after_character_definition', order: 42 };
+    await run.generate();
+    assert.deepEqual(plain(run.mirror().position), { type: 'after_character_definition', order: 42 }, '镜像要跟随原条目挪位置');
     assert.deepEqual(run.errors, []);
 });
 
@@ -827,16 +732,17 @@ test('2.0 的旧配置和旧进度自动迁移成多绑定结构', async () => {
     };
     const run = load(helper);
     await new Promise(setImmediate);
-    assert.equal(state.injected.length, 1);
-    assert.match(state.injected[0].content, /第二段正文/, '旧进度要落到第一个绑定名下');
-    assert.doesNotMatch(state.injected[0].content, /第一段正文/);
+    const mirror = state.entries.find(isMirror);
+    assert.ok(mirror, '迁移后要建镜像');
+    assert.match(mirror.content, /第二段正文/, '旧进度要落到第一个绑定名下');
+    assert.doesNotMatch(mirror.content, /第一段正文/);
     const chatState = state.variables.chat.$dynamicGuideAssistant.state;
     assert.equal(chatState.version, 2, '旧进度读出后立刻写回新结构');
     assert.equal(chatState.bindings[keyOf('测试世界书', 1)].stageIndex, 1);
     assert.deepEqual(run.errors, []);
 });
 
-test('两条绑定各自注入回自己的位置', async () => {
+test('两条绑定各自在自己的世界书里建镜像、各自推进', async () => {
     const books = {
         书A: [{ uid: 1, name: '大纲A', content: '## 甲一\n甲一正文\n\n## 甲二\n甲二正文', enabled: false, position: { type: 'at_depth', depth: 4, role: 'assistant' } }],
         书B: [{ uid: 2, name: '大纲B', content: '## 乙一\n乙一正文', enabled: false }],
@@ -851,21 +757,18 @@ test('两条绑定各自注入回自己的位置', async () => {
     const { state, helper } = multiWorld(books, { config });
     const run = load(helper);
     await new Promise(setImmediate);
-    assert.equal(state.injected.length, 2, '每条绑定各注入一条');
-    const a = state.injected.find(item => item.depth === 4);
-    const b = state.injected.find(item => item.depth === 0);
-    assert.ok(a && b);
-    assert.equal(a.role, 'assistant');
-    assert.match(a.content, /甲一正文/);
-    assert.doesNotMatch(a.content, /甲二正文/);
-    assert.match(b.content, /乙一正文/);
-    assert.notEqual(a.id, b.id, '两条注入的 id 不能互相覆盖');
-    assert.match(a.id, /^dynamic-guide-assistant-current-/);
+    const mirrorA = state.books.书A.find(isMirror);
+    const mirrorB = state.books.书B.find(isMirror);
+    assert.ok(mirrorA && mirrorB, '每条绑定各建一个镜像');
+    assert.deepEqual(plain(mirrorA.position), { type: 'at_depth', depth: 4, role: 'assistant' }, 'A 的镜像跟随 A 的位置');
+    assert.match(mirrorA.content, /甲一正文/);
+    assert.doesNotMatch(mirrorA.content, /甲二正文/);
+    assert.match(mirrorB.content, /乙一正文/);
+    assert.notEqual(mirrorA.uid, mirrorB.uid, '两个镜像的 uid 不能互相覆盖');
     await run.core.next();
-    const aNext = state.injected.filter(item => item.id === a.id).pop();
-    assert.match(aNext.content, /甲二正文/);
-    assert.doesNotMatch(aNext.content, /甲一正文/);
-    assert.match(state.active.get(b.id).content, /乙一正文/, 'B 的注入内容不受影响');
+    assert.match(mirrorA.content, /甲二正文/, '推进后 A 的镜像换成新阶段');
+    assert.doesNotMatch(mirrorA.content, /甲一正文/);
+    assert.match(mirrorB.content, /乙一正文/, 'B 的镜像内容不受影响');
     assert.deepEqual(run.errors, []);
 });
 
@@ -893,13 +796,13 @@ test('一条消息里的完成标记只推进匹配的那条绑定', async () =>
     assert.equal(chatState.bindings[keyOf('书A', 1)].stageIndex, 0, 'A 不该被推进');
     assert.equal(chatState.bindings[keyOf('书B', 2)].stageIndex, 1, 'B 要被推进');
     assert.equal(message.message.includes('DGA_COMPLETE'), false, '标记要从消息里清掉');
-    const lastB = state.injected.filter(item => /乙/.test(item.content)).pop();
-    assert.match(lastB.content, /乙二正文/);
-    assert.doesNotMatch(lastB.content, /乙一正文/);
+    const mirrorB = state.books.书B.find(isMirror);
+    assert.match(mirrorB.content, /乙二正文/, '推进后 B 的镜像换成新阶段');
+    assert.doesNotMatch(mirrorB.content, /乙一正文/);
     assert.deepEqual(run.errors, []);
 });
 
-test('移出绑定会重新打开条目、删掉进度并清掉它的注入', async () => {
+test('移出绑定会重新打开条目、删掉镜像和进度', async () => {
     const books = {
         书A: [{ uid: 1, name: '大纲A', content: '## 甲一\n甲一正文', enabled: false }],
         书B: [{ uid: 2, name: '大纲B', content: '## 乙一\n乙一正文', enabled: false }],
@@ -914,19 +817,20 @@ test('移出绑定会重新打开条目、删掉进度并清掉它的注入', as
     const { state, helper } = multiWorld(books, { config });
     const run = load(helper);
     await new Promise(setImmediate);
-    assert.equal(state.injected.length, 2);
-    const idA = state.injected.find(item => /甲一正文/.test(item.content)).id;
+    assert.ok(state.books.书A.some(isMirror), 'A 要有镜像');
+    assert.ok(state.books.书B.some(isMirror), 'B 要有镜像');
     await run.core.unbind(keyOf('书A', 1), { confirm: false });
     assert.equal(books.书A[0].enabled, true, '条目要重新打开');
+    assert.equal(state.books.书A.some(isMirror), false, 'A 的镜像要删掉');
     assert.equal(books.书B[0].enabled, false, '其他绑定不受影响');
+    assert.ok(state.books.书B.some(isMirror), 'B 的镜像保留');
     const remaining = state.variables.character.$dynamicGuideAssistant.config.bindings;
     assert.equal(remaining.length, 1);
     assert.equal(remaining[0].worldbookName, '书B');
     const chatState = state.variables.chat.$dynamicGuideAssistant.state;
     assert.equal(chatState.bindings[keyOf('书A', 1)], undefined, '进度要删掉');
-    assert.ok(state.removed.includes(idA), '这条绑定的注入要清掉');
     await state.events.get('generate')('normal', {}, false);
-    assert.equal(state.injected.filter(item => item.id === idA).length, 1, '移出后不会再注入这条绑定');
+    assert.equal(state.books.书A.some(isMirror), false, '移出后不会再建镜像');
     assert.deepEqual(run.errors, []);
 });
 

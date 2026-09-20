@@ -2,17 +2,18 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.4
+     * 动态指导助手 v2.5
      *
      * 这个文件分三部分：
-     *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
-     *       拼成注入文本；选区划分也在这里做载入和重建。不碰页面，
-     *       不碰酒馆接口，可以单独测试。
-     *   二、适配层：读写酒馆助手的变量、世界书、注入和事件。
+     *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
+     *       选区划分也在这里做载入和重建。不碰页面，不碰酒馆接口，可以单独测试。
+     *   二、适配层：读写酒馆助手的变量、世界书和事件；在同一本世界书里
+     *       维护「（动态指导）」镜像条目，把当前阶段显示在原条目的位置。
      *   三、界面：管理页和“划分阶段”编辑器（看分段 / 选区划分 / 编辑原文）。
      *
-     * 可以同时绑定好几个大纲条目：每个条目被关闭后，只有当前阶段的切片
-     * 会注入回它原来的位置，相当于暂时让其余内容不被 AI 看到。
+     * 可以同时绑定好几个大纲条目：每个条目被关闭后，插件在同一本世界书里
+     * 克隆出一个镜像条目——位置、顺序、关键词等设置全部跟随原条目，只有
+     * 当前阶段的切片作为内容，相当于暂时让其余内容不被 AI 看到。
      *
      * 数据只存两处：
      *   - 阶段结构就是世界书条目正文本身，用标题行（## 名称）分段。
@@ -24,7 +25,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.4';
+    const VERSION = '2.5';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -330,17 +331,17 @@
     function formatInjection(stage, addons) {
         if (!stage) return '';
         // 写在所有阶段之前的常驻排在最前面，其余附加/常驻按正文顺序放在阶段之后。
+        // 不要加任何插件头部或解释文字：这份内容会原样出现在镜像条目里，
+        // 用户在提示词查看器里看到的就是大纲正文本身。
         const above = addons.filter(item => item.kind === 'always' && item.aboveStages);
         const below = addons.filter(item => !above.includes(item));
-        const lines = [
-            '[动态指导助手：当前有效内容]',
-            '以下是作者为当前进度准备的内部创作指导。自然地遵守它，不要向用户提及指导系统、阶段、完成判定或隐藏标记。',
-        ];
+        const lines = [];
         if (above.length > 0) {
-            lines.push('', '## 常驻提示');
+            lines.push('## 常驻提示');
             above.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
+            lines.push('');
         }
-        lines.push('', `## 当前阶段：${stage.name}`, stage.prompt);
+        lines.push(`## 当前阶段：${stage.name}`, stage.prompt);
         if (below.length > 0) {
             lines.push('', '## 同时有效的附加内容');
             below.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
@@ -959,7 +960,7 @@
     // 二、适配层：变量（角色变量存绑定列表，聊天变量按绑定分别存进度）
     //
     // 一条绑定 = 一个被关闭的大纲条目。可以同时有好几条绑定，
-    // 每条绑定的注入和进度都靠 bindingKey 区分开。
+    // 每条绑定的镜像和进度都靠 bindingKey 区分开。
     // ---------------------------------------------------------------
 
     async function readVariables(type) {
@@ -1004,7 +1005,7 @@
         return `${String((binding && binding.worldbookName) || '')}#${target}`;
     }
 
-    // 每个绑定一条注入，id 带绑定指纹后缀，互不覆盖；旧版无后缀的注入由清理逻辑兜底。
+    // ≤2.4 的注入 id：带绑定指纹后缀。现在只在启动清理旧版注入残留时用到。
     function injectionIdFor(key) {
         return `${INJECTION_ID}-${hashText(key).slice(0, 6)}`;
     }
@@ -1241,7 +1242,7 @@
     }
 
     // ---------------------------------------------------------------
-    // 二、适配层：读取当前状态、注入、推进、绑定
+    // 二、适配层：读取当前状态、镜像同步、推进、绑定
     // ---------------------------------------------------------------
 
     async function locateEntry(config) {
@@ -1262,7 +1263,7 @@
     // 每条绑定各读各的：单个条目出问题（broken）不影响其他绑定。
     async function loadContexts() {
         const config = await readConfig();
-        if (config.bindings.length === 0) return rememberContexts({ configured: false, config, contexts: [] });
+        if (config.bindings.length === 0) return { configured: false, config, contexts: [] };
         const stateMap = await readState(config);
         const contexts = [];
         for (const binding of config.bindings) {
@@ -1293,7 +1294,7 @@
                 contexts.push({ key, binding, configured: true, broken: true, error: error.message || String(error) });
             }
         }
-        return rememberContexts({ configured: true, config, contexts });
+        return { configured: true, config, contexts };
     }
 
     // 快捷指令（next/previous/reset）只操作第一条能用的绑定。
@@ -1312,75 +1313,54 @@
             || left.lastCompletionFingerprint !== right.lastCompletionFingerprint;
     }
 
-    // 注入纪律与 1.3.6 相同：每次生成都“先撤后注”，且注入只对下一次请求生效（once: true）。
-    // 绝不能做“内容没变就跳过”的去重——酒馆助手 4.8.17 起会在脚本重载等时机自动清掉
-    // 持久注入，提示词查看器的预组装也会消耗注入；去重跳过会让指导悄悄消失而脚本
-    // 毫不知情（v2.0–v2.3 “注入没了” 的根源就在这里）。cache 只用于清理时记账。
-    const injectionCache = { all: null, byKey: {} };
-    let clearedBaseInjection = false;
+    // ---------------------------------------------------------------
+    // 二、适配层：镜像条目（v2.5 起）
+    //
+    // 扩展提示词的锚点（预设之前 / 主提示词块 / 聊天深度）复刻不了世界书
+    // 条目的位置——BEFORE_PROMPT 会排到预设开头之前，IN_PROMPT 会并进主
+    // 提示词块，这就是 v2.4 注入出现在提示词最顶上的原因。所以现在不再
+    // 注入提示词，而是在同一本世界书里维护一个「（动态指导）」镜像条目：
+    // 克隆原条目的位置、顺序、关键词等全部设置，只把内容换成当前阶段。
+    // 原条目保持关闭、原文不动；镜像就排在原条目原来的位置。
+    // ---------------------------------------------------------------
 
-    function cacheFor(key) {
-        if (!injectionCache.byKey[key]) injectionCache.byKey[key] = { text: undefined, channel: null };
-        return injectionCache.byKey[key];
-    }
+    // 旧版（≤2.4）走 injectPrompts / setExtensionPrompt 注入；升级后第一次启动时清掉残留。
+    let clearedLegacyInjections = false;
 
-    async function clearAllInjections() {
+    async function clearLegacyInjections() {
+        if (clearedLegacyInjections) return;
+        clearedLegacyInjections = true;
         const uninjectPrompts = api('uninjectPrompts', false);
         const channel = extensionPromptChannel();
-        const ids = [INJECTION_ID];
-        Object.keys(injectionCache.byKey).forEach(key => {
-            if (injectionCache.byKey[key].text != null) ids.push(injectionIdFor(key));
-        });
+        let ids = [INJECTION_ID];
+        try {
+            const config = await readConfig();
+            ids = ids.concat(config.bindings.map(binding => injectionIdFor(bindingKey(binding))));
+        } catch (error) {
+            // 配置读不出来也至少清掉无后缀的旧 id
+        }
         if (uninjectPrompts) await Promise.resolve(uninjectPrompts(ids));
         if (channel) ids.forEach(id => channel.set(id, '', channel.types.NONE, 0));
-        injectionCache.byKey = {};
-        clearedBaseInjection = true;
     }
 
-    // 清掉已经不在绑定列表里的注入；旧版无后缀 id 每页只清一次。
-    function clearStaleInjections(activeIds) {
-        const uninjectPrompts = api('uninjectPrompts', false);
-        Object.keys(injectionCache.byKey).forEach(key => {
-            const cache = injectionCache.byKey[key];
-            const id = injectionIdFor(key);
-            if (activeIds.includes(id)) return;
-            if (cache.text != null) {
-                if (uninjectPrompts) uninjectPrompts([id]);
-                clearAnchorInjection(id);
+    // 诊断和界面里展示条目位置用的中文描述。
+    function positionText(position) {
+        const spot = position || {};
+        switch (spot.type) {
+            case 'before_character_definition': return '角色定义前';
+            case 'after_character_definition': return '角色定义后';
+            case 'before_example_messages': return '示例消息前';
+            case 'after_example_messages': return '示例消息后';
+            case 'at_depth': {
+                const depth = Math.max(0, Number(spot.depth) || 0);
+                const role = spot.role === 'user' ? '用户' : spot.role === 'assistant' ? 'AI' : '系统';
+                return `聊天深度 ${depth} · ${role}`;
             }
-            delete injectionCache.byKey[key];
-        });
-        if (!clearedBaseInjection) {
-            clearedBaseInjection = true;
-            if (uninjectPrompts) uninjectPrompts([INJECTION_ID]);
-            clearAnchorInjection(INJECTION_ID);
+            default: return spot.type ? String(spot.type) : '未设置（跟随世界书默认位置）';
         }
     }
 
-    // 把指导放回来源条目原来在提示词里的位置：条目是“按深度插入”时跟随它的深度和角色；
-    // “角色定义前/后”改用酒馆原生扩展提示锚点（酒馆助手的注入只能插在聊天里，做不到这两个位置）；
-    // 示例消息、作者注释等其余位置没有可复制的注入通道，仍然放在聊天末尾。
-    function injectionPlacement(entry) {
-        const position = (entry && entry.position) || {};
-        if (position.type === 'at_depth') {
-            const depth = Math.max(0, Number(position.depth) || 0);
-            const role = position.role === 'user' || position.role === 'assistant' ? position.role : 'system';
-            return { channel: 'in_chat', depth, role, followed: true };
-        }
-        if (position.type === 'before_character_definition') return { channel: 'anchor', slot: 'before', followed: true };
-        if (position.type === 'after_character_definition') return { channel: 'anchor', slot: 'after', followed: true };
-        return { channel: 'in_chat', depth: 0, role: 'system', followed: false };
-    }
-
-    function injectionPlacementText(placement) {
-        if (!placement || !placement.followed) return '聊天末尾（深度 0）';
-        if (placement.channel === 'anchor') {
-            return placement.slot === 'before' ? '跟随大纲条目：角色定义前' : '跟随大纲条目：角色定义后';
-        }
-        return `跟随大纲条目：深度 ${placement.depth} · ${placement.role}`;
-    }
-
-    // 酒馆原生扩展提示接口：角色定义前/后锚点只能靠它。
+    // 酒馆原生扩展提示接口：现在只用于清理 ≤2.4 留下的注入残留。
     // 数值常量与酒馆源码 script.js 里的 extension_prompt_types 一致：
     // NONE=-1, IN_PROMPT=0（角色定义后）, IN_CHAT=1, BEFORE_PROMPT=2（角色定义前）。
     function extensionPromptChannel() {
@@ -1400,9 +1380,107 @@
         return null;
     }
 
-    function clearAnchorInjection(id) {
-        const channel = extensionPromptChannel();
-        if (channel) channel.set(id || INJECTION_ID, '', channel.types.NONE, 0);
+    // ---------------------------------------------------------------
+    // 二、适配层：镜像条目的读写小工具
+    // ---------------------------------------------------------------
+
+    function mirrorNameFor(name) {
+        return `${name}（动态指导）`;
+    }
+
+    // 返回可原地增删的条目数组；{entries:{...}} 对象形态时返回 null，增删走对象键。
+    function worldbookEntryList(worldbook) {
+        if (Array.isArray(worldbook)) return worldbook;
+        if (worldbook && Array.isArray(worldbook.entries)) return worldbook.entries;
+        return null;
+    }
+
+    function addEntryToWorldbook(worldbook, entry) {
+        const list = worldbookEntryList(worldbook);
+        if (list) {
+            list.push(entry);
+            return;
+        }
+        if (worldbook && worldbook.entries && typeof worldbook.entries === 'object') {
+            worldbook.entries[String(entry.uid)] = entry;
+        }
+    }
+
+    function removeEntryFromWorldbook(worldbook, target) {
+        const list = worldbookEntryList(worldbook);
+        if (list) {
+            const at = list.indexOf(target);
+            if (at >= 0) list.splice(at, 1);
+            return;
+        }
+        if (worldbook && worldbook.entries && typeof worldbook.entries === 'object') {
+            Object.keys(worldbook.entries).forEach(key => {
+                if (worldbook.entries[key] === target) delete worldbook.entries[key];
+            });
+        }
+    }
+
+    function freshUid(worldbook) {
+        const used = worldbookEntries(worldbook).map(entry => Number(entry.uid)).filter(Number.isFinite);
+        return used.length > 0 ? Math.max(...used) + 1 : 1;
+    }
+
+    // 克隆原条目的全部设置（位置、顺序、关键词、概率、递归开关……），
+    // 只覆盖镜像自己的身份：uid、名字、内容、开关。
+    function buildMirrorEntry(original, uid, name, content) {
+        const mirror = { ...original, uid, comment: name, name, title: name, content, enabled: true };
+        if ('disable' in mirror) mirror.disable = false;
+        return mirror;
+    }
+
+    function mirrorDiffers(mirror, want) {
+        return Object.keys(want).some(key => key !== 'uid'
+            && JSON.stringify(mirror[key]) !== JSON.stringify(want[key]));
+    }
+
+    // 找一条绑定名下的镜像（可能有历史遗留的多个同名，调用方只留第一个）。
+    function findMirrorEntries(worldbook, context, mirrorName) {
+        const originalUid = context.entry && context.entry.uid;
+        return worldbookEntries(worldbook).filter(item =>
+            !sameUid(item.uid, originalUid)
+            && (sameUid(item.uid, context.binding && context.binding.mirrorUid) || entryName(item) === mirrorName));
+    }
+
+    // 原地同步：原条目保持关闭；镜像存在，且位置等字段、内容都与原条目和当前阶段对齐。
+    // 调用方先在读到的副本上试跑，有变化才真的写世界书——避免每次生成都写一次世界书文件。
+    function syncMirrorInPlace(worldbook, context, text) {
+        const mirrorName = mirrorNameFor(entryName(context.entry));
+        const original = findEntry(worldbook, context.entry.uid, entryName(context.entry));
+        let changed = false;
+        if (original && !entryIsDisabled(original)) {
+            original.enabled = false;
+            if ('disable' in original) original.disable = true;
+            changed = true;
+        }
+        const mirrors = findMirrorEntries(worldbook, context, mirrorName);
+        const mirror = mirrors[0] || null;
+        mirrors.slice(1).forEach(extra => {
+            removeEntryFromWorldbook(worldbook, extra);
+            changed = true;
+        });
+        if (text == null) {
+            if (mirror) {
+                removeEntryFromWorldbook(worldbook, mirror);
+                changed = true;
+            }
+            return { changed, mirrorName, mirrorUid: null, text };
+        }
+        if (!mirror) {
+            const created = buildMirrorEntry(original || context.entry, freshUid(worldbook), mirrorName, text);
+            addEntryToWorldbook(worldbook, created);
+            return { changed: true, mirrorName, mirrorUid: created.uid, text };
+        }
+        const want = buildMirrorEntry(original || context.entry, mirror.uid, mirrorName, text);
+        if (mirrorDiffers(mirror, want)) {
+            Object.assign(mirror, want);
+            changed = true;
+        }
+        return { changed, mirrorName, mirrorUid: mirror.uid, text };
     }
 
     function currentMessageId() {
@@ -1416,11 +1494,12 @@
         }
     }
 
-    function injectionTextFor(context, generationType) {
+    // 当前进度应该显示给 AI 的正文；没有可显示的内容（旧布局、没阶段）时返回 null。
+    function guideTextFor(context, generationType) {
         if (!context || !context.configured) return null;
         if (context.legacy || context.parsed.stages.length === 0) return null;
         let index = context.state.stageIndex;
-        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段注入
+        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段显示
         if ((generationType === 'swipe' || generationType === 'regenerate')
             && index > 0
             && context.state.lastCompletionMessageId != null) {
@@ -1432,118 +1511,81 @@
         return formatInjection(stage, activeAddons(context.parsed, index));
     }
 
-    // 聊天内注入的双通道。优先酒馆助手 injectPrompts（按聊天文件隔离、once 只发一次）；
-    // 接口缺失或调用抛错时，退回酒馆原生 setExtensionPrompt(IN_CHAT, 深度, 角色)——
-    // 这是几乎任何版本酒馆都有的老接口。两条通道共用同一个注入 id，清理时两边都清。
-    function injectViaChat(id, text, depth, role, key) {
-        const injectPrompts = api('injectPrompts', false);
-        if (injectPrompts) {
-            try {
-                injectPrompts([{ id, position: 'in_chat', depth, role, content: text, should_scan: false }], { once: true });
-                return 'helper';
-            } catch (error) {
-                reportOnce(`inject-error-${key}`, `酒馆助手注入接口报错，已改用酒馆原生注入：${error.message || String(error)}`);
-            }
-        }
-        const channel = extensionPromptChannel();
-        if (channel) {
-            // 原生 setExtensionPrompt 的角色参数：0=system 1=user 2=assistant
-            const roleCode = role === 'user' ? 1 : role === 'assistant' ? 2 : 0;
-            channel.set(id, text, channel.types.IN_CHAT, depth, false, roleCode);
-            reportOnce(`native-channel-${key}`, '当前酒馆助手没有可用的注入接口，指导已改走酒馆原生扩展提示（聊天内深度注入）。建议把酒馆助手更新到最新版。');
-            return 'native';
-        }
-        reportOnce(`no-channel-${key}`, '当前环境没有任何可用的注入通道（酒馆助手注入接口和酒馆原生扩展提示都拿不到），无法注入指导。请把酒馆和酒馆助手更新到最新版。');
-        return null;
-    }
-
-    // 每次调用都真实地重新注入：先撤掉旧注入再按 id 注入新内容，once 模式下
-    // 注入只对下一次请求生效，生成事件里会再次撤注，因此不会累积重复。
-    function applyInjection(text, placement, key) {
-        const id = injectionIdFor(key);
-        const cache = cacheFor(key);
-        const spot = placement || { channel: 'in_chat', depth: 0, role: 'system', followed: false };
-        const uninjectPrompts = api('uninjectPrompts', false);
-        if (text == null) {
-            if (cache.text !== null) {
-                if (uninjectPrompts) uninjectPrompts([id]);
-                clearAnchorInjection(id);
-            }
-            cache.text = null;
-            cache.channel = null;
-            return;
-        }
-        if (uninjectPrompts) uninjectPrompts([id]);
-        if (spot.channel === 'anchor') {
-            const channel = extensionPromptChannel();
-            if (channel) {
-                channel.set(id, text,
-                    spot.slot === 'before' ? channel.types.BEFORE_PROMPT : channel.types.IN_PROMPT, 0, false, 0);
-            } else {
-                // 拿不到原生扩展提示接口时退化为聊天末尾，并说明原因
-                reportOnce(`anchor-unavailable-${key}`, '当前环境没有酒馆原生扩展提示接口，指导改放在聊天末尾（深度 0）。');
-                injectViaChat(id, text, 0, 'system', key);
-            }
-        } else {
-            if (cache.channel === 'anchor') clearAnchorInjection(id);
-            injectViaChat(id, text, spot.depth, spot.role, key);
-        }
-        cache.text = text;
-        cache.channel = spot.channel;
-    }
-
-    function rememberContexts(all) {
-        injectionCache.all = all;
-        return all;
-    }
-
-    // 用缓存里的上下文同步对齐注入内容：不读世界书，也不等任何 Promise。
-    function syncInjection(generationType) {
-        const all = injectionCache.all;
-        if (!all) return;
-        all.contexts.forEach(context => {
-            if (context.broken) return;
-            applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry), context.key);
+    // 同步一条绑定的镜像。先在读到的副本上试跑，没变化就不写世界书；
+    // 有变化才写，写后读回验证内容，防止世界书接口把字段吞掉。
+    async function syncMirrorFor(context, generationType) {
+        const text = guideTextFor(context, generationType);
+        const preview = await getWorldbook(context.worldbookName);
+        const plan = syncMirrorInPlace(preview, context, text);
+        if (!plan.changed) return plan;
+        await updateWorldbook(context.worldbookName, worldbook => {
+            syncMirrorInPlace(worldbook, context, text);
+            return worldbook;
         });
+        const saved = findMirrorEntries(await getWorldbook(context.worldbookName), context, plan.mirrorName)[0] || null;
+        if (text != null && (!saved || normalizeText(saved.content || '') !== normalizeText(text))) {
+            throw new Error(`镜像条目“${plan.mirrorName}”写入后读回不一致，请稍后重试。`);
+        }
+        return plan;
     }
 
-    async function injectCurrentGuide(generationType) {
-        // 先按缓存同步注入：即使酒馆没有等待这个事件，这次请求也已经带上当前阶段。
-        syncInjection(generationType);
+    // 绑定坏了（条目被删或改名）时，把可能残留的镜像清掉，避免旧阶段内容继续发给 AI。
+    async function removeOrphanMirror(binding) {
+        const mirrorName = mirrorNameFor(binding.entryName || '');
+        const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
+        const candidates = Array.from(new Set([binding.worldbookName, ...bound].filter(Boolean)));
+        for (const worldbookName of candidates) {
+            try {
+                const matches = entry => sameUid(entry.uid, binding.mirrorUid) || entryName(entry) === mirrorName;
+                const orphans = worldbookEntries(await getWorldbook(worldbookName)).filter(matches);
+                if (orphans.length === 0) continue;
+                await updateWorldbook(worldbookName, worldbook => {
+                    worldbookEntries(worldbook).slice().forEach(entry => {
+                        if (matches(entry)) removeEntryFromWorldbook(worldbook, entry);
+                    });
+                    return worldbook;
+                });
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] 清理世界书“${worldbookName}”里的镜像失败`, error);
+            }
+        }
+    }
+
+    // 每条绑定各自同步自己的镜像：内容 = 当前阶段（swipe/重新生成时用推进前的阶段）。
+    async function syncMirrors(generationType) {
         const all = await loadContexts();
-        const activeIds = [];
+        let configChanged = false;
         for (const context of all.contexts) {
             if (context.broken) {
                 reportOnce(`broken-${context.key}`, context.error);
+                await removeOrphanMirror(context.binding);
                 continue;
             }
-            activeIds.push(injectionIdFor(context.key));
             if (context.entryEnabled) {
-                // 来源条目又被打开了：为了不让整份大纲直接发给 AI，生成前重新关闭它。
-                // 旧格式尚未转换或正文暂时没有阶段时，也必须保持来源关闭。
-                await disableEntry(context.worldbookName, context.entry.uid, entryName(context.entry));
+                // 来源条目又被打开了：为了不让整份大纲直接发给 AI，同步时会重新关闭它。
                 reportOnce(`re-disabled-${context.key}`, `“${entryName(context.entry)}”被重新打开过，已再次关闭，避免整份大纲直接发给 AI。`);
             }
             if (context.legacy) {
-                reportOnce(`legacy-layout-${context.key}`, `“${entryName(context.entry)}”仍使用旧版划分。请先打开动态指导助手，点“转换成新版格式”；转换前不会注入指导。`);
-                applyInjection(null, null, context.key);
-                continue;
-            }
-            if (context.parsed.stages.length === 0) {
-                reportOnce(`no-stages-${context.key}`, `“${entryName(context.entry)}”还没有分阶段，这次不会注入指导。`);
-                applyInjection(null, null, context.key);
-                continue;
-            }
-            if (statesDiffer(context.rawState, context.state)) {
+                reportOnce(`legacy-layout-${context.key}`, `“${entryName(context.entry)}”仍使用旧版划分。请先打开动态指导助手，点“转换成新版格式”；转换前不会显示指导。`);
+            } else if (context.parsed.stages.length === 0) {
+                reportOnce(`no-stages-${context.key}`, `“${entryName(context.entry)}”还没有分阶段，这次不会显示指导。`);
+            } else if (statesDiffer(context.rawState, context.state)) {
                 await writeStateFor(context.key, { ...context.state, updatedAt: new Date().toISOString() });
             }
-            applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry), context.key);
+            const plan = await syncMirrorFor(context, generationType);
+            const before = context.binding.mirrorUid == null ? null : String(context.binding.mirrorUid);
+            const after = plan.mirrorUid == null ? null : String(plan.mirrorUid);
+            if (before !== after) {
+                context.binding.mirrorUid = plan.mirrorUid == null ? undefined : plan.mirrorUid;
+                configChanged = true;
+            }
         }
-        clearStaleInjections(activeIds);
+        if (configChanged && all.config) await writeConfig(all.config);
+        return all;
     }
 
-    // 把整条注入链路逐项体检一遍：环境、接口、事件、绑定、双通道试注。
-    // 结果给面板上的「诊断」卡用，也挂在 publicApi 上方便排查。
+    // 把链路逐项体检一遍：环境、接口、事件、绑定，以及每条绑定的镜像条目
+    // 是否存在、内容是否与当前阶段一致。结果给面板上的「诊断」卡用，也挂在 publicApi 上。
     async function collectDiagnostics() {
         const rows = [];
         const push = (label, ok, detail) => rows.push({ label, ok: Boolean(ok), detail: String(detail == null ? '' : detail) });
@@ -1556,7 +1598,7 @@
             push('酒馆助手版本', false, error.message || String(error));
         }
         ['getVariables', 'updateVariablesWith', 'getWorldbook', 'updateWorldbookWith', 'getWorldbookNames',
-            'getCharWorldbookNames', 'getCharData', 'injectPrompts', 'uninjectPrompts', 'eventOn', 'getLastMessageId']
+            'getCharWorldbookNames', 'getCharData', 'eventOn', 'getLastMessageId']
             .forEach(name => push(`接口 ${name}`, Boolean(api(name, false)), api(name, false) ? '可用' : '缺失'));
         const eventsTable = apiValue('tavern_events');
         push('事件表 tavern_events', Boolean(eventsTable), eventsTable ? '可用' : '缺失');
@@ -1564,11 +1606,10 @@
             ['GENERATION_AFTER_COMMANDS', 'MESSAGE_RECEIVED', 'CHAT_CHANGED']
                 .forEach(name => push(`事件 ${name}`, Boolean(eventsTable[name]), String(eventsTable[name] || '缺失')));
         }
-        const channel = extensionPromptChannel();
-        push('酒馆原生扩展提示', Boolean(channel), channel ? `可用（IN_CHAT=${channel.types.IN_CHAT}）` : '拿不到 SillyTavern 的 setExtensionPrompt');
         try {
             const config = await readConfig();
             push('绑定数量', config.bindings.length > 0, `${config.bindings.length} 条`);
+            const stateMap = config.bindings.length > 0 ? await readState(config) : {};
             for (const binding of config.bindings) {
                 const label = `绑定「${binding.entryName || binding.worldbookName}」`;
                 try {
@@ -1579,38 +1620,32 @@
                     }
                     const parsed = parseOutline(located.entry.content || '');
                     push(label, parsed.stages.length > 0,
-                        `${parsed.stages.length} 个阶段；条目${entryIsDisabled(located.entry) ? '已关闭' : '现在是打开的（生成前会自动关闭）'}`);
+                        `${parsed.stages.length} 个阶段；条目${entryIsDisabled(located.entry) ? '已关闭' : '现在是打开的（同步时会自动关闭）'}；位置：${positionText(located.entry.position)}`);
+                    // 镜像行：内容必须与当前进度应有的正文逐字一致
+                    const mirrorName = mirrorNameFor(entryName(located.entry));
+                    const state = reconcileState(stateMap[bindingKey(binding)] || null, parsed);
+                    const stage = parsed.stages[state.stageIndex] || null;
+                    const want = stage && !hasLegacyLayout(located.entry)
+                        ? formatInjection(stage, activeAddons(parsed, state.stageIndex))
+                        : null;
+                    const mirror = findMirrorEntries(await getWorldbook(located.worldbookName),
+                        { binding, entry: located.entry }, mirrorName)[0] || null;
+                    if (want == null) {
+                        push(`镜像「${mirrorName}」`, mirror == null,
+                            mirror == null ? '当前没有可显示的内容，不需要镜像' : '有多余镜像，同步时会自动删掉');
+                    } else if (!mirror) {
+                        push(`镜像「${mirrorName}」`, false, '还没创建——下一次生成、或打开管理页时会自动创建');
+                    } else {
+                        const synced = normalizeText(mirror.content || '') === normalizeText(want);
+                        push(`镜像「${mirrorName}」`, synced && !entryIsDisabled(mirror),
+                            `${String(mirror.content || '').length} 字，${synced ? '与当前阶段一致' : '与当前阶段不一致（同步时会自动更新）'}；位置：${positionText(mirror.position)}`);
+                    }
                 } catch (error) {
                     push(label, false, error.message || String(error));
                 }
             }
         } catch (error) {
             push('读取绑定列表', false, error.message || String(error));
-        }
-        const probeId = `${INJECTION_ID}-probe`;
-        try {
-            const injectPrompts = api('injectPrompts', false);
-            if (!injectPrompts) {
-                push('试注：酒馆助手通道', false, 'injectPrompts 缺失');
-            } else {
-                injectPrompts([{ id: probeId, position: 'in_chat', depth: 0, role: 'system', content: '诊断试注，立即撤回', should_scan: false }], { once: true });
-                const uninjectPrompts = api('uninjectPrompts', false);
-                if (uninjectPrompts) uninjectPrompts([probeId]);
-                push('试注：酒馆助手通道', true, '注入并撤回成功');
-            }
-        } catch (error) {
-            push('试注：酒馆助手通道', false, `调用报错：${error.message || String(error)}`);
-        }
-        try {
-            if (!channel) {
-                push('试注：酒馆原生通道', false, '拿不到 setExtensionPrompt');
-            } else {
-                channel.set(probeId, '诊断试注，立即撤回', channel.types.IN_CHAT, 0, false, 0);
-                channel.set(probeId, '', channel.types.NONE, 0);
-                push('试注：酒馆原生通道', true, '写入并清理成功');
-            }
-        } catch (error) {
-            push('试注：酒馆原生通道', false, `调用报错：${error.message || String(error)}`);
         }
         return rows;
     }
@@ -1635,24 +1670,13 @@
             updatedAt: new Date().toISOString(),
         };
         await writeStateFor(context.key, next);
-        // 进度一变就把注入内容换成新阶段，下一次生成不需要等任何异步读取。
-        if (injectionCache.all) {
-            const at = injectionCache.all.contexts.findIndex(item => item.key === context.key);
-            if (at >= 0) {
-                injectionCache.all.contexts[at] = {
-                    ...injectionCache.all.contexts[at],
-                    state: next,
-                    stage: context.parsed.stages[index] || null,
-                    addons: activeAddons(context.parsed, index),
-                };
-            }
-        }
-        syncInjection('normal');
+        // 进度一变就把镜像内容换成新阶段，不用等下一次生成事件。
+        await syncMirrors('normal');
         if (settings.notify !== false) {
             const label = entryName(context.entry);
             notify(next.stageName
                 ? `「${label}」当前阶段：${next.stageName}`
-                : `「${label}」全部阶段已完成，之后不再注入指导。`, 'success');
+                : `「${label}」全部阶段已完成，之后不再显示指导。`, 'success');
         }
         return next;
     }
@@ -1696,8 +1720,8 @@
             lastCompletionFingerprint: '',
             updatedAt: new Date().toISOString(),
         });
-        // 立刻按最新绑定列表重新注入，不用等下一次事件。
-        await injectCurrentGuide('normal');
+        // 立刻按最新绑定列表同步镜像，不用等下一次事件。
+        await syncMirrors('normal');
         notify(`已添加“${entryName(fresh)}”，当前阶段：${parsed.stages[0].name}`, 'success');
         return true;
     }
@@ -1715,25 +1739,28 @@
             );
             if (!accepted) return false;
         }
-        // 先恢复条目，再删绑定；即使中途失败也不会留下“条目关着却没人管”的状态。
+        // 先恢复条目、删掉镜像，再删绑定；即使中途失败也不会留下“条目关着却没人管”的状态。
         if (located) {
+            const mirrorName = mirrorNameFor(entryName(located.entry));
             await updateWorldbook(located.worldbookName, worldbook => {
                 const target = findEntry(worldbook, binding.entryUid, binding.entryName);
-                if (!target) return worldbook;
-                target.enabled = true;
-                if ('disable' in target) target.disable = false;
+                if (target) {
+                    target.enabled = true;
+                    if ('disable' in target) target.disable = false;
+                }
+                worldbookEntries(worldbook).slice().forEach(item => {
+                    if (sameUid(item.uid, located.entry.uid)) return;
+                    if (sameUid(item.uid, binding.mirrorUid) || entryName(item) === mirrorName) {
+                        removeEntryFromWorldbook(worldbook, item);
+                    }
+                });
                 return worldbook;
             });
+        } else {
+            await removeOrphanMirror(binding);
         }
         await writeConfig({ version: 2, bindings: config.bindings.filter(item => bindingKey(item) !== key) });
         await writeStateFor(key, null);
-        // 直接清掉这条注入，并把它从缓存里摘掉。
-        applyInjection(null, null, key);
-        delete injectionCache.byKey[key];
-        if (injectionCache.all) {
-            const contexts = injectionCache.all.contexts.filter(item => item.key !== key);
-            injectionCache.all = { ...injectionCache.all, contexts, configured: contexts.length > 0 };
-        }
         notify(`已移出“${binding.entryName || '条目'}”，条目已重新打开。`, 'success');
         return true;
     }
@@ -2088,7 +2115,7 @@
             parts.push('现在不发送任何指导。');
         }
         details.append(el('pre', { class: 'dga-pre', text: parts.join('\n\n') }));
-        details.append(muted(`注入位置：${injectionPlacementText(injectionPlacement(context.entry))}`));
+        details.append(muted(`显示位置：镜像条目「${mirrorNameFor(entryName(context.entry))}」，${positionText(context.entry.position)}，与原条目同序`));
         if (context.parsed.warnings.length > 0) {
             details.append(messageBar({ type: 'warning', text: context.parsed.warnings.join('\n') }));
         }
@@ -2106,10 +2133,10 @@
                     text: tag,
                 })),
             context.legacy
-                ? messageBar({ type: 'warning', text: '这个条目还是旧版（1.x）的划分，转换前不会注入。在下面选中它，点“转换成新版格式”。' })
+                ? messageBar({ type: 'warning', text: '这个条目还是旧版（1.x）的划分，转换前不会显示指导。在下面选中它，点“转换成新版格式”。' })
                 : null,
             !context.legacy && total === 0
-                ? messageBar({ type: 'warning', text: '这个条目还没有分阶段，暂时不会注入。在下面选中它，点“划分阶段”。' })
+                ? messageBar({ type: 'warning', text: '这个条目还没有分阶段，暂时不会显示指导。在下面选中它，点“划分阶段”。' })
                 : null,
             usable ? el('div', {
                 class: 'dga-stage-name',
@@ -2186,43 +2213,64 @@
                 disabled: !selected || legacy || !parsed || parsed.stages.length === 0,
             }),
         ));
-        children.push(muted('添加后会关闭这个条目，AI 只能看到当前阶段的切片；想看回全文时点卡片上的“移出”就会重新打开。'));
+        children.push(muted('添加后会关闭这个条目，并在同一本世界书里建一个“（动态指导）”镜像条目：AI 在原条目的位置只能看到当前阶段的切片；想看回全文时点卡片上的“移出”就会删掉镜像、重新打开原条目。'));
         children.push(row(
             btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }),
-            btn('诊断注入链路', () => runAction('诊断', async () => {
+            btn('运行诊断', () => runAction('诊断', async () => {
                 ui.diagnosis = await collectDiagnostics();
             }), { ghost: true }),
         ));
         return card('添加指导条目', ...children);
     }
 
-    // 诊断卡：逐项体检注入链路，结果可以一键复制发给别人排查。
+    // 诊断卡：逐项体检环境和镜像同步状态，结果可以一键复制发给别人排查。
     function diagnosticsCard() {
         if (!ui.diagnosis) return null;
         const rows = ui.diagnosis;
         const failed = rows.filter(row => !row.ok).length;
-        return card('注入链路诊断',
+        return card('运行诊断',
             muted(failed === 0
-                ? `${rows.length} 项全部通过。如果提示词查看器里还是看不到指导，把这份报告发给作者。`
+                ? `${rows.length} 项全部通过。提示词查看器里找「（动态指导）」条目就能看到当前阶段，位置与原条目一致。还是看不到的话，把这份报告发给作者。`
                 : `${rows.length} 项里有 ${failed} 项不通过。把这份报告复制下来发给作者。`),
             el('pre', { class: 'dga-diag' }, diagnosticsText(rows)),
             btn('复制诊断报告', () => runAction('复制诊断报告', async () => {
-                const text = diagnosticsText(rows);
-                const nav = currentWindow.navigator;
-                if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
-                    await nav.clipboard.writeText(text);
-                } else {
-                    const doc = hostDocument();
-                    const area = doc.createElement('textarea');
-                    area.value = text;
-                    doc.body.appendChild(area);
-                    area.select();
-                    doc.execCommand('copy');
-                    area.remove();
-                }
-                notify('诊断报告已复制', 'success');
+                const copied = await copyText(diagnosticsText(rows));
+                notify(copied ? '诊断报告已复制' : '复制失败：浏览器拦了剪贴板。请直接选中上面的报告文本，长按或 Ctrl+C 复制。', copied ? 'success' : 'error');
             }), { ghost: true }),
         );
+    }
+
+    // 脚本跑在 iframe 里，document 没焦点时 navigator.clipboard.writeText 会抛
+    // “Document is not focused”。所以先走 textarea + execCommand（点击事件里可用），
+    // 失败再试 clipboard API，两头都不行就如实告诉用户。
+    async function copyText(text) {
+        try {
+            const doc = hostDocument();
+            const area = doc.createElement('textarea');
+            area.value = text;
+            area.setAttribute('readonly', '');
+            area.style.position = 'fixed';
+            area.style.left = '-9999px';
+            area.style.top = '0';
+            doc.body.appendChild(area);
+            area.focus();
+            area.select();
+            const ok = doc.execCommand && doc.execCommand('copy');
+            area.remove();
+            if (ok) return true;
+        } catch (error) {
+            // 继续试下一种方式
+        }
+        try {
+            const nav = currentWindow.navigator;
+            if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+                await nav.clipboard.writeText(text);
+                return true;
+            }
+        } catch (error) {
+            // 两种都失败了
+        }
+        return false;
     }
 
     function guideCard() {
@@ -2232,7 +2280,7 @@
                 el('li', {}, '在下面选中这个条目，点“划分阶段”：点一个段落把它设成某一阶段的开头，也可以切到“编辑原文”直接改正文。'),
                 el('li', {}, '点“保存并添加”。之后每次聊天，AI 只会收到当前这一段的内容。'),
             ),
-            muted('可以同时添加好几个条目，各自独立推进、各自注入回原来的位置。也可以直接在正文里写“## 阶段名”分段；写“合并到：阶段名”可以把这段并进已有阶段。'),
+            muted('可以同时添加好几个条目，各自独立推进。插件会在同一本世界书里维护一个“（动态指导）”镜像条目，内容就是当前阶段，位置、顺序、关键词都和原条目一致，所以 AI 在它原来的位置看到当前这一段。也可以直接在正文里写“## 阶段名”分段；写“合并到：阶段名”可以把这段并进已有阶段。'),
         );
     }
 
@@ -3210,8 +3258,8 @@
             setMessage('已保存并添加。当前聊天从第一段开始。', 'success');
             return;
         }
-        // 已添加的条目：保存后立刻按新正文重新注入，进度按阶段名自动对上。
-        if (editor.bound) await injectCurrentGuide('normal');
+        // 已添加的条目：保存后立刻按新正文同步镜像，进度按阶段名自动对上。
+        if (editor.bound) await syncMirrors('normal');
         // 留在选区模式：按保存后的正文重新铺开，待分配的预览不保留。
         if (wasPick) {
             pickDetach(editor);
@@ -3522,6 +3570,8 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
         openEditorAt,
         openManager,
         refresh: () => runAction('刷新', async () => {}),
+        sync: () => syncMirrors('normal'),
+        mirrorNameFor,
         next,
         previous,
         reset,
@@ -3539,21 +3589,25 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
 
     removeStaleUi();
     registerMenuEntry(0);
-    // 页面一打开就把当前阶段准备好：第一次生成同样不用等异步读取。
-    runEventTask('准备注入', () => injectCurrentGuide('startup'));
+    // 页面一打开就清掉旧版注入残留，并把镜像同步到当前进度。
+    // 镜像条目存在世界书里、跨重载有效，第一次生成前同步完即可。
+    runEventTask('准备指导', async () => {
+        await clearLegacyInjections();
+        await syncMirrors('startup');
+    });
 
     const eventOn = api('eventOn', false);
     const events = apiValue('tavern_events');
     if (!eventOn || !events) {
-        reportOnce('events', '当前酒馆助手缺少事件接口，管理页可以用，但无法自动注入内容。');
+        reportOnce('events', '当前酒馆助手缺少事件接口，管理页可以用，但无法自动同步当前阶段。');
         return;
     }
     if (events.GENERATION_AFTER_COMMANDS) {
         eventOn(events.GENERATION_AFTER_COMMANDS, function (type, params, dryRun) {
-            // 不跳过 dryRun：提示词查看器等预组装也必须能看到当前指导（1.3.6 就不区分）。
-            // SillyTavern 会等待这个事件监听器返回的 Promise。必须把注入任务返回，
-            // 否则世界书读取尚未完成，请求就已经继续组装，当前阶段会从提示词中消失。
-            return runEventTask('注入当前阶段', () => injectCurrentGuide(type));
+            // 不跳过 dryRun：提示词查看器等预组装也必须看到当前镜像内容。
+            // SillyTavern 会等待这个事件监听器返回的 Promise。必须把同步任务返回，
+            // 否则世界书读取尚未完成，请求就已经继续组装，镜像调整（如 swipe 回退）赶不上本次生成。
+            return runEventTask('同步当前阶段', () => syncMirrors(type));
         });
     }
     if (events.MESSAGE_RECEIVED) {
@@ -3564,11 +3618,8 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
     }
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
-            // 换聊天后进度不同：先丢掉缓存和旧注入，再按读到的状态重新注入。
-            // 注入按聊天文件隔离，即使新聊天阶段内容相同也要重新注入，所以缓存也要清掉。
-            injectionCache.all = null;
-            await clearAllInjections();
-            await injectCurrentGuide('normal');
+            // 换聊天后进度不同：镜像内容按新聊天的进度重新对齐（镜像在世界书里，不按聊天隔离）。
+            await syncMirrors('normal');
             const doc = hostDocument();
             const panel = doc && doc.getElementById(PANEL_ID);
             if (panel && !panel.hidden) await runAction('刷新', async () => {});
