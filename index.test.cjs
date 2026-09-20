@@ -25,6 +25,17 @@ const { core } = load();
 const plain = value => JSON.parse(JSON.stringify(value));
 const range = (text, quote) => ({ start: text.indexOf(quote), end: text.indexOf(quote) + quote.length, quote });
 
+function memoryStorage(initial) {
+    const data = new Map(Object.entries(initial || {}));
+    return {
+        getItem: key => data.has(key) ? data.get(key) : null,
+        setItem: (key, value) => data.set(key, String(value)),
+        removeItem: key => data.delete(key),
+        clear: () => data.clear(),
+        dump: () => Object.fromEntries(data),
+    };
+}
+
 test('v2 只发送当前阶段、范围内附加和常驻内容', () => {
     const parsed = core.parseOutline('## 第一幕\n完成：正式交谈结束。\n当前正文\n\n## 第二幕\n未来正文\n\n## 道具 [附加]\n从：第一幕\n到：第二幕\n道具正文\n\n## 风格 [常驻]\n风格正文\n\n## 秘密 [备注]\n不应发送');
     assert.equal(parsed.stages.length, 2);
@@ -1254,108 +1265,124 @@ test('后台裁判档：自定义提问模板替换占位符后发出', async ()
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：auto 引擎优先用 SP·数据库 III 的 callAI，缺 generateRaw 也能推进', async () => {
+test('后台裁判档：酒馆代理预设写入 generateRaw.custom_api', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
         bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge' },
+        settings: { autoAdvance: 'judge', judgePreset: '代理小模型' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    let rawCalled = 0;
     const calls = [];
-    helper.generateRaw = async () => { rawCalled += 1; return 'NO'; };
-    const run = load(helper, {
-        AutoCardUpdaterAPI: {
-            callAI: async (messages, options) => { calls.push({ messages, options }); return 'YES'; },
-        },
+    helper.generateRaw = async options => { calls.push(options); return 'YES'; };
+    const localStorage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
+            name: '代理小模型', category: '便宜模型', type: 'proxy', note: '',
+            proxyPreset: '酒馆代理A', model: 'gpt-mini', maxTokens: 16, temperature: 0.2,
+        }]),
     });
+    const run = load(helper, { localStorage });
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.equal(calls.length, 1, 'auto 引擎要优先走 callAI');
-    assert.equal(rawCalled, 0, 'callAI 可用时不该回落 generateRaw');
-    assert.equal(calls[0].messages[0].role, 'system');
-    assert.match(String(calls[0].messages[1].content), /甲一正文/);
-    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'callAI 答 YES 要推进');
-    assert.deepEqual(run.errors, []);
-});
-
-test('后台裁判档：judgeEngine=callAI 但插件缺失时不推进且不碰 generateRaw', async () => {
-    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
-    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
-    const config = {
-        version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgeEngine: 'callAI' },
-    };
-    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
-    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    let rawCalled = 0;
-    helper.generateRaw = async () => { rawCalled += 1; return 'YES'; };
-    const run = load(helper);
-    await new Promise(setImmediate);
-
-    await state.events.get('message_received')(5);
-    assert.equal(rawCalled, 0, '指定 callAI 引擎时不能回落 generateRaw');
-    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '引擎缺失不能推进');
-    assert.match(run.logs.join('\n'), /AutoCardUpdaterAPI/, '要提示数据库插件缺失');
-    assert.deepEqual(run.errors, []);
-});
-
-
-
-test('后台裁判档：选了 API 预设时先 loadApiPreset 再 callAI', async () => {
-    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
-    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
-    const config = {
-        version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgeEngine: 'callAI', judgePreset: '裁判用小模型' },
-    };
-    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
-    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    const loaded = [];
-    const run = load(helper, {
-        AutoCardUpdaterAPI: {
-            getApiPresets: () => [{ name: '裁判用小模型', apiMode: 'custom' }],
-            loadApiPreset: name => { loaded.push(name); return true; },
-            callAI: async () => 'YES',
-        },
+    assert.equal(calls.length, 1);
+    assert.deepEqual(plain(calls[0].custom_api), {
+        proxy_preset: '酒馆代理A', model: 'gpt-mini', max_tokens: 16, temperature: 0.2,
     });
-    await new Promise(setImmediate);
-
-    await state.events.get('message_received')(5);
-    assert.deepEqual(loaded, ['裁判用小模型'], 'callAI 前要先加载选中的预设');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：选的 API 预设不存在时报错不推进', async () => {
+test('后台裁判档：自定义 API 预设完整写入 custom_api', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
         bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgeEngine: 'callAI', judgePreset: '不存在的预设' },
+        settings: { autoAdvance: 'judge', judgePreset: '自定义裁判' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    let aiCalled = 0;
-    const run = load(helper, {
-        AutoCardUpdaterAPI: {
-            getApiPresets: () => [],
-            loadApiPreset: () => false,
-            callAI: async () => { aiCalled += 1; return 'YES'; },
-        },
+    const calls = [];
+    helper.generateRaw = async options => { calls.push(options); return 'NO'; };
+    const localStorage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
+            name: '自定义裁判', category: '云端', type: 'custom', note: '独立连接',
+            apiurl: 'https://api.example.com/v1', key: 'sk-secret', model: 'judge-model',
+            source: 'openai', maxTokens: 20, temperature: 0,
+        }]),
     });
+    const run = load(helper, { localStorage });
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.equal(aiCalled, 0, '预设加载失败就不能发起 AI 调用');
-    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '预设缺失不能推进');
-    assert.match(run.logs.join('\n'), /不存在的预设/, '要明确提示预设不存在');
+    assert.deepEqual(plain(calls[0].custom_api), {
+        apiurl: 'https://api.example.com/v1', key: 'sk-secret', source: 'openai',
+        model: 'judge-model', max_tokens: 20, temperature: 0,
+    });
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：选择不存在的本机预设时不调用 generateRaw', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgePreset: '不存在' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let calls = 0;
+    helper.generateRaw = async () => { calls += 1; return 'YES'; };
+    const run = load(helper, { localStorage: memoryStorage() });
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(calls, 0);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0);
+    assert.match(run.logs.join('\n'), /找不到本机裁判 API 预设/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('本机裁判 API 预设：规范化类型、分类与数值字段', () => {
+    assert.deepEqual(plain(core.normalizeJudgeApiPreset({
+        name: ' 自定义裁判 ', category: '', type: 'custom', note: ' 测试 ',
+        apiurl: ' https://api.example.com/v1 ', key: 'sk-x', model: ' m1 ', source: '',
+        maxTokens: '24', temperature: '0.3',
+    })), {
+        name: '自定义裁判', category: '未分类', type: 'custom', note: '测试',
+        proxyPreset: '', apiurl: 'https://api.example.com/v1', key: 'sk-x', model: 'm1',
+        source: 'openai', maxTokens: 24, temperature: 0.3,
+    });
+});
+
+test('本机裁判 API 预设：列表去重并生成代理 custom_api', () => {
+    const list = core.normalizeJudgeApiPresets([
+        { name: '小模型', category: '便宜', type: 'proxy', proxyPreset: '代理A', model: 'm', maxTokens: 8 },
+        { name: ' 小模型 ', type: 'custom', apiurl: 'x', model: 'y' },
+        { name: '', type: 'current' },
+    ]);
+    assert.equal(list.length, 1);
+    assert.deepEqual(plain(core.customApiForJudgePreset(list[0])), {
+        proxy_preset: '代理A', model: 'm', max_tokens: 8,
+    });
+});
+
+test('normalizeConfig 清除 v2.8 数据库引擎遗留，只保留当前本机预设名', () => {
+    const normalized = core.normalizeConfig({
+        version: 2,
+        bindings: [],
+        settings: {
+            judgeEngine: 'callAI',
+            judgeApiPresets: [{ name: '旧数据库预设' }],
+            judgePreset: '本机预设',
+        },
+    });
+    assert.equal(normalized.settings.judgePreset, '本机预设');
+    assert.equal('judgeEngine' in normalized.settings, false);
+    assert.equal('judgeApiPresets' in normalized.settings, false);
 });

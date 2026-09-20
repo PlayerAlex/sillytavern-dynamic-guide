@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.8**（发布标签：`v2.8`）
+当前版本：**v2.9**（发布标签：`v2.9`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点“移出”就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.8 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.8)下载导入文件：
+在 [v2.9 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.9)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.8/dynamic-guide-offline-v2.8.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.8/dynamic-guide-online-v2.8.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.8/dynamic-guide-regex-marker-hide-v2.8.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.9/dynamic-guide-offline-v2.9.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.9/dynamic-guide-online-v2.9.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.9/dynamic-guide-regex-marker-hide-v2.9.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.8/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.9/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.8`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.9`。
 
 ## v2.0 文本格式
 
@@ -165,11 +165,19 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 - 镜像内容始终跟随进度：页面打开、添加、上一段 / 下一段、完成标记推进和切换聊天后都会立刻同步镜像；生成事件里再同步兜底一次（swipe / 重新生成时换用推进前的阶段）。同步是幂等的：内容或位置有变化才写世界书，没有变化就不写。一条回复可以同时带多条绑定的完成标记，脚本按各自的阶段 id 分别推进，并在接口可用时从回复中移除标记。
 - 自动推进后立即重新生成该条回复时，脚本会尝试仍使用推进前的阶段。管理页随时可以手动调整每条绑定的进度。
 - 全部阶段完成后这条绑定不再显示任何指导（镜像会被移除），包括附加与常驻内容；可以点“上一段”或“回到第一段”恢复。
-- 「自动推进」是全局三档设置（管理页顶部设置卡），对没有写 `完成：` 条件的阶段生效：**手动推进**（默认）只能手动点“下一段”；**标记判断**在镜像末尾附一段通用判断指令和隐藏标记，由正文 AI 自己决定时机，不额外花请求；**后台裁判**在每条 AI 回复后用当前 API 连接静默多问一次「当前阶段完成了吗」（`generateRaw`，回答 YES 才推进），每条回复多花一次小请求。单个阶段写 `完成：自动` 可跨档位单独开启 AI 判断；裁判期间如果进度已被标记或手动推进、或来了新回复，这次判定会被放弃。
+- 「自动推进」是全局三档设置（管理页顶部设置卡），对没有写 `完成：` 条件的阶段生效：**手动推进**（默认）只能手动点“下一段”；**标记判断**在镜像末尾附一段通用判断指令和隐藏标记，由正文 AI 自己决定时机，不额外花请求；**后台裁判**在每条 AI 回复后用 `generateRaw` 静默判定，回答 YES 才推进，每条回复多花一次小请求。单个阶段写 `完成：自动` 可跨档位单独开启 AI 判断；裁判期间如果进度已被标记或手动推进、或来了新回复，这次判定会被放弃。
+- 后台裁判可以使用动态指导助手自己的 API 预设：按分类保存「酒馆当前 API / 酒馆代理预设 / 自定义 API」，可单独配置 URL、Key、模型、source、最大 tokens 和温度。完整预设只保存在当前浏览器的 `localStorage`；角色变量只记当前选中的预设名，因此 Key 不随角色卡导出。`localStorage` 是本机明文存储，使用共享设备时不要保存敏感 Key。
 
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.9（2026-09-20）
+
+- **裁判 API 预设完全独立**：不再依赖 SP·数据库 III。核查 shujuku 最新源码后确认，其公开 `getApiPresets/loadApiPreset/saveApiPreset` 已全部弃用并拒绝外部读取/写入；这就是 v2.8 真机无法拉取预设的根因。v2.9 删除数据库运行依赖，后台裁判统一走酒馆助手 `generateRaw`。
+- **仿新版预设管理 UI**：新增独立「裁判 API 预设」分类管理区，预设按分类展示，支持添加/更新、编辑、设为当前和删除；类型包括「酒馆当前 API」「酒馆代理预设」「自定义 API」。代理预设名单从酒馆助手 `getProxyPresetNames()` 读取。
+- **保存完整 API 配置**：自定义预设可保存 API 地址、Key、模型、API source、最大输出 tokens、温度与备注；裁判调用时映射到 `generateRaw.custom_api`。选择不存在的本机预设时不发请求、不推进，并明确提示重新选择。
+- **密钥边界**：完整预设只存当前浏览器同源 `localStorage`，不写角色变量/聊天变量，不随角色卡导出；角色配置只保存当前预设名。注意 `localStorage` 仍是本机明文存储，共享设备请勿保存敏感 Key。
 
 ### v2.8（2026-09-20）
 
