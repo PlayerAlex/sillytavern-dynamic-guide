@@ -1309,9 +1309,9 @@ test('后台裁判档：自定义 API 预设完整写入 custom_api', async () =
     helper.generateRaw = async options => { calls.push(options); return 'NO'; };
     const localStorage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
-            name: '自定义裁判', category: '云端', type: 'custom', note: '独立连接',
+            name: '自定义裁判', connection: 'custom', customApiFormat: 'openai_compat',
             apiurl: 'https://api.example.com/v1', key: 'sk-secret', model: 'judge-model',
-            source: 'openai', maxTokens: 20, temperature: 0,
+            maxTokens: 20, temperature: 0,
         }]),
     });
     const run = load(helper, { localStorage });
@@ -1319,7 +1319,8 @@ test('后台裁判档：自定义 API 预设完整写入 custom_api', async () =
 
     await state.events.get('message_received')(5);
     assert.deepEqual(plain(calls[0].custom_api), {
-        apiurl: 'https://api.example.com/v1', key: 'sk-secret', source: 'openai',
+        apiurl: 'https://api.example.com/v1', key: 'sk-secret', source: 'custom',
+        custom_prompt_post_processing: 'strict',
         model: 'judge-model', max_tokens: 20, temperature: 0,
     });
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
@@ -1348,23 +1349,24 @@ test('后台裁判档：选择不存在的本机预设时不调用 generateRaw',
     assert.deepEqual(run.errors, []);
 });
 
-test('本机裁判 API 预设：规范化类型、分类与数值字段', () => {
+test('本机裁判 API 预设：连接方式、接口协议与数值字段', () => {
     assert.deepEqual(plain(core.normalizeJudgeApiPreset({
-        name: ' 自定义裁判 ', category: '', type: 'custom', note: ' 测试 ',
-        apiurl: ' https://api.example.com/v1 ', key: 'sk-x', model: ' m1 ', source: '',
-        maxTokens: '24', temperature: '0.3',
+        name: ' 自定义裁判 ', connection: 'custom', customApiFormat: 'claude_messages',
+        apiurl: ' https://api.example.com/v1 ', key: 'sk-x', model: ' m1 ',
+        maxTokens: '24', temperature: '0.3', bodyParams: 'top_k: 50',
     })), {
-        name: '自定义裁判', category: '未分类', type: 'custom', note: '测试',
-        proxyPreset: '', apiurl: 'https://api.example.com/v1', key: 'sk-x', model: 'm1',
-        source: 'openai', maxTokens: 24, temperature: 0.3,
+        name: '自定义裁判', connection: 'custom', customApiFormat: 'claude_messages',
+        apiurl: 'https://api.example.com/v1', key: 'sk-x', model: 'm1',
+        maxTokens: 24, temperature: 0.3, bodyParams: 'top_k: 50',
+        excludeBodyParams: '', requestHeaders: '', promptPostProcessing: 'strict', tavernProfile: '',
     });
 });
 
-test('本机裁判 API 预设：列表去重并生成代理 custom_api', () => {
+test('本机裁判 API 预设：酒馆连接预设生成 proxy_preset custom_api', () => {
     const list = core.normalizeJudgeApiPresets([
-        { name: '小模型', category: '便宜', type: 'proxy', proxyPreset: '代理A', model: 'm', maxTokens: 8 },
-        { name: ' 小模型 ', type: 'custom', apiurl: 'x', model: 'y' },
-        { name: '', type: 'current' },
+        { name: '小模型', connection: 'tavern', tavernProfile: '代理A', model: 'm', maxTokens: 8 },
+        { name: ' 小模型 ', connection: 'custom', apiurl: 'x', model: 'y' },
+        { name: '', connection: 'main' },
     ]);
     assert.equal(list.length, 1);
     assert.deepEqual(plain(core.customApiForJudgePreset(list[0])), {
@@ -1372,7 +1374,7 @@ test('本机裁判 API 预设：列表去重并生成代理 custom_api', () => {
     });
 });
 
-test('normalizeConfig 清除 v2.8 数据库引擎遗留，只保留当前本机预设名', () => {
+test('normalizeConfig 清除 v2.8/v2.9 遗留字段，只保留当前本机预设名', () => {
     const normalized = core.normalizeConfig({
         version: 2,
         bindings: [],
@@ -1385,4 +1387,14 @@ test('normalizeConfig 清除 v2.8 数据库引擎遗留，只保留当前本机�
     assert.equal(normalized.settings.judgePreset, '本机预设');
     assert.equal('judgeEngine' in normalized.settings, false);
     assert.equal('judgeApiPresets' in normalized.settings, false);
+});
+
+test('v1 预设迁移：type=proxy → tavern，type=current → main', () => {
+    const list = core.normalizeJudgeApiPresets([
+        { name: '代理', type: 'proxy', proxyPreset: '酒馆代理A', model: 'm' },
+        { name: '主 API', type: 'current' },
+    ]);
+    assert.equal(list[0].connection, 'tavern');
+    assert.equal(list[0].tavernProfile, '酒馆代理A');
+    assert.equal(list[1].connection, 'main');
 });
