@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.6**（发布标签：`v2.6`）
+当前版本：**v2.7**（发布标签：`v2.7`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点“移出”就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,10 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.6 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.6)下载导入文件：
+在 [v2.7 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.7)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.6/dynamic-guide-offline-v2.6.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.6/dynamic-guide-online-v2.6.json)：启动时加载固定版本的远程脚本。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.7/dynamic-guide-offline-v2.7.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.7/dynamic-guide-online-v2.7.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.7/dynamic-guide-regex-marker-hide-v2.7.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -29,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.6/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.7/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.6`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.7`。
 
 ## v2.0 文本格式
 
@@ -169,6 +170,12 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.7（2026-09-20）
+
+- **裁判提示词可自定义**：后台裁判的提问不再是固定文案，设置卡里直接改；支持 `{{stage}}`（阶段名）、`{{prompt}}`（阶段正文）、`{{condition}}`（完成条件）、`{{history}}`（最近 6 条剧情，自动剥离隐藏标记）占位符，留空用默认模板。
+- **裁判引擎可选**：新增「裁判引擎」设置（存 `config.settings.judgeEngine`）：自动（优先用 SP·数据库 III / shujuku 暴露的 `window.AutoCardUpdaterAPI.callAI` 复用数据库插件的 API 配置，未安装时回落酒馆助手 `generateRaw`）、强制 callAI、强制 generateRaw。诊断页 judge 档会同时列出两个引擎的可用性。
+- **完成标记彻底不显示**：发布页新增配套 Regex 资产「动态指导助手 · 隐藏完成标记」（只作用于 AI 输出的显示层，不改聊天文件）。装上后标记从出现的那一刻起就不可见；脚本侧仍会在推进后把标记从存储正文擦掉，聊天历史保持干净。
 
 ### v2.6（2026-09-20）
 

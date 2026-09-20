@@ -711,7 +711,13 @@ function multiWorld(books, options) {
             state.active.delete(id);
         }),
         getLastMessageId: () => state.lastMessageId,
-        getChatMessages: id => state.messages.filter(message => message.message_id === id),
+        getChatMessages: id => {
+            if (typeof id === 'string' && id.includes('-')) {
+                const [from, to] = id.split('-').map(Number);
+                return state.messages.filter(message => message.message_id >= from && message.message_id <= to);
+            }
+            return state.messages.filter(message => message.message_id === id);
+        },
         setChatMessages: updates => {
             updates.forEach(update => {
                 const message = state.messages.find(item => item.message_id === update.message_id);
@@ -1218,6 +1224,84 @@ test('手动推进档不调用后台裁判', async () => {
     await state.events.get('message_received')(5);
     assert.equal(called, 0, 'off 档没有标记时不能发起裁判请求');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0);
+    assert.deepEqual(run.errors, []);
+});
+
+
+test('后台裁判档：自定义提问模板替换占位符后发出', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgePrompt: '阶段={{stage}}\n条件={{condition}}\n正文={{prompt}}\n历史={{history}}\n走没走？' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const verdicts = [];
+    helper.generateRaw = async options => { verdicts.push(options); return 'NO'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(verdicts.length, 1);
+    const sent = String(verdicts[0].user_input);
+    assert.match(sent, /^阶段=甲一/, '模板要按自定义文案组装');
+    assert.match(sent, /条件=没有预设完成条件/);
+    assert.match(sent, /正文=甲一正文/);
+    assert.match(sent, /历史=[\s\S]*这一轮的回复/);
+    assert.doesNotMatch(sent, /\{\{/, '占位符要全部替换掉');
+    assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：auto 引擎优先用 SP·数据库 III 的 callAI，缺 generateRaw 也能推进', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let rawCalled = 0;
+    const calls = [];
+    helper.generateRaw = async () => { rawCalled += 1; return 'NO'; };
+    const run = load(helper, {
+        AutoCardUpdaterAPI: {
+            callAI: async (messages, options) => { calls.push({ messages, options }); return 'YES'; },
+        },
+    });
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(calls.length, 1, 'auto 引擎要优先走 callAI');
+    assert.equal(rawCalled, 0, 'callAI 可用时不该回落 generateRaw');
+    assert.equal(calls[0].messages[0].role, 'system');
+    assert.match(String(calls[0].messages[1].content), /甲一正文/);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'callAI 答 YES 要推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：judgeEngine=callAI 但插件缺失时不推进且不碰 generateRaw', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgeEngine: 'callAI' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let rawCalled = 0;
+    helper.generateRaw = async () => { rawCalled += 1; return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(rawCalled, 0, '指定 callAI 引擎时不能回落 generateRaw');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '引擎缺失不能推进');
+    assert.match(run.logs.join('\n'), /AutoCardUpdaterAPI/, '要提示数据库插件缺失');
     assert.deepEqual(run.errors, []);
 });
 

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.6
+     * 动态指导助手 v2.7
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -25,7 +25,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.6';
+    const VERSION = '2.7';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1056,6 +1056,11 @@
         // settings 原样保留，逐个字段校验（目前只有 autoAdvance 三档）。
         const settings = raw.settings && typeof raw.settings === 'object' ? { ...raw.settings } : {};
         if (!['off', 'marker', 'judge'].includes(settings.autoAdvance)) settings.autoAdvance = 'off';
+        // 后台裁判的提问模板：空值回落到默认文案；引擎非法值归 auto。
+        if (settings.judgePrompt != null && typeof settings.judgePrompt !== 'string') {
+            settings.judgePrompt = String(settings.judgePrompt);
+        }
+        if (!['auto', 'generateRaw', 'callAI'].includes(settings.judgeEngine)) settings.judgeEngine = 'auto';
         return { version: 2, bindings, settings };
     }
 
@@ -1651,6 +1656,8 @@
             if (mode === 'judge') {
                 push('接口 generateRaw', Boolean(api('generateRaw', false)),
                     api('generateRaw', false) ? '可用' : '缺失——后台裁判用不了，请改用「标记判断」或升级酒馆助手');
+                push('SP·数据库 III callAI', Boolean(shujukuCallAI()),
+                    shujukuCallAI() ? '可用（裁判引擎 auto 时优先用它）' : '未检测到 window.AutoCardUpdaterAPI（裁判引擎 auto 时回落 generateRaw）');
             }
             const stateMap = config.bindings.length > 0 ? await readState(config) : {};
             for (const binding of config.bindings) {
@@ -1827,18 +1834,106 @@
         return null;
     }
 
-    // 后台裁判（judge 档）：每条 AI 回复后，用 generateRaw 静默问一次当前阶段是否完成。
+    // 后台裁判（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
+    // 提问模板可在设置里自定义（{{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符）；
+    // 引擎可选：auto = SP·数据库 III 的 callAI 优先、缺失时回落 generateRaw。
     // running 集合防止同一绑定并发裁判；裁判结果一律只信一次，失败不重试。
     const judgeState = { running: new Set() };
 
-    async function maybeJudgeAdvance(context, messageId) {
+    const JUDGE_SYSTEM_PROMPT = '你是剧情进度裁判。只根据给定的阶段信息和最近剧情判断当前阶段是否完成，只回答 YES 或 NO，不要输出任何其他内容。';
+
+    const DEFAULT_JUDGE_PROMPT = [
+        '当前阶段：{{stage}}',
+        '',
+        '阶段正文：',
+        '{{prompt}}',
+        '',
+        '完成条件：{{condition}}',
+        '',
+        '最近剧情：',
+        '{{history}}',
+        '',
+        '根据最近剧情判断：当前阶段是否已经完成、该进入下一段了？只回答 YES 或 NO。',
+    ].join('\n');
+
+    function judgePromptFor(settings, stage, condition, history) {
+        const template = settings && typeof settings.judgePrompt === 'string' && settings.judgePrompt.trim()
+            ? settings.judgePrompt
+            : DEFAULT_JUDGE_PROMPT;
+        return template
+            .replace(/\{\{\s*stage\s*\}\}/g, stage.name)
+            .replace(/\{\{\s*prompt\s*\}\}/g, stage.prompt)
+            .replace(/\{\{\s*condition\s*\}\}/g, condition)
+            .replace(/\{\{\s*history\s*\}\}/g, history);
+    }
+
+    // 第三方插件 SP·数据库 III（shujuku）暴露的 window.AutoCardUpdaterAPI.callAI：
+    // 复用数据库插件当前配置的 API，不用用户另配 key。
+    function shujukuCallAI() {
+        for (const candidate of [currentWindow, ...windowCandidates]) {
+            try {
+                const target = candidate && candidate.AutoCardUpdaterAPI;
+                if (target && typeof target.callAI === 'function') return target.callAI.bind(target);
+            } catch (error) {
+                // 跨域候选不是运行接口来源。
+            }
+        }
+        return null;
+    }
+
+    async function recentHistoryText(messageId, count) {
+        const getChatMessages = api('getChatMessages', false);
+        if (!getChatMessages || messageId == null) return '';
+        const start = Math.max(0, Number(messageId) - count + 1);
+        const messages = await Promise.resolve(getChatMessages(`${start}-${messageId}`, { include_swipes: false }));
+        if (!Array.isArray(messages)) return '';
+        return messages.map(item => {
+            const role = item && item.role === 'user' ? '用户' : (item && item.role === 'assistant' ? '角色' : '系统');
+            const text = String((item && item.message) || '').replace(COMPLETE_MARKER_RE, '').trim();
+            return text ? `${role}：${text}` : '';
+        }).filter(Boolean).join('\n\n');
+    }
+
+    async function askJudge(engine, question) {
+        if (engine === 'callAI') {
+            const callAI = shujukuCallAI();
+            if (!callAI) return null;
+            const answer = await Promise.resolve(callAI([
+                { role: 'system', content: JUDGE_SYSTEM_PROMPT },
+                { role: 'user', content: question },
+            ], { maxTokens: 8 }));
+            return typeof answer === 'string' ? answer : '';
+        }
+        const generateRaw = api('generateRaw', false);
+        if (!generateRaw) return null;
+        const result = await generateRaw({
+            user_input: question,
+            should_silence: true,
+            max_chat_history: 6,
+            ordered_prompts: [
+                { role: 'system', content: JUDGE_SYSTEM_PROMPT },
+                'chat_history',
+                'user_input',
+            ],
+        });
+        return typeof result === 'string'
+            ? result
+            : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
+    }
+
+    async function maybeJudgeAdvance(context, messageId, config) {
         if (!context || context.broken || !context.stage) return;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到裁判跳过。
         if (context.state.lastCompletionMessageId === messageId) return;
         if (judgeState.running.has(context.key)) return;
-        const generateRaw = api('generateRaw', false);
-        if (!generateRaw) {
-            reportOnce('judge-no-generateRaw', '「后台裁判」需要酒馆助手的 generateRaw 接口，当前环境不支持；请把「自动推进」改用「标记判断」档。');
+        const settings = config && config.settings ? config.settings : {};
+        const engineSetting = ['auto', 'generateRaw', 'callAI'].includes(settings.judgeEngine) ? settings.judgeEngine : 'auto';
+        const engines = engineSetting === 'auto' ? ['callAI', 'generateRaw'] : [engineSetting];
+        const usable = engines.filter(engine => engine === 'callAI' ? Boolean(shujukuCallAI()) : Boolean(api('generateRaw', false)));
+        if (usable.length === 0) {
+            reportOnce('judge-no-engine', engineSetting === 'callAI'
+                ? '「后台裁判」设置为 SP·数据库 III（shujuku）的 callAI，但没有检测到 window.AutoCardUpdaterAPI；请安装启用数据库插件，或把裁判引擎改回「自动 / generateRaw」。'
+                : '「后台裁判」需要酒馆助手的 generateRaw 接口或 SP·数据库 III 的 callAI，当前都不可用；请把「自动推进」改用「标记判断」档。');
             return;
         }
         judgeState.running.add(context.key);
@@ -1848,29 +1943,9 @@
             const condition = stage.completion
                 ? stage.completion
                 : '没有预设完成条件：内容充分展开、剧情自然该走就算完成。';
-            const question = [
-                `当前阶段：${stage.name}`,
-                '',
-                '阶段正文：',
-                stage.prompt,
-                '',
-                `完成条件：${condition}`,
-                '',
-                '根据最近的剧情回复判断：当前阶段是否已经完成、该进入下一段了？只回答 YES 或 NO。',
-            ].join('\n');
-            const result = await generateRaw({
-                user_input: question,
-                should_silence: true,
-                max_chat_history: 6,
-                ordered_prompts: [
-                    { role: 'system', content: '你是剧情进度裁判。只根据给定的阶段信息和聊天记录判断当前阶段是否完成，只回答 YES 或 NO，不要输出任何其他内容。' },
-                    'chat_history',
-                    'user_input',
-                ],
-            });
-            const text = typeof result === 'string'
-                ? result
-                : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
+            const history = await recentHistoryText(messageId, 6);
+            const question = judgePromptFor(settings, stage, condition, history || '（没有取到聊天记录）');
+            const text = await askJudge(usable[0], question);
             if (!/^\s*YES\b/i.test(text)) return;
             // 防误判守卫：裁判是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
             // 这些情况下这次 YES 已经过期，必须放弃推进。
@@ -1928,7 +2003,7 @@
             const fresh = await loadContexts();
             for (const context of fresh.contexts) {
                 if (context.broken || !context.stage) continue;
-                await maybeJudgeAdvance(context, messageId);
+                await maybeJudgeAdvance(context, messageId, fresh.config);
             }
         }
     }
@@ -2200,17 +2275,35 @@
     function settingsCard() {
         const config = ui.snapshot ? ui.snapshot.config : null;
         const mode = autoAdvanceMode(config);
+        const settings = config && config.settings ? config.settings : {};
         const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
+        const engineOptions = [
+            { value: 'auto', label: '自动（优先 SP·数据库 III 的 callAI，缺失时用 generateRaw）' },
+            { value: 'callAI', label: 'SP·数据库 III（shujuku）callAI' },
+            { value: 'generateRaw', label: '酒馆助手 generateRaw' },
+        ];
+        const saveSettings = (patch, success) => runAction('修改自动推进设置', async () => {
+            const fresh = await readConfig();
+            fresh.settings = { ...(fresh.settings || {}), ...patch };
+            await writeConfig(fresh);
+            await syncMirrors('normal');
+            return true;
+        }, { success });
         return card('自动推进',
             field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
-                runAction('修改自动推进设置', async () => {
-                    const fresh = await readConfig();
-                    fresh.settings = { ...(fresh.settings || {}), autoAdvance: value };
-                    await writeConfig(fresh);
-                    await syncMirrors('normal');
-                    return true;
-                }, { success: `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}` });
+                saveSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
+            mode === 'judge' ? field('裁判引擎', selectControl(engineOptions, settings.judgeEngine || 'auto', value => {
+                saveSettings({ judgeEngine: value }, '裁判引擎已保存');
+            })) : null,
+            mode === 'judge' ? field('裁判提问（留空用默认；占位符 {{stage}} {{prompt}} {{condition}} {{history}}）',
+                el('textarea', {
+                    class: 'dga-input',
+                    rows: 5,
+                    placeholder: DEFAULT_JUDGE_PROMPT,
+                    text: settings.judgePrompt || '',
+                    onchange: event => saveSettings({ judgePrompt: event.target.value }, '裁判提问已保存'),
+                })) : null,
             muted('手动推进：只有写了「完成：」条件的阶段会自动进入下一段；标记判断：镜像末尾附通用判断指令，AI 自己判断时机；后台裁判：每条回复后多问一次「当前阶段完成了吗」。单个阶段写「完成：自动」可跨档位单独开启 AI 判断。'),
         );
     }
