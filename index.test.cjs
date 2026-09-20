@@ -1189,7 +1189,15 @@ test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进'
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1, 'judge 档没有标记也要问一次裁判');
     assert.equal(verdicts[0].should_silence, true, '裁判请求必须静默');
-    assert.match(String(verdicts[0].user_input), /甲一正文/, '提问要带上阶段正文');
+    const ordered = verdicts[0].ordered_prompts;
+    assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
+        ['system', 'assistant', 'user', 'user_input'], '默认段列表要按 系统/预确认/上下文/最终注入 顺序映射');
+    assert.match(ordered[0].content, /<结论>YES 或 NO<\/结论>/, '系统段要给出填表标签输出契约');
+    assert.match(ordered[1].content, /收到/, '第二段是 assistant 预确认（抄数据库 ACK 段）');
+    assert.match(ordered[2].content, /【当前阶段】\n甲一/, '上下文段要带阶段名');
+    assert.match(ordered[2].content, /甲一正文/, '上下文段要带阶段正文');
+    assert.match(ordered[2].content, /这一轮的回复/, '上下文段要带最近剧情');
+    assert.match(String(verdicts[0].user_input), /现在填表/, '最终提示词注入要作为 user_input');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
     await state.events.get('message_received')(5);
@@ -1197,6 +1205,78 @@ test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进'
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
     assert.deepEqual(run.errors, []);
 });
+
+test('后台裁判档：填表标签结论优先——<结论>YES</结论> 推进、NO 不推进', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    helper.generateRaw = async () => '<依据>两人已经正式谈过。</依据>\n<结论>YES</结论>';
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, '标签里 YES 要推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：标签里 NO 不推进，即使正文提到 YES', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    // 依据栏里出现 YES 字样也不能算数，只信 <结论> 标签。
+    helper.generateRaw = async () => '<依据>条件里写了 YES 才算。</依据>\n<结论>NO</结论>';
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '标签里 NO 不能推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：自定义提示词段与最终注入按序组装并替换占位符', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: {
+            autoAdvance: 'judge',
+            judgeSegments: [
+                { role: 'user', content: '阶段={{stage}} 条件={{condition}}' },
+                { role: 'assistant', content: '明白，只看 {{history}}' },
+            ],
+            judgeFinalPrompt: '收尾一问：{{stage}} 完了吗？',
+        },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const verdicts = [];
+    helper.generateRaw = async options => { verdicts.push(options); return 'NO'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(verdicts.length, 1);
+    const ordered = verdicts[0].ordered_prompts;
+    assert.deepEqual(ordered.map(item => (typeof item === 'string' ? item : item.role)), ['user', 'assistant', 'user_input']);
+    assert.match(ordered[0].content, /^阶段=甲一 条件=没有写完成条件/, '段里占位符要替换');
+    assert.match(ordered[1].content, /这一轮的回复/, 'assistant 段里的 {{history}} 也要替换');
+    assert.equal(verdicts[0].user_input, '收尾一问：甲一 完了吗？', '自定义最终注入要作为 user_input');
+    assert.deepEqual(run.errors, []);
+});
+
 
 test('后台裁判档：裁判回答 NO 时不推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
@@ -1258,7 +1338,7 @@ test('后台裁判档：自定义提问模板替换占位符后发出', async ()
     assert.equal(verdicts.length, 1);
     const sent = String(verdicts[0].user_input);
     assert.match(sent, /^阶段=甲一/, '模板要按自定义文案组装');
-    assert.match(sent, /条件=没有预设完成条件/);
+    assert.match(sent, /条件=没有写完成条件/);
     assert.match(sent, /正文=甲一正文/);
     assert.match(sent, /历史=[\s\S]*这一轮的回复/);
     assert.doesNotMatch(sent, /\{\{/, '占位符要全部替换掉');
@@ -1304,8 +1384,11 @@ test('后台裁判档：酒馆预设连接走酒馆连接管理器', async () =>
     assert.equal(cmCalls[0].profileId, '酒馆代理A');
     assert.equal(cmCalls[0].maxTokens, 16);
     assert.equal(cmCalls[0].messages[0].role, 'system');
-    assert.equal(cmCalls[0].messages[1].role, 'user');
-    assert.match(cmCalls[0].messages[1].content, /这一轮的回复/);
+    assert.equal(cmCalls[0].messages[1].role, 'assistant', '第二段是 assistant 预确认');
+    assert.equal(cmCalls[0].messages[2].role, 'user');
+    assert.match(cmCalls[0].messages[2].content, /这一轮的回复/);
+    assert.equal(cmCalls[0].messages[3].role, 'user', '最终提示词注入是最后一条 user 消息');
+    assert.match(cmCalls[0].messages[3].content, /现在填表/);
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
@@ -1352,7 +1435,9 @@ test('后台裁判档：自定义 API 预设直连酒馆后端 generate 端点',
     assert.equal(body.custom_prompt_post_processing, 'strict');
     assert.equal(body.stream, false);
     assert.equal(body.messages[0].role, 'system');
-    assert.match(body.messages[1].content, /这一轮的回复/);
+    assert.equal(body.messages[1].role, 'assistant', '第二段是 assistant 预确认');
+    assert.match(body.messages[2].content, /这一轮的回复/);
+    assert.equal(body.messages[3].role, 'user', '最终提示词注入是最后一条 user 消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
 });
@@ -1424,8 +1509,17 @@ test('API 预设请求体：OpenAI 兼容协议走 custom 源', () => {
     assert.equal(body.proxy_password, '', 'custom 源不用 proxy_password');
     assert.equal(body.model, 'gpt-x', 'models/ 前缀要剥掉');
     assert.equal(body.custom_prompt_post_processing, 'strict', '缺省归一为严格');
-    assert.equal(body.max_tokens, 512, '裁判默认 512');
-    assert.equal(body.temperature, 1);
+    assert.equal(body.max_tokens, 60000, '缺省最大回复长度对齐数据库 60000');
+    assert.equal(body.temperature, 1, '缺省温度对齐数据库 1');
+});
+
+test('本机裁判 API 预设：缺省数值回退数据库默认 60000 / 1', () => {
+    const preset = plain(core.normalizeJudgeApiPreset({ name: '裸预设', connection: 'main' }));
+    assert.equal(preset.maxTokens, 60000, '最大回复长度缺省 60000（同数据库）');
+    assert.equal(preset.temperature, 1, '温度缺省 1（同数据库）');
+    const broken = plain(core.normalizeJudgeApiPreset({ name: '坏数值', connection: 'main', maxTokens: 'abc', temperature: 'x' }));
+    assert.equal(broken.maxTokens, 60000, '非法值也回退 60000');
+    assert.equal(broken.temperature, 1, '非法温度回退 1');
 });
 
 test('提示词后处理归一化：空串保留、非法回退严格', () => {

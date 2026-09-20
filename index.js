@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.11
+     * 动态指导助手 v2.11.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -26,7 +26,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.11';
+    const VERSION = '2.11.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1000,10 +1000,10 @@
         const item = raw && typeof raw === 'object' ? raw : {};
         const name = String(item.name || '').trim();
         if (!name) return null;
-        const numberOrNull = value => {
-            if (value === '' || value == null) return null;
+        const numberOrDefault = (value, fallback) => {
+            if (value === '' || value == null) return fallback;
             const num = Number(value);
-            return Number.isFinite(num) ? num : null;
+            return Number.isFinite(num) ? num : fallback;
         };
         // v1（2.9）的 type 迁移：current→main、proxy→tavern、custom→custom。
         let connection = ['main', 'custom', 'tavern'].includes(item.connection) ? item.connection : '';
@@ -1021,8 +1021,9 @@
             apiurl: connection === 'custom' ? String(item.apiurl || '').trim() : '',
             key: connection === 'custom' ? String(item.key || '') : '',
             model: connection === 'main' ? '' : String(item.model || '').trim(),
-            maxTokens: numberOrNull(item.maxTokens),
-            temperature: numberOrNull(item.temperature),
+            // 缺省/非法值回退数据库（shujuku）同款默认：最大回复长度 60000、温度 1。
+            maxTokens: Math.max(1, Math.floor(numberOrDefault(item.maxTokens, 60000))),
+            temperature: numberOrDefault(item.temperature, 1),
             bodyParams: connection === 'custom' ? String(item.bodyParams || '') : '',
             excludeBodyParams: connection === 'custom' ? String(item.excludeBodyParams || '') : '',
             requestHeaders: connection === 'custom' ? String(item.requestHeaders || '') : '',
@@ -1132,7 +1133,7 @@
                     ? { ...message, role: message.role.toLowerCase() }
                     : message),
             model: String(preset.model || '').replace(/^models\//, ''),
-            max_tokens: preset.maxTokens != null ? preset.maxTokens : 512,
+            max_tokens: preset.maxTokens != null ? preset.maxTokens : 60000,
             temperature: preset.temperature != null ? preset.temperature : 1,
             stream: false,
             chat_completion_source: chatCompletionSource,
@@ -1343,6 +1344,25 @@
         // 后台裁判的提问模板：空值回落到默认文案；引擎非法值归 auto。
         if (settings.judgePrompt != null && typeof settings.judgePrompt !== 'string') {
             settings.judgePrompt = String(settings.judgePrompt);
+        }
+        // 裁判提示词段（v2.11.1）：必须是 [{role: system|user|assistant, content: string}]；
+        // 非法项丢弃，整列非法时删字段回落默认段。旧 judgePrompt 单模板在组装时仍兼容。
+        if (settings.judgeSegments != null) {
+            if (!Array.isArray(settings.judgeSegments)) {
+                delete settings.judgeSegments;
+            } else {
+                const cleaned = settings.judgeSegments
+                    .filter(seg => seg && typeof seg === 'object')
+                    .map(seg => ({
+                        role: ['system', 'user', 'assistant'].includes(seg.role) ? seg.role : 'user',
+                        content: seg.content != null ? String(seg.content) : '',
+                    }));
+                if (cleaned.length) settings.judgeSegments = cleaned;
+                else delete settings.judgeSegments;
+            }
+        }
+        if (settings.judgeFinalPrompt != null && typeof settings.judgeFinalPrompt !== 'string') {
+            settings.judgeFinalPrompt = String(settings.judgeFinalPrompt);
         }
         // 裁判选用的本地 API 预设名；空字符串 = 使用酒馆当前 API。
         if (settings.judgePreset != null && typeof settings.judgePreset !== 'string') settings.judgePreset = String(settings.judgePreset);
@@ -2125,38 +2145,102 @@
     }
 
     // 后台裁判（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
-    // 提问模板可在设置里自定义（{{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符）；
+    // 提示词在设置里按「段」自定义（每段可选 system/user/assistant 角色 + 最终提示词注入，
+    // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符）；
     // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
     //   酒馆主 API → 酒馆助手 generateRaw；酒馆预设 → ConnectionManagerRequestService；
     //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
     // running 集合防止同一绑定并发裁判；裁判结果一律只信一次，失败不重试。
     const judgeState = { running: new Set() };
 
-    const JUDGE_SYSTEM_PROMPT = '你是剧情进度裁判。只根据给定的阶段信息和最近剧情判断当前阶段是否完成，只回答 YES 或 NO，不要输出任何其他内容。';
-
-    const DEFAULT_JUDGE_PROMPT = [
-        '当前阶段：{{stage}}',
-        '',
-        '阶段正文：',
-        '{{prompt}}',
-        '',
-        '完成条件：{{condition}}',
-        '',
-        '最近剧情：',
-        '{{history}}',
-        '',
-        '根据最近剧情判断：当前阶段是否已经完成、该进入下一段了？只回答 YES 或 NO。',
+    // 后台裁判提示词：抄数据库（shujuku）剧情推进页的「提示词段」结构——
+    // 每段可选 system / user / assistant 角色，段列表后再追加一条「最终提示词注入」。
+    // 默认模板用数据库填表格式：标签化输出契约 + assistant 预确认段 + 【】分区上下文，
+    // 面向低智力模型——句子短、规则只有三条、结论写进 <结论> 标签，拿不准就 NO。
+    const DEFAULT_JUDGE_SYSTEM_PROMPT = [
+        '你是剧情进度裁判，只负责判断当前剧情阶段有没有演完。',
+        '输出格式（填表）：把判断写进下面两个标签，标签外不要写任何内容。',
+        '<依据>最近剧情里实际演到的事，一两句话</依据>',
+        '<结论>YES 或 NO</结论>',
     ].join('\n');
 
-    function judgePromptFor(settings, stage, condition, history) {
-        const template = settings && typeof settings.judgePrompt === 'string' && settings.judgePrompt.trim()
-            ? settings.judgePrompt
-            : DEFAULT_JUDGE_PROMPT;
-        return template
+    const DEFAULT_JUDGE_SEGMENTS = [
+        { role: 'system', content: DEFAULT_JUDGE_SYSTEM_PROMPT },
+        { role: 'assistant', content: '收到。我只根据给定的剧情填表：完成条件里的事真实演过，<结论> 才写 YES；没演到、只演了一半、或者我不确定，都写 NO。' },
+        {
+            role: 'user',
+            content: [
+                '【当前阶段】',
+                '{{stage}}',
+                '',
+                '【本阶段要演的内容】',
+                '{{prompt}}',
+                '',
+                '【完成条件】',
+                '{{condition}}',
+                '',
+                '【最近演到哪了】',
+                '{{history}}',
+            ].join('\n'),
+        },
+    ];
+
+    const DEFAULT_JUDGE_FINAL_PROMPT = [
+        '判断规则：',
+        '1. 只看「最近演到哪了」，不要脑补里面没写的事。',
+        '2. 完成条件里写的事，在剧情里真实演过了，才算完成。',
+        '3. 没演到、只演了一半、或者你不确定，都算没完成。',
+        '现在填表：当前阶段演完了吗？',
+    ].join('\n');
+
+    const JUDGE_SEGMENT_ROLES = ['system', 'user', 'assistant'];
+
+    function fillJudgePlaceholders(template, stage, condition, history) {
+        return String(template || '')
             .replace(/\{\{\s*stage\s*\}\}/g, stage.name)
             .replace(/\{\{\s*prompt\s*\}\}/g, stage.prompt)
             .replace(/\{\{\s*condition\s*\}\}/g, condition)
             .replace(/\{\{\s*history\s*\}\}/g, history);
+    }
+
+    // 兼容旧版：settings.judgePrompt 单模板字符串仍然生效（相当于 system 段 + 单个 user 段，无最终注入）；
+    // 一旦保存过 judgeSegments 就改用段列表。judgeFinalPrompt 留空时用默认最终注入。
+    function judgeMessageSpecs(settings) {
+        const legacy = settings && typeof settings.judgePrompt === 'string' ? settings.judgePrompt.trim() : '';
+        if (legacy && !Array.isArray(settings.judgeSegments)) {
+            return {
+                segments: [{ role: 'system', content: DEFAULT_JUDGE_SYSTEM_PROMPT }, { role: 'user', content: settings.judgePrompt }],
+                finalPrompt: '',
+            };
+        }
+        const segments = Array.isArray(settings && settings.judgeSegments) && settings.judgeSegments.length
+            ? settings.judgeSegments : DEFAULT_JUDGE_SEGMENTS;
+        const finalPrompt = settings && typeof settings.judgeFinalPrompt === 'string' && settings.judgeFinalPrompt.trim()
+            ? settings.judgeFinalPrompt : DEFAULT_JUDGE_FINAL_PROMPT;
+        return { segments, finalPrompt };
+    }
+
+    // 组装裁判消息：逐段替换占位符；空内容段丢弃；最后追加「最终提示词注入」（user 角色）。
+    function judgeMessagesFor(settings, stage, condition, history) {
+        const specs = judgeMessageSpecs(settings);
+        const messages = specs.segments
+            .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role) && typeof seg.content === 'string' && seg.content.trim())
+            .map(seg => ({ role: seg.role, content: fillJudgePlaceholders(seg.content, stage, condition, history) }));
+        if (typeof specs.finalPrompt === 'string' && specs.finalPrompt.trim()) {
+            messages.push({ role: 'user', content: fillJudgePlaceholders(specs.finalPrompt, stage, condition, history) });
+        }
+        if (!messages.length) {
+            messages.push({ role: 'user', content: fillJudgePlaceholders(DEFAULT_JUDGE_FINAL_PROMPT, stage, condition, history) });
+        }
+        return messages;
+    }
+
+    // 判定结论：优先读 <结论> 标签（填表格式）；没有标签时回退「开头就是 YES」的旧规则。
+    function judgeSaysYes(text) {
+        const raw = String(text || '');
+        const tag = raw.match(/<结论>\s*([\s\S]*?)<\/结论>/i);
+        if (tag) return /^\s*YES\b/i.test(tag[1]);
+        return /^\s*YES\b/i.test(raw);
     }
 
     async function recentHistoryText(messageId, count) {
@@ -2173,17 +2257,13 @@
     }
 
     // 「酒馆预设」连接：走酒馆连接管理器（对齐 shujuku sendConnectionManagerRequest_ACU），
-    // 不再走 generateRaw 的 proxy_preset。
-    async function askJudgeViaConnectionProfile(question, preset) {
+    // 不再走 generateRaw 的 proxy_preset。messages 为完整段列表（含最终注入）。
+    async function askJudgeViaConnectionProfile(messages, preset) {
         const service = connectionManagerService();
         if (!service) {
             throw new Error('酒馆连接管理器不可用（找不到 ConnectionManagerRequestService）：请升级酒馆版本，或把这个 API 预设改成「酒馆主 API / 自定义」连接。');
         }
-        const messages = [
-            { role: 'system', content: JUDGE_SYSTEM_PROMPT },
-            { role: 'user', content: question },
-        ];
-        const maxTokens = preset.maxTokens != null ? preset.maxTokens : 512;
+        const maxTokens = preset.maxTokens != null ? preset.maxTokens : 60000;
         const result = await service.sendRequest(preset.tavernProfile, messages, maxTokens);
         // 对齐 shujuku：优先 result.result.choices[0].message.content，再退 result.content / 字符串。
         if (result && result.result && Array.isArray(result.result.choices)
@@ -2198,11 +2278,8 @@
 
     // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
     // （复刻 shujuku 的自定义 API 调用，附加主体/排除参数/请求标头/提示词后处理全部生效）。
-    async function askJudgeViaCustomApi(question, preset) {
-        const messages = [
-            { role: 'system', content: JUDGE_SYSTEM_PROMPT },
-            { role: 'user', content: question },
-        ];
+    // messages 为完整段列表（含最终注入）。
+    async function askJudgeViaCustomApi(messages, preset) {
         const response = await hostFetch('/api/backends/chat-completions/generate', {
             method: 'POST',
             headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
@@ -2223,31 +2300,34 @@
         return String(text);
     }
 
-    async function askJudge(question, preset) {
+    async function askJudge(messages, preset) {
         if (preset && preset.connection === 'tavern') {
             if (!preset.tavernProfile) {
                 throw new Error(`API 预设「${preset.name}」没有选择酒馆预设。`);
             }
-            return askJudgeViaConnectionProfile(question, preset);
+            return askJudgeViaConnectionProfile(messages, preset);
         }
         if (preset && preset.connection === 'custom') {
             if (!preset.apiurl || !preset.model) {
                 throw new Error(`API 预设「${preset.name}」缺少端点(基础URL)或模型名。`);
             }
-            return askJudgeViaCustomApi(question, preset);
+            return askJudgeViaCustomApi(messages, preset);
         }
         // 酒馆主 API（或无预设）：走酒馆助手 generateRaw。
+        // 段列表映射为 ordered_prompts 条目，最后一条 user 消息作为 user_input（最终注入）。
+        // 最近剧情已通过 {{history}} 占位符写进段内容，不再叠加 chat_history，避免弱模型被重复内容干扰。
         const generateRaw = api('generateRaw', false);
         if (!generateRaw) return null;
+        const lastUserIndex = messages.map((item, index) => (item.role === 'user' ? index : -1)).filter(index => index >= 0).pop();
+        const userInput = lastUserIndex != null ? messages[lastUserIndex].content : '';
+        const ordered = messages.filter((item, index) => index !== lastUserIndex)
+            .map(item => ({ role: item.role, content: item.content }));
+        ordered.push('user_input');
         const request = {
-            user_input: question,
+            user_input: userInput,
             should_silence: true,
-            max_chat_history: 6,
-            ordered_prompts: [
-                { role: 'system', content: JUDGE_SYSTEM_PROMPT },
-                'chat_history',
-                'user_input',
-            ],
+            max_chat_history: 0,
+            ordered_prompts: ordered,
         };
         const result = await generateRaw(request);
         return typeof result === 'string'
@@ -2283,11 +2363,11 @@
             const stage = context.stage;
             const condition = stage.completion
                 ? stage.completion
-                : '没有预设完成条件：内容充分展开、剧情自然该走就算完成。';
+                : '没有写完成条件：本阶段要演的内容都演完、剧情自然该往下走了，就算完成。';
             const history = await recentHistoryText(messageId, 6);
-            const question = judgePromptFor(settings, stage, condition, history || '（没有取到聊天记录）');
-            const text = await askJudge(question, preset);
-            if (!/^\s*YES\b/i.test(text)) return;
+            const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
+            const text = await askJudge(messages, preset);
+            if (!judgeSaysYes(text)) return;
             // 防误判守卫：裁判是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
             // 这些情况下这次 YES 已经过期，必须放弃推进。
             const fresh = await loadContexts();
@@ -2685,7 +2765,8 @@
     function emptyApiDraft() {
         return {
             name: '', connection: 'main', customApiFormat: 'openai_compat',
-            apiurl: '', key: '', model: '', maxTokens: '', temperature: '',
+            // 默认值与数据库（shujuku）一致：最大回复长度 60000、温度 1，不留空。
+            apiurl: '', key: '', model: '', maxTokens: 60000, temperature: 1,
             bodyParams: '', excludeBodyParams: '', requestHeaders: '',
             promptPostProcessing: 'strict', tavernProfile: '',
         };
@@ -2904,7 +2985,12 @@
                 field('API 密钥', keyInput),
                 field('模型名', modelInput),
                 el('div', { class: 'dga-inline-action' }, loadModelsBtn, modelStatus),
-                ui.apiModelOptions.length > 0 ? field('模型列表', modelListSelect) : null,
+                ui.apiModelOptions.length > 0
+                    ? field('模型列表', el('div', { class: 'dga-model-pick' },
+                        el('div', { class: 'dga-model-pick-arrow', text: '⬇ 模型拉到了，点下面的下拉框选一个' }),
+                        modelListSelect,
+                    ), '选中后会自动填进上面的「模型名」，填完也可以再手改。')
+                    : null,
                 el('div', { class: 'dga-two-col' },
                     field('最大回复长度', maxTokensInput),
                     field('温度', temperatureInput)),
@@ -2943,6 +3029,77 @@
         ];
     }
 
+    // 裁判提示词段编辑器：仿数据库（shujuku）剧情推进页的提示词段列表——
+    // 每段可选 system / user / assistant 角色，支持上移/下移/删除与首尾插入，
+    // 段列表后加一条「最终提示词注入」。旧版 judgePrompt 单模板仍生效，任何改动自动转成段。
+    function judgePromptEditor(settings, saveSettings) {
+        const legacy = typeof settings.judgePrompt === 'string' ? settings.judgePrompt.trim() : '';
+        const useLegacy = Boolean(legacy) && !Array.isArray(settings.judgeSegments);
+        const specs = judgeMessageSpecs(settings);
+        // 编辑基于「当前生效的段」；任何改动都会先把生效段物化进设置再改。
+        const segments = specs.segments.map(seg => ({ role: seg.role, content: seg.content }));
+        const roleOptions = JUDGE_SEGMENT_ROLES.map(role => ({ value: role, label: role.toUpperCase() }));
+        const commit = (nextSegments, nextFinal, success) => saveSettings({
+            judgeSegments: nextSegments,
+            judgeFinalPrompt: nextFinal != null ? nextFinal : (settings.judgeFinalPrompt || ''),
+            judgePrompt: '',
+        }, success);
+        const patchAt = (index, patch, success) => {
+            const next = segments.map((seg, i) => (i === index ? { ...seg, ...patch } : { ...seg }));
+            commit(next, null, success || '裁判提示词已保存');
+        };
+        const moveAt = (index, delta) => {
+            const target = index + delta;
+            if (target < 0 || target >= segments.length) return;
+            const next = segments.map(seg => ({ ...seg }));
+            const [item] = next.splice(index, 1);
+            next.splice(target, 0, item);
+            commit(next, null, '提示词段顺序已保存');
+        };
+        const removeAt = index => commit(segments.filter((_, i) => i !== index), null, '提示词段已删除');
+        const insertAt = position => {
+            const next = segments.map(seg => ({ ...seg }));
+            const seg = { role: 'user', content: '' };
+            if (position === 'top') next.unshift(seg); else next.push(seg);
+            commit(next, null, '提示词段已插入');
+        };
+        const iconBtn = (label, title, onclick, options) => el('button', {
+            type: 'button',
+            class: `dga-icon-btn${options && options.danger ? ' dga-icon-danger' : ''}`,
+            title, 'aria-label': title,
+            disabled: Boolean(ui.busy || (options && options.disabled)),
+            onclick,
+        }, label);
+        const items = segments.map((seg, index) => el('div', { class: 'dga-pseg' },
+            el('div', { class: 'dga-pseg-head' },
+                el('span', { class: 'dga-pseg-index', text: `#${index + 1}` }),
+                selectControl(roleOptions, seg.role, value => patchAt(index, { role: value })),
+                el('div', { class: 'dga-pseg-actions' },
+                    iconBtn('↑', index === 0 ? '已经是第一段' : '上移该段', () => moveAt(index, -1), { disabled: index === 0 }),
+                    iconBtn('↓', index === segments.length - 1 ? '已经是最后一段' : '下移该段', () => moveAt(index, 1), { disabled: index === segments.length - 1 }),
+                    iconBtn('✕', '删除该段', () => removeAt(index), { danger: true }))),
+            el('textarea', {
+                class: 'dga-input', rows: 4, placeholder: '提示词内容…支持 {{stage}} {{prompt}} {{condition}} {{history}} 占位符',
+                text: seg.content,
+                onchange: event => patchAt(index, { content: event.target.value }),
+            })));
+        return card('裁判提示词',
+            useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在使用旧版自定义提问（按 system + 单个 user 段生效）。下面任何改动都会自动转成提示词段，旧模板内容已放进 user 段。') : null,
+            el('div', { class: 'dga-pseg-add' }, btn('＋ 在最上方插入', () => insertAt('top'), { ghost: true })),
+            ...items,
+            el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
+            field('最终提示词注入（最后追加的一条 user 消息）',
+                el('textarea', {
+                    class: 'dga-input', rows: 4,
+                    placeholder: DEFAULT_JUDGE_FINAL_PROMPT,
+                    text: settings.judgeFinalPrompt || '',
+                    onchange: event => commit(segments, event.target.value, '最终提示词注入已保存'),
+                }),
+                '留空用默认注入；占位符同样可用。裁判结论优先读 <结论> 标签，没有标签时看回答开头是不是 YES。'),
+            btn('恢复默认提示词', () => commit(DEFAULT_JUDGE_SEGMENTS.map(seg => ({ ...seg })), '', '已恢复默认裁判提示词'), { ghost: true }),
+        );
+    }
+
     // 全局「自动推进」三档设置。marker / judge 改变镜像里是否附通用判断指令，切换后必须重同步镜像。
     function settingsCard() {
         const config = ui.snapshot ? ui.snapshot.config : null;
@@ -2969,14 +3126,7 @@
             mode === 'judge' && presetList.length === 0
                 ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
                 : null,
-            mode === 'judge' ? field('裁判提问（留空用默认；占位符 {{stage}} {{prompt}} {{condition}} {{history}}）',
-                el('textarea', {
-                    class: 'dga-input',
-                    rows: 5,
-                    placeholder: DEFAULT_JUDGE_PROMPT,
-                    text: settings.judgePrompt || '',
-                    onchange: event => saveSettings({ judgePrompt: event.target.value }, '裁判提问已保存'),
-                })) : null,
+            mode === 'judge' ? judgePromptEditor(settings, saveSettings) : null,
             muted('手动推进：只有写了「完成：」条件的阶段会自动进入下一段；标记判断：正文 AI 自己判断时机；后台裁判：通过酒馆助手 generateRaw 静默判定，可使用本机独立 API 预设。单个阶段写「完成：自动」可跨档位开启 AI 判断。'),
         );
     }
@@ -4312,6 +4462,17 @@ ${P} .dga-two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1f
 ${P} .dga-api-actions { display: flex; justify-content: flex-end; gap: 8px; }
 ${P} .dga-api-actions .dga-btn { flex: 0 1 auto; min-height: 40px; padding: 8px 16px; }
 ${P} .dga-field-hint { font-size: 0.78rem; opacity: 0.6; line-height: 1.5; }
+${P} .dga-model-pick-arrow { color: var(--SmartThemeQuoteColor, #7c6cf0); font-size: 0.85rem; font-weight: 700; margin-bottom: 4px; animation: dga-pick-bounce 1.2s ease-in-out infinite; }
+@keyframes dga-pick-bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
+${P} .dga-pseg { display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.09); }
+${P} .dga-pseg:last-of-type { border-bottom: 0; padding-bottom: 0; }
+${P} .dga-pseg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+${P} .dga-pseg-index { font-size: 0.78rem; opacity: 0.55; min-width: 26px; font-family: monospace; }
+${P} .dga-pseg-head select { flex: 1 1 110px; max-width: 180px; min-height: 36px; }
+${P} .dga-pseg-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+${P} .dga-pseg-actions .dga-icon-btn { width: 36px; min-width: 36px; min-height: 36px; font-size: 0.95rem; }
+${P} .dga-pseg-add { display: flex; justify-content: center; }
+${P} .dga-pseg-add .dga-btn { min-height: 36px; padding: 6px 14px; font-size: 0.85rem; }
 ${P} .dga-danger-text { color: #ff9b9b; font-size: 0.85rem; overflow-wrap: anywhere; }
 ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 11px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(0, 0, 0, 0.26); color: inherit; font: inherit; }
 @media (max-width: 680px) {
@@ -4513,6 +4674,8 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         buildJudgeCustomRequestBody,
         fetchAvailableModels,
         readTavernConnectionProfiles,
+        judgeMessagesFor,
+        judgeSaysYes,
         pickLoad,
         pickBuild,
         pickAssign,
