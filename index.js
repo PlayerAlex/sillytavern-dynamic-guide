@@ -2140,6 +2140,8 @@
         contextError: '',
         editor: null,
         diagnosis: null,
+        apiEditing: null,
+        apiModelOptions: [],
     };
 
     function el(tag, attrs, ...children) {
@@ -2487,6 +2489,7 @@
             const connection = connectionSelect.value;
             const isCustom = connection === 'custom';
             const isTavern = connection === 'tavern';
+            loadModelsBtn.disabled = !isCustom;
             formatField.hidden = !isCustom;
             apiurlField.hidden = !isCustom;
             keyField.hidden = !isCustom;
@@ -2512,7 +2515,7 @@
             }
             modelStatus.textContent = `拉到 ${names.length} 个模型`;
             ui.apiModelOptions = names;
-        }, { success: '模型列表已更新' }), { ghost: true, disabled: connectionSelect.value !== 'custom' });
+        }, { success: '模型列表已更新' }), { ghost: true });
 
         const modelListSelect = selectControl(
             (ui.apiModelOptions || []).map(name => ({ value: name, label: name })),

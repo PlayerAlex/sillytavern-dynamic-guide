@@ -178,6 +178,7 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 - **独立 API 页**：API 预设管理从管理首页迁移到独立页面，按 shujuku 新版 ApiConfigPanel 重做：预设下拉（含新建/删除）、连接方式三段切换（酒馆当前 API / 自定义 / 酒馆连接预设）、自定义时显示接口协议四选（兼容 OpenAI / OpenAI Responses / Claude Messages / Gemini Interactions）、端点 URL、API 密钥、模型名、加载模型按钮与模型列表下拉、最大输出 tokens、温度。
 - **字段精简**：删除分类、备注、酒馆代理预设名字段，不再保留兼容 UI；旧版 v1 预设自动迁移（`type: proxy → tavern`、`type: current → main`）。
 - **密钥边界不变**：完整预设只存当前浏览器 `localStorage`，API Key 不进入角色变量/聊天变量、不随角色卡导出；`localStorage` 是本机明文存储，共享设备请勿保存敏感 Key。
+- **修复**：「加载模型」按钮的启用状态现在跟随连接方式实时更新——此前新建预设（默认「酒馆当前 API」）时按钮被禁用，切到「自定义」后也不会恢复，导致无法拉取模型。
 
 ### v2.9（2026-09-20）
 
