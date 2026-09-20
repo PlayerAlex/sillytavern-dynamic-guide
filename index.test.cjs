@@ -1100,3 +1100,124 @@ test('看分段界面：标题卡的下移按钮交换阶段顺序且不打开�
     assert.match(panel.querySelector('.dga-head-text').children[1].textContent, /未保存/);
     assert.deepEqual(errors, []);
 });
+
+// ---------------------------------------------------------------
+// v2.6 自动推进三档
+// ---------------------------------------------------------------
+
+test('“完成：自动”解析为 autoComplete，“自动门”这类文本不误判', () => {
+    const parsed = core.parseOutline('## 第一幕\n完成：自动\n正文一\n\n## 第二幕\n完成：自动门被推开\n正文二');
+    assert.equal(parsed.stages[0].autoComplete, true);
+    assert.equal(parsed.stages[0].completion, '');
+    assert.equal(parsed.stages[1].autoComplete, false);
+    assert.equal(parsed.stages[1].completion, '自动门被推开');
+});
+
+test('formatInjection 只在 auto 档追加通用判断指令，有完成条件时不变成通用块', () => {
+    const parsed = core.parseOutline('## 第一幕\n正文一');
+    const stage = parsed.stages[0];
+    assert.doesNotMatch(core.formatInjection(stage, []), /进入下一段的时机/);
+    const marker = core.formatInjection(stage, [], { auto: true });
+    assert.match(marker, /进入下一段的时机/);
+    assert.match(marker, new RegExp(`DGA_COMPLETE:${stage.id}`));
+    const withCondition = core.parseOutline('## 第一幕\n完成：交谈结束。\n正文一');
+    const conditional = core.formatInjection(withCondition.stages[0], [], { auto: true });
+    assert.match(conditional, /当前阶段的完成判定/);
+    assert.doesNotMatch(conditional, /进入下一段的时机/);
+});
+
+test('选区模式往返保留“完成：自动”', () => {
+    const text = '## 第一幕\n完成：自动\n正文一\n\n## 第二幕\n正文二';
+    const rebuilt = core.pickBuild(core.pickLoad(core.parseOutline(text)));
+    const again = core.parseOutline(rebuilt);
+    assert.equal(again.stages[0].autoComplete, true);
+    assert.equal(again.stages[0].completion, '');
+    assert.equal(again.stages[1].autoComplete, false);
+});
+
+test('标记判断档给没有完成条件的阶段镜像附通用判断指令', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const stageId = core.parseOutline(content).stages[0].id;
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'marker' },
+    };
+    const { state, helper } = multiWorld(books, { config });
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const mirror = state.books.书A.find(isMirror);
+    assert.match(mirror.content, /进入下一段的时机/);
+    assert.match(mirror.content, new RegExp(`DGA_COMPLETE:${stageId}`));
+    assert.deepEqual(run.errors, []);
+});
+
+
+test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复，没有隐藏标记。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const verdicts = [];
+    helper.generateRaw = async options => { verdicts.push(options); return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(verdicts.length, 1, 'judge 档没有标记也要问一次裁判');
+    assert.equal(verdicts[0].should_silence, true, '裁判请求必须静默');
+    assert.match(String(verdicts[0].user_input), /甲一正文/, '提问要带上阶段正文');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
+
+    await state.events.get('message_received')(5);
+    assert.equal(verdicts.length, 1, '同一消息第二次触发不能重复推进');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
+    assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：裁判回答 NO 时不推进', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '还没走完的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    helper.generateRaw = async () => 'NO';
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不能推进');
+    assert.match(state.books.书A.find(isMirror).content, /甲一正文/, '镜像保持当前阶段');
+    assert.deepEqual(run.errors, []);
+});
+
+test('手动推进档不调用后台裁判', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+    };
+    const message = { message_id: 5, role: 'assistant', message: '普通回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let called = 0;
+    helper.generateRaw = async () => { called += 1; return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(called, 0, 'off 档没有标记时不能发起裁判请求');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0);
+    assert.deepEqual(run.errors, []);
+});
+

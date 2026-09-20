@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.5
+     * 动态指导助手 v2.6
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -25,7 +25,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.5';
+    const VERSION = '2.6';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -258,7 +258,10 @@
                 item.id = `stage-${stages.length + 1}-${hashText(item.name).slice(0, 6)}`;
                 item.color = STAGE_COLORS[stages.length % STAGE_COLORS.length];
                 // 旧模板的“什么时候消失”对剧情阶段来说就是完成条件
-                item.completion = String(item.labels.completion || item.labels.to || '').trim();
+                const rawCompletion = String(item.labels.completion || item.labels.to || '').trim();
+                // “完成：自动”表示这个阶段不预设具体条件，交给 AI 自己判断该不该进入下一段。
+                item.autoComplete = /^(自动|自动判断|auto)$/i.test(rawCompletion);
+                item.completion = item.autoComplete ? '' : rawCompletion;
                 stages.push(item);
             } else {
                 item.anchorStage = Math.max(0, stages.length - 1);
@@ -328,8 +331,35 @@
         return parsed.addons.filter(item => stageIndex >= item.fromIndex && stageIndex <= item.toIndex && item.prompt);
     }
 
-    function formatInjection(stage, addons) {
+    // 完成判定块：有 completion 就用用户写的条件；否则 auto 档给一段通用判断指令。
+    // 两种都在回复末尾要同一行隐藏标记，handleMessageReceived 识别后推进。
+    function completionInstruction(stage, auto) {
+        if (!stage) return [];
+        const marker = `<!-- DGA_COMPLETE:${stage.id} -->`;
+        if (stage.completion) {
+            return [
+                '',
+                '## 当前阶段的完成判定',
+                stage.completion,
+                '',
+                '只有当你确信本次回复已经实际完成上述判定时，才在回复末尾原样附加下面这行 HTML 注释；尚未完成时不要附加：',
+                marker,
+            ];
+        }
+        if (auto) {
+            return [
+                '',
+                '## 进入下一段的时机',
+                '当前阶段没有预设完成条件：当你判断这一阶段的内容已经充分展开、剧情自然该进入下一段时，在回复末尾原样附加下面这行 HTML 注释；还不该走时绝对不要附加：',
+                marker,
+            ];
+        }
+        return [];
+    }
+
+    function formatInjection(stage, addons, options) {
         if (!stage) return '';
+        const auto = Boolean(options && options.auto);
         // 写在所有阶段之前的常驻排在最前面，其余附加/常驻按正文顺序放在阶段之后。
         // 不要加任何插件头部或解释文字：这份内容会原样出现在镜像条目里，
         // 用户在提示词查看器里看到的就是大纲正文本身。
@@ -346,16 +376,7 @@
             lines.push('', '## 同时有效的附加内容');
             below.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
         }
-        if (stage.completion) {
-            lines.push(
-                '',
-                '## 当前阶段的完成判定',
-                stage.completion,
-                '',
-                '只有当你确信本次回复已经实际完成上述判定时，才在回复末尾原样附加下面这行 HTML 注释；尚未完成时不要附加：',
-                `<!-- DGA_COMPLETE:${stage.id} -->`,
-            );
-        }
+        lines.push(...completionInstruction(stage, auto || stage.autoComplete));
         return lines.join('\n');
     }
 
@@ -685,7 +706,7 @@
             id: block.id,
             kind: 'stage',
             name: block.name,
-            completion: block.completion || '',
+            completion: block.autoComplete ? '自动' : (block.completion || ''),
             ranges: [],
             color: block.color || STAGE_COLORS[index % STAGE_COLORS.length],
         }));
@@ -1012,7 +1033,7 @@
 
     // 2.0 的 config 是扁平的单个绑定；2.1 变成 { version: 2, bindings: […] }。
     function normalizeConfig(raw) {
-        const empty = { version: 2, bindings: [] };
+        const empty = { version: 2, bindings: [], settings: {} };
         if (!raw || typeof raw !== 'object') return empty;
         const list = Array.isArray(raw.bindings)
             ? raw.bindings
@@ -1032,8 +1053,22 @@
             seen.add(key);
             bindings.push(binding);
         });
-        return { version: 2, bindings };
+        // settings 原样保留，逐个字段校验（目前只有 autoAdvance 三档）。
+        const settings = raw.settings && typeof raw.settings === 'object' ? { ...raw.settings } : {};
+        if (!['off', 'marker', 'judge'].includes(settings.autoAdvance)) settings.autoAdvance = 'off';
+        return { version: 2, bindings, settings };
     }
+
+    function autoAdvanceMode(config) {
+        const mode = config && config.settings ? config.settings.autoAdvance : 'off';
+        return ['off', 'marker', 'judge'].includes(mode) ? mode : 'off';
+    }
+
+    const AUTO_ADVANCE_LABELS = {
+        off: '手动推进（只有写了完成条件的阶段会自动进入下一段）',
+        marker: '标记判断（AI 自己判断时机，不额外花请求）',
+        judge: '后台裁判（每条回复多花一次小请求，判断更准确）',
+    };
 
     async function readConfig() {
         return normalizeConfig(await readRawConfig());
@@ -1285,6 +1320,7 @@
                     parsed,
                     rawState,
                     state,
+                    autoAdvance: autoAdvanceMode(config),
                     stage: parsed.stages[state.stageIndex] || null,
                     addons: activeAddons(parsed, state.stageIndex),
                     entryEnabled: !entryIsDisabled(located.entry),
@@ -1508,7 +1544,8 @@
         }
         const stage = context.parsed.stages[index];
         if (!stage) return null;
-        return formatInjection(stage, activeAddons(context.parsed, index));
+        return formatInjection(stage, activeAddons(context.parsed, index),
+            { auto: context.autoAdvance === 'marker' });
     }
 
     // 同步一条绑定的镜像。先在读到的副本上试跑，没变化就不写世界书；
@@ -1609,6 +1646,12 @@
         try {
             const config = await readConfig();
             push('绑定数量', config.bindings.length > 0, `${config.bindings.length} 条`);
+            const mode = autoAdvanceMode(config);
+            push('自动推进', true, AUTO_ADVANCE_LABELS[mode]);
+            if (mode === 'judge') {
+                push('接口 generateRaw', Boolean(api('generateRaw', false)),
+                    api('generateRaw', false) ? '可用' : '缺失——后台裁判用不了，请改用「标记判断」或升级酒馆助手');
+            }
             const stateMap = config.bindings.length > 0 ? await readState(config) : {};
             for (const binding of config.bindings) {
                 const label = `绑定「${binding.entryName || binding.worldbookName}」`;
@@ -1626,7 +1669,8 @@
                     const state = reconcileState(stateMap[bindingKey(binding)] || null, parsed);
                     const stage = parsed.stages[state.stageIndex] || null;
                     const want = stage && !hasLegacyLayout(located.entry)
-                        ? formatInjection(stage, activeAddons(parsed, state.stageIndex))
+                        ? formatInjection(stage, activeAddons(parsed, state.stageIndex),
+                            { auto: autoAdvanceMode(config) === 'marker' })
                         : null;
                     const mirror = findMirrorEntries(await getWorldbook(located.worldbookName),
                         { binding, entry: located.entry }, mirrorName)[0] || null;
@@ -1712,7 +1756,7 @@
         const bindings = existing
             ? config.bindings.map(item => (bindingKey(item) === key ? { ...item, ...candidate } : item))
             : [...config.bindings, candidate];
-        await writeConfig({ version: 2, bindings });
+        await writeConfig({ version: 2, bindings, settings: config.settings || {} });
         await writeStateFor(key, {
             stageIndex: 0,
             stageName: parsed.stages[0].name,
@@ -1759,7 +1803,7 @@
         } else {
             await removeOrphanMirror(binding);
         }
-        await writeConfig({ version: 2, bindings: config.bindings.filter(item => bindingKey(item) !== key) });
+        await writeConfig({ version: 2, bindings: config.bindings.filter(item => bindingKey(item) !== key), settings: config.settings || {} });
         await writeStateFor(key, null);
         notify(`已移出“${binding.entryName || '条目'}”，条目已重新打开。`, 'success');
         return true;
@@ -1783,6 +1827,69 @@
         return null;
     }
 
+    // 后台裁判（judge 档）：每条 AI 回复后，用 generateRaw 静默问一次当前阶段是否完成。
+    // running 集合防止同一绑定并发裁判；裁判结果一律只信一次，失败不重试。
+    const judgeState = { running: new Set() };
+
+    async function maybeJudgeAdvance(context, messageId) {
+        if (!context || context.broken || !context.stage) return;
+        // 同一条消息每条绑定最多推进一次：标记流程先到就轮到裁判跳过。
+        if (context.state.lastCompletionMessageId === messageId) return;
+        if (judgeState.running.has(context.key)) return;
+        const generateRaw = api('generateRaw', false);
+        if (!generateRaw) {
+            reportOnce('judge-no-generateRaw', '「后台裁判」需要酒馆助手的 generateRaw 接口，当前环境不支持；请把「自动推进」改用「标记判断」档。');
+            return;
+        }
+        judgeState.running.add(context.key);
+        const startStageIndex = context.state.stageIndex;
+        try {
+            const stage = context.stage;
+            const condition = stage.completion
+                ? stage.completion
+                : '没有预设完成条件：内容充分展开、剧情自然该走就算完成。';
+            const question = [
+                `当前阶段：${stage.name}`,
+                '',
+                '阶段正文：',
+                stage.prompt,
+                '',
+                `完成条件：${condition}`,
+                '',
+                '根据最近的剧情回复判断：当前阶段是否已经完成、该进入下一段了？只回答 YES 或 NO。',
+            ].join('\n');
+            const result = await generateRaw({
+                user_input: question,
+                should_silence: true,
+                max_chat_history: 6,
+                ordered_prompts: [
+                    { role: 'system', content: '你是剧情进度裁判。只根据给定的阶段信息和聊天记录判断当前阶段是否完成，只回答 YES 或 NO，不要输出任何其他内容。' },
+                    'chat_history',
+                    'user_input',
+                ],
+            });
+            const text = typeof result === 'string'
+                ? result
+                : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
+            if (!/^\s*YES\b/i.test(text)) return;
+            // 防误判守卫：裁判是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
+            // 这些情况下这次 YES 已经过期，必须放弃推进。
+            const fresh = await loadContexts();
+            const latest = fresh.contexts.find(item => item.key === context.key);
+            if (!latest || latest.broken || !latest.stage) return;
+            if (latest.state.stageIndex !== startStageIndex) return;
+            const nowMessageId = currentMessageId();
+            if (nowMessageId != null && nowMessageId !== messageId) return;
+            if (latest.state.lastCompletionMessageId === messageId) return;
+            await moveToIndex(latest, latest.state.stageIndex + 1, { messageId });
+        } catch (error) {
+            const reason = error && error.message ? error.message : String(error);
+            reportOnce('judge-failed', `后台裁判调用失败：${reason}。请检查当前 API 连接，或把「自动推进」改用「标记判断」档。`);
+        } finally {
+            judgeState.running.delete(context.key);
+        }
+    }
+
     async function handleMessageReceived() {
         if (!isCurrentInstance()) return;
         const args = Array.from(arguments);
@@ -1795,22 +1902,34 @@
         if (!message || message.role !== 'assistant' || typeof message.message !== 'string') return;
 
         const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
-        if (markers.length === 0) return;
+        // judge 档即使没有完成标记也要走裁判，所以不能在这里提前 return。
+        if (markers.length === 0 && autoAdvanceMode(await readConfig()) !== 'judge') return;
         const all = await loadContexts();
         if (!all.configured) return;
 
-        const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
-        const setChatMessages = api('setChatMessages', false);
-        if (setChatMessages && cleaned !== message.message) {
-            await Promise.resolve(setChatMessages([{ message_id: messageId, message: cleaned }], { refresh: 'affected' }));
+        if (markers.length > 0) {
+            const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
+            const setChatMessages = api('setChatMessages', false);
+            if (setChatMessages && cleaned !== message.message) {
+                await Promise.resolve(setChatMessages([{ message_id: messageId, message: cleaned }], { refresh: 'affected' }));
+            }
+            // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
+            for (const context of all.contexts) {
+                if (context.broken || !context.stage) continue;
+                const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
+                if (context.state.lastCompletionFingerprint === fingerprint) continue;
+                if (!markers.some(match => match[1] === context.stage.id)) continue;
+                await moveToIndex(context, context.state.stageIndex + 1, { messageId, fingerprint });
+            }
         }
-        // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
-        for (const context of all.contexts) {
-            if (context.broken || !context.stage) continue;
-            const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
-            if (context.state.lastCompletionFingerprint === fingerprint) continue;
-            if (!markers.some(match => match[1] === context.stage.id)) continue;
-            await moveToIndex(context, context.state.stageIndex + 1, { messageId, fingerprint });
+
+        // 后台裁判档：标记流程之后按最新进度逐条绑定裁判（标记已推进的会被守卫跳过）。
+        if (all.configured && autoAdvanceMode(all.config) === 'judge') {
+            const fresh = await loadContexts();
+            for (const context of fresh.contexts) {
+                if (context.broken || !context.stage) continue;
+                await maybeJudgeAdvance(context, messageId);
+            }
         }
     }
 
@@ -2070,10 +2189,30 @@
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             ...contexts.map(boundCard),
             contexts.length === 0 ? guideCard() : null,
+            settingsCard(),
             addCard(),
             diagnosticsCard(),
         );
         return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
+    }
+
+    // 全局「自动推进」三档设置。marker / judge 改变镜像里是否附通用判断指令，切换后必须重同步镜像。
+    function settingsCard() {
+        const config = ui.snapshot ? ui.snapshot.config : null;
+        const mode = autoAdvanceMode(config);
+        const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
+        return card('自动推进',
+            field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
+                runAction('修改自动推进设置', async () => {
+                    const fresh = await readConfig();
+                    fresh.settings = { ...(fresh.settings || {}), autoAdvance: value };
+                    await writeConfig(fresh);
+                    await syncMirrors('normal');
+                    return true;
+                }, { success: `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}` });
+            })),
+            muted('手动推进：只有写了「完成：」条件的阶段会自动进入下一段；标记判断：镜像末尾附通用判断指令，AI 自己判断时机；后台裁判：每条回复后多问一次「当前阶段完成了吗」。单个阶段写「完成：自动」可跨档位单独开启 AI 判断。'),
+        );
     }
 
     // 一条绑定一张卡：条目名、走到哪一段、上一段/下一段，外加一排不常用的操作。
@@ -2108,9 +2247,17 @@
         if (context.stage && usable) {
             parts.push(`【${context.stage.name}】\n${context.stage.prompt}`);
             context.addons.forEach(item => parts.push(`【附加：${item.name}】\n${item.prompt}`));
-            parts.push(context.stage.completion
-                ? `【进入下一段的条件（由 AI 判断）】\n${context.stage.completion}`
-                : '【进入下一段】\n没有写完成条件，只能手动点“下一段”。');
+            if (context.stage.completion) {
+                parts.push(`【进入下一段的条件（由 AI 判断）】\n${context.stage.completion}`);
+            } else if (context.stage.autoComplete) {
+                parts.push('【进入下一段】\n自动判断：AI 自己判断时机。');
+            } else if (context.autoAdvance === 'marker') {
+                parts.push('【进入下一段】\nAI 判断时机（标记判断档）。');
+            } else if (context.autoAdvance === 'judge') {
+                parts.push('【进入下一段】\n后台裁判判断（每条回复多问一次）。');
+            } else {
+                parts.push('【进入下一段】\n没有写完成条件，只能手动点“下一段”。');
+            }
         } else {
             parts.push('现在不发送任何指导。');
         }
@@ -2444,7 +2591,7 @@
     }
 
     function headingSubtitle(block) {
-        if (block.kind === 'stage') return block.completion ? `进入下一段：${block.completion}` : '手动点“下一段”推进';
+        if (block.kind === 'stage') return block.completion ? `进入下一段：${block.completion}` : (block.autoComplete ? '进入下一段：自动判断' : '手动点“下一段”推进');
         if (block.kind === 'addon') {
             const stages = ui.editor.parsed.stages;
             if (stages.length === 0) return '还没有剧情阶段';
@@ -2547,7 +2694,7 @@
                 block,
                 name: block.name,
                 kind: block.kind,
-                completion: block.completion || '',
+                completion: block.autoComplete ? '自动' : (block.completion || ''),
                 from: nameAt(isAddon ? block.fromIndex : block.anchorStage),
                 to: nameAt(isAddon ? block.toIndex : block.anchorStage),
                 merge: nameAt(isMerged ? block.mergeInto : block.anchorStage),
@@ -2621,7 +2768,7 @@
         if (sheet.kind === 'stage') {
             const completion = el('textarea', {
                 rows: 2,
-                placeholder: '例如：两人完成第一次正式交谈。留空就只能手动点“下一段”。',
+                placeholder: '例如：两人完成第一次正式交谈。留空=手动点“下一段”；填“自动”=AI 自己判断。',
                 oninput: event => { sheet.completion = event.target.value; },
             });
             completion.value = sheet.completion;
@@ -3203,7 +3350,7 @@
         if (owner.kind === 'stage') {
             const completion = el('textarea', {
                 rows: 2,
-                placeholder: '例如：两人完成第一次正式交谈。留空就只能手动点“下一段”。',
+                placeholder: '例如：两人完成第一次正式交谈。留空=手动点“下一段”；填“自动”=AI 自己判断。',
             });
             completion.value = owner.completion;
             completion.addEventListener('input', event => {
