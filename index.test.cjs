@@ -1305,3 +1305,57 @@ test('后台裁判档：judgeEngine=callAI 但插件缺失时不推进且不碰 
     assert.deepEqual(run.errors, []);
 });
 
+
+
+test('后台裁判档：选了 API 预设时先 loadApiPreset 再 callAI', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgeEngine: 'callAI', judgePreset: '裁判用小模型' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const loaded = [];
+    const run = load(helper, {
+        AutoCardUpdaterAPI: {
+            getApiPresets: () => [{ name: '裁判用小模型', apiMode: 'custom' }],
+            loadApiPreset: name => { loaded.push(name); return true; },
+            callAI: async () => 'YES',
+        },
+    });
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.deepEqual(loaded, ['裁判用小模型'], 'callAI 前要先加载选中的预设');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('后台裁判档：选的 API 预设不存在时报错不推进', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgeEngine: 'callAI', judgePreset: '不存在的预设' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let aiCalled = 0;
+    const run = load(helper, {
+        AutoCardUpdaterAPI: {
+            getApiPresets: () => [],
+            loadApiPreset: () => false,
+            callAI: async () => { aiCalled += 1; return 'YES'; },
+        },
+    });
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(aiCalled, 0, '预设加载失败就不能发起 AI 调用');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '预设缺失不能推进');
+    assert.match(run.logs.join('\n'), /不存在的预设/, '要明确提示预设不存在');
+    assert.deepEqual(run.errors, []);
+});

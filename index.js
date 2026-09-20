@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.7
+     * 动态指导助手 v2.8
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -25,7 +25,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.7';
+    const VERSION = '2.8';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1060,6 +1060,8 @@
         if (settings.judgePrompt != null && typeof settings.judgePrompt !== 'string') {
             settings.judgePrompt = String(settings.judgePrompt);
         }
+        // 裁判选用的数据库 API 预设名；空字符串 = 跟随数据库当前配置。
+        if (settings.judgePreset != null && typeof settings.judgePreset !== 'string') settings.judgePreset = String(settings.judgePreset);
         if (!['auto', 'generateRaw', 'callAI'].includes(settings.judgeEngine)) settings.judgeEngine = 'auto';
         return { version: 2, bindings, settings };
     }
@@ -1867,18 +1869,23 @@
             .replace(/\{\{\s*history\s*\}\}/g, history);
     }
 
-    // 第三方插件 SP·数据库 III（shujuku）暴露的 window.AutoCardUpdaterAPI.callAI：
-    // 复用数据库插件当前配置的 API，不用用户另配 key。
-    function shujukuCallAI() {
+    // 第三方插件 SP·数据库 III（shujuku）暴露的 window.AutoCardUpdaterAPI：
+    // 复用数据库插件的 API 配置，不用用户另配 key；可选 API 预设（loadApiPreset 后再 callAI）。
+    function shujukuApi() {
         for (const candidate of [currentWindow, ...windowCandidates]) {
             try {
                 const target = candidate && candidate.AutoCardUpdaterAPI;
-                if (target && typeof target.callAI === 'function') return target.callAI.bind(target);
+                if (target && typeof target.callAI === 'function') return target;
             } catch (error) {
                 // 跨域候选不是运行接口来源。
             }
         }
         return null;
+    }
+
+    function shujukuCallAI() {
+        const target = shujukuApi();
+        return target ? target.callAI.bind(target) : null;
     }
 
     async function recentHistoryText(messageId, count) {
@@ -1894,10 +1901,19 @@
         }).filter(Boolean).join('\n\n');
     }
 
-    async function askJudge(engine, question) {
+    async function askJudge(engine, question, presetName) {
         if (engine === 'callAI') {
-            const callAI = shujukuCallAI();
-            if (!callAI) return null;
+            const shujuku = shujukuApi();
+            if (!shujuku) return null;
+            const callAI = shujuku.callAI.bind(shujuku);
+            // 选了 API 预设：先把预设应用到数据库当前配置，再调用。
+            if (presetName) {
+                if (typeof shujuku.loadApiPreset !== 'function') {
+                    throw new Error('当前数据库插件不支持加载 API 预设（缺 loadApiPreset），请在设置里清空「裁判 API 预设」或升级 SP·数据库 III。');
+                }
+                const loaded = await Promise.resolve(shujuku.loadApiPreset(presetName));
+                if (loaded === false) throw new Error(`数据库里没有 API 预设「${presetName}」，请到数据库插件里建好，或在设置里清空「裁判 API 预设」。`);
+            }
             const answer = await Promise.resolve(callAI([
                 { role: 'system', content: JUDGE_SYSTEM_PROMPT },
                 { role: 'user', content: question },
@@ -1945,7 +1961,8 @@
                 : '没有预设完成条件：内容充分展开、剧情自然该走就算完成。';
             const history = await recentHistoryText(messageId, 6);
             const question = judgePromptFor(settings, stage, condition, history || '（没有取到聊天记录）');
-            const text = await askJudge(usable[0], question);
+            const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
+            const text = await askJudge(usable[0], question, presetName);
             if (!/^\s*YES\b/i.test(text)) return;
             // 防误判守卫：裁判是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
             // 这些情况下这次 YES 已经过期，必须放弃推进。
@@ -2276,12 +2293,25 @@
         const config = ui.snapshot ? ui.snapshot.config : null;
         const mode = autoAdvanceMode(config);
         const settings = config && config.settings ? config.settings : {};
+        // 数据库插件的 API 预设列表（getApiPresets 同步返回深拷贝）。
+        const shujuku = shujukuApi();
+        let presetNames = [];
+        if (shujuku && typeof shujuku.getApiPresets === 'function') {
+            try {
+                const list = shujuku.getApiPresets();
+                if (Array.isArray(list)) presetNames = list.map(item => String(item && item.name || '')).filter(Boolean);
+            } catch (error) {
+                presetNames = [];
+            }
+        }
         const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const engineOptions = [
             { value: 'auto', label: '自动（优先 SP·数据库 III 的 callAI，缺失时用 generateRaw）' },
             { value: 'callAI', label: 'SP·数据库 III（shujuku）callAI' },
             { value: 'generateRaw', label: '酒馆助手 generateRaw' },
         ];
+        const presetOptions = [{ value: '', label: '跟随数据库当前配置' }]
+            .concat(presetNames.map(name => ({ value: name, label: name })));
         const saveSettings = (patch, success) => runAction('修改自动推进设置', async () => {
             const fresh = await readConfig();
             fresh.settings = { ...(fresh.settings || {}), ...patch };
@@ -2296,6 +2326,13 @@
             mode === 'judge' ? field('裁判引擎', selectControl(engineOptions, settings.judgeEngine || 'auto', value => {
                 saveSettings({ judgeEngine: value }, '裁判引擎已保存');
             })) : null,
+            mode === 'judge' && (settings.judgeEngine || 'auto') !== 'generateRaw'
+                ? field('裁判 API 预设（来自 SP·数据库 III）', selectControl(presetOptions, settings.judgePreset || '', value => {
+                    saveSettings({ judgePreset: value }, value ? `裁判 API 预设已切换为：${value}` : '裁判 API 预设已清空，跟随数据库当前配置');
+                })) : null,
+            mode === 'judge' && (settings.judgeEngine || 'auto') !== 'generateRaw' && presetNames.length === 0
+                ? muted(shujuku ? '数据库插件里没有 API 预设：到数据库插件的 API 设置里保存一个预设后，这里就能选。' : '未检测到 SP·数据库 III；裁判会回落酒馆助手 generateRaw。')
+                : null,
             mode === 'judge' ? field('裁判提问（留空用默认；占位符 {{stage}} {{prompt}} {{condition}} {{history}}）',
                 el('textarea', {
                     class: 'dga-input',
