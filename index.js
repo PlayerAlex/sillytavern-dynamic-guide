@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.3.1
+     * 动态指导助手 v2.4
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容，
@@ -24,7 +24,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.3.1';
+    const VERSION = '2.4';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1432,6 +1432,31 @@
         return formatInjection(stage, activeAddons(context.parsed, index));
     }
 
+    // 聊天内注入的双通道。优先酒馆助手 injectPrompts（按聊天文件隔离、once 只发一次）；
+    // 接口缺失或调用抛错时，退回酒馆原生 setExtensionPrompt(IN_CHAT, 深度, 角色)——
+    // 这是几乎任何版本酒馆都有的老接口。两条通道共用同一个注入 id，清理时两边都清。
+    function injectViaChat(id, text, depth, role, key) {
+        const injectPrompts = api('injectPrompts', false);
+        if (injectPrompts) {
+            try {
+                injectPrompts([{ id, position: 'in_chat', depth, role, content: text, should_scan: false }], { once: true });
+                return 'helper';
+            } catch (error) {
+                reportOnce(`inject-error-${key}`, `酒馆助手注入接口报错，已改用酒馆原生注入：${error.message || String(error)}`);
+            }
+        }
+        const channel = extensionPromptChannel();
+        if (channel) {
+            // 原生 setExtensionPrompt 的角色参数：0=system 1=user 2=assistant
+            const roleCode = role === 'user' ? 1 : role === 'assistant' ? 2 : 0;
+            channel.set(id, text, channel.types.IN_CHAT, depth, false, roleCode);
+            reportOnce(`native-channel-${key}`, '当前酒馆助手没有可用的注入接口，指导已改走酒馆原生扩展提示（聊天内深度注入）。建议把酒馆助手更新到最新版。');
+            return 'native';
+        }
+        reportOnce(`no-channel-${key}`, '当前环境没有任何可用的注入通道（酒馆助手注入接口和酒馆原生扩展提示都拿不到），无法注入指导。请把酒馆和酒馆助手更新到最新版。');
+        return null;
+    }
+
     // 每次调用都真实地重新注入：先撤掉旧注入再按 id 注入新内容，once 模式下
     // 注入只对下一次请求生效，生成事件里会再次撤注，因此不会累积重复。
     function applyInjection(text, placement, key) {
@@ -1457,25 +1482,11 @@
             } else {
                 // 拿不到原生扩展提示接口时退化为聊天末尾，并说明原因
                 reportOnce(`anchor-unavailable-${key}`, '当前环境没有酒馆原生扩展提示接口，指导改放在聊天末尾（深度 0）。');
-                api('injectPrompts', true)([{
-                    id,
-                    position: 'in_chat',
-                    depth: 0,
-                    role: 'system',
-                    content: text,
-                    should_scan: false,
-                }], { once: true });
+                injectViaChat(id, text, 0, 'system', key);
             }
         } else {
             if (cache.channel === 'anchor') clearAnchorInjection(id);
-            api('injectPrompts', true)([{
-                id,
-                position: 'in_chat',
-                depth: spot.depth,
-                role: spot.role,
-                content: text,
-                should_scan: false,
-            }], { once: true });
+            injectViaChat(id, text, spot.depth, spot.role, key);
         }
         cache.text = text;
         cache.channel = spot.channel;
@@ -1529,6 +1540,85 @@
             applyInjection(injectionTextFor(context, generationType), injectionPlacement(context.entry), context.key);
         }
         clearStaleInjections(activeIds);
+    }
+
+    // 把整条注入链路逐项体检一遍：环境、接口、事件、绑定、双通道试注。
+    // 结果给面板上的「诊断」卡用，也挂在 publicApi 上方便排查。
+    async function collectDiagnostics() {
+        const rows = [];
+        const push = (label, ok, detail) => rows.push({ label, ok: Boolean(ok), detail: String(detail == null ? '' : detail) });
+        push('脚本实例', isCurrentInstance(), isCurrentInstance() ? `v${VERSION} 是当前实例` : '有另一个实例在运行，本实例已停用（可能重复启用了多个版本）');
+        push('酒馆助手本体', Boolean(helper), helper ? '已找到' : '没有找到 TavernHelper，脚本只有解析功能');
+        try {
+            const getVersion = api('getTavernHelperVersion', false);
+            if (getVersion) push('酒馆助手版本', true, String(await Promise.resolve(getVersion())));
+        } catch (error) {
+            push('酒馆助手版本', false, error.message || String(error));
+        }
+        ['getVariables', 'updateVariablesWith', 'getWorldbook', 'updateWorldbookWith', 'getWorldbookNames',
+            'getCharWorldbookNames', 'getCharData', 'injectPrompts', 'uninjectPrompts', 'eventOn', 'getLastMessageId']
+            .forEach(name => push(`接口 ${name}`, Boolean(api(name, false)), api(name, false) ? '可用' : '缺失'));
+        const eventsTable = apiValue('tavern_events');
+        push('事件表 tavern_events', Boolean(eventsTable), eventsTable ? '可用' : '缺失');
+        if (eventsTable) {
+            ['GENERATION_AFTER_COMMANDS', 'MESSAGE_RECEIVED', 'CHAT_CHANGED']
+                .forEach(name => push(`事件 ${name}`, Boolean(eventsTable[name]), String(eventsTable[name] || '缺失')));
+        }
+        const channel = extensionPromptChannel();
+        push('酒馆原生扩展提示', Boolean(channel), channel ? `可用（IN_CHAT=${channel.types.IN_CHAT}）` : '拿不到 SillyTavern 的 setExtensionPrompt');
+        try {
+            const config = await readConfig();
+            push('绑定数量', config.bindings.length > 0, `${config.bindings.length} 条`);
+            for (const binding of config.bindings) {
+                const label = `绑定「${binding.entryName || binding.worldbookName}」`;
+                try {
+                    const located = await locateEntry(binding);
+                    if (!located) {
+                        push(label, false, '找不到条目（可能被删或改名）');
+                        continue;
+                    }
+                    const parsed = parseOutline(located.entry.content || '');
+                    push(label, parsed.stages.length > 0,
+                        `${parsed.stages.length} 个阶段；条目${entryIsDisabled(located.entry) ? '已关闭' : '现在是打开的（生成前会自动关闭）'}`);
+                } catch (error) {
+                    push(label, false, error.message || String(error));
+                }
+            }
+        } catch (error) {
+            push('读取绑定列表', false, error.message || String(error));
+        }
+        const probeId = `${INJECTION_ID}-probe`;
+        try {
+            const injectPrompts = api('injectPrompts', false);
+            if (!injectPrompts) {
+                push('试注：酒馆助手通道', false, 'injectPrompts 缺失');
+            } else {
+                injectPrompts([{ id: probeId, position: 'in_chat', depth: 0, role: 'system', content: '诊断试注，立即撤回', should_scan: false }], { once: true });
+                const uninjectPrompts = api('uninjectPrompts', false);
+                if (uninjectPrompts) uninjectPrompts([probeId]);
+                push('试注：酒馆助手通道', true, '注入并撤回成功');
+            }
+        } catch (error) {
+            push('试注：酒馆助手通道', false, `调用报错：${error.message || String(error)}`);
+        }
+        try {
+            if (!channel) {
+                push('试注：酒馆原生通道', false, '拿不到 setExtensionPrompt');
+            } else {
+                channel.set(probeId, '诊断试注，立即撤回', channel.types.IN_CHAT, 0, false, 0);
+                channel.set(probeId, '', channel.types.NONE, 0);
+                push('试注：酒馆原生通道', true, '写入并清理成功');
+            }
+        } catch (error) {
+            push('试注：酒馆原生通道', false, `调用报错：${error.message || String(error)}`);
+        }
+        return rows;
+    }
+
+    function diagnosticsText(rows) {
+        const lines = [`动态指导助手 v${VERSION} 诊断报告`];
+        rows.forEach(row => lines.push(`${row.ok ? '✅' : '❌'} ${row.label}${row.detail ? `：${row.detail}` : ''}`));
+        return lines.join('\n');
     }
 
     async function moveToIndex(context, target, options) {
@@ -1717,6 +1807,7 @@
         snapshot: null,
         contextError: '',
         editor: null,
+        diagnosis: null,
     };
 
     function el(tag, attrs, ...children) {
@@ -1953,6 +2044,7 @@
             ...contexts.map(boundCard),
             contexts.length === 0 ? guideCard() : null,
             addCard(),
+            diagnosticsCard(),
         );
         return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
     }
@@ -2095,8 +2187,42 @@
             }),
         ));
         children.push(muted('添加后会关闭这个条目，AI 只能看到当前阶段的切片；想看回全文时点卡片上的“移出”就会重新打开。'));
-        children.push(btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }));
+        children.push(row(
+            btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }),
+            btn('诊断注入链路', () => runAction('诊断', async () => {
+                ui.diagnosis = await collectDiagnostics();
+            }), { ghost: true }),
+        ));
         return card('添加指导条目', ...children);
+    }
+
+    // 诊断卡：逐项体检注入链路，结果可以一键复制发给别人排查。
+    function diagnosticsCard() {
+        if (!ui.diagnosis) return null;
+        const rows = ui.diagnosis;
+        const failed = rows.filter(row => !row.ok).length;
+        return card('注入链路诊断',
+            muted(failed === 0
+                ? `${rows.length} 项全部通过。如果提示词查看器里还是看不到指导，把这份报告发给作者。`
+                : `${rows.length} 项里有 ${failed} 项不通过。把这份报告复制下来发给作者。`),
+            el('pre', { class: 'dga-diag' }, diagnosticsText(rows)),
+            btn('复制诊断报告', () => runAction('复制诊断报告', async () => {
+                const text = diagnosticsText(rows);
+                const nav = currentWindow.navigator;
+                if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+                    await nav.clipboard.writeText(text);
+                } else {
+                    const doc = hostDocument();
+                    const area = doc.createElement('textarea');
+                    area.value = text;
+                    doc.body.appendChild(area);
+                    area.select();
+                    doc.execCommand('copy');
+                    area.remove();
+                }
+                notify('诊断报告已复制', 'success');
+            }), { ghost: true }),
+        );
     }
 
     function guideCard() {
@@ -3165,6 +3291,7 @@ ${P} .dga-move-wrap { display: flex; flex-direction: column; gap: 3px; flex: 0 0
 ${P} .dga-move { width: 32px; min-height: 26px; padding: 0; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.18); background: rgba(255, 255, 255, 0.06); color: inherit; font: inherit; font-size: 0.82rem; line-height: 1; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-move:hover { background: rgba(255, 255, 255, 0.14); }
 ${P} .dga-move:disabled { opacity: 0.25; cursor: default; }
+${P} .dga-diag { margin: 0; padding: 10px 12px; max-height: 260px; overflow: auto; border-radius: 10px; background: rgba(0, 0, 0, 0.28); font-size: 0.78rem; line-height: 1.6; white-space: pre-wrap; word-break: break-all; user-select: text; }
 ${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 0.82rem; opacity: 0.6; }
 ${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 ${P} .dga-seg-btn { min-height: 40px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit; cursor: pointer; }
@@ -3401,6 +3528,7 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
         add: (worldbookName, entry, options) => addBinding(worldbookName, entry, options),
         unbind: (key, options) => unbindEntry(key, options),
         getCurrentSnapshot: loadContexts,
+        diagnose: collectDiagnostics,
     };
     currentWindow.DynamicGuideAssistantCore = publicApi;
 

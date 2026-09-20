@@ -258,6 +258,83 @@ test('dryRun 预组装（提示词查看器）也会注入当前指导', async (
     assert.deepEqual(run.errors, []);
 });
 
+// v2.4 双通道：酒馆助手注入接口缺失或报错时，退回酒馆原生 setExtensionPrompt(IN_CHAT)
+test('酒馆助手没有注入接口时，改走原生 IN_CHAT 深度注入', async () => {
+    const calls = [];
+    const sillyTavern = {
+        getContext: () => ({
+            setExtensionPrompt: (id, text, position, depth, scan, role) => calls.push({ id, text, position, depth, role }),
+        }),
+    };
+    const entry = {
+        uid: 1,
+        name: '大纲',
+        content: '## 第一幕\n原生通道正文',
+        enabled: false,
+        position: { type: 'at_depth', depth: 4, role: 'assistant' },
+    };
+    const { state, helper } = helperFor(entry);
+    delete helper.injectPrompts;
+    delete helper.uninjectPrompts;
+    const run = load(helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    assert.equal(state.injected.length, 0, '助手通道缺失时不走 injectPrompts');
+    const live = calls.filter(call => call.text);
+    assert.equal(live.length, 1, '原生通道要写一条注入');
+    assert.equal(live[0].position, 1, '原生聊天内注入对应 IN_CHAT=1');
+    assert.equal(live[0].depth, 4, '深度跟随条目');
+    assert.equal(live[0].role, 2, 'assistant 对应原生角色码 2');
+    assert.match(live[0].text, /原生通道正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('注入接口调用抛错时也退回原生通道', async () => {
+    const calls = [];
+    const sillyTavern = {
+        getContext: () => ({
+            setExtensionPrompt: (id, text, position, depth) => calls.push({ id, text, position, depth }),
+        }),
+    };
+    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n回退正文', enabled: false };
+    const { helper } = helperFor(entry);
+    helper.injectPrompts = () => { throw new Error('模拟注入接口报错'); };
+    const run = load(helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    const live = calls.filter(call => call.text);
+    assert.equal(live.length, 1, '接口报错后原生通道要接管');
+    assert.match(live[0].text, /回退正文/);
+    assert.match(run.logs.join('\n'), /改用酒馆原生注入/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('诊断：链路完好时全部通过，缺注入接口时明确标出', async () => {
+    const entry = { uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false };
+    const sillyTavern = {
+        getContext: () => ({
+            setExtensionPrompt: () => {},
+            extension_prompt_types: { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 },
+        }),
+    };
+    const good = helperFor(entry);
+    good.helper.getWorldbookNames = () => ['测试世界书'];
+    good.helper.getCharWorldbookNames = () => ['测试世界书'];
+    good.helper.getCharData = () => ({ name: '测试角色' });
+    good.helper.getLastMessageId = () => 0;
+    const run = load(good.helper, { SillyTavern: sillyTavern });
+    await new Promise(setImmediate);
+    const rows = plain(await run.core.diagnose());
+    const failed = rows.filter(row => !row.ok);
+    assert.deepEqual(failed.map(row => row.label), [], `全部应通过，未通过：${failed.map(row => row.label).join('、')}`);
+    const bad = helperFor(entry);
+    delete bad.helper.injectPrompts;
+    const runBad = load(bad.helper, { SillyTavern: sillyTavern });
+    const badRows = plain(await runBad.core.diagnose());
+    const probe = badRows.find(row => row.label === '试注：酒馆助手通道');
+    assert.equal(probe.ok, false, '缺 injectPrompts 时试注要标出');
+    assert.match(probe.detail, /缺失/);
+    assert.deepEqual(runBad.errors, []);
+});
+
 // 手机端回归：魔法棒菜单的触摸事件必须同步显示整屏管理页。
 function element(tag, registry) {
     const node = {
