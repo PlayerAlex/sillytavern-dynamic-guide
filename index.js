@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.11.1
+     * 动态指导助手 v2.11.2
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -26,7 +26,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.11.1';
+    const VERSION = '2.11.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1347,6 +1347,8 @@
         }
         // 裁判提示词段（v2.11.1）：必须是 [{role: system|user|assistant, content: string}]；
         // 非法项丢弃，整列非法时删字段回落默认段。旧 judgePrompt 单模板在组装时仍兼容。
+        // v2.11.2 起取消「最终提示词注入」，清除该字段。
+        delete settings.judgeFinalPrompt;
         if (settings.judgeSegments != null) {
             if (!Array.isArray(settings.judgeSegments)) {
                 delete settings.judgeSegments;
@@ -1360,9 +1362,6 @@
                 if (cleaned.length) settings.judgeSegments = cleaned;
                 else delete settings.judgeSegments;
             }
-        }
-        if (settings.judgeFinalPrompt != null && typeof settings.judgeFinalPrompt !== 'string') {
-            settings.judgeFinalPrompt = String(settings.judgeFinalPrompt);
         }
         // 裁判选用的本地 API 预设名；空字符串 = 使用酒馆当前 API。
         if (settings.judgePreset != null && typeof settings.judgePreset !== 'string') settings.judgePreset = String(settings.judgePreset);
@@ -2145,17 +2144,17 @@
     }
 
     // 后台裁判（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
-    // 提示词在设置里按「段」自定义（每段可选 system/user/assistant 角色 + 最终提示词注入，
-    // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符）；
+    // 提示词在二级页面按「段」自定义（每段可选 system/user/assistant 角色，
+    // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符，可导入导出/恢复默认）；
     // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
     //   酒馆主 API → 酒馆助手 generateRaw；酒馆预设 → ConnectionManagerRequestService；
     //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
     // running 集合防止同一绑定并发裁判；裁判结果一律只信一次，失败不重试。
     const judgeState = { running: new Set() };
 
-    // 后台裁判提示词：抄数据库（shujuku）剧情推进页的「提示词段」结构——
-    // 每段可选 system / user / assistant 角色，段列表后再追加一条「最终提示词注入」。
-    // 默认模板用数据库填表格式：标签化输出契约 + assistant 预确认段 + 【】分区上下文，
+    // 后台裁判提示词：抄数据库（shujuku）剧情推进页的「提示词段」结构，每段可选
+    // system / user / assistant 角色。默认模板用数据库填表格式：标签化输出契约 +
+    // assistant 预确认段 + 【】分区上下文（判断规则直接写在上下文段末尾），
     // 面向低智力模型——句子短、规则只有三条、结论写进 <结论> 标签，拿不准就 NO。
     const DEFAULT_JUDGE_SYSTEM_PROMPT = [
         '你是剧情进度裁判，只负责判断当前剧情阶段有没有演完。',
@@ -2181,17 +2180,15 @@
                 '',
                 '【最近演到哪了】',
                 '{{history}}',
+                '',
+                '判断规则：',
+                '1. 只看「最近演到哪了」，不要脑补里面没写的事。',
+                '2. 完成条件里写的事，在剧情里真实演过了，才算完成。',
+                '3. 没演到、只演了一半、或者你不确定，都算没完成。',
+                '现在填表：当前阶段演完了吗？',
             ].join('\n'),
         },
     ];
-
-    const DEFAULT_JUDGE_FINAL_PROMPT = [
-        '判断规则：',
-        '1. 只看「最近演到哪了」，不要脑补里面没写的事。',
-        '2. 完成条件里写的事，在剧情里真实演过了，才算完成。',
-        '3. 没演到、只演了一半、或者你不确定，都算没完成。',
-        '现在填表：当前阶段演完了吗？',
-    ].join('\n');
 
     const JUDGE_SEGMENT_ROLES = ['system', 'user', 'assistant'];
 
@@ -2203,34 +2200,24 @@
             .replace(/\{\{\s*history\s*\}\}/g, history);
     }
 
-    // 兼容旧版：settings.judgePrompt 单模板字符串仍然生效（相当于 system 段 + 单个 user 段，无最终注入）；
-    // 一旦保存过 judgeSegments 就改用段列表。judgeFinalPrompt 留空时用默认最终注入。
+    // 兼容旧版：settings.judgePrompt 单模板字符串仍然生效（相当于 system 段 + 单个 user 段）；
+    // 一旦保存过 judgeSegments 就改用段列表。judgeSegments 为空/未设时用默认段。
     function judgeMessageSpecs(settings) {
         const legacy = settings && typeof settings.judgePrompt === 'string' ? settings.judgePrompt.trim() : '';
         if (legacy && !Array.isArray(settings.judgeSegments)) {
-            return {
-                segments: [{ role: 'system', content: DEFAULT_JUDGE_SYSTEM_PROMPT }, { role: 'user', content: settings.judgePrompt }],
-                finalPrompt: '',
-            };
+            return [{ role: 'system', content: DEFAULT_JUDGE_SYSTEM_PROMPT }, { role: 'user', content: settings.judgePrompt }];
         }
-        const segments = Array.isArray(settings && settings.judgeSegments) && settings.judgeSegments.length
+        return Array.isArray(settings && settings.judgeSegments) && settings.judgeSegments.length
             ? settings.judgeSegments : DEFAULT_JUDGE_SEGMENTS;
-        const finalPrompt = settings && typeof settings.judgeFinalPrompt === 'string' && settings.judgeFinalPrompt.trim()
-            ? settings.judgeFinalPrompt : DEFAULT_JUDGE_FINAL_PROMPT;
-        return { segments, finalPrompt };
     }
 
-    // 组装裁判消息：逐段替换占位符；空内容段丢弃；最后追加「最终提示词注入」（user 角色）。
+    // 组装裁判消息：逐段替换占位符；空内容段丢弃。
     function judgeMessagesFor(settings, stage, condition, history) {
-        const specs = judgeMessageSpecs(settings);
-        const messages = specs.segments
+        const messages = judgeMessageSpecs(settings)
             .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role) && typeof seg.content === 'string' && seg.content.trim())
             .map(seg => ({ role: seg.role, content: fillJudgePlaceholders(seg.content, stage, condition, history) }));
-        if (typeof specs.finalPrompt === 'string' && specs.finalPrompt.trim()) {
-            messages.push({ role: 'user', content: fillJudgePlaceholders(specs.finalPrompt, stage, condition, history) });
-        }
         if (!messages.length) {
-            messages.push({ role: 'user', content: fillJudgePlaceholders(DEFAULT_JUDGE_FINAL_PROMPT, stage, condition, history) });
+            messages.push({ role: 'user', content: fillJudgePlaceholders('当前阶段「{{stage}}」演完了吗？演完了回答 YES，没演完回答 NO。', stage, condition, history) });
         }
         return messages;
     }
@@ -2460,6 +2447,9 @@
         apiModelStatus: 'idle',
         apiModelError: '',
         apiTavernProfiles: [],
+        // 裁判提示词二级页草稿态（draft/snapshot 脏检查，对齐 shujuku 提示词抽屉）
+        judgePromptDraft: null,
+        judgePromptDraftSnapshot: '',
     };
 
     function el(tag, attrs, ...children) {
@@ -2594,7 +2584,7 @@
         const shell = panel.querySelector('.dga-shell');
         const oldBody = shell.querySelector('.dga-body');
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
-        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : renderManager())));
+        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : renderManager()))));
         shell.classList.toggle('dga-busy', ui.busy);
         const body = shell.querySelector('.dga-body');
         if (body) body.scrollTop = scrollTop;
@@ -3029,39 +3019,41 @@
         ];
     }
 
-    // 裁判提示词段编辑器：仿数据库（shujuku）剧情推进页的提示词段列表——
-    // 每段可选 system / user / assistant 角色，支持上移/下移/删除与首尾插入，
-    // 段列表后加一条「最终提示词注入」。旧版 judgePrompt 单模板仍生效，任何改动自动转成段。
-    function judgePromptEditor(settings, saveSettings) {
-        const legacy = typeof settings.judgePrompt === 'string' ? settings.judgePrompt.trim() : '';
-        const useLegacy = Boolean(legacy) && !Array.isArray(settings.judgeSegments);
-        const specs = judgeMessageSpecs(settings);
-        // 编辑基于「当前生效的段」；任何改动都会先把生效段物化进设置再改。
-        const segments = specs.segments.map(seg => ({ role: seg.role, content: seg.content }));
+    // 裁判提示词二级页（从管理页设置卡「裁判提示词…」进入）：仿数据库剧情推进页的
+    // 提示词段编辑 + 提示词抽屉的草稿/保存语义——编辑只改草稿，点「保存」才写入设置；
+    // 支持一键导入/导出 JSON、放弃修改与恢复默认。旧版 judgePrompt 单模板仍生效，
+    // 在本页保存一次即自动转成段结构。
+    function syncJudgePromptDraft() {
+        const config = ui.snapshot ? ui.snapshot.config : null;
+        const settings = config && config.settings ? config.settings : {};
+        const segments = judgeMessageSpecs(settings).map(seg => ({ role: seg.role, content: seg.content }));
+        ui.judgePromptDraft = { segments };
+        ui.judgePromptDraftSnapshot = JSON.stringify(ui.judgePromptDraft);
+    }
+
+    function renderJudgePromptPage() {
+        if (!ui.judgePromptDraft) syncJudgePromptDraft();
+        const config = ui.snapshot ? ui.snapshot.config : null;
+        const settings = config && config.settings ? config.settings : {};
+        const useLegacy = Boolean(typeof settings.judgePrompt === 'string' && settings.judgePrompt.trim())
+            && !Array.isArray(settings.judgeSegments);
+        const draft = ui.judgePromptDraft;
+        const segments = draft.segments;
+        const dirty = JSON.stringify(draft) !== ui.judgePromptDraftSnapshot;
         const roleOptions = JUDGE_SEGMENT_ROLES.map(role => ({ value: role, label: role.toUpperCase() }));
-        const commit = (nextSegments, nextFinal, success) => saveSettings({
-            judgeSegments: nextSegments,
-            judgeFinalPrompt: nextFinal != null ? nextFinal : (settings.judgeFinalPrompt || ''),
-            judgePrompt: '',
-        }, success);
-        const patchAt = (index, patch, success) => {
-            const next = segments.map((seg, i) => (i === index ? { ...seg, ...patch } : { ...seg }));
-            commit(next, null, success || '裁判提示词已保存');
-        };
+        const touch = () => render();
+        const patchAt = (index, patch) => { segments[index] = { ...segments[index], ...patch }; };
         const moveAt = (index, delta) => {
             const target = index + delta;
             if (target < 0 || target >= segments.length) return;
-            const next = segments.map(seg => ({ ...seg }));
-            const [item] = next.splice(index, 1);
-            next.splice(target, 0, item);
-            commit(next, null, '提示词段顺序已保存');
+            const [item] = segments.splice(index, 1);
+            segments.splice(target, 0, item);
+            touch();
         };
-        const removeAt = index => commit(segments.filter((_, i) => i !== index), null, '提示词段已删除');
         const insertAt = position => {
-            const next = segments.map(seg => ({ ...seg }));
             const seg = { role: 'user', content: '' };
-            if (position === 'top') next.unshift(seg); else next.push(seg);
-            commit(next, null, '提示词段已插入');
+            if (position === 'top') segments.unshift(seg); else segments.push(seg);
+            touch();
         };
         const iconBtn = (label, title, onclick, options) => el('button', {
             type: 'button',
@@ -3073,31 +3065,97 @@
         const items = segments.map((seg, index) => el('div', { class: 'dga-pseg' },
             el('div', { class: 'dga-pseg-head' },
                 el('span', { class: 'dga-pseg-index', text: `#${index + 1}` }),
-                selectControl(roleOptions, seg.role, value => patchAt(index, { role: value })),
+                selectControl(roleOptions, seg.role, value => { patchAt(index, { role: value }); touch(); }),
                 el('div', { class: 'dga-pseg-actions' },
                     iconBtn('↑', index === 0 ? '已经是第一段' : '上移该段', () => moveAt(index, -1), { disabled: index === 0 }),
                     iconBtn('↓', index === segments.length - 1 ? '已经是最后一段' : '下移该段', () => moveAt(index, 1), { disabled: index === segments.length - 1 }),
-                    iconBtn('✕', '删除该段', () => removeAt(index), { danger: true }))),
+                    iconBtn('✕', '删除该段', () => { segments.splice(index, 1); touch(); }, { danger: true }))),
             el('textarea', {
                 class: 'dga-input', rows: 4, placeholder: '提示词内容…支持 {{stage}} {{prompt}} {{condition}} {{history}} 占位符',
                 text: seg.content,
-                onchange: event => patchAt(index, { content: event.target.value }),
+                onchange: event => { patchAt(index, { content: event.target.value }); touch(); },
             })));
-        return card('裁判提示词',
-            useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在使用旧版自定义提问（按 system + 单个 user 段生效）。下面任何改动都会自动转成提示词段，旧模板内容已放进 user 段。') : null,
-            el('div', { class: 'dga-pseg-add' }, btn('＋ 在最上方插入', () => insertAt('top'), { ghost: true })),
-            ...items,
-            el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
-            field('最终提示词注入（最后追加的一条 user 消息）',
-                el('textarea', {
-                    class: 'dga-input', rows: 4,
-                    placeholder: DEFAULT_JUDGE_FINAL_PROMPT,
-                    text: settings.judgeFinalPrompt || '',
-                    onchange: event => commit(segments, event.target.value, '最终提示词注入已保存'),
-                }),
-                '留空用默认注入；占位符同样可用。裁判结论优先读 <结论> 标签，没有标签时看回答开头是不是 YES。'),
-            btn('恢复默认提示词', () => commit(DEFAULT_JUDGE_SEGMENTS.map(seg => ({ ...seg })), '', '已恢复默认裁判提示词'), { ghost: true }),
-        );
+
+        const saveDraft = () => runAction('保存裁判提示词', async () => {
+            const fresh = await readConfig();
+            fresh.settings = { ...(fresh.settings || {}) };
+            fresh.settings.judgeSegments = draft.segments
+                .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role))
+                .map(seg => ({ role: seg.role, content: String(seg.content || '') }));
+            fresh.settings.judgePrompt = '';
+            delete fresh.settings.judgeFinalPrompt;
+            await writeConfig(fresh);
+            ui.judgePromptDraftSnapshot = JSON.stringify(ui.judgePromptDraft);
+            return true;
+        }, { success: '裁判提示词已保存' });
+
+        const importInput = el('input', {
+            type: 'file', accept: '.json,application/json', style: 'display:none',
+            onchange: async event => {
+                const input = event.target;
+                const file = input.files && input.files[0];
+                input.value = '';
+                if (!file) return;
+                try {
+                    const parsed = JSON.parse(await file.text());
+                    const list = Array.isArray(parsed) ? parsed : (parsed && parsed.segments);
+                    if (!Array.isArray(list)) throw new Error('文件里没有提示词段列表（segments）。');
+                    const cleaned = list
+                        .filter(seg => seg && typeof seg === 'object')
+                        .map(seg => ({
+                            role: JUDGE_SEGMENT_ROLES.includes(seg.role) ? seg.role : 'user',
+                            content: seg.content != null ? String(seg.content) : '',
+                        }));
+                    if (!cleaned.length) throw new Error('文件里没有可用的提示词段。');
+                    draft.segments = cleaned;
+                    setMessage(`已导入 ${cleaned.length} 个提示词段；点「保存」后生效。`, 'success');
+                    render();
+                } catch (error) {
+                    setMessage(`导入裁判提示词失败：${error.message || error}`, 'error');
+                    render();
+                }
+            },
+        });
+        const exportBtn = btn('导出', () => {
+            const win = hostWindow();
+            const payload = { type: 'dynamic-guide-judge-prompt', version: 1, segments: draft.segments };
+            const blob = new win.Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+            const url = win.URL.createObjectURL(blob);
+            const link = el('a', { href: url, download: '动态指导助手-裁判提示词.json' });
+            hostDocument().body.appendChild(link);
+            link.click();
+            link.remove();
+            win.setTimeout(() => win.URL.revokeObjectURL(url), 1000);
+            setMessage('已导出当前草稿的提示词段。', 'success');
+        }, { ghost: true });
+
+        const back = () => { ui.view = 'manager'; ui.judgePromptDraft = null; render(); };
+        return [
+            header('裁判提示词', '后台裁判 · 提示词段', back, '返回'),
+            el('div', { class: 'dga-body' },
+                messageBar(),
+                muted('每段可选 SYSTEM / USER / ASSISTANT 角色，按顺序发给裁判模型；占位符 {{stage}} {{prompt}} {{condition}} {{history}} 在每段里都可用。裁判结论优先读 <结论> 标签，模型没按格式输出时看回答开头是不是 YES。'),
+                useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在使用旧版自定义提问（按 system + 单个 user 段生效）。在本页点「保存」会自动转成提示词段，旧模板内容已放进 user 段。') : null,
+                card('提示词段',
+                    el('div', { class: 'dga-pseg-add' }, btn('＋ 在最上方插入', () => insertAt('top'), { ghost: true })),
+                    ...items,
+                    segments.length === 0 ? muted('暂无提示词段。用上方按钮添加，或点「恢复默认提示词」。') : null,
+                    el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
+                ),
+                el('div', { class: 'dga-api-actions' },
+                    btn('导入', () => importInput.click(), { ghost: true }),
+                    exportBtn,
+                    btn('恢复默认提示词', () => {
+                        draft.segments = DEFAULT_JUDGE_SEGMENTS.map(seg => ({ ...seg }));
+                        setMessage('已载入内置默认提示词；点「保存」后生效。', 'info');
+                        render();
+                    }, { ghost: true }),
+                    btn('放弃修改', () => { syncJudgePromptDraft(); render(); }, { ghost: true, disabled: !dirty }),
+                    btn('保存', saveDraft, { primary: true, disabled: !dirty }),
+                ),
+                importInput,
+            ),
+        ];
     }
 
     // 全局「自动推进」三档设置。marker / judge 改变镜像里是否附通用判断指令，切换后必须重同步镜像。
@@ -3126,7 +3184,9 @@
             mode === 'judge' && presetList.length === 0
                 ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
                 : null,
-            mode === 'judge' ? judgePromptEditor(settings, saveSettings) : null,
+            mode === 'judge' ? el('div', { class: 'dga-inline-action' },
+                btn('裁判提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
+                el('span', { class: 'dga-muted', text: '提示词段（system/user/assistant）、导入导出与恢复默认在独立页面里。' })) : null,
             muted('手动推进：只有写了「完成：」条件的阶段会自动进入下一段；标记判断：正文 AI 自己判断时机；后台裁判：通过酒馆助手 generateRaw 静默判定，可使用本机独立 API 预设。单个阶段写「完成：自动」可跨档位开启 AI 判断。'),
         );
     }

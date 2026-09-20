@@ -1191,13 +1191,13 @@ test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进'
     assert.equal(verdicts[0].should_silence, true, '裁判请求必须静默');
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'assistant', 'user', 'user_input'], '默认段列表要按 系统/预确认/上下文/最终注入 顺序映射');
+        ['system', 'assistant', 'user_input'], '默认段列表要按 系统/预确认/上下文 顺序映射');
     assert.match(ordered[0].content, /<结论>YES 或 NO<\/结论>/, '系统段要给出填表标签输出契约');
     assert.match(ordered[1].content, /收到/, '第二段是 assistant 预确认（抄数据库 ACK 段）');
-    assert.match(ordered[2].content, /【当前阶段】\n甲一/, '上下文段要带阶段名');
-    assert.match(ordered[2].content, /甲一正文/, '上下文段要带阶段正文');
-    assert.match(ordered[2].content, /这一轮的回复/, '上下文段要带最近剧情');
-    assert.match(String(verdicts[0].user_input), /现在填表/, '最终提示词注入要作为 user_input');
+    assert.match(String(verdicts[0].user_input), /【当前阶段】\n甲一/, '上下文段要带阶段名');
+    assert.match(String(verdicts[0].user_input), /甲一正文/, '上下文段要带阶段正文');
+    assert.match(String(verdicts[0].user_input), /这一轮的回复/, '上下文段要带最近剧情');
+    assert.match(String(verdicts[0].user_input), /现在填表/, '判断规则收尾在上下文段末尾（无独立最终注入）');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
     await state.events.get('message_received')(5);
@@ -1245,7 +1245,7 @@ test('后台裁判档：标签里 NO 不推进，即使正文提到 YES', async 
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：自定义提示词段与最终注入按序组装并替换占位符', async () => {
+test('后台裁判档：自定义提示词段按序组装并替换占位符', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1254,10 +1254,10 @@ test('后台裁判档：自定义提示词段与最终注入按序组装并替�
         settings: {
             autoAdvance: 'judge',
             judgeSegments: [
-                { role: 'user', content: '阶段={{stage}} 条件={{condition}}' },
+                { role: 'system', content: '规则：只判断 {{stage}}' },
                 { role: 'assistant', content: '明白，只看 {{history}}' },
+                { role: 'user', content: '阶段={{stage}} 条件={{condition}}' },
             ],
-            judgeFinalPrompt: '收尾一问：{{stage}} 完了吗？',
         },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
@@ -1270,10 +1270,10 @@ test('后台裁判档：自定义提示词段与最终注入按序组装并替�
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1);
     const ordered = verdicts[0].ordered_prompts;
-    assert.deepEqual(ordered.map(item => (typeof item === 'string' ? item : item.role)), ['user', 'assistant', 'user_input']);
-    assert.match(ordered[0].content, /^阶段=甲一 条件=没有写完成条件/, '段里占位符要替换');
+    assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))), ['system', 'assistant', 'user_input']);
+    assert.match(ordered[0].content, /^规则：只判断 甲一$/, 'system 段里占位符要替换');
     assert.match(ordered[1].content, /这一轮的回复/, 'assistant 段里的 {{history}} 也要替换');
-    assert.equal(verdicts[0].user_input, '收尾一问：甲一 完了吗？', '自定义最终注入要作为 user_input');
+    assert.equal(verdicts[0].user_input, '阶段=甲一 条件=没有写完成条件：本阶段要演的内容都演完、剧情自然该往下走了，就算完成。', '最后一条 user 段作为 user_input');
     assert.deepEqual(run.errors, []);
 });
 
@@ -1387,8 +1387,8 @@ test('后台裁判档：酒馆预设连接走酒馆连接管理器', async () =>
     assert.equal(cmCalls[0].messages[1].role, 'assistant', '第二段是 assistant 预确认');
     assert.equal(cmCalls[0].messages[2].role, 'user');
     assert.match(cmCalls[0].messages[2].content, /这一轮的回复/);
-    assert.equal(cmCalls[0].messages[3].role, 'user', '最终提示词注入是最后一条 user 消息');
-    assert.match(cmCalls[0].messages[3].content, /现在填表/);
+    assert.match(cmCalls[0].messages[2].content, /现在填表/, '判断规则收尾在上下文段末尾');
+    assert.equal(cmCalls[0].messages.length, 3, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
@@ -1437,7 +1437,7 @@ test('后台裁判档：自定义 API 预设直连酒馆后端 generate 端点',
     assert.equal(body.messages[0].role, 'system');
     assert.equal(body.messages[1].role, 'assistant', '第二段是 assistant 预确认');
     assert.match(body.messages[2].content, /这一轮的回复/);
-    assert.equal(body.messages[3].role, 'user', '最终提示词注入是最后一条 user 消息');
+    assert.equal(body.messages.length, 3, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
 });
