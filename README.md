@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.10.1**（发布标签：`v2.10.1`）
+当前版本：**v2.11**（发布标签：`v2.11`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点“移出”就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.10.1 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.10.1)下载导入文件：
+在 [v2.11 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.11)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.10.1/dynamic-guide-offline-v2.10.1.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.10.1/dynamic-guide-online-v2.10.1.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.10.1/dynamic-guide-regex-marker-hide-v2.10.1.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.11/dynamic-guide-offline-v2.11.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.11/dynamic-guide-online-v2.11.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.11/dynamic-guide-regex-marker-hide-v2.11.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.10.1/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.11/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.10.1`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.11`。
 
 ## v2.0 文本格式
 
@@ -166,11 +166,22 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 - 自动推进后立即重新生成该条回复时，脚本会尝试仍使用推进前的阶段。管理页随时可以手动调整每条绑定的进度。
 - 全部阶段完成后这条绑定不再显示任何指导（镜像会被移除），包括附加与常驻内容；可以点“上一段”或“回到第一段”恢复。
 - 「自动推进」是全局三档设置（管理页顶部设置卡），对没有写 `完成：` 条件的阶段生效：**手动推进**（默认）只能手动点“下一段”；**标记判断**在镜像末尾附一段通用判断指令和隐藏标记，由正文 AI 自己决定时机，不额外花请求；**后台裁判**在每条 AI 回复后用 `generateRaw` 静默判定，回答 YES 才推进，每条回复多花一次小请求。单个阶段写 `完成：自动` 可跨档位单独开启 AI 判断；裁判期间如果进度已被标记或手动推进、或来了新回复，这次判定会被放弃。
-- 后台裁判可以使用动态指导助手自己管理的 API 预设：点左上角目录按钮进入「API」页，连接方式三选（酒馆当前 API / 自定义 / 酒馆连接预设），自定义时再选接口协议四选（兼容 OpenAI / OpenAI Responses / Claude Messages / Gemini Interactions），填写端点 URL、API Key、模型名（可拉取模型列表）、最大输出 tokens 和温度。完整预设只保存在当前浏览器的 `localStorage`；角色变量只记当前选中的预设名，因此 Key 不随角色卡导出。`localStorage` 是本机明文存储，使用共享设备时不要保存敏感 Key。
+- 后台裁判可以使用动态指导助手自己管理的 API 预设：点左上角目录按钮进入「API」页，连接方式三选（酒馆主 API / 自定义 / 酒馆预设——分别走酒馆当前主接口、直连酒馆后端转发、酒馆连接管理器中的预设）。自定义时再选接口协议四选（兼容 OpenAI / OpenAI Responses / Claude Messages / Gemini Interactions），填写端点 URL、API Key、模型名（点「加载模型」由酒馆服务器代发拉取，新建预设不用先保存）、最大回复长度和温度，并可设置附加主体参数、排除主体参数、提示词后处理、附加请求标头等高级参数。完整预设只保存在当前浏览器的 `localStorage`；角色变量只记当前选中的预设名，因此 Key 不随角色卡导出。`localStorage` 是本机明文存储，使用共享设备时不要保存敏感 Key。
 
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.11（2026-09-21）
+
+- **API 页整体复刻数据库（shujuku）新版 ApiConfigPanel**：预设选择行（下拉 + ＋新建 + ✕删除图标按钮）、草稿/快照脏检查（「放弃修改」「保存并选中预设 / 保存当前预设」未改动时不可点）、连接方式改为三段开关（酒馆主 API / 自定义 / 酒馆预设）、字段说明文字与数据库一致。
+- **补齐数据库 API 页的全部可设参数**：自定义连接新增「附加主体参数」（custom_include_body，YAML）、「排除主体参数」（custom_exclude_body）、「提示词后处理」（八档，含「未选择」原样透传）、「附加请求标头」（每行一个 Header: Value）；「最大回复长度 / 温度」改两列布局。
+- **接口全部改走酒馆**（与数据库同一套通道）：「加载模型」改为 POST 酒馆后端 `/api/backends/chat-completions/status`，由酒馆服务器代发（行为同酒馆「测试连接」，无浏览器跨域问题）；按钮在自定义连接下始终可点，直接用当前表单里的端点与密钥，**新建预设不用先保存**。修复 v2.10 填了 URL 和密钥仍点不了/拉了没反应的问题。
+- **裁判调用按连接方式分流**：酒馆主 API 走酒馆助手 `generateRaw`；酒馆预设走酒馆连接管理器 `ConnectionManagerRequestService.sendRequest`（不再用 generateRaw 的 proxy_preset）；自定义改为直连酒馆后端 `/api/backends/chat-completions/generate`，请求体复刻数据库的构建方式（协议四选映射：Claude/Gemini 走酒馆原生协议源并自动补 /v1 或剥版本段，OpenAI Responses 回退兼容 OpenAI），四个高级参数真实生效。
+- **酒馆预设改为下拉选择**：选项实时读自酒馆连接管理器的 profiles，附「刷新列表」按钮；不再手填预设名。
+- **目录抽屉美化**：复刻数据库 Sidebar——品牌区（方块标 + 名称 + 版本副标）、组标题、整宽导航项、当前页主题色高亮、滑入动画（此前抽屉只有骨架、完全没有样式）。
+- 命名统一：界面与提示中的「裁判 API 预设」统一改称「API 预设」。
+- **迁移注意**：v2.9 及以前存过「酒馆代理预设」的老预设，连接方式会迁移为「酒馆预设」，但代理预设名与连接管理器 profile id 不一定对得上，请在 API 页重新从下拉里选一次。
 
 ### v2.10.1（2026-09-21）
 

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.10.1
+     * 动态指导助手 v2.11
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -18,7 +18,7 @@
      * 数据分三类存储：
      *   - 阶段结构就是世界书条目正文本身，用标题行（## 名称）分段。
      *   - 绑定列表存在角色变量里；每个绑定的进度按绑定分开存在聊天变量里。
-     *   - 裁判 API 预设存在当前浏览器 localStorage，不随角色卡导出。
+     *   - API 预设存在当前浏览器 localStorage，不随角色卡导出。
      * ================================================================ */
 
     // ---------------------------------------------------------------
@@ -26,7 +26,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.10.1';
+    const VERSION = '2.11';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -986,6 +986,16 @@
     // 因此预设实体只存在当前浏览器同源 localStorage；角色 config 只保存当前选择名。
     // ---------------------------------------------------------------
 
+    // 提示词后处理（对齐 shujuku 与酒馆「提示词后处理」下拉）：'' = 未选择（不带该字段原样透传）；
+    // 缺失/非法值归一为 'strict'（与历史写死 strict 的行为兼容）。
+    const PROMPT_POST_PROCESSING_VALUES = ['', 'merge', 'semi', 'strict', 'single', 'merge_tools', 'semi_tools', 'strict_tools'];
+    function normalizePromptPostProcessing(value) {
+        if (typeof value !== 'string') return 'strict';
+        const normalized = value.trim();
+        if (normalized === '') return '';
+        return PROMPT_POST_PROCESSING_VALUES.includes(normalized) ? normalized : 'strict';
+    }
+
     function normalizeJudgeApiPreset(raw) {
         const item = raw && typeof raw === 'object' ? raw : {};
         const name = String(item.name || '').trim();
@@ -1016,7 +1026,7 @@
             bodyParams: connection === 'custom' ? String(item.bodyParams || '') : '',
             excludeBodyParams: connection === 'custom' ? String(item.excludeBodyParams || '') : '',
             requestHeaders: connection === 'custom' ? String(item.requestHeaders || '') : '',
-            promptPostProcessing: connection === 'custom' ? String(item.promptPostProcessing || 'strict') : '',
+            promptPostProcessing: connection === 'custom' ? normalizePromptPostProcessing(item.promptPostProcessing) : '',
             tavernProfile: connection === 'tavern'
                 ? String(item.tavernProfile || item.proxyPreset || '').trim()
                 : '',
@@ -1071,27 +1081,184 @@
         return readJudgeApiPresets().find(item => item.name === wanted) || null;
     }
 
-    function customApiForJudgePreset(preset) {
-        if (!preset || preset.connection === 'main') return null;
-        const custom = {};
-        if (preset.connection === 'tavern') {
-            custom.proxy_preset = preset.tavernProfile;
-        } else if (preset.connection === 'custom') {
-            custom.apiurl = preset.apiurl;
-            if (preset.key) custom.key = preset.key;
-            const sourceByFormat = {
-                openai_compat: 'custom',
-                openai_responses: 'custom',
-                claude_messages: 'claude',
-                gemini_interactions: 'makersuite',
-            };
-            custom.source = sourceByFormat[preset.customApiFormat] || 'custom';
-            if (preset.promptPostProcessing) custom.custom_prompt_post_processing = preset.promptPostProcessing;
+    // 排除主体参数归一化（复刻 shujuku normalizeExcludeBodyParamsForSillyTavern_ACU）：
+    // 逗号/换行分隔的键名列表转成 YAML 序列；已是 YAML（- 开头 / [ / {）则原样透传。
+    function normalizeExcludeBodyParams(raw) {
+        if (typeof raw !== 'string') return '';
+        const trimmed = raw.trim();
+        if (!trimmed) return '';
+        if (trimmed.startsWith('- ') || trimmed.startsWith('[') || trimmed.startsWith('{')) return trimmed;
+        return trimmed.split(/[,\n]/).map(item => item.trim()).filter(Boolean).map(key => `- ${key}`).join('\n');
+    }
+
+    // 原版酒馆原生协议源的 reverse_proxy 基址归一化（复刻 shujuku normalizeSTNativeProxyBase_ACU）：
+    // - claude 源后端 fetch(基址 + '/messages')：基址须含 /v1；
+    // - makersuite 源后端自补 /v1beta：基址不得带版本段。
+    function normalizeNativeProxyBase(rawUrl, nativeSource) {
+        let base = String(rawUrl || '').trim().replace(/\/+$/, '');
+        if (!base) return '';
+        for (const suffix of ['/chat/completions', '/messages', '/responses', '/interactions']) {
+            if (base.endsWith(suffix)) { base = base.slice(0, -suffix.length).replace(/\/+$/, ''); break; }
         }
-        if (preset.model) custom.model = preset.model;
-        if (preset.maxTokens != null) custom.max_tokens = preset.maxTokens;
-        if (preset.temperature != null) custom.temperature = preset.temperature;
-        return custom;
+        if (nativeSource === 'claude') {
+            if (base.endsWith('/v1beta')) base = base.slice(0, -'/v1beta'.length).replace(/\/+$/, '');
+            if (!base.endsWith('/v1')) return `${base}/v1`;
+            return base;
+        }
+        for (const suffix of ['/v1beta', '/v1']) {
+            if (base.endsWith(suffix)) { base = base.slice(0, -suffix.length).replace(/\/+$/, ''); break; }
+        }
+        return base;
+    }
+
+    // 自定义连接的裁判请求体（复刻 shujuku buildCustomApiRequestBody_ACU 的非流式形态）。
+    // 接口协议映射原版酒馆：claude_messages→claude、gemini_interactions→makersuite（原生协议源），
+    // openai_compat / openai_responses→custom（ST 无 Responses 后端，回退 /chat/completions）。
+    function buildJudgeCustomRequestBody(messages, preset) {
+        const sourceByFormat = {
+            openai_compat: 'custom',
+            openai_responses: 'custom',
+            claude_messages: 'claude',
+            gemini_interactions: 'makersuite',
+        };
+        const chatCompletionSource = sourceByFormat[preset.customApiFormat] || 'custom';
+        const nativeSource = chatCompletionSource !== 'custom' ? chatCompletionSource : null;
+        let headers = preset.key ? `Authorization: Bearer ${preset.key}` : '';
+        const extraHeaders = String(preset.requestHeaders || '').trim();
+        if (extraHeaders) headers = headers ? `${headers}\n${extraHeaders}` : extraHeaders;
+        const body = {
+            messages: (Array.isArray(messages) ? messages : []).map(message =>
+                message && typeof message === 'object' && !Array.isArray(message) && typeof message.role === 'string'
+                    ? { ...message, role: message.role.toLowerCase() }
+                    : message),
+            model: String(preset.model || '').replace(/^models\//, ''),
+            max_tokens: preset.maxTokens != null ? preset.maxTokens : 512,
+            temperature: preset.temperature != null ? preset.temperature : 1,
+            stream: false,
+            chat_completion_source: chatCompletionSource,
+            group_names: [],
+            include_reasoning: false,
+            reasoning_effort: 'medium',
+            enable_web_search: false,
+            request_images: false,
+            reverse_proxy: nativeSource ? normalizeNativeProxyBase(preset.apiurl, nativeSource) : preset.apiurl,
+            // 原生协议源（claude/makersuite）从 reverse_proxy + proxy_password 取地址与密钥；
+            // custom 源不用该字段，保持空串。
+            proxy_password: nativeSource ? String(preset.key || '') : '',
+            custom_url: preset.apiurl,
+            custom_include_headers: headers,
+            custom_include_body: String(preset.bodyParams || ''),
+            custom_exclude_body: normalizeExcludeBodyParams(preset.excludeBodyParams),
+        };
+        // 「未选择」（''）时不携带该字段，酒馆后端按 none 处理、原样透传消息。
+        if (preset.promptPostProcessing) body.custom_prompt_post_processing = preset.promptPostProcessing;
+        return body;
+    }
+
+    // ---------------------------------------------------------------
+    // 二、适配层：酒馆宿主接口（对齐 shujuku ai-gateway，全部走酒馆）
+    //
+    // 脚本不直接连第三方 API：拉模型走酒馆后端 /api/backends/chat-completions/status
+    // （由酒馆服务器代发，行为和酒馆自己的「测试连接 / 拉模型」一致，也没有浏览器跨域问题）；
+    // 「酒馆预设」连接的裁判走酒馆连接管理器 ConnectionManagerRequestService。
+    // ---------------------------------------------------------------
+
+    // 主窗口的 window.SillyTavern 只有 { libs, getContext }，真正的接口都在 getContext() 里。
+    function sillyTavernContext() {
+        for (const candidate of [hostWindow, currentWindow, ...windowCandidates]) {
+            try {
+                const st = candidate && candidate.SillyTavern;
+                const context = st && typeof st.getContext === 'function' ? st.getContext() : null;
+                if (context && typeof context === 'object') return context;
+            } catch (error) {
+                // 跨域窗口读不了属性，继续尝试同源候选。
+            }
+        }
+        return null;
+    }
+
+    // 酒馆请求头（含 CSRF token），拿不到的场合返回空对象，由后端报错提示。
+    function hostRequestHeaders() {
+        try {
+            const context = sillyTavernContext();
+            if (context && typeof context.getRequestHeaders === 'function') {
+                const headers = context.getRequestHeaders();
+                if (headers && typeof headers === 'object') return headers;
+            }
+        } catch (error) {
+            // 忽略，按空请求头继续。
+        }
+        return {};
+    }
+
+    function hostFetch(...args) {
+        const fetchFn = (typeof fetch === 'function' && fetch)
+            || (hostWindow && hostWindow.fetch)
+            || (currentWindow && currentWindow.fetch);
+        if (!fetchFn) throw new Error('当前环境没有 fetch，无法通过酒馆后端请求。');
+        return fetchFn(...args);
+    }
+
+    // 酒馆连接管理器（ConnectionManagerRequestService），「酒馆预设」连接的裁判调用走这里。
+    function connectionManagerService() {
+        try {
+            const context = sillyTavernContext();
+            const service = context && context.ConnectionManagerRequestService;
+            if (service && typeof service.sendRequest === 'function') return service;
+        } catch (error) {
+            // 同上：跨域候选不是运行接口来源。
+        }
+        return null;
+    }
+
+    // 酒馆连接预设列表（连接管理器里的 profiles），对应 API 页「酒馆预设」下拉。
+    function readTavernConnectionProfiles() {
+        try {
+            const context = sillyTavernContext();
+            const manager = context && context.extensionSettings && context.extensionSettings.connectionManager;
+            const profiles = manager && manager.profiles;
+            return (Array.isArray(profiles) ? profiles : [])
+                .filter(profile => profile && profile.id)
+                .map(profile => ({ id: String(profile.id), name: String(profile.name || profile.id) }));
+        } catch (error) {
+            return [];
+        }
+    }
+
+    // 复刻 shujuku fetchAvailableModels_ACU：把拉模型请求发给酒馆后端
+    // /api/backends/chat-completions/status，由酒馆服务器带着端点与密钥去请求目标 API。
+    async function fetchAvailableModels(apiurl, key) {
+        const url = String(apiurl || '').trim();
+        if (!url) throw new Error('请输入端点(基础URL)。');
+        const response = await hostFetch('/api/backends/chat-completions/status', {
+            method: 'POST',
+            headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                reverse_proxy: url,
+                proxy_password: '',
+                chat_completion_source: 'custom',
+                custom_url: url,
+                custom_include_headers: key ? `Authorization: Bearer ${key}` : '',
+            }),
+        });
+        if (!response.ok) {
+            const detail = await response.text();
+            let message = `酒馆端点状态检查失败：${response.status} ${response.statusText || ''}`.trim();
+            try {
+                const parsed = JSON.parse(detail);
+                message += `。详情：${parsed.error || parsed.message || detail}`;
+            } catch (error) {
+                if (detail) message += `。详情：${detail}`;
+            }
+            throw new Error(message);
+        }
+        const data = await response.json();
+        const list = Array.isArray(data) ? data
+            : (Array.isArray(data && data.models) ? data.models
+                : (Array.isArray(data && data.data) ? data.data : []));
+        return list.map(item => (typeof item === 'string' ? item : (item && item.id)))
+            .filter(Boolean)
+            .map(String);
     }
 
     // ---------------------------------------------------------------
@@ -1959,7 +2126,9 @@
 
     // 后台裁判（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
     // 提问模板可在设置里自定义（{{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符）；
-    // 统一使用酒馆助手 generateRaw；可按本机预设选择酒馆当前 API、代理预设或自定义 API。
+    // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
+    //   酒馆主 API → 酒馆助手 generateRaw；酒馆预设 → ConnectionManagerRequestService；
+    //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
     // running 集合防止同一绑定并发裁判；裁判结果一律只信一次，失败不重试。
     const judgeState = { running: new Set() };
 
@@ -2003,16 +2172,73 @@
         }).filter(Boolean).join('\n\n');
     }
 
+    // 「酒馆预设」连接：走酒馆连接管理器（对齐 shujuku sendConnectionManagerRequest_ACU），
+    // 不再走 generateRaw 的 proxy_preset。
+    async function askJudgeViaConnectionProfile(question, preset) {
+        const service = connectionManagerService();
+        if (!service) {
+            throw new Error('酒馆连接管理器不可用（找不到 ConnectionManagerRequestService）：请升级酒馆版本，或把这个 API 预设改成「酒馆主 API / 自定义」连接。');
+        }
+        const messages = [
+            { role: 'system', content: JUDGE_SYSTEM_PROMPT },
+            { role: 'user', content: question },
+        ];
+        const maxTokens = preset.maxTokens != null ? preset.maxTokens : 512;
+        const result = await service.sendRequest(preset.tavernProfile, messages, maxTokens);
+        // 对齐 shujuku：优先 result.result.choices[0].message.content，再退 result.content / 字符串。
+        if (result && result.result && Array.isArray(result.result.choices)
+            && result.result.choices[0] && result.result.choices[0].message
+            && typeof result.result.choices[0].message.content === 'string') {
+            return result.result.choices[0].message.content;
+        }
+        if (result && typeof result.content === 'string') return result.content;
+        if (typeof result === 'string') return result;
+        return '';
+    }
+
+    // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
+    // （复刻 shujuku 的自定义 API 调用，附加主体/排除参数/请求标头/提示词后处理全部生效）。
+    async function askJudgeViaCustomApi(question, preset) {
+        const messages = [
+            { role: 'system', content: JUDGE_SYSTEM_PROMPT },
+            { role: 'user', content: question },
+        ];
+        const response = await hostFetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(buildJudgeCustomRequestBody(messages, preset)),
+        });
+        if (!response.ok) {
+            const detail = await response.text();
+            throw new Error(`自定义 API 请求失败：${response.status} ${response.statusText || ''}${detail ? `。详情：${detail}` : ''}`.trim());
+        }
+        const data = await response.json();
+        const choice = data && Array.isArray(data.choices) && data.choices[0];
+        const text = (choice && choice.message && choice.message.content)
+            || (choice && choice.text)
+            || (data && data.content)
+            || (data && data.text)
+            || '';
+        if (!text) throw new Error('自定义 API 返回无效响应（没有正文）。');
+        return String(text);
+    }
+
     async function askJudge(question, preset) {
+        if (preset && preset.connection === 'tavern') {
+            if (!preset.tavernProfile) {
+                throw new Error(`API 预设「${preset.name}」没有选择酒馆预设。`);
+            }
+            return askJudgeViaConnectionProfile(question, preset);
+        }
+        if (preset && preset.connection === 'custom') {
+            if (!preset.apiurl || !preset.model) {
+                throw new Error(`API 预设「${preset.name}」缺少端点(基础URL)或模型名。`);
+            }
+            return askJudgeViaCustomApi(question, preset);
+        }
+        // 酒馆主 API（或无预设）：走酒馆助手 generateRaw。
         const generateRaw = api('generateRaw', false);
         if (!generateRaw) return null;
-        if (preset && preset.connection === 'tavern' && !preset.tavernProfile) {
-            throw new Error(`裁判 API 预设「${preset.name}」没有选择酒馆连接预设。`);
-        }
-        if (preset && preset.connection === 'custom' && (!preset.apiurl || !preset.model)) {
-            throw new Error(`裁判 API 预设「${preset.name}」缺少 API 地址或模型名。`);
-        }
-        const customApi = customApiForJudgePreset(preset);
         const request = {
             user_input: question,
             should_silence: true,
@@ -2023,7 +2249,6 @@
                 'user_input',
             ],
         };
-        if (customApi) request.custom_api = customApi;
         const result = await generateRaw(request);
         return typeof result === 'string'
             ? result
@@ -2036,7 +2261,19 @@
         if (context.state.lastCompletionMessageId === messageId) return;
         if (judgeState.running.has(context.key)) return;
         const settings = config && config.settings ? config.settings : {};
-        if (!api('generateRaw', false)) {
+        const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
+        const preset = presetName ? findJudgeApiPreset(presetName) : null;
+        if (presetName && !preset) {
+            reportOnce(`judge-preset-missing:${presetName}`, `找不到本机 API 预设「${presetName}」，本次不推进；请重新选择或保存同名预设。`);
+            return;
+        }
+        if (preset && preset.connection === 'tavern') {
+            if (!connectionManagerService()) {
+                reportOnce('judge-no-cm', '「酒馆预设」连接需要酒馆的连接管理器（ConnectionManagerRequestService），当前不可用；请升级酒馆版本或改用其他连接方式。');
+                return;
+            }
+        } else if ((!preset || preset.connection === 'main') && !api('generateRaw', false)) {
+            // 自定义连接直连酒馆后端，不需要 generateRaw。
             reportOnce('judge-no-engine', '「后台裁判」需要酒馆助手的 generateRaw 接口，当前不可用；请改用「标记判断」档或升级酒馆助手。');
             return;
         }
@@ -2049,12 +2286,6 @@
                 : '没有预设完成条件：内容充分展开、剧情自然该走就算完成。';
             const history = await recentHistoryText(messageId, 6);
             const question = judgePromptFor(settings, stage, condition, history || '（没有取到聊天记录）');
-            const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
-            const preset = presetName ? findJudgeApiPreset(presetName) : null;
-            if (presetName && !preset) {
-                reportOnce(`judge-preset-missing:${presetName}`, `找不到本机裁判 API 预设「${presetName}」，本次不推进；请重新选择或保存同名预设。`);
-                return;
-            }
             const text = await askJudge(question, preset);
             if (!/^\s*YES\b/i.test(text)) return;
             // 防误判守卫：裁判是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
@@ -2140,8 +2371,15 @@
         contextError: '',
         editor: null,
         diagnosis: null,
-        apiEditing: null,
+        // API 页草稿态（对齐 shujuku ApiConfigPanel 的 draft/snapshot/formMode）
+        apiFormMode: 'empty',
+        apiDraft: null,
+        apiDraftOriginalName: '',
+        apiDraftSnapshot: '',
         apiModelOptions: [],
+        apiModelStatus: 'idle',
+        apiModelError: '',
+        apiTavernProfiles: [],
     };
 
     function el(tag, attrs, ...children) {
@@ -2190,8 +2428,11 @@
         return el('div', { class: 'dga-row' }, ...children);
     }
 
-    function field(label, control) {
-        return el('label', { class: 'dga-field' }, el('span', { text: label }), control);
+    function field(label, control, hint) {
+        return el('label', { class: 'dga-field' },
+            el('span', { text: label }),
+            control,
+            hint ? el('small', { class: 'dga-field-hint', text: hint }) : null);
     }
 
     function selectControl(options, value, onchange) {
@@ -2391,10 +2632,12 @@
         return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
     }
 
-    // 目录抽屉：仿 shujuku 左上角菜单。点击进入对应页面后自动收起。
+    // 目录抽屉：复刻 shujuku 新版 Sidebar——品牌区（方块标 + 标题 + 版本副标）、
+    // 组标题、整宽导航项（当前页用主题强调色高亮）。点击进入对应页面后自动收起。
     function renderNavDrawer() {
         const go = view => {
             if (view === 'editor' && !ui.editor) return;
+            if (view === 'api') enterApiPage();
             ui.view = view;
             ui.navOpen = false;
             render();
@@ -2402,6 +2645,7 @@
         const item = (label, view, disabled) => el('button', {
             type: 'button',
             class: `dga-nav-item${ui.view === view ? ' is-on' : ''}`,
+            'aria-current': ui.view === view ? 'page' : null,
             disabled: Boolean(disabled),
             onclick: () => go(view),
         }, label);
@@ -2411,167 +2655,290 @@
                 if (event.target === backdrop) { ui.navOpen = false; render(); }
             },
         });
-        backdrop.append(el('aside', { class: 'dga-nav-drawer', role: 'dialog', 'aria-label': '页面目录' },
-            el('div', { class: 'dga-nav-brand' }, '动态指导助手'),
-            el('div', { class: 'dga-nav-group' }, '页面'),
-            item('管理', 'manager'),
-            item('API', 'api'),
-            item('划分阶段', 'editor', !ui.editor),
+        backdrop.append(el('aside', { class: 'dga-nav-drawer', role: 'dialog', 'aria-label': '页面导航' },
+            el('div', { class: 'dga-nav-brand' },
+                el('span', { class: 'dga-nav-brand-mark', 'aria-hidden': 'true' }, '指'),
+                el('span', { class: 'dga-nav-brand-copy' },
+                    el('span', { class: 'dga-nav-brand-title' }, SCRIPT_NAME),
+                    el('span', { class: 'dga-nav-brand-tag' }, `v${VERSION} · 页面导航`),
+                ),
+            ),
+            el('div', { class: 'dga-nav-group-title' }, '页面'),
+            el('div', { class: 'dga-nav-group' },
+                item('管理', 'manager'),
+                item('API', 'api'),
+                item('划分阶段', 'editor', !ui.editor),
+            ),
         ));
         return backdrop;
     }
 
-    // 独立 API 页：仿 shujuku 新版 ApiConfigPanel。预设下拉+新建/删除、连接方式、自定义协议/URL/Key/模型、加载模型、tokens/温度、保存。
-    function renderApiPage() {
+    // ---------------------------------------------------------------
+    // 三、界面：独立 API 页（复刻 shujuku 新版 ApiConfigPanel）
+    //
+    // 结构对齐：预设选择行（下拉 + 新建 + 删除）→ 草稿表单（预设名称 /
+    // 连接方式三段开关 / 各连接方式的字段区）→ 加载模型 inline 行 →
+    // 最大回复长度+温度两列 → 放弃修改 / 保存按钮（脏检查）。
+    // 草稿（draft）+ 快照（snapshot）比对决定按钮可用态，输入过程不重渲染。
+    // ---------------------------------------------------------------
+
+    function emptyApiDraft() {
+        return {
+            name: '', connection: 'main', customApiFormat: 'openai_compat',
+            apiurl: '', key: '', model: '', maxTokens: '', temperature: '',
+            bodyParams: '', excludeBodyParams: '', requestHeaders: '',
+            promptPostProcessing: 'strict', tavernProfile: '',
+        };
+    }
+
+    function currentJudgePreset() {
         const config = ui.snapshot ? ui.snapshot.config : null;
         const settings = config && config.settings ? config.settings : {};
-        const list = readJudgeApiPresets();
-        const currentName = String(settings.judgePreset || '');
-        const current = list.find(item => item.name === currentName) || null;
+        const name = String(settings.judgePreset || '');
+        return { name, preset: readJudgeApiPresets().find(item => item.name === name) || null };
+    }
 
-        // 预设下拉 + 新建 + 删除
-        const presetOptions = [{ value: '', label: '酒馆当前 API（不使用独立预设）' }]
+    function syncApiDraft() {
+        const { preset } = currentJudgePreset();
+        if (preset) {
+            ui.apiDraft = { ...emptyApiDraft(), ...preset };
+            ui.apiDraftOriginalName = preset.name;
+            ui.apiFormMode = 'edit';
+        } else {
+            ui.apiDraft = emptyApiDraft();
+            ui.apiDraftOriginalName = '';
+            ui.apiFormMode = 'empty';
+        }
+        ui.apiDraftSnapshot = JSON.stringify(ui.apiDraft);
+        ui.apiModelStatus = 'idle';
+        ui.apiModelError = '';
+        ui.apiModelOptions = [];
+    }
+
+    // 进入 API 页：同步草稿 + 读酒馆连接预设列表（对齐 refreshAll）。
+    function enterApiPage() {
+        ui.apiTavernProfiles = readTavernConnectionProfiles();
+        syncApiDraft();
+    }
+
+    function renderApiPage() {
+        if (!ui.apiDraft) enterApiPage();
+        const list = readJudgeApiPresets();
+        const { name: currentName, preset: current } = currentJudgePreset();
+        const draft = ui.apiDraft;
+        const dirty = JSON.stringify(draft) !== ui.apiDraftSnapshot;
+
+        // ── 预设选择行：下拉 + 新建 + 删除（对齐 AcuPresetDropdown 行）
+        const presetOptions = [{ value: '', label: '酒馆主 API（不使用 API 预设）' }]
             .concat(list.map(item => ({ value: item.name, label: item.name })));
-        const presetSelect = selectControl(presetOptions, currentName, value => runAction('切换裁判 API 预设', async () => {
+        const presetSelect = selectControl(presetOptions, currentName, value => runAction('切换 API 预设', async () => {
             const fresh = await readConfig();
             fresh.settings = { ...(fresh.settings || {}), judgePreset: value };
             await writeConfig(fresh);
-        }, { success: value ? `裁判 API 预设已切换为：${value}` : '裁判改用酒馆当前 API' }));
-        const newBtn = btn('新建预设', () => { ui.apiEditing = { name: '', connection: 'main', customApiFormat: 'openai_compat', apiurl: '', key: '', model: '', maxTokens: null, temperature: null, tavernProfile: '' }; render(); }, { ghost: true });
-        const deleteBtn = current ? btn('删除当前预设', () => runAction('删除裁判 API 预设', async () => {
-            writeJudgeApiPresets(list.filter(item => item.name !== current.name));
-            const fresh = await readConfig();
-            if (fresh.settings && fresh.settings.judgePreset === current.name) {
-                fresh.settings = { ...fresh.settings, judgePreset: '' };
-                await writeConfig(fresh);
-            }
-            ui.apiEditing = null;
-        }, { success: `预设「${current.name}」已删除` }), { danger: true, ghost: true }) : null;
+            syncApiDraft();
+        }, { success: value ? `API 预设已切换为：${value}` : '已改用酒馆主 API' }));
+        const newBtn = el('button', {
+            type: 'button', class: 'dga-icon-btn', title: '新建预设', 'aria-label': '新建预设',
+            onclick: () => {
+                ui.apiDraft = emptyApiDraft();
+                ui.apiDraftOriginalName = '';
+                ui.apiFormMode = 'create';
+                ui.apiDraftSnapshot = JSON.stringify(ui.apiDraft);
+                ui.apiModelStatus = 'idle';
+                ui.apiModelError = '';
+                ui.apiModelOptions = [];
+                render();
+            },
+        }, '＋');
+        const deleteBtn = el('button', {
+            type: 'button', class: 'dga-icon-btn dga-icon-danger', title: '删除当前预设', 'aria-label': '删除当前预设',
+            disabled: !current,
+            onclick: () => {
+                if (!current) return;
+                if (!hostWindow.confirm(`删除 API 预设「${current.name}」？`)) return;
+                runAction('删除 API 预设', async () => {
+                    writeJudgeApiPresets(readJudgeApiPresets().filter(item => item.name !== current.name));
+                    const fresh = await readConfig();
+                    if (fresh.settings && fresh.settings.judgePreset === current.name) {
+                        fresh.settings = { ...fresh.settings, judgePreset: '' };
+                        await writeConfig(fresh);
+                    }
+                    syncApiDraft();
+                }, { success: `API 预设「${current.name}」已删除` });
+            },
+        }, '✕');
 
-        // 编辑区：有当前预设就编辑它，否则显示空表单（新建模式）
-        const editing = ui.apiEditing || (current ? { ...current } : null);
-        const nameInput = el('input', { class: 'dga-input', type: 'text', maxlength: 60, placeholder: '预设名' });
-        nameInput.value = editing ? editing.name : '';
+        // ── 草稿表单
+        const bindText = key => event => { draft[key] = event.target.value; };
+        const bindAndRender = key => event => { draft[key] = event.target.value; render(); };
+
+        const nameInput = el('input', { class: 'dga-input', type: 'text', maxlength: 60, autocomplete: 'off', oninput: bindText('name') });
+        nameInput.value = draft.name;
+
         const connectionOptions = [
-            { value: 'main', label: '酒馆当前 API' },
+            { value: 'main', label: '酒馆主 API' },
             { value: 'custom', label: '自定义' },
-            { value: 'tavern', label: '酒馆连接预设' },
+            { value: 'tavern', label: '酒馆预设' },
         ];
-        const connectionSelect = selectControl(connectionOptions, editing ? editing.connection : 'main', () => updateApiFieldVisibility());
+        const connectionSeg = el('div', { class: 'dga-seg dga-mode-seg', role: 'group', 'aria-label': '连接方式' },
+            connectionOptions.map(option => el('button', {
+                type: 'button',
+                class: `dga-seg-btn${draft.connection === option.value ? ' is-on' : ''}`,
+                'aria-pressed': draft.connection === option.value,
+                onclick: () => { draft.connection = option.value; render(); },
+            }, option.label)));
+
         const formatOptions = [
             { value: 'openai_compat', label: '兼容 OpenAI' },
             { value: 'openai_responses', label: '兼容 OpenAI Responses' },
             { value: 'claude_messages', label: '兼容 Claude Messages' },
             { value: 'gemini_interactions', label: '兼容 Gemini Interactions' },
         ];
-        const formatSelect = selectControl(formatOptions, editing && editing.customApiFormat || 'openai_compat', () => updateApiFieldVisibility());
-        const apiurlInput = el('input', { class: 'dga-input', type: 'text', maxlength: 500, placeholder: 'https://api.example.com/v1' });
-        apiurlInput.value = editing ? editing.apiurl : '';
-        const keyInput = el('input', { class: 'dga-input', type: 'password', maxlength: 500, placeholder: 'API Key（留空=保留旧 Key）' });
-        keyInput.value = '';
-        const modelInput = el('input', { class: 'dga-input', type: 'text', maxlength: 160, placeholder: '模型名' });
-        modelInput.value = editing ? editing.model : '';
-        const tavernInput = el('input', { class: 'dga-input', type: 'text', maxlength: 100, placeholder: '酒馆连接预设名' });
-        tavernInput.value = editing ? editing.tavernProfile : '';
-        const maxTokensInput = el('input', { class: 'dga-input', type: 'number', min: 1, step: 1, placeholder: '最大输出 tokens（可选）' });
-        maxTokensInput.value = editing && editing.maxTokens != null ? String(editing.maxTokens) : '';
-        const temperatureInput = el('input', { class: 'dga-input', type: 'number', min: 0, max: 2, step: 0.1, placeholder: '温度（可选）' });
-        temperatureInput.value = editing && editing.temperature != null ? String(editing.temperature) : '';
+        const formatSelect = selectControl(formatOptions, draft.customApiFormat, value => { draft.customApiFormat = value; });
 
-        const apiurlField = field('端点(基础URL)', apiurlInput);
-        const keyField = field('API 密钥', keyInput);
-        const formatField = field('接口协议', formatSelect);
-        const modelField = field('模型名', modelInput);
-        const tavernField = field('酒馆连接预设', tavernInput);
-        const maxTokensField = field('最大输出 tokens', maxTokensInput);
-        const temperatureField = field('温度', temperatureInput);
-        function updateApiFieldVisibility() {
-            const connection = connectionSelect.value;
-            const isCustom = connection === 'custom';
-            const isTavern = connection === 'tavern';
-            loadModelsBtn.disabled = !isCustom;
-            formatField.hidden = !isCustom;
-            apiurlField.hidden = !isCustom;
-            keyField.hidden = !isCustom;
-            modelField.hidden = connection === 'main';
-            tavernField.hidden = !isTavern;
-            maxTokensField.hidden = connection === 'main';
-            temperatureField.hidden = connection === 'main';
-        }
+        const apiurlInput = el('input', { class: 'dga-input', type: 'text', maxlength: 500, placeholder: 'https://example.com/v1', autocomplete: 'off', oninput: bindText('apiurl') });
+        apiurlInput.value = draft.apiurl;
+        const keyInput = el('input', { class: 'dga-input', type: 'password', maxlength: 500, autocomplete: 'off', oninput: bindText('key') });
+        keyInput.value = draft.key;
+        const modelInput = el('input', { class: 'dga-input', type: 'text', maxlength: 160, autocomplete: 'off', oninput: bindText('model') });
+        modelInput.value = draft.model;
 
-        // 加载模型
-        const modelStatus = el('span', { class: 'dga-muted' });
-        const loadModelsBtn = btn('加载模型', () => runAction('加载模型', async () => {
-            const apiurl = String(apiurlInput.value || '').trim();
-            if (!apiurl) throw new Error('先填端点(基础URL)。');
-            modelStatus.textContent = '加载中...';
-            const getModelList = api('getModelList', false);
-            if (!getModelList) throw new Error('当前酒馆助手不支持 getModelList，无法加载模型列表。');
-            const models = await Promise.resolve(getModelList({ apiurl, key: String(keyInput.value || '') }));
-            const names = Array.isArray(models) ? models.map(String).filter(Boolean) : [];
-            if (names.length === 0) {
-                modelStatus.textContent = '没有拉到模型（可以手填模型名）。';
-                return;
-            }
-            modelStatus.textContent = `拉到 ${names.length} 个模型`;
-            ui.apiModelOptions = names;
-        }, { success: '模型列表已更新' }), { ghost: true });
-
+        // 加载模型：始终可点，直接用当前表单里的端点与密钥（不需要先保存），
+        // 请求走酒馆后端 /api/backends/chat-completions/status（与 shujuku 一致）。
+        const loadModelsBtn = btn('加载模型', () => {
+            ui.apiModelStatus = 'loading';
+            ui.apiModelError = '';
+            render();
+            runAction('加载模型', async () => {
+                try {
+                    const names = await fetchAvailableModels(draft.apiurl, draft.key);
+                    ui.apiModelOptions = names;
+                    if (names.length === 0) {
+                        ui.apiModelStatus = 'error';
+                        ui.apiModelError = '未能解析模型数据或列表为空，可手填模型名。';
+                        setMessage('没有拉到模型，可以手填模型名。', 'warning');
+                        return false;
+                    }
+                    ui.apiModelStatus = 'success';
+                    setMessage(`拉到 ${names.length} 个模型。`, 'success');
+                } catch (error) {
+                    ui.apiModelStatus = 'error';
+                    ui.apiModelError = error.message || String(error);
+                    throw error;
+                }
+            }, { refresh: false });
+        });
+        const modelStatus = ui.apiModelStatus === 'loading' ? el('span', { class: 'dga-muted' }, '加载中...')
+            : ui.apiModelStatus === 'error' ? el('span', { class: 'dga-danger-text' }, ui.apiModelError)
+                : ui.apiModelStatus === 'success' ? el('span', { class: 'dga-muted' }, `已加载 ${ui.apiModelOptions.length} 个模型`)
+                    : null;
         const modelListSelect = selectControl(
-            (ui.apiModelOptions || []).map(name => ({ value: name, label: name })),
-            editing ? editing.model : '',
-            value => { modelInput.value = value; },
+            ui.apiModelOptions.map(name => ({ value: name, label: name })),
+            draft.model,
+            value => { draft.model = value; render(); },
         );
 
-        const saveBtn = btn('保存当前预设', () => runAction('保存裁判 API 预设', async () => {
-            const name = String(nameInput.value || '').trim();
-            if (!name) throw new Error('先填预设名。');
-            const connection = connectionSelect.value;
-            const existing = list.find(item => item.name === name);
-            const preset = normalizeJudgeApiPreset({
-                name,
-                connection,
-                customApiFormat: formatSelect.value,
-                apiurl: apiurlInput.value,
-                key: keyInput.value || (existing && existing.key) || '',
-                model: modelInput.value,
-                maxTokens: maxTokensInput.value,
-                temperature: temperatureInput.value,
-                tavernProfile: tavernInput.value,
-            });
-            if (preset.connection === 'custom' && (!preset.apiurl || !preset.model)) throw new Error('自定义 API 需要填写端点和模型。');
-            if (preset.connection === 'tavern' && !preset.tavernProfile) throw new Error('请选择酒馆连接预设。');
-            writeJudgeApiPresets(list.filter(item => item.name !== name).concat([preset]));
-            // 保存后自动设为当前裁判预设
-            const fresh = await readConfig();
-            fresh.settings = { ...(fresh.settings || {}), judgePreset: name };
-            await writeConfig(fresh);
-            ui.apiEditing = null;
-        }, { success: 'API 预设已保存并设为当前' }), { primary: true });
+        // 酒馆预设下拉：选项来自酒馆连接管理器的 profiles；草稿里存的是 profile id。
+        const profileIds = ui.apiTavernProfiles.map(profile => profile.id);
+        const tavernOptions = [{ value: '', label: '请选择' }]
+            .concat(ui.apiTavernProfiles.map(profile => ({ value: profile.id, label: profile.name })));
+        if (draft.tavernProfile && !profileIds.includes(draft.tavernProfile)) {
+            tavernOptions.push({ value: draft.tavernProfile, label: `${draft.tavernProfile}（不在当前酒馆预设列表）` });
+        }
+        const tavernSelect = selectControl(tavernOptions, draft.tavernProfile, value => { draft.tavernProfile = value; render(); });
+        const refreshProfilesBtn = btn('刷新列表', () => {
+            ui.apiTavernProfiles = readTavernConnectionProfiles();
+            render();
+        }, { ghost: true });
 
-        updateApiFieldVisibility();
+        const maxTokensInput = el('input', { class: 'dga-input', type: 'number', min: 1, step: 1, oninput: bindText('maxTokens') });
+        maxTokensInput.value = draft.maxTokens != null ? String(draft.maxTokens) : '';
+        const temperatureInput = el('input', { class: 'dga-input', type: 'number', min: 0, max: 2, step: 0.05, oninput: bindText('temperature') });
+        temperatureInput.value = draft.temperature != null ? String(draft.temperature) : '';
+
+        // ── 保存 / 放弃（脏检查对齐 shujuku：与快照不一致才可点）
+        const saveDraft = () => runAction('保存 API 预设', async () => {
+            const preset = normalizeJudgeApiPreset(draft);
+            if (!preset) throw new Error('预设名称不能为空。');
+            if (preset.connection === 'tavern' && !preset.tavernProfile) throw new Error('请选择酒馆预设。');
+            if (preset.connection === 'custom') {
+                if (!preset.apiurl) throw new Error('自定义 API 需要填写端点(基础URL)。');
+                if (!preset.model) throw new Error('自定义 API 需要填写模型。');
+            }
+            const remaining = readJudgeApiPresets()
+                .filter(item => item.name !== ui.apiDraftOriginalName && item.name !== preset.name);
+            writeJudgeApiPresets(remaining.concat([preset]));
+            // 保存后自动设为当前（对齐 shujuku：保存即绑定到当前聊天）
+            const fresh = await readConfig();
+            fresh.settings = { ...(fresh.settings || {}), judgePreset: preset.name };
+            await writeConfig(fresh);
+            ui.apiDraftOriginalName = preset.name;
+            syncApiDraft();
+        }, { success: 'API 预设已保存并设为当前' });
+
+        const formChildren = [
+            field('预设名称', nameInput),
+            field('连接方式', connectionSeg),
+        ];
+        if (draft.connection === 'custom') {
+            const bodyParamsArea = el('textarea', { class: 'dga-input', rows: 3, placeholder: 'response_format:\n  type: json_object\ntop_k: 50', oninput: bindText('bodyParams') });
+            bodyParamsArea.value = draft.bodyParams;
+            const excludeBodyArea = el('textarea', { class: 'dga-input', rows: 2, placeholder: 'top_p, reasoning_effort', oninput: bindText('excludeBodyParams') });
+            excludeBodyArea.value = draft.excludeBodyParams;
+            const postProcessingOptions = [
+                { value: '', label: '未选择' },
+                { value: 'merge_tools', label: '合并相同角色连续的发言（含工具）' },
+                { value: 'semi_tools', label: '半严格（强制对话角色交替）（含工具）' },
+                { value: 'strict_tools', label: '严格（强制对话角色交替、用户最先）（含工具）' },
+                { value: 'merge', label: '合并相同角色连续的发言' },
+                { value: 'semi', label: '半严格（强制对话角色交替）' },
+                { value: 'strict', label: '严格（强制对话角色交替、用户最先）' },
+                { value: 'single', label: '单一用户消息（无工具）' },
+            ];
+            const postProcessingSelect = selectControl(postProcessingOptions, draft.promptPostProcessing, value => { draft.promptPostProcessing = value; });
+            const requestHeadersArea = el('textarea', { class: 'dga-input', rows: 2, placeholder: 'X-Custom-Header: value', oninput: bindText('requestHeaders') });
+            requestHeadersArea.value = draft.requestHeaders;
+            formChildren.push(
+                field('接口协议', formatSelect, '决定上游端点与请求/响应变形，默认兼容 OpenAI。原版酒馆把 Claude/Gemini 映射到服务端原生协议源（端点填协议根即可，自动补 /v1 或剥版本段），OpenAI Responses 回退兼容 OpenAI；纯原生端点下「加载模型」可能失败，可手填模型名。'),
+                field('端点(基础URL)', apiurlInput),
+                field('API 密钥', keyInput),
+                field('模型名', modelInput),
+                el('div', { class: 'dga-inline-action' }, loadModelsBtn, modelStatus),
+                ui.apiModelOptions.length > 0 ? field('模型列表', modelListSelect) : null,
+                el('div', { class: 'dga-two-col' },
+                    field('最大回复长度', maxTokensInput),
+                    field('温度', temperatureInput)),
+                field('附加主体参数', bodyParamsArea, 'SillyTavern custom_include_body，填写 YAML object，会合并到最终模型请求体。'),
+                field('排除主体参数', excludeBodyArea, '会转换为 SillyTavern custom_exclude_body，从最终模型请求体删除指定字段。'),
+                field('提示词后处理', postProcessingSelect, '默认严格（与旧版本行为一致）。未选择=不带该字段原样透传消息，可保留提示词组中 system 段的角色。'),
+                field('附加请求标头', requestHeadersArea, '每行一个 Header: Value，追加到请求头中。'),
+            );
+        } else if (draft.connection === 'tavern') {
+            formChildren.push(
+                field('酒馆预设', tavernSelect, '选项来自酒馆的连接管理器（Connection Manager） profiles。'),
+                el('div', { class: 'dga-inline-action' }, refreshProfilesBtn),
+                el('div', { class: 'dga-two-col' },
+                    field('最大回复长度', maxTokensInput),
+                    field('温度', temperatureInput)),
+            );
+        }
+
         return [
-            header('API', '独立 API 预设管理', () => { ui.view = 'manager'; render(); }, '返回'),
+            header('API', 'API 预设管理', () => { ui.view = 'manager'; render(); }, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
-                muted('完整预设只保存在当前浏览器 localStorage（本机明文），不依赖数据库插件、不随角色卡导出。'),
+                muted('完整预设只保存在当前浏览器 localStorage（本机明文），不依赖数据库插件、不随角色卡导出；共享设备请勿保存敏感密钥。'),
                 card('当前 API 预设',
-                    el('div', { class: 'dga-row' }, presetSelect, newBtn, deleteBtn),
+                    list.length === 0 ? el('div', { class: 'dga-msg', 'data-type': 'warning' }, '暂无可用 API 预设，点右侧「＋」新建。') : null,
+                    el('div', { class: 'dga-api-select-row' }, presetSelect, newBtn, deleteBtn),
                 ),
-                card('预设配置',
-                    field('预设名', nameInput),
-                    field('连接方式', connectionSelect),
-                    formatField,
-                    apiurlField,
-                    keyField,
-                    modelField,
-                    tavernField,
-                    el('div', { class: 'dga-row' }, loadModelsBtn, modelStatus),
-                    (ui.apiModelOptions || []).length > 0 ? field('模型列表', modelListSelect) : null,
-                    maxTokensField,
-                    temperatureField,
-                    saveBtn,
-                ),
+                ui.apiFormMode !== 'empty' ? card(ui.apiFormMode === 'create' ? '新建预设' : `预设配置 · ${ui.apiDraftOriginalName}`,
+                    ...formChildren,
+                    el('div', { class: 'dga-api-actions' },
+                        btn('放弃修改', () => { syncApiDraft(); render(); }, { ghost: true, disabled: !dirty }),
+                        btn(ui.apiFormMode === 'create' ? '保存并选中预设' : '保存当前预设', saveDraft, { primary: true, disabled: !dirty }),
+                    ),
+                ) : null,
             ),
         ];
     }
@@ -2583,7 +2950,7 @@
         const settings = config && config.settings ? config.settings : {};
         const presetList = readJudgeApiPresets();
         const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
-        const presetOptions = [{ value: '', label: '酒馆当前 API（不使用独立预设）' }]
+        const presetOptions = [{ value: '', label: '酒馆主 API（不使用 API 预设）' }]
             .concat(presetList.map(item => ({ value: item.name, label: item.name })));
         const saveSettings = (patch, success) => runAction('修改自动推进设置', async () => {
             const fresh = await readConfig();
@@ -2596,11 +2963,11 @@
             field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
                 saveSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
-            mode === 'judge' ? field('裁判 API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
-                saveSettings({ judgePreset: value }, value ? `裁判 API 预设已切换为：${value}` : '裁判改用酒馆当前 API');
+            mode === 'judge' ? field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
+                saveSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '裁判改用酒馆主 API');
             })) : null,
             mode === 'judge' && presetList.length === 0
-                ? muted('还没有独立 API 预设。可点左上角目录按钮进入「API」页保存；也可以直接使用酒馆当前 API。')
+                ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
                 : null,
             mode === 'judge' ? field('裁判提问（留空用默认；占位符 {{stage}} {{prompt}} {{condition}} {{history}}）',
                 el('textarea', {
@@ -3919,6 +4286,34 @@ ${P} .dga-pending { border-bottom: 2px dashed rgba(255, 255, 255, 0.75); }
 ${P} .dga-text-mark.is-pending, ${P} .dga-pending { background: rgba(255, 255, 255, 0.14); }
 ${P} .dga-tap-caret { display: inline-block; width: 0; height: 1.15em; vertical-align: -0.2em; border-left: 2px solid #ffd166; position: relative; }
 ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em; left: -3px; padding: 0 5px; border-radius: 4px; background: #ffd166; color: #221a00; font-size: 0.7rem; line-height: 1.5; white-space: nowrap; }
+${P} .dga-nav-backdrop { position: absolute; inset: 0; z-index: 3; display: flex; background: rgba(0, 0, 0, 0.55); }
+${P} .dga-nav-drawer { width: 250px; max-width: 84%; height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 22px 12px 16px; background: var(--SmartThemeBlurTintColor, #1b1d24); border-right: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 12px 0 40px rgba(0, 0, 0, 0.45); animation: dga-nav-in 0.18s ease-out; }
+@keyframes dga-nav-in { from { transform: translateX(-28px); opacity: 0; } to { transform: none; opacity: 1; } }
+${P} .dga-nav-brand { display: flex; align-items: center; gap: 10px; padding: 4px 4px 18px; margin-bottom: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+${P} .dga-nav-brand-mark { width: 34px; height: 34px; flex: 0 0 34px; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; background: var(--SmartThemeQuoteColor, #7c6cf0); color: #fff; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; }
+${P} .dga-nav-brand-copy { min-width: 0; display: block; }
+${P} .dga-nav-brand-title { display: block; font-size: 15px; font-weight: 700; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+${P} .dga-nav-brand-tag { display: block; margin-top: 3px; font-size: 11px; opacity: 0.6; }
+${P} .dga-nav-group-title { padding: 7px 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; opacity: 0.55; }
+${P} .dga-nav-group { display: flex; flex-direction: column; gap: 2px; }
+${P} .dga-nav-item { display: block; width: 100%; min-height: 40px; padding: 10px 12px; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left; cursor: pointer; opacity: 0.85; transition: background 0.15s ease, opacity 0.15s ease; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-nav-item:not(.is-on):hover { background: rgba(255, 255, 255, 0.08); opacity: 1; }
+${P} .dga-nav-item.is-on { background: var(--SmartThemeQuoteColor, #7c6cf0); color: #fff; font-weight: 700; opacity: 1; }
+${P} .dga-nav-item:disabled { opacity: 0.35; cursor: default; }
+${P} .dga-icon-btn { width: 44px; min-width: 44px; min-height: 44px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 11px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.07); color: inherit; font: inherit; font-size: 1.05rem; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-icon-btn:hover { background: rgba(255, 255, 255, 0.14); }
+${P} .dga-icon-btn:disabled { opacity: 0.35; cursor: default; }
+${P} .dga-icon-btn.dga-icon-danger { color: #ff9b9b; border-color: rgba(255, 120, 120, 0.35); }
+${P} .dga-api-select-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 6px; align-items: stretch; }
+${P} .dga-api-select-row select { width: 100%; }
+${P} .dga-inline-action { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+${P} .dga-inline-action .dga-btn { flex: 0 0 auto; min-height: 40px; padding: 8px 14px; }
+${P} .dga-two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+${P} .dga-api-actions { display: flex; justify-content: flex-end; gap: 8px; }
+${P} .dga-api-actions .dga-btn { flex: 0 1 auto; min-height: 40px; padding: 8px 16px; }
+${P} .dga-field-hint { font-size: 0.78rem; opacity: 0.6; line-height: 1.5; }
+${P} .dga-danger-text { color: #ff9b9b; font-size: 0.85rem; overflow-wrap: anywhere; }
+${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 11px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(0, 0, 0, 0.26); color: inherit; font: inherit; }
 @media (max-width: 680px) {
     ${P} { padding: 0; }
     ${P} .dga-shell { max-width: none; height: 100%; max-height: none; border-radius: 0; border: 0; }
@@ -4112,7 +4507,12 @@ ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em;
         normalizeConfig,
         normalizeJudgeApiPreset,
         normalizeJudgeApiPresets,
-        customApiForJudgePreset,
+        normalizePromptPostProcessing,
+        normalizeExcludeBodyParams,
+        normalizeNativeProxyBase,
+        buildJudgeCustomRequestBody,
+        fetchAvailableModels,
+        readTavernConnectionProfiles,
         pickLoad,
         pickBuild,
         pickAssign,

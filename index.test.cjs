@@ -1265,7 +1265,7 @@ test('后台裁判档：自定义提问模板替换占位符后发出', async ()
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：酒馆代理预设写入 generateRaw.custom_api', async () => {
+test('后台裁判档：酒馆预设连接走酒馆连接管理器', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1277,25 +1277,40 @@ test('后台裁判档：酒馆代理预设写入 generateRaw.custom_api', async 
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
     const calls = [];
     helper.generateRaw = async options => { calls.push(options); return 'YES'; };
+    const cmCalls = [];
+    const SillyTavern = {
+        getContext: () => ({
+            ConnectionManagerRequestService: {
+                sendRequest: async (profileId, messages, maxTokens) => {
+                    cmCalls.push({ profileId, messages, maxTokens });
+                    return { result: { choices: [{ message: { content: 'YES' } }] } };
+                },
+            },
+            extensionSettings: { connectionManager: { profiles: [{ id: '酒馆代理A', name: '酒馆代理A' }] } },
+        }),
+    };
     const localStorage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
             name: '代理小模型', category: '便宜模型', type: 'proxy', note: '',
             proxyPreset: '酒馆代理A', model: 'gpt-mini', maxTokens: 16, temperature: 0.2,
         }]),
     });
-    const run = load(helper, { localStorage });
+    const run = load(helper, { localStorage, SillyTavern });
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(plain(calls[0].custom_api), {
-        proxy_preset: '酒馆代理A', model: 'gpt-mini', max_tokens: 16, temperature: 0.2,
-    });
+    assert.equal(calls.length, 0, '酒馆预设连接不走 generateRaw');
+    assert.equal(cmCalls.length, 1, '要走 ConnectionManagerRequestService.sendRequest');
+    assert.equal(cmCalls[0].profileId, '酒馆代理A');
+    assert.equal(cmCalls[0].maxTokens, 16);
+    assert.equal(cmCalls[0].messages[0].role, 'system');
+    assert.equal(cmCalls[0].messages[1].role, 'user');
+    assert.match(cmCalls[0].messages[1].content, /这一轮的回复/);
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：自定义 API 预设完整写入 custom_api', async () => {
+test('后台裁判档：自定义 API 预设直连酒馆后端 generate 端点', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1307,6 +1322,11 @@ test('后台裁判档：自定义 API 预设完整写入 custom_api', async () =
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
     const calls = [];
     helper.generateRaw = async options => { calls.push(options); return 'NO'; };
+    const fetches = [];
+    const fetchMock = async (url, options) => {
+        fetches.push({ url, options });
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'NO' } }] }), text: async () => '' };
+    };
     const localStorage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
             name: '自定义裁判', connection: 'custom', customApiFormat: 'openai_compat',
@@ -1314,15 +1334,25 @@ test('后台裁判档：自定义 API 预设完整写入 custom_api', async () =
             maxTokens: 20, temperature: 0,
         }]),
     });
-    const run = load(helper, { localStorage });
+    const run = load(helper, { localStorage, fetch: fetchMock });
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.deepEqual(plain(calls[0].custom_api), {
-        apiurl: 'https://api.example.com/v1', key: 'sk-secret', source: 'custom',
-        custom_prompt_post_processing: 'strict',
-        model: 'judge-model', max_tokens: 20, temperature: 0,
-    });
+    assert.equal(calls.length, 0, '自定义连接不走 generateRaw');
+    assert.equal(fetches.length, 1, '要直连酒馆后端 generate 端点');
+    assert.equal(fetches[0].url, '/api/backends/chat-completions/generate');
+    assert.equal(fetches[0].options.method, 'POST');
+    const body = JSON.parse(fetches[0].options.body);
+    assert.equal(body.chat_completion_source, 'custom');
+    assert.equal(body.custom_url, 'https://api.example.com/v1');
+    assert.equal(body.custom_include_headers, 'Authorization: Bearer sk-secret');
+    assert.equal(body.model, 'judge-model');
+    assert.equal(body.max_tokens, 20);
+    assert.equal(body.temperature, 0);
+    assert.equal(body.custom_prompt_post_processing, 'strict');
+    assert.equal(body.stream, false);
+    assert.equal(body.messages[0].role, 'system');
+    assert.match(body.messages[1].content, /这一轮的回复/);
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
 });
@@ -1345,7 +1375,7 @@ test('后台裁判档：选择不存在的本机预设时不调用 generateRaw',
     await state.events.get('message_received')(5);
     assert.equal(calls, 0);
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0);
-    assert.match(run.logs.join('\n'), /找不到本机裁判 API 预设/);
+    assert.match(run.logs.join('\n'), /找不到本机 API 预设/);
     assert.deepEqual(run.errors, []);
 });
 
@@ -1362,16 +1392,101 @@ test('本机裁判 API 预设：连接方式、接口协议与数值字段', () 
     });
 });
 
-test('本机裁判 API 预设：酒馆连接预设生成 proxy_preset custom_api', () => {
-    const list = core.normalizeJudgeApiPresets([
-        { name: '小模型', connection: 'tavern', tavernProfile: '代理A', model: 'm', maxTokens: 8 },
-        { name: ' 小模型 ', connection: 'custom', apiurl: 'x', model: 'y' },
-        { name: '', connection: 'main' },
-    ]);
-    assert.equal(list.length, 1);
-    assert.deepEqual(plain(core.customApiForJudgePreset(list[0])), {
-        proxy_preset: '代理A', model: 'm', max_tokens: 8,
+test('API 预设请求体：Claude 协议映射原生源并规范基址', () => {
+    const preset = core.normalizeJudgeApiPreset({
+        name: '克劳德', connection: 'custom', customApiFormat: 'claude_messages',
+        apiurl: 'https://api.anthropic.com', key: 'sk-ant', model: 'claude-sonnet',
+        maxTokens: 24, temperature: 0.3, bodyParams: 'top_k: 50', excludeBodyParams: 'top_p, reasoning_effort',
+        requestHeaders: 'X-Extra: 1', promptPostProcessing: '',
     });
+    const body = core.buildJudgeCustomRequestBody([{ role: 'SYSTEM', content: 's' }, { role: 'user', content: 'u' }], preset);
+    assert.equal(body.chat_completion_source, 'claude');
+    assert.equal(body.reverse_proxy, 'https://api.anthropic.com/v1', 'claude 源基址要补 /v1');
+    assert.equal(body.proxy_password, 'sk-ant', '原生源密钥走 proxy_password');
+    assert.equal(body.custom_url, 'https://api.anthropic.com');
+    assert.equal(body.custom_include_headers, 'Authorization: Bearer sk-ant\nX-Extra: 1');
+    assert.equal(body.custom_include_body, 'top_k: 50');
+    assert.equal(body.custom_exclude_body, '- top_p\n- reasoning_effort');
+    assert.equal('custom_prompt_post_processing' in body, false, '显式「未选择」时不带该字段');
+    assert.equal(body.messages[0].role, 'system', 'role 统一小写');
+    assert.equal(body.max_tokens, 24);
+    assert.equal(body.temperature, 0.3);
+});
+
+test('API 预设请求体：OpenAI 兼容协议走 custom 源', () => {
+    const preset = core.normalizeJudgeApiPreset({
+        name: 'o', connection: 'custom', customApiFormat: 'openai_compat',
+        apiurl: 'https://api.example.com/v1', key: 'k', model: 'models/gpt-x',
+    });
+    const body = core.buildJudgeCustomRequestBody([{ role: 'user', content: 'q' }], preset);
+    assert.equal(body.chat_completion_source, 'custom');
+    assert.equal(body.reverse_proxy, 'https://api.example.com/v1');
+    assert.equal(body.proxy_password, '', 'custom 源不用 proxy_password');
+    assert.equal(body.model, 'gpt-x', 'models/ 前缀要剥掉');
+    assert.equal(body.custom_prompt_post_processing, 'strict', '缺省归一为严格');
+    assert.equal(body.max_tokens, 512, '裁判默认 512');
+    assert.equal(body.temperature, 1);
+});
+
+test('提示词后处理归一化：空串保留、非法回退严格', () => {
+    assert.equal(core.normalizePromptPostProcessing(''), '');
+    assert.equal(core.normalizePromptPostProcessing('strict'), 'strict');
+    assert.equal(core.normalizePromptPostProcessing('merge_tools'), 'merge_tools');
+    assert.equal(core.normalizePromptPostProcessing(undefined), 'strict');
+    assert.equal(core.normalizePromptPostProcessing('junk'), 'strict');
+});
+
+test('排除主体参数归一化：逗号/换行转 YAML 序列，YAML 原样透传', () => {
+    assert.equal(core.normalizeExcludeBodyParams('top_p, reasoning_effort'), '- top_p\n- reasoning_effort');
+    assert.equal(core.normalizeExcludeBodyParams('top_p\nreasoning_effort'), '- top_p\n- reasoning_effort');
+    assert.equal(core.normalizeExcludeBodyParams('- top_p\n- reasoning_effort'), '- top_p\n- reasoning_effort');
+    assert.equal(core.normalizeExcludeBodyParams(''), '');
+    assert.equal(core.normalizeExcludeBodyParams(null), '');
+});
+
+test('原生协议源基址归一化：claude 补 /v1、makersuite 剥版本段', () => {
+    assert.equal(core.normalizeNativeProxyBase('https://api.anthropic.com', 'claude'), 'https://api.anthropic.com/v1');
+    assert.equal(core.normalizeNativeProxyBase('https://api.anthropic.com/v1/', 'claude'), 'https://api.anthropic.com/v1');
+    assert.equal(core.normalizeNativeProxyBase('https://gw.example.com/claude/messages', 'claude'), 'https://gw.example.com/claude/v1');
+    assert.equal(core.normalizeNativeProxyBase('https://generativelanguage.googleapis.com/v1beta', 'makersuite'), 'https://generativelanguage.googleapis.com');
+    assert.equal(core.normalizeNativeProxyBase('', 'claude'), '');
+});
+
+test('拉模型走酒馆后端 status 端点并解析 models 列表', async () => {
+    const fetches = [];
+    const fetchMock = async (url, options) => {
+        fetches.push({ url, options });
+        return { ok: true, json: async () => ({ models: [{ id: 'm1' }, { id: 'm2' }, 'm3'] }), text: async () => '' };
+    };
+    const run = load(null, { fetch: fetchMock });
+    const models = await run.core.fetchAvailableModels('https://api.example.com/v1', 'sk-x');
+    assert.deepEqual(models, ['m1', 'm2', 'm3']);
+    assert.equal(fetches[0].url, '/api/backends/chat-completions/status');
+    const body = JSON.parse(fetches[0].options.body);
+    assert.equal(body.chat_completion_source, 'custom');
+    assert.equal(body.custom_url, 'https://api.example.com/v1');
+    assert.equal(body.custom_include_headers, 'Authorization: Bearer sk-x');
+});
+
+test('拉模型失败时抛出带状态的错误，空端点直接拒绝', async () => {
+    const fetchMock = async () => ({ ok: false, status: 401, statusText: 'Unauthorized', text: async () => '{"error":"bad key"}' });
+    const run = load(null, { fetch: fetchMock });
+    await assert.rejects(() => run.core.fetchAvailableModels('https://x', 'k'), /401/);
+    await assert.rejects(() => run.core.fetchAvailableModels('', 'k'), /请输入端点/);
+});
+
+test('酒馆连接预设列表从连接管理器读取', () => {
+    const SillyTavern = {
+        getContext: () => ({
+            extensionSettings: {
+                connectionManager: { profiles: [{ id: 'p1', name: '配置一' }, { id: 'p2' }, { name: '没id不要' }, null] },
+            },
+        }),
+    };
+    const run = load(null, { SillyTavern });
+    assert.deepEqual(plain(run.core.readTavernConnectionProfiles()), [{ id: 'p1', name: '配置一' }, { id: 'p2', name: 'p2' }]);
+    const empty = load(null);
+    assert.deepEqual(plain(empty.core.readTavernConnectionProfiles()), [], '没有 SillyTavern 上下文时返回空列表');
 });
 
 test('normalizeConfig 清除 v2.8/v2.9 遗留字段，只保留当前本机预设名', () => {
