@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.27
+     * 动态指导助手 v2.28
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.27';
+    const VERSION = '2.28';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -961,12 +961,8 @@
             note,
             // 常驻写在所有阶段之前 = 注入时排在阶段内容之前；重建要保留这个位置
             alwaysTop: Boolean(firstAlways && firstAlways.aboveStages),
-            activeOwnerId: stages.length > 0 ? stages[0].id : 'always',
+            // 待分配的选区（v2.28 只留这一个交互态；选中段/点选头尾那套状态已删）
             pendingRanges: [],
-            selectedMark: null,
-            tapMode: false,
-            tapHead: null,
-            stale: false,
         };
     }
 
@@ -2945,6 +2941,13 @@
         // 新绑定小卡的入场高亮只播一次（v2.27）：节点已经带上 is-new，这里立刻清掉
         // 标记，下次因为别的操作重渲染时不会重播动画。
         ui.justBoundKey = '';
+        // 小卡点进来时带的「落在这一段」（v2.28）：滚过去看一次就好，标记同样立刻清掉。
+        if (ui.editor) ui.editor.focusStage = null;
+        const focusTarget = pendingFocusScroll;
+        pendingFocusScroll = null;
+        if (focusTarget && typeof focusTarget.scrollIntoView === 'function') {
+            try { focusTarget.scrollIntoView({ block: 'center' }); } catch (error) { /* 老环境不支持就算了 */ }
+        }
         shell.classList.toggle('dga-busy', ui.busy);
         const body = shell.querySelector('.dga-body');
         if (body) body.scrollTop = scrollTop;
@@ -3996,10 +3999,20 @@
                 : null,
             el('div', { class: 'dga-stepper' },
                 btn('‹ 上一段', () => move('切换到上一段', stageIndex - 1), { ghost: true, disabled: !usable || stageIndex <= 0 }),
-                el('div', { class: 'dga-stepper-mid' },
+                // 步进器中间这块就是「划分阶段」的入口（v2.28）：点进去直接落在这一条
+                // 绑定当前的段上，于是不同小卡进去分的就是各自条目的段，不再依赖
+                // 添加行里那个「下拉选中是谁」的猜测。
+                el('div', pressable({
+                    class: 'dga-stepper-mid',
+                    title: usable ? '划分阶段：直接落在这一段' : '划分阶段',
+                    'aria-label': '划分阶段',
+                }, () => runAction('打开编辑器', () => openEditorAt(context.worldbookName, context.entry, {
+                    focusStageIndex: total > 0 ? stageIndex : null,
+                }), { refresh: false })),
                     el('span', { class: 'dga-stepper-stage', text: stageText }),
                     nameText ? el('span', { class: 'dga-stepper-name', text: nameText }) : null,
-                    el('div', { class: 'dga-stepper-bar' }, el('i', { style: { width: `${percent}%` } }))),
+                    el('div', { class: 'dga-stepper-bar' }, el('i', { style: { width: `${percent}%` } })),
+                    el('span', { class: 'dga-stepper-edit', text: '划分 ›' })),
                 btn('下一段 ›', () => move('切换到下一段', stageIndex + 1), {
                     ghost: !usable || finished, primary: usable && !finished, disabled: !usable || stageIndex >= total,
                 })),
@@ -4054,22 +4067,26 @@
         const parsed = entry && !legacy ? parseOutline(entry.content) : null;
         const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
         children.push(muted('条目'));
-        children.push(el('div', { class: 'dga-add-row' },
-            selectControl(entryOptions, addKey, value => { ui.addEntryKey = value; render(); }),
-            btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
-                ghost: true, disabled: !entry || legacy,
-            }),
-            binding
-                ? btn('已绑定', () => {}, { disabled: true, ghost: true })
-                : btn('绑定', () => runAction('添加指导条目', async () => {
+        // 这一行只有一个按钮，按状态变形（v2.28）：还没分阶段 → 「划分阶段」，
+        // 分好了 → 「绑定」，已绑定 → 置灰的「已绑定」。划分阶段的日常入口在小卡上，
+        // 这里只负责「第一次分好再绑」这一步，于是不再有两个目标的同名按钮。
+        const ready = Boolean(entry && !legacy && parsed && parsed.stages.length > 0);
+        const rowAction = binding
+            ? btn('已绑定', () => {}, { disabled: true, ghost: true })
+            : ready
+                ? btn('绑定', () => runAction('添加指导条目', async () => {
                     const done = await addBinding(ui.selectedWorldbook, entry);
                     // 认领：这一行当场让位给上面的常驻小卡（并点亮一次）。
                     if (done) claimAddRow(bindingKey({ worldbookName: ui.selectedWorldbook, entryUid: entry.uid, entryName: entryName(entry) }));
                     return done;
-                }), {
-                    primary: Boolean(parsed) && parsed.stages.length > 0,
-                    disabled: !entry || legacy || !parsed || parsed.stages.length === 0,
-                }),
+                }), { primary: true })
+                : btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
+                    ghost: true,
+                    disabled: !entry || legacy,
+                });
+        children.push(el('div', { class: 'dga-add-row' },
+            selectControl(entryOptions, addKey, value => { ui.addEntryKey = value; render(); }),
+            rowAction,
         ));
         if (entry && legacy) {
             children.push(
@@ -4079,9 +4096,9 @@
         } else if (binding) {
             children.push(muted('↳ 已绑定，就在上面的小卡里；解绑点 ×。'));
         } else if (entry && parsed && parsed.stages.length === 0) {
-            children.push(muted('↳ 还没分阶段：先「划分阶段」，再绑定。'));
+            children.push(muted('↳ 还没分阶段：点「划分阶段」分好，才能绑定。'));
         } else {
-            children.push(muted('绑定后条目会被关闭，AI 只看到当前阶段。'));
+            children.push(muted('绑定后条目会被关闭，AI 只看到当前阶段；之后点小卡中间那块随时改划分。'));
         }
         return card('绑定世界书', ...children);
     }
@@ -4128,14 +4145,18 @@
     }
 
     // ---------------------------------------------------------------
-    // 三、界面：划分阶段编辑器
+    // 三、界面：划分阶段编辑器（v2.28 重构为两档视图）
     //
-    // 正文按段落一块块列出来。点一个段落 → 把它设成某个标题的开头；
-    // 点一个标题 → 改名、改类型、改条件或删掉。正文文字本身不会被改。
+    // 分段：正文连续铺开，每一段的标题条内联在它的文字前面，未分配的文字留在
+    //       最前面等着被划走；拖选文字 → 底部选归属（含新建阶段/附加、常驻、备注）。
+    // 编辑原文：直接改条目正文的逃生口。
+    // editor.lines 是唯一真相：所有结构改动都 pickBuild 落回正文再重新派生 pick，
+    // 于是不再有「改了但还没重建」的中间态，stale / pickCommit 那套机制整个删除。
     // ---------------------------------------------------------------
 
-    async function openEditorAt(worldbookName, entry) {
+    async function openEditorAt(worldbookName, entry, options) {
         if (!worldbookName || !entry) throw new Error('请先选择一个条目。');
+        const settings = options || {};
         const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
         if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
         const lines = normalizeText(fresh.content).split('\n');
@@ -4149,17 +4170,20 @@
             parsed: parseOutline(lines.join('\n')),
             dirty: false,
             sheet: null,
-            mode: 'doc',
+            // 两档视图：'seg' 分段 / 'raw' 编辑原文
+            mode: 'seg',
             bound,
             pick: null,
             pickListeners: null,
+            // 从小卡点进来时带的当前段：渲染完滚到它并高亮一次
+            focusStage: Number.isInteger(settings.focusStageIndex) ? settings.focusStageIndex : null,
         };
         ui.view = 'editor';
     }
 
-    // 选区模式里改过名字、条件但还没重建正文，也算有未保存的修改。
+    // lines 是唯一真相（v2.28）：结构改动一律落回正文，所以未保存只看 dirty。
     function editorUnsaved(editor) {
-        return Boolean(editor && (editor.dirty || (editor.pick && editor.pick.stale)));
+        return Boolean(editor && editor.dirty);
     }
 
     function discardEditor() {
@@ -4175,27 +4199,19 @@
         render();
     }
 
+    // 从小卡点进来的那一段：渲染完把它的标题条滚进视野并高亮一次（v2.28）。
+    let pendingFocusScroll = null;
+
     function renderEditor() {
         const editor = ui.editor;
         const parsed = editor.parsed;
         const mode = editor.mode;
-        const hasHeadings = parsed.blocks.length > 0;
-        const docChildren = [];
-        if (parsed.items.length === 0) {
-            docChildren.push(muted('这个条目是空的。先在世界书里把大纲写好，再来分段。'));
+        // 分段是默认视图（v2.28）：第一次进来就要把派生模型和文档级拖选监听准备好，
+        // 否则拖选事件没人接（旧版要先点「选区划分」那一档才会挂）。
+        if (mode === 'seg') {
+            if (!editor.pick) rebuildPick(editor, { dirty: false });
+            if (!editor.pickListeners) pickAttach(editor);
         }
-        let hintShown = false;
-        parsed.items.forEach(item => {
-            if (item.kind === 'heading') {
-                docChildren.push(headingCard(item.block));
-                return;
-            }
-            if (!item.block && hasHeadings && !hintShown) {
-                docChildren.push(el('p', { class: 'dga-hint', text: '↓ 第一个标题之前的文字不会发给 AI' }));
-                hintShown = true;
-            }
-            docChildren.push(paragraphCard(item));
-        });
 
         const rawArea = el('textarea', { class: 'dga-raw', rows: 14, spellcheck: 'false' });
         rawArea.value = editor.lines.join('\n');
@@ -4211,39 +4227,40 @@
         }, label);
         const toolbar = el('div', { class: 'dga-toolbar' },
             el('div', { class: 'dga-seg dga-mode-seg' },
-                modeButton('看分段', 'doc'),
-                modeButton('选区划分', 'pick'),
+                modeButton('分段', 'seg'),
                 modeButton('编辑原文', 'raw')),
-            mode === 'doc' && hasHeadings ? muted('点段落设开头 · 点标题改名或改条件') : null,
         );
         const helpText = mode === 'raw'
-            ? '直接改条目原文：增删、调序、自己写「## 阶段名」都行。回「看分段」会重新按标题分段。'
-            : mode === 'pick'
-                ? '先点一个分段，再拖选文字后点「分配给」；不好拖就用「点选头尾」点两下。没分配的文字留在最前面。'
-                : '点段落设成某阶段的开头；点标题可改名、改条件、并入或删除。也可切「编辑原文」直接改。';
-        const pickStages = mode === 'pick' && editor.pick ? editor.pick.stages.length : 0;
+            ? '直接改条目原文：增删、调序、自己写「## 阶段名」都行。回「分段」会重新按标题分段。'
+            : '拖选正文 → 从底部选归属；点标题条改名称、类型和进入条件。';
+        const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
             toolbar,
-            mode === 'doc' && !hasHeadings && parsed.items.length > 0
-                ? btn('按空行自动分段（每块的第一行当标题）', () => {
+            mode === 'raw' ? rawArea : renderSegments(editor),
+            // 一个标题都还没有：原始正文就是不分段的，分段完全由用户自己划。
+            // 想省事可以先按空行切块，再逐块拖选归属。
+            mode === 'seg' && !parsed.blocks.length && parsed.items.length > 0
+                ? btn('按空行先切成块（每块第一行当标题）', () => {
                     editor.lines = autoSplitByBlankLines(editor.lines);
-                    editor.mode = 'doc';
-                    afterEdit();
-                }, { primary: true })
+                    editor.dirty = true;
+                    editor.sheet = null;
+                    pickDetach(editor);
+                    rebuildPick(editor, { dirty: false });
+                    pickAttach(editor);
+                    render();
+                }, { ghost: true })
                 : null,
-            mode === 'raw' ? rawArea
-                : mode === 'pick' ? renderPick(editor)
-                    : el('div', { class: 'dga-doc' }, ...docChildren),
-            mode === 'doc' && hasHeadings ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` }) : null,
+            mode === 'seg' && mergedCount > 0
+                ? messageBar({ type: 'warning', text: `这个条目有 ${mergedCount} 处「合并到」；在「分段」里保存会把它们并进目标阶段的正文（文字不丢，「合并到：」头会没了）。要保留结构请用「编辑原文」。` })
+                : null,
+            mode === 'seg' && parsed.blocks.length > 0
+                ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` })
+                : null,
         );
         const foot = el('footer', { class: 'dga-foot' },
-            btn('保存', () => runAction('保存', () => saveEditor(false), { refresh: false }), { primary: editor.bound }),
-            editor.bound ? null : btn('保存并添加', () => runAction('保存并添加', () => saveEditor(true), { refresh: false }), {
-                primary: true,
-                disabled: mode !== 'raw' && parsed.stages.length === 0 && pickStages === 0,
-            }),
+            btn('保存', () => runAction('保存', () => saveEditor(), { refresh: false }), { primary: true }),
         );
         const parts = [
             header('划分阶段', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回'),
@@ -4259,40 +4276,96 @@
         if (!editor || editor.mode === mode) return;
         if (editor.mode === 'raw' && rawArea) {
             editor.lines = normalizeText(rawArea.value).split('\n');
-            editor.parsed = parseOutline(editor.lines.join('\n'));
         }
-        if (editor.mode === 'pick') {
-            pickDetach(editor);
-            if (editor.pick && editor.pick.stale) {
-                editor.lines = normalizeText(pickBuild(editor.pick)).split('\n');
-                editor.parsed = parseOutline(editor.lines.join('\n'));
-                editor.dirty = true;
-            }
-            editor.pick = null;
-        }
+        if (editor.mode === 'seg') pickDetach(editor);
         editor.mode = mode;
-        if (mode === 'pick') {
-            editor.pick = pickLoad(editor.parsed);
+        if (mode === 'seg') {
+            rebuildPick(editor, { dirty: false });
             pickAttach(editor);
+        } else {
+            editor.pick = null;
         }
         render();
     }
 
-    function headingSubtitle(block) {
-        if (block.kind === 'stage') return block.completion ? `进入下一段：${block.completion}` : (block.autoComplete ? '进入下一段：自动判断' : '手动点“下一段”推进');
-        if (block.kind === 'addon') {
-            const stages = ui.editor.parsed.stages;
-            if (stages.length === 0) return '还没有剧情阶段';
-            return block.fromIndex === block.toIndex
-                ? `只在第 ${block.fromIndex + 1} 段有效`
-                : `第 ${block.fromIndex + 1} 段到第 ${block.toIndex + 1} 段有效`;
+    // lines 是唯一真相（v2.28）：pick 只是从正文派生出来的渲染/交互模型。
+    // 任何结构改动都走「改 pick → pickBuild 落回正文 → 重新派生」这一条路。
+    function rebuildPick(editor, options) {
+        const settings = options || {};
+        editor.parsed = parseOutline(editor.lines.join('\n'));
+        editor.pick = pickLoad(editor.parsed);
+        if (settings.dirty !== false) editor.dirty = true;
+        return editor.pick;
+    }
+
+    // 所有结构改动的唯一出口：把 pick 落回正文，重新派生，再重绘。
+    function commitPick(editor) {
+        editor.lines = normalizeText(pickBuild(editor.pick)).split('\n');
+        rebuildPick(editor);
+        render();
+    }
+
+    function segmentSubtitle(editor, owner) {
+        if (owner.kind === 'stage') {
+            if (owner.completion === '自动') return '进入下一段：AI 自己判断';
+            return owner.completion ? `进入下一段：${owner.completion}` : '手动点「下一段」推进';
         }
-        if (block.kind === 'merged') {
-            const stage = ui.editor.parsed.stages[block.mergeInto];
-            return stage ? `并入「${stage.name}」，和它一起发送` : '找不到要并入的阶段，已按独立阶段处理';
+        if (owner.kind === 'addon') {
+            if (!sortedStages(editor.pick).length) return '还没有剧情阶段';
+            if (!owner.from && !owner.to) return '还没选生效范围';
+            return owner.from === owner.to ? `只在「${owner.from}」有效` : `「${owner.from}」到「${owner.to}」有效`;
         }
-        if (block.kind === 'always') return block.aboveStages ? '每一段都发送 · 排在阶段内容之前' : '每一段都发送 · 排在阶段内容之后';
+        if (owner.kind === 'always') return editor.pick.alwaysTop ? '每段都发送 · 排在阶段内容之前' : '每段都发送 · 排在阶段内容之后';
         return '只给自己看，不发送';
+    }
+
+    // 标题条：内联在正文流里的分段头。点它 = 打开唯一属性弹层。
+    // data-dga-skip 让 textOffsetTo 跳过它的文字，内联也不会污染选区偏移。
+    function segmentBar(editor, owner, options) {
+        const settings = options || {};
+        const stageIndex = settings.stageIndex;
+        const chars = owner.ranges.reduce((sum, range) => sum + (range.end - range.start), 0);
+        const tag = owner.kind === 'stage' ? `第 ${stageIndex + 1} 段` : KIND_LABELS[owner.kind];
+        const moveBtn = (label, delta, disabled, title) => el('button', {
+            type: 'button', class: 'dga-move', title,
+            disabled: Boolean(disabled),
+            onclick: event => { event.stopPropagation(); moveSegment(editor, owner, delta); },
+        }, label);
+        const canMove = owner.kind === 'stage' && stageIndex != null && stageIndex >= 0;
+        return el('div', pressable({
+            class: 'dga-segbar',
+            'data-dga-skip': '1',
+            style: { '--dga-c': owner.color },
+        }, () => openSheet({ owner })),
+            el('span', { class: 'dga-tag', text: tag }),
+            el('div', { class: 'dga-heading-text' },
+                el('b', { text: owner.name }),
+                el('small', { text: segmentSubtitle(editor, owner) })),
+            el('span', { class: 'dga-segbar-count', text: chars > 0 ? `${chars} 字` : '空' }),
+            canMove ? el('span', { class: 'dga-move-wrap' },
+                moveBtn('↑', -1, stageIndex <= 0, '和上一段交换'),
+                moveBtn('↓', 1, false, '和下一段交换')) : null,
+            el('span', { class: 'dga-chev', text: '›' }),
+        );
+    }
+
+    // ↑↓ 只给阶段：阶段顺序本来就由文字位置推导（sortedStages），所以这里落回正文
+    // 交换相邻两块再重新派生。附加/常驻的位置是类型规则决定的，不给 ↑↓。
+    function moveSegment(editor, owner, delta) {
+        if (owner.kind !== 'stage') return;
+        const order = sortedStages(editor.pick);
+        const index = order.indexOf(owner);
+        if (index < 0) return;
+        editor.lines = normalizeText(pickBuild(editor.pick)).split('\n');
+        const stages = parseOutline(editor.lines.join('\n')).stages;
+        if (!stages[index] || !stages[index + delta]) return;
+        editor.lines = moveBlock(editor.lines, stages[index], delta);
+        editor.dirty = true;
+        editor.sheet = null;
+        pickDetach(editor);
+        rebuildPick(editor, { dirty: false });
+        pickAttach(editor);
+        render();
     }
 
     function pressable(attrs, handler) {
@@ -4310,87 +4383,24 @@
         };
     }
 
-    function headingCard(block) {
-        const editor = ui.editor;
-        const blocks = editor.parsed.blocks;
-        const at = blocks.findIndex(item => item.headingLine === block.headingLine);
-        const tag = block.kind === 'stage' ? `第 ${block.stageIndex + 1} 段` : KIND_LABELS[block.kind];
-        // 整块上移/下移：标题、标签、正文一起动；常驻挪到所有阶段之前 = 注入时排在阶段内容之前
-        const moveBtn = (label, delta, disabled, title) => el('button', {
-            type: 'button',
-            class: 'dga-move',
-            title,
-            disabled: Boolean(disabled),
-            onclick: event => {
-                event.stopPropagation();
-                editor.lines = moveBlock(editor.lines, block, delta);
-                afterEdit();
-            },
-        }, label);
-        return el('div', pressable({ class: 'dga-heading', style: { '--dga-c': block.color } }, () => openSheet({ mode: 'edit', block })),
-            el('span', { class: 'dga-tag', text: tag }),
-            el('div', { class: 'dga-heading-text' },
-                el('b', { text: block.name }),
-                el('small', { text: headingSubtitle(block) })),
-            el('span', { class: 'dga-move-wrap' },
-                moveBtn('↑', -1, at <= 0, '上移一块'),
-                moveBtn('↓', 1, at < 0 || at >= blocks.length - 1, '下移一块')),
-            el('span', { class: 'dga-chev', text: '›' }),
-        );
-    }
-
-    function paragraphCard(item) {
-        return el('div', pressable({ class: `dga-para${item.block ? '' : ' dga-dim'}` }, () => openSheet({ mode: 'new', item })),
-            item.lines.join('\n'));
+    // 唯一属性编辑器（v2.28）：一个属主（阶段/附加/常驻/备注）的全部属性都在这里改。
+    // 弹层按按钮才落盘，所以不存在边打字边重建正文的焦点问题。
+    function makeSheet(owner) {
+        return {
+            owner,
+            name: owner.name,
+            kind: owner.kind === 'addon' ? 'addon' : 'stage',
+            completion: owner.kind === 'stage' ? (owner.completion || '') : '',
+            from: owner.kind === 'addon' ? owner.from : '',
+            to: owner.kind === 'addon' ? owner.to : '',
+            alwaysTop: Boolean(ui.editor && ui.editor.pick && ui.editor.pick.alwaysTop),
+            error: '',
+        };
     }
 
     function openSheet(spec) {
         if (ui.busy) return;
-        const editor = ui.editor;
-        const stages = editor.parsed.stages;
-        const nameAt = index => (stages[index] ? stages[index].name : '');
-        if (spec.mode === 'new') {
-            const item = spec.item;
-            const first = item.lines[0].trim();
-            const titleLike = item.lines.length > 1 && first.length <= 24 && !/[。！？!?，,；;…”"）)]$/.test(first);
-            const anchor = item.block
-                ? (item.block.kind === 'stage' ? item.block.stageIndex : item.block.anchorStage)
-                : 0;
-            editor.sheet = {
-                mode: 'new',
-                atLine: item.start,
-                name: titleLike ? first : '',
-                kind: 'stage',
-                completion: '',
-                from: nameAt(anchor),
-                to: nameAt(anchor),
-                merge: nameAt(anchor),
-                lineOptions: item.lines.map((text, offset) => ({
-                    value: String(item.start + offset),
-                    label: `${item.start + offset + 1}. ${oneLine(text).slice(0, 20) || '（空行）'}`,
-                })),
-                canConsumeFirstLine: titleLike,
-                consumeFirstLine: titleLike,
-                error: '',
-            };
-        } else {
-            const block = spec.block;
-            const isAddon = block.kind === 'addon';
-            const isMerged = block.kind === 'merged';
-            editor.sheet = {
-                mode: 'edit',
-                block,
-                name: block.name,
-                kind: block.kind,
-                completion: block.autoComplete ? '自动' : (block.completion || ''),
-                from: nameAt(isAddon ? block.fromIndex : block.anchorStage),
-                to: nameAt(isAddon ? block.toIndex : block.anchorStage),
-                merge: nameAt(isMerged ? block.mergeInto : block.anchorStage),
-                canConsumeFirstLine: false,
-                consumeFirstLine: false,
-                error: '',
-            };
-        }
+        ui.editor.sheet = makeSheet(spec.owner);
         render();
     }
 
@@ -4399,17 +4409,9 @@
         render();
     }
 
-    function afterEdit() {
-        const editor = ui.editor;
-        editor.parsed = parseOutline(editor.lines.join('\n'));
-        editor.dirty = true;
-        editor.sheet = null;
-        render();
-    }
-
     function renderSheet(sheet) {
         const editor = ui.editor;
-        const stages = editor.parsed.stages.filter(stage => !(sheet.mode === 'edit' && stage === sheet.block));
+        const owner = sheet.owner;
         const backdrop = el('div', {
             class: 'dga-sheet-bg',
             onclick: event => {
@@ -4417,7 +4419,7 @@
             },
         });
         const box = el('div', { class: 'dga-sheet', role: 'dialog' });
-        box.append(el('h3', { text: sheet.mode === 'new' ? '从这一段开始一个新标题' : '修改这个标题' }));
+        box.append(el('h3', { text: `修改「${owner.name}」` }));
         if (sheet.error) box.append(messageBar({ type: 'error', text: sheet.error }));
 
         const nameInput = el('input', {
@@ -4429,29 +4431,15 @@
         nameInput.value = sheet.name;
         box.append(field('名称', nameInput));
 
-        if (sheet.mode === 'new' && sheet.lineOptions && sheet.lineOptions.length > 1) {
-            box.append(field('从这一段的哪一行开始', selectControl(sheet.lineOptions, String(sheet.atLine), value => {
-                sheet.atLine = Number(value);
-                render();
-            })));
+        // 常驻 / 备注是单例，不给类型切换：想换类型就重新拖选文字、选另一个归属。
+        if (owner.kind === 'stage' || owner.kind === 'addon') {
+            box.append(field('这是什么', el('div', { class: 'dga-seg' },
+                ...[['stage', '剧情阶段'], ['addon', '附加内容']].map(([kind, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
+                    onclick: () => { sheet.kind = kind; render(); },
+                }, label)))));
         }
-
-        if (sheet.canConsumeFirstLine) {
-            const checkbox = el('input', { type: 'checkbox', onchange: event => { sheet.consumeFirstLine = event.target.checked; } });
-            checkbox.checked = sheet.consumeFirstLine;
-            box.append(el('label', { class: 'dga-check' }, checkbox, el('span', { text: '选中的那一行就是标题，把它变成标题行' })));
-        }
-
-        box.append(field('这是什么', el('div', { class: 'dga-seg' },
-            ...['stage', 'merged', 'addon', 'always', 'note'].map(kind => el('button', {
-                type: 'button',
-                class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
-                onclick: () => {
-                    sheet.kind = kind;
-                    render();
-                },
-            }, KIND_LABELS[kind])),
-        )));
 
         if (sheet.kind === 'stage') {
             const completion = el('textarea', {
@@ -4463,10 +4451,11 @@
             box.append(field('什么时候进入下一段（AI 自己判断）', completion));
         }
         if (sheet.kind === 'addon') {
+            const stages = sortedStages(editor.pick);
             if (stages.length === 0) {
-                box.append(muted('还没有剧情阶段。先把上面的段落设成阶段，再来设置附加内容的有效范围。'));
+                box.append(muted('还没有剧情阶段。先分段，再给附加内容选生效范围。'));
             } else {
-                const options = stages.map(stage => ({ value: stage.name, label: `第 ${stage.stageIndex + 1} 段 · ${stage.name}` }));
+                const options = stages.map((stage, index) => ({ value: stage.name, label: `第 ${index + 1} 段 · ${stage.name}` }));
                 if (!options.some(option => option.value === sheet.from)) sheet.from = options[0].value;
                 if (!options.some(option => option.value === sheet.to)) sheet.to = sheet.from;
                 box.append(field('从哪一段开始有效', selectControl(options, sheet.from, value => {
@@ -4480,36 +4469,53 @@
             }
             box.append(muted('不占进度，只在指定几段里一起发送。'));
         }
-        if (sheet.kind === 'merged') {
-            if (stages.length === 0) {
-                box.append(muted('还没有剧情阶段。先把某个段落设成阶段，再让这段文字并进去。'));
-            } else {
-                const options = stages.map(stage => ({ value: stage.name, label: `第 ${stage.stageIndex + 1} 段 · ${stage.name}` }));
-                if (!options.some(option => option.value === sheet.merge)) sheet.merge = options[0].value;
-                box.append(field('并进哪一个阶段', selectControl(options, sheet.merge, value => {
-                    sheet.merge = value;
-                    render();
-                })));
-            }
-            box.append(muted('和那个阶段一起发送，自己不占进度——一个阶段能吃掉几段不连续的内容。'));
+        if (owner.kind === 'always') {
+            box.append(field('位置', el('div', { class: 'dga-seg' },
+                ...[['top', '排在阶段内容之前'], ['bottom', '排在阶段内容之后']].map(([value, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${(sheet.alwaysTop ? 'top' : 'bottom') === value ? ' is-on' : ''}`,
+                    onclick: () => { sheet.alwaysTop = value === 'top'; render(); },
+                }, label)))));
+            box.append(muted('这部分每一段都会发送，直到全部阶段结束。'));
         }
-        if (sheet.kind === 'always') box.append(muted('这部分会在每一段都发给 AI。'));
-        if (sheet.kind === 'note') box.append(muted('这部分只给作者自己看，不会发给 AI。'));
+        if (owner.kind === 'note') box.append(muted('这部分只给作者自己看，不会发给 AI。'));
 
         const actions = [
-            btn(sheet.mode === 'new' ? '添加标题' : '保存修改', applySheet, { primary: true }),
+            btn('保存修改', applySheet, { primary: true }),
             btn('取消', closeSheet),
         ];
-        if (sheet.mode === 'edit') actions.push(btn('删除这个标题', deleteSheetHeading, { danger: true }));
+        actions.push(btn('删除', () => deleteOwner(editor, owner), { danger: true }));
         box.append(el('div', { class: 'dga-sheet-actions' }, ...actions));
         backdrop.append(box);
         return backdrop;
+    }
+
+    // 阶段 ↔ 附加：属主在两条列表之间搬家，它名下的文字跟着走。
+    function changeOwnerKind(pick, owner, kind) {
+        if (kind === 'stage') {
+            pick.addons = pick.addons.filter(item => item !== owner);
+            owner.kind = 'stage';
+            owner.completion = '';
+            delete owner.from;
+            delete owner.to;
+            owner.color = STAGE_COLORS[pick.stages.length % STAGE_COLORS.length];
+            if (!pick.stages.includes(owner)) pick.stages.push(owner);
+            return;
+        }
+        pick.stages = pick.stages.filter(item => item !== owner);
+        owner.kind = 'addon';
+        const stages = sortedStages(pick);
+        owner.from = stages.length ? stages[0].name : '';
+        owner.to = stages.length ? stages[stages.length - 1].name : '';
+        owner.color = KIND_COLORS.addon;
+        if (!pick.addons.includes(owner)) pick.addons.push(owner);
     }
 
     function applySheet() {
         const editor = ui.editor;
         const sheet = editor && editor.sheet;
         if (!sheet) return;
+        const owner = sheet.owner;
         const name = String(sheet.name || '').trim();
         if (!name) {
             sheet.error = '请先填写名称。';
@@ -4521,45 +4527,52 @@
             render();
             return;
         }
-        if (sheet.kind === 'merged' && !String(sheet.merge || '').trim()) {
-            sheet.error = '请选择要并进的阶段。';
-            render();
-            return;
+        owner.name = name;
+        if (owner.kind === 'stage') owner.completion = String(sheet.completion || '').trim();
+        if (owner.kind === 'addon') {
+            owner.from = sheet.from;
+            owner.to = sheet.to;
         }
-        const spec = {
-            name,
-            kind: sheet.kind,
-            completion: sheet.completion,
-            from: sheet.kind === 'addon' ? sheet.from : '',
-            to: sheet.kind === 'addon' ? sheet.to : '',
-            merge: sheet.kind === 'merged' ? sheet.merge : '',
-        };
-        if (sheet.mode === 'new') {
-            editor.lines = insertHeading(editor.lines, sheet.atLine, spec, sheet.canConsumeFirstLine && sheet.consumeFirstLine);
-        } else {
-            editor.lines = replaceHeading(editor.lines, sheet.block, spec);
+        if (owner.kind === 'always') editor.pick.alwaysTop = Boolean(sheet.alwaysTop);
+        if ((owner.kind === 'stage' || owner.kind === 'addon') && sheet.kind !== owner.kind) {
+            changeOwnerKind(editor.pick, owner, sheet.kind);
         }
-        afterEdit();
+        editor.sheet = null;
+        // 名称、进入条件都会写进正文（## 名称 / 完成：条件），所以必须重建。
+        commitPick(editor);
     }
 
-    function deleteSheetHeading() {
-        const editor = ui.editor;
-        const sheet = editor && editor.sheet;
-        if (!sheet || sheet.mode !== 'edit') return;
-        if (!hostWindow.confirm(`删除标题“${sheet.block.name}”？下面的文字会并入上一段。`)) return;
-        editor.lines = deleteHeading(editor.lines, sheet.block);
-        afterEdit();
+    function deleteOwner(editor, owner) {
+        const pick = editor.pick;
+        if (!pick || !owner) return;
+        if (!hostWindow.confirm(`删除「${owner.name}」？它的文字会回到未分配。`)) return;
+        if (owner.kind === 'stage') {
+            const order = sortedStages(pick);
+            const index = order.indexOf(owner);
+            const fallback = order[index + 1] || order[index - 1] || null;
+            pick.stages = pick.stages.filter(item => item !== owner);
+            pick.addons.forEach(addon => {
+                if (addon.from === owner.name) addon.from = fallback ? fallback.name : '';
+                if (addon.to === owner.name) addon.to = fallback ? fallback.name : '';
+            });
+        } else if (owner.kind === 'addon') {
+            pick.addons = pick.addons.filter(item => item !== owner);
+        } else {
+            // 常驻 / 备注是单例：清空名下的文字就等于删掉这一块。
+            owner.ranges = [];
+        }
+        editor.sheet = null;
+        commitPick(editor);
     }
 
     // ---------------------------------------------------------------
-    // 三、界面：选区划分
+    // 三、界面：分段视图的选区交互（v2.28）
     //
-    // 正文铺成一段可以拖选的连续文字，每个分段一种颜色：
-    //   - 拖选（鼠标或触屏系统选区）→ 进入“待分配”，再点“分配给”当前分段；
-    //   - 触屏不好拖选时开“点选头尾”：点一下设开头，再点一下设结尾；
-    //   - 点已上色的文字 = 把它所在的分段设为当前分段，可以再“移除选中段”。
-    // 分配和移除会立刻按归属重建正文（pickCommit），名字和条件的修改
-    // 则在离开选区或保存时一次性重建，打字时不会丢焦点。
+    // 正文铺成一段可以拖选的连续文字，每个分段一种颜色，标题条内联在正文流里：
+    //   - 拖选（鼠标或触屏系统选区）→ 进入「待分配」，底部浮出归属下拉；
+    //   - 归属下拉同时负责新建：＋ 新阶段 / ＋ 新附加 直接拿选中的文字建；
+    //   - 「未分配（不发送）」= 从所有属主名下减掉，取代原来的「移除选中段」。
+    // 分配之后立刻 pickBuild 落回正文并重新派生 pick，不再有待重建的中间态。
     // ---------------------------------------------------------------
 
     function pickSurfaceNode() {
@@ -4588,18 +4601,35 @@
         }
     }
 
-    // 用 Range 量出“从正文开头到某个节点位置”的字数，也就是选区偏移。
+    // 量出「从正文开头到某节点位置」的字数，也就是选区偏移。
+    // 不用 Range.toString()：标题条内联在正文流里，它的文字不能算进偏移，
+    // 所以这里自己走 DOM，并整块跳过带 data-dga-skip 的子树。
     function textOffsetTo(surface, node, offset) {
-        const doc = hostDocument();
-        if (!doc || typeof doc.createRange !== 'function') return null;
-        try {
-            const range = doc.createRange();
-            range.selectNodeContents(surface);
-            range.setEnd(node, offset);
-            return range.toString().length;
-        } catch (error) {
-            return null;
-        }
+        if (!surface || !node) return null;
+        if (node !== surface && !nodeContains(surface, node)) return null;
+        const kids = current => current.childNodes || current.children || [];
+        let total = 0;
+        let hit = false;
+        const walk = current => {
+            if (hit || !current) return;
+            if (current.nodeType === 3) {
+                const text = String(current.textContent || '');
+                if (current === node) {
+                    total += Math.max(0, Math.min(Number(offset) || 0, text.length));
+                    hit = true;
+                    return;
+                }
+                total += text.length;
+                return;
+            }
+            if (current !== surface && current.getAttribute && current.getAttribute('data-dga-skip') != null) return;
+            const list = kids(current);
+            const limit = current === node ? Math.max(0, Math.min(Number(offset) || 0, list.length)) : list.length;
+            for (let index = 0; index < limit && !hit; index++) walk(list[index]);
+            if (current === node) hit = true;
+        };
+        walk(surface);
+        return hit ? total : null;
     }
 
     function selectionOffsets() {
@@ -4623,138 +4653,78 @@
         return { start: Math.min(start, end), end: Math.max(start, end) };
     }
 
-    function offsetAtPoint(x, y) {
-        const surface = pickSurfaceNode();
-        const doc = hostDocument();
-        if (!surface || !doc) return null;
-        let node = null;
-        let offset = 0;
-        try {
-            if (typeof doc.caretRangeFromPoint === 'function') {
-                const caret = doc.caretRangeFromPoint(x, y);
-                if (caret) { node = caret.startContainer; offset = caret.startOffset; }
-            } else if (typeof doc.caretPositionFromPoint === 'function') {
-                const caret = doc.caretPositionFromPoint(x, y);
-                if (caret) { node = caret.offsetNode; offset = caret.offset; }
-            }
-        } catch (error) {
-            return null;
-        }
-        if (!node || !nodeContains(surface, node)) return null;
-        return textOffsetTo(surface, node, offset);
-    }
-
-    // 把当前系统选区收进“待分配”。选完立刻清掉系统高亮，改由我们的底色显示。
+    // 把当前系统选区收进「待分配」。选完立刻清掉系统高亮，改由我们的底色显示。
     function captureSelection(editor) {
         const pick = editor && editor.pick;
-        if (!pick || editor.mode !== 'pick') return;
+        if (!pick || editor.mode !== 'seg') return;
         const range = selectionOffsets();
         if (!range || range.end - range.start < 1) return;
         pick.pendingRanges = normalizeRanges([...pick.pendingRanges, range]);
-        pick.selectedMark = null;
         clearNativeSelection();
         if (editor.pickListeners) editor.pickListeners.ignoreClickUntil = Date.now() + 300;
         render();
     }
 
-    // 点选头尾：第一下记开头，第二下把两点之间收进“待分配”。
-    function placeTapMarker(editor, offset) {
-        const pick = editor && editor.pick;
-        if (!pick || offset == null) return;
-        if (pick.tapHead == null) {
-            pick.tapHead = offset;
-        } else {
-            const start = Math.min(pick.tapHead, offset);
-            const end = Math.max(pick.tapHead, offset);
-            pick.tapHead = null;
-            if (end > start) {
-                pick.pendingRanges = normalizeRanges([...pick.pendingRanges, { start, end }]);
-                pick.selectedMark = null;
-            }
-        }
-        render();
-    }
-
-    // 结构性修改（分配、移除、删除分段）后：按归属重建正文并重新载入选区。
-    function pickCommit(editor, removedId) {
-        const pick = editor && editor.pick;
-        if (!pick) return;
-        const active = pickOwner(pick, pick.activeOwnerId);
-        const activeKey = active && active.id !== removedId ? `${active.kind}：${active.name}` : '';
-        const tapMode = pick.tapMode;
-        editor.lines = normalizeText(pickBuild(pick)).split('\n');
-        editor.parsed = parseOutline(editor.lines.join('\n'));
-        editor.dirty = true;
-        editor.pick = pickLoad(editor.parsed);
-        editor.pick.tapMode = tapMode;
-        if (activeKey) {
-            const found = pickOwners(editor.pick).find(owner => `${owner.kind}：${owner.name}` === activeKey);
-            if (found) editor.pick.activeOwnerId = found.id;
-        }
-        render();
-    }
-
-    function pickAssignPending(editor) {
-        const pick = editor && editor.pick;
-        if (!pick || pick.pendingRanges.length === 0) return;
-        if (pickAssign(pick, pick.activeOwnerId, pick.pendingRanges)) pickCommit(editor);
-    }
-
-    function pickRemoveSelected(editor) {
-        const pick = editor && editor.pick;
-        if (!pick || !pick.selectedMark) return;
-        if (pickRemove(pick, pick.selectedMark.ownerId, pick.selectedMark)) pickCommit(editor);
-    }
-
-    function pickNewOwner(editor, kind) {
-        const pick = editor && editor.pick;
-        if (!pick) return;
-        const serial = `${Date.now().toString(36)}-${pick.stages.length + pick.addons.length}`;
+    // 新建一个分段/附加（v2.28）：只能从选中的文字建，名字取那段文字的首个非空行，
+    // 建完直接打开属性弹层让用户确认——不再有「+ 阶段」造空壳这条路。
+    function newOwner(pick, kind, text) {
+        const firstLine = String(text || '').split('\n').map(line => line.trim()).find(Boolean) || '';
+        const stamp = Date.now().toString(36);
         if (kind === 'stage') {
             const stage = {
-                id: `pick-stage-${serial}`,
+                id: `pick-stage-${stamp}-${pick.stages.length}`,
                 kind: 'stage',
-                name: `第 ${pick.stages.length + 1} 段`,
+                name: pickSafeName(firstLine, `第 ${pick.stages.length + 1} 段`),
                 completion: '',
                 ranges: [],
                 color: STAGE_COLORS[pick.stages.length % STAGE_COLORS.length],
             };
             pick.stages.push(stage);
-            pick.activeOwnerId = stage.id;
-        } else {
-            const first = sortedStages(pick)[0];
-            const addon = {
-                id: `pick-addon-${serial}`,
-                kind: 'addon',
-                name: `附加 ${pick.addons.length + 1}`,
-                from: first ? first.name : '',
-                to: first ? first.name : '',
-                ranges: [],
-                color: KIND_COLORS.addon,
-            };
-            pick.addons.push(addon);
-            pick.activeOwnerId = addon.id;
+            return stage;
         }
-        pick.stale = true;
-        render();
+        const stages = sortedStages(pick);
+        const addon = {
+            id: `pick-addon-${stamp}-${pick.addons.length}`,
+            kind: 'addon',
+            name: pickSafeName(firstLine, `附加 ${pick.addons.length + 1}`),
+            from: stages.length ? stages[0].name : '',
+            to: stages.length ? stages[stages.length - 1].name : '',
+            ranges: [],
+            color: KIND_COLORS.addon,
+        };
+        pick.addons.push(addon);
+        return addon;
     }
 
-    function pickDeleteOwner(editor, owner) {
-        const pick = editor && editor.pick;
-        if (!pick || !owner) return;
-        if (!hostWindow.confirm(`删除「${owner.name}」？它的文字会回到未分配。`)) return;
-        if (owner.kind === 'stage') {
-            const sorted = sortedStages(pick);
-            const fallback = sorted[sorted.indexOf(owner) + 1] || sorted[sorted.indexOf(owner) - 1] || null;
-            pick.stages = pick.stages.filter(item => item !== owner);
-            pick.addons.forEach(addon => {
-                if (addon.from === owner.name) addon.from = fallback ? fallback.name : '';
-                if (addon.to === owner.name) addon.to = fallback ? fallback.name : '';
-            });
-        } else if (owner.kind === 'addon') {
-            pick.addons = pick.addons.filter(item => item !== owner);
+    // 分配（v2.28）：把「待分配」交给一个归属目标——未分配 / 已有属主 / 新建阶段 / 新建附加。
+    // 分配完立刻落回正文并重新派生，不再有等待重建的中间态。
+    function assignPending(editor, target) {
+        const pick = editor.pick;
+        const ranges = normalizeRanges(pick.pendingRanges);
+        if (!pick || ranges.length === 0) return;
+        const text = ranges.map(range => pick.text.slice(range.start, range.end)).join('\n');
+        let created = null;
+        if (target === '__unassigned') {
+            // 取消分配：从所有属主名下减掉这些区间，文字回到「未分配」。
+            pickOwners(pick).forEach(owner => { owner.ranges = subtractRanges(owner.ranges, ranges); });
+        } else if (target === '__new-stage' || target === '__new-addon') {
+            created = newOwner(pick, target === '__new-stage' ? 'stage' : 'addon', text);
+            pickAssign(pick, created.id, ranges);
+        } else {
+            const owner = pickOwner(pick, target);
+            if (!owner) return;
+            pickAssign(pick, owner.id, ranges);
         }
-        pickCommit(editor, owner.id);
+        pick.pendingRanges = [];
+        clearNativeSelection();
+        editor.lines = normalizeText(pickBuild(pick)).split('\n');
+        rebuildPick(editor);
+        // 刚建出来的直接开弹层，让用户确认名称与进入条件。
+        if (created) {
+            const fresh = pickOwners(editor.pick).find(owner => owner.kind === created.kind && owner.name === created.name);
+            if (fresh) editor.sheet = makeSheet(fresh);
+        }
+        render();
     }
 
     // 选区模式的文档级监听：拖选手势期间不碰选区；手指滑动当成滚页面，
@@ -4777,7 +4747,7 @@
         const doc = hostDocument();
         if (!doc || typeof doc.addEventListener !== 'function') return;
         listeners.onSelectionChange = () => {
-            if (!ui.editor || ui.editor !== editor || editor.mode !== 'pick') return;
+            if (!ui.editor || ui.editor !== editor || editor.mode !== 'seg') return;
             if (listeners.gestureOpen || listeners.touchActive) return;
             if (Date.now() < listeners.ignoreSelectionUntil) return;
             if (listeners.timer && typeof hostWindow.clearTimeout === 'function') hostWindow.clearTimeout(listeners.timer);
@@ -4814,114 +4784,56 @@
         if (editor) editor.pickListeners = null;
     }
 
-    function renderPick(editor) {
+    // 分段视图（v2.28）：正文连续铺开，每一段的标题条内联在它第一片文字之前；
+    // 没有归属的文字留在最前面（不发送）。拖选文字 → 底部浮出分配栏。
+    function renderSegments(editor) {
         const pick = editor.pick;
         if (!pick.text) {
             return el('div', { class: 'dga-pick' },
-                renderPickSide(editor),
-                muted('这个条目还没有正文。切到“编辑原文”先写内容，再回来拖选划分。'));
+                muted('这个条目还没有正文。切到「编辑原文」先写内容，再回来分段。'));
         }
-        return el('div', { class: 'dga-pick' },
-            renderPickSide(editor),
-            renderPickBar(editor),
-            renderPickSurface(editor));
-    }
-
-    function renderPickBar(editor) {
-        const pick = editor.pick;
-        const owner = pickOwner(pick, pick.activeOwnerId);
-        const chars = pick.pendingRanges.reduce((sum, range) => sum + (range.end - range.start), 0);
-        const bar = el('div', { class: 'dga-pick-bar' });
-        if (pick.tapMode) {
-            bar.append(
-                el('span', {
-                    class: 'dga-pick-bar-text',
-                    text: pick.tapHead == null ? '点选：点一下正文，设开头' : '再点一下，设结尾',
-                }),
-                btn('退出点选', () => {
-                    pick.tapMode = false;
-                    pick.tapHead = null;
-                    render();
-                }, { ghost: true }));
-            return bar;
-        }
-        bar.append(el('span', {
-            class: 'dga-pick-bar-text',
-            text: chars > 0 ? `已准备 ${pick.pendingRanges.length} 段 · ${chars} 字` : '在下面的正文上拖选文字',
-        }));
-        if (pick.selectedMark) bar.append(btn('移除选中段', () => pickRemoveSelected(editor), { danger: true }));
-        bar.append(
-            btn(owner ? `分配给「${oneLine(owner.name).slice(0, 12)}」` : '先选一个分段', () => pickAssignPending(editor), {
-                primary: true,
-                disabled: chars === 0 || !owner,
-            }),
-            btn('点选头尾', () => {
-                pick.tapMode = true;
-                pick.selectedMark = null;
-                clearNativeSelection();
-                render();
-            }, { ghost: true }),
-            btn('清除', () => {
-                pick.pendingRanges = [];
-                pick.selectedMark = null;
-                clearNativeSelection();
-                render();
-            }, { ghost: true, disabled: chars === 0 && !pick.selectedMark }));
-        return bar;
-    }
-
-    function renderPickSurface(editor) {
-        const pick = editor.pick;
-        const listeners = editor.pickListeners;
-        const surface = el('div', { class: `dga-pick-surface${pick.tapMode ? ' dga-tap-mode' : ''}` });
-
-        // 按所有区间边界把正文切成小片，每片看归属决定底色。
+        const order = sortedStages(pick);
+        const surface = el('div', { class: 'dga-pick-surface' });
         const marks = [];
-        pickOwners(pick).forEach(owner => {
-            owner.ranges.forEach(range => marks.push({ start: range.start, end: range.end, owner }));
-        });
+        pickOwners(pick).forEach(owner => owner.ranges.forEach(range => marks.push({ start: range.start, end: range.end, owner })));
         const pending = normalizeRanges(pick.pendingRanges);
         const cuts = new Set([0, pick.text.length]);
         marks.forEach(mark => { cuts.add(mark.start); cuts.add(mark.end); });
         pending.forEach(range => { cuts.add(range.start); cuts.add(range.end); });
-        if (pick.tapHead != null) cuts.add(pick.tapHead);
         const points = [...cuts].sort((left, right) => left - right);
-        let caretPlaced = false;
+        const shown = new Set();
         points.forEach((point, index) => {
-            if (!caretPlaced && pick.tapHead === point) {
-                surface.append(el('span', { class: 'dga-tap-caret', title: '开头' }));
-                caretPlaced = true;
-            }
             if (index >= points.length - 1) return;
             const end = points[index + 1];
             const mark = marks.find(item => item.start <= point && item.end >= end);
             const isPending = pending.some(range => range.start <= point && range.end >= end);
             const slice = pick.text.slice(point, end);
+            // 这一片是某个属主的第一片 → 先把它的标题条插进正文流里
+            if (mark && !shown.has(mark.owner.id)) {
+                shown.add(mark.owner.id);
+                const stageIndex = order.indexOf(mark.owner);
+                const bar = segmentBar(editor, mark.owner, { stageIndex });
+                if (mark.owner.kind === 'stage' && editor.focusStage === stageIndex) {
+                    bar.classList.add('is-focus');
+                    pendingFocusScroll = bar;
+                }
+                surface.append(bar);
+            }
             if (!mark && !isPending) {
                 surface.append(hostDocument().createTextNode(slice));
                 return;
             }
-            const classes = [];
-            if (mark) {
-                classes.push('dga-text-mark');
-                if (mark.owner.id === pick.activeOwnerId) classes.push('is-active');
-                if (pick.selectedMark && pick.selectedMark.ownerId === mark.owner.id
-                    && pick.selectedMark.start === mark.start && pick.selectedMark.end === mark.end) {
-                    classes.push('is-selected');
-                }
-            } else {
-                classes.push('dga-pending');
-            }
+            const classes = mark ? ['dga-text-mark'] : ['dga-pending'];
             if (isPending) classes.push('is-pending');
             surface.append(el('span', {
                 class: classes.join(' '),
                 style: mark ? { '--dga-c': mark.owner.color } : null,
-                'data-owner': mark ? mark.owner.id : null,
                 'data-s': String(point),
                 'data-e': String(end),
             }, slice));
         });
 
+        const listeners = editor.pickListeners;
         surface.addEventListener('mousedown', () => {
             if (listeners) listeners.gestureOpen = true;
         });
@@ -4929,23 +4841,6 @@
             if (!listeners || !listeners.gestureOpen) return;
             listeners.gestureOpen = false;
             captureSelection(editor);
-        });
-        surface.addEventListener('click', event => {
-            if (!listeners || Date.now() < listeners.ignoreClickUntil) return;
-            if (pick.tapMode) {
-                placeTapMarker(editor, offsetAtPoint(event.clientX, event.clientY));
-                return;
-            }
-            const target = event.target;
-            if (!target || !target.classList || !target.classList.contains('dga-text-mark')) return;
-            const owner = pickOwner(pick, target.getAttribute('data-owner'));
-            if (!owner) return;
-            pick.activeOwnerId = owner.id;
-            const start = Number(target.getAttribute('data-s'));
-            const end = Number(target.getAttribute('data-e'));
-            const mark = owner.ranges.find(range => range.start <= start && range.end >= end);
-            pick.selectedMark = mark ? { ownerId: owner.id, start: mark.start, end: mark.end } : null;
-            render();
         });
         surface.addEventListener('touchstart', event => {
             if (!listeners) return;
@@ -4958,152 +4853,78 @@
             if (!listeners || !listeners.touchActive) return;
             const touch = event.touches && event.touches[0];
             if (touch && Math.hypot(touch.clientX - listeners.touchX, touch.clientY - listeners.touchY) > 12) listeners.touchMoved = true;
-            if (pick.tapMode) clearNativeSelection();
         }, { passive: true });
-        surface.addEventListener('touchend', event => {
+        surface.addEventListener('touchend', () => {
             if (!listeners || !listeners.touchActive) return;
             listeners.touchActive = false;
             if (listeners.touchMoved) return;
-            if (pick.tapMode) {
-                const touch = event.changedTouches && event.changedTouches[0];
-                if (touch) placeTapMarker(editor, offsetAtPoint(touch.clientX, touch.clientY));
-                listeners.ignoreClickUntil = Date.now() + 500;
-                return;
-            }
             // 系统拖把手选区在手指抬起后才定形，延迟一轮再读取。
             hostWindow.setTimeout(() => captureSelection(editor), 0);
         });
         surface.addEventListener('touchcancel', () => {
             if (listeners) listeners.touchActive = false;
         });
-        return surface;
+
+        const empty = pickOwners(pick).filter(owner => !shown.has(owner.id) && (owner.kind === 'stage' || owner.kind === 'addon'));
+        const root = el('div', { class: 'dga-pick' },
+            renderAssignBar(editor),
+            order.length === 0 ? el('p', { class: 'dga-hint', text: '还没有分段：在下面的正文上拖选一段文字，再从底部选「＋ 新阶段…」。' }) : null,
+            surface,
+            empty.length > 0 ? muted('空分段（名下没有文字，不会发送）') : null,
+            ...empty.map(owner => segmentBar(editor, owner, { stageIndex: owner.kind === 'stage' ? order.indexOf(owner) : null })),
+        );
+        return root;
     }
 
-    function renderPickSide(editor) {
+    // 分配栏（v2.28）：一个下拉覆盖全部归属目标与两种新建，替代原来的 chips 侧栏
+    // 和「分配给 / 点选头尾 / 移除选中段 / 清除」四个按钮。
+    function renderAssignBar(editor) {
         const pick = editor.pick;
-        const refs = { chipNames: {} };
-        editor.pickRefs = refs;
-        const chips = el('div', { class: 'dga-pick-chips' });
-        [...sortedStages(pick), ...pick.addons, pick.always, pick.note].forEach(owner => {
-            const chars = owner.ranges.reduce((sum, range) => sum + (range.end - range.start), 0);
-            const nameNode = el('span', { class: 'dga-chip-name', text: owner.name });
-            refs.chipNames[owner.id] = nameNode;
-            chips.append(el('button', {
-                type: 'button',
-                class: `dga-chip${owner.id === pick.activeOwnerId ? ' is-on' : ''}`,
-                style: { '--dga-c': owner.color },
-                onclick: () => {
-                    pick.activeOwnerId = owner.id;
-                    pick.selectedMark = null;
-                    render();
-                },
-            },
-                el('span', { class: 'dga-chip-dot' }),
-                nameNode,
-                el('span', { class: 'dga-chip-count', text: chars > 0 ? `${chars} 字` : '空' })));
-        });
-        chips.append(el('button', { type: 'button', class: 'dga-chip dga-chip-add', onclick: () => pickNewOwner(editor, 'stage') }, '+ 阶段'));
-        chips.append(el('button', { type: 'button', class: 'dga-chip dga-chip-add', onclick: () => pickNewOwner(editor, 'addon') }, '+ 附加'));
-        return el('div', { class: 'dga-pick-side' }, chips, renderPickSettings(editor));
+        const chars = pick.pendingRanges.reduce((sum, range) => sum + (range.end - range.start), 0);
+        if (chars === 0) return null;
+        const options = [
+            { value: '', label: '选择归属…' },
+            { value: '__unassigned', label: '未分配（不发送）' },
+            ...sortedStages(pick).map((stage, index) => ({ value: stage.id, label: `第 ${index + 1} 段 · ${stage.name}` })),
+            ...pick.addons.map(addon => ({ value: addon.id, label: `附加 · ${addon.name}` })),
+            { value: 'always', label: '常驻提示（每段都发送）' },
+            { value: 'note', label: '备注（只给自己看）' },
+            { value: '__new-stage', label: '＋ 新阶段…' },
+            { value: '__new-addon', label: '＋ 新附加…' },
+        ];
+        return el('div', { class: 'dga-pick-bar' },
+            el('span', { class: 'dga-pick-bar-text', text: `已选 ${pick.pendingRanges.length} 段 · ${chars} 字` }),
+            selectControl(options, '', value => {
+                if (value) assignPending(editor, value);
+            }),
+            btn('取消', () => {
+                pick.pendingRanges = [];
+                clearNativeSelection();
+                render();
+            }, { ghost: true }),
+        );
     }
 
-    function renderPickSettings(editor) {
-        const pick = editor.pick;
-        const owner = pickOwner(pick, pick.activeOwnerId);
-        if (!owner) return null;
-        if (owner.kind === 'always') {
-            return el('div', { class: 'dga-pick-settings' },
-                muted('常驻提示：每段都会发送。'),
-                btn(pick.alwaysTop ? '位置：排在阶段内容之前（点我改到之后）' : '位置：排在阶段内容之后（点我改到之前）', () => {
-                    pick.alwaysTop = !pick.alwaysTop;
-                    pick.stale = true;
-                    render();
-                }, { ghost: true }));
-        }
-        if (owner.kind === 'note') {
-            return el('div', { class: 'dga-pick-settings' }, muted('备注：只给自己看，不发送。'));
-        }
-        const box = el('div', { class: 'dga-pick-settings' });
-        const nameInput = el('input', { type: 'text', maxlength: 60 });
-        nameInput.value = owner.name;
-        // 改名不重建正文，只记“待重建”，打字不会丢焦点。
-        nameInput.addEventListener('input', event => {
-            owner.name = event.target.value.replace(/[#【】\[\]]/g, '');
-            pick.stale = true;
-            const label = editor.pickRefs && editor.pickRefs.chipNames[owner.id];
-            if (label) label.textContent = owner.name.trim() || '（未命名）';
-        });
-        box.append(field('名称', nameInput));
-
-        if (owner.kind === 'stage') {
-            const completion = el('textarea', {
-                rows: 2,
-                placeholder: '例：两人完成第一次正式交谈。留空 = 手动，填「自动」= AI 自己判断。',
-            });
-            completion.value = owner.completion;
-            completion.addEventListener('input', event => {
-                owner.completion = event.target.value;
-                pick.stale = true;
-            });
-            box.append(field('什么时候进入下一段（AI 自己判断）', completion));
-        } else {
-            const sorted = sortedStages(pick);
-            const options = sorted.map((stage, index) => ({ value: stage.name, label: `第 ${index + 1} 段 · ${stage.name}` }));
-            if (options.length === 0) {
-                box.append(muted('先点「+ 阶段」，再给附加内容选生效范围。'));
-            } else {
-                if (!options.some(option => option.value === owner.from)) owner.from = options[0].value;
-                if (!options.some(option => option.value === owner.to)) owner.to = owner.from;
-                box.append(field('从哪一段开始有效', selectControl(options, owner.from, value => {
-                    owner.from = value;
-                    pick.stale = true;
-                })));
-                box.append(field('到哪一段为止（含这一段）', selectControl(options, owner.to, value => {
-                    owner.to = value;
-                    pick.stale = true;
-                })));
-            }
-        }
-        box.append(el('div', { class: 'dga-row' },
-            btn(owner.kind === 'stage' ? '删除这个阶段' : '删除这个附加', () => pickDeleteOwner(editor, owner), { danger: true })));
-        return box;
-    }
-
-    async function saveEditor(bindAfter) {
+    async function saveEditor() {
         const editor = ui.editor;
-        const wasPick = editor.mode === 'pick' && editor.pick;
-        if (wasPick && editor.pick.stale) {
-            editor.lines = normalizeText(pickBuild(editor.pick)).split('\n');
-        }
         const content = editor.lines.join('\n');
-        const parsed = parseOutline(content);
-        if (bindAfter && parsed.stages.length === 0) {
-            throw new Error('还没有剧情阶段，不能添加。先点一个段落，把它设为第一阶段的开头。');
-        }
         const saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
         editor.entry = saved;
         editor.lines = normalizeText(saved.content).split('\n');
         editor.parsed = parseOutline(saved.content);
         editor.dirty = false;
-        if (bindAfter) {
-            await addBinding(editor.worldbookName, saved, { confirm: false });
-            ui.view = 'guide';
-            enterGuidePage();
-            discardEditor();
-            await refresh({ worldbookName: editor.worldbookName, entryKey: entryKey(saved, 0) });
-            setMessage('已保存并添加。当前聊天从第一段开始。', 'success');
-            return;
-        }
-        // 已添加的条目：保存后立刻按新正文同步镜像，进度按阶段名自动对上。
+        // 已绑定的条目：保存后立刻按新正文同步镜像，进度按阶段名自动对上。
         if (editor.bound) await syncMirrors('normal');
-        // 留在选区模式：按保存后的正文重新铺开，待分配的预览不保留。
-        if (wasPick) {
+        // 留在分段视图：按保存后的正文重新铺开，待分配的预览不保留。
+        if (editor.mode === 'seg') {
             pickDetach(editor);
-            editor.pick = pickLoad(editor.parsed);
+            rebuildPick(editor, { dirty: false });
+            editor.pick.pendingRanges = [];
             pickAttach(editor);
-            editor.mode = 'pick';
         }
-        setMessage(editor.bound ? '已保存，进度按阶段名自动对上。' : '已保存。正文只增减了标题行。', 'success');
+        setMessage(editor.bound
+            ? '已保存，进度按阶段名自动对上。'
+            : '已保存。回「动态指导」页点「绑定」开始使用。', 'success');
     }
 
     // ---------------------------------------------------------------
@@ -5176,18 +4997,11 @@ ${P} .dga-msg { padding: 10px 12px; border-radius: 11px; font-size: 0.9rem; whit
 ${P} .dga-msg[data-type="success"] { background: rgba(60, 190, 120, 0.14); border-color: rgba(60, 190, 120, 0.35); }
 ${P} .dga-msg[data-type="warning"] { background: rgba(245, 170, 50, 0.14); border-color: rgba(245, 170, 50, 0.38); }
 ${P} .dga-msg[data-type="error"] { background: rgba(240, 80, 80, 0.14); border-color: rgba(240, 80, 80, 0.4); }
-${P} .dga-doc { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 ${P} .dga-toolbar .dga-btn { flex: 0 0 auto; min-height: 40px; padding: 8px 12px; }
 ${P} .dga-toolbar .dga-muted { flex: 1 1 auto; opacity: 0.55; }
 ${P} textarea.dga-raw { min-height: 46vh; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92rem; line-height: 1.5; }
-${P} .dga-para { padding: 11px 13px; border-radius: 12px; border: 1px dashed rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.03); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.93rem; cursor: pointer; }
-${P} .dga-para:hover, ${P} .dga-para:focus-visible, ${P} .dga-heading:hover, ${P} .dga-heading:focus-visible { outline: 2px solid var(--SmartThemeQuoteColor, #7c6cf0); outline-offset: 1px; }
-${P} .dga-para.dga-dim { opacity: 0.5; }
-${P} .dga-heading { display: flex; align-items: center; gap: 10px; margin-top: 8px; padding: 10px 12px; border-radius: 12px; border-left: 5px solid var(--dga-c, #8b5cf6); background: color-mix(in srgb, var(--dga-c, #8b5cf6) 18%, transparent); cursor: pointer; }
 ${P} .dga-heading-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-${P} .dga-heading b { font-size: 1rem; overflow-wrap: anywhere; }
-${P} .dga-heading small { opacity: 0.75; font-size: 0.8rem; overflow-wrap: anywhere; }
 ${P} .dga-tag { flex: 0 0 auto; padding: 2px 9px; border-radius: 999px; background: var(--dga-c, #8b5cf6); color: #fff; font-size: 0.75rem; font-weight: 700; white-space: nowrap; }
 ${P} .dga-chev { opacity: 0.5; font-size: 1.3rem; }
 ${P} .dga-move-wrap { display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto; }
@@ -5195,6 +5009,13 @@ ${P} .dga-move { width: 32px; min-height: 26px; padding: 0; border-radius: 8px; 
 ${P} .dga-move:hover { background: rgba(255, 255, 255, 0.14); }
 ${P} .dga-move:disabled { opacity: 0.25; cursor: default; }
 ${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 0.82rem; opacity: 0.6; }
+/* 标题条（v2.28）：内联在正文流里的分段头，user-select 关掉避免被选中，
+   textOffsetTo 按 data-dga-skip 整块跳过它的文字，所以不会污染选区偏移。 */
+${P} .dga-segbar { display: flex; align-items: center; gap: 9px; margin: 6px 0; padding: 9px 11px; border-radius: 12px; border-left: 5px solid var(--dga-c, #8b5cf6); background: color-mix(in srgb, var(--dga-c, #8b5cf6) 18%, transparent); cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-segbar:hover, ${P} .dga-segbar:focus-visible { outline: 2px solid var(--SmartThemeQuoteColor, #7c6cf0); outline-offset: 1px; }
+${P} .dga-segbar b { font-size: 1rem; overflow-wrap: anywhere; }
+${P} .dga-segbar small { opacity: 0.75; font-size: 0.8rem; overflow-wrap: anywhere; }
+${P} .dga-segbar-count { flex: 0 0 auto; opacity: 0.6; font-size: 0.78rem; }
 ${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 ${P} .dga-seg-btn { min-height: 40px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit; cursor: pointer; }
 ${P} .dga-seg-btn.is-on { background: var(--SmartThemeQuoteColor, #7c6cf0); border-color: transparent; color: #fff; font-weight: 700; }
@@ -5205,28 +5026,16 @@ ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
 ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-events: none; }
 #${MENU_ITEM_ID} { width: 100%; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-${P} .dga-seg.dga-mode-seg { flex: 1 1 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+${P} .dga-seg.dga-mode-seg { flex: 1 1 auto; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 ${P} .dga-pick { display: flex; flex-direction: column; gap: 10px; }
-${P} .dga-pick-side { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-pick-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-${P} .dga-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 38px; padding: 6px 11px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit; font-size: 0.86rem; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-${P} .dga-chip.is-on { border-color: var(--dga-c, #8b5cf6); background: color-mix(in srgb, var(--dga-c, #8b5cf6) 24%, transparent); font-weight: 700; }
-${P} .dga-chip-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dga-c, #8b5cf6); flex: 0 0 auto; }
-${P} .dga-chip-count { opacity: 0.6; font-size: 0.78rem; }
-${P} .dga-chip-add { border-style: dashed; opacity: 0.85; }
-${P} .dga-pick-settings { display: flex; flex-direction: column; gap: 9px; padding: 11px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); }
 ${P} .dga-pick-bar { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding: 8px 9px; border-radius: 12px; background: var(--SmartThemeBlurTintColor, #1b1d24); border: 1px solid rgba(255, 255, 255, 0.14); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3); }
 ${P} .dga-pick-bar .dga-btn { flex: 0 0 auto; min-height: 38px; padding: 7px 12px; font-size: 0.87rem; }
+${P} .dga-pick-bar select { flex: 1 1 160px; min-width: 0; min-height: 38px; }
 ${P} .dga-pick-bar-text { flex: 1 1 100%; font-size: 0.86rem; opacity: 0.78; }
-${P} .dga-pick-surface { padding: 12px 13px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(0, 0, 0, 0.18); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.95rem; line-height: 1.75; user-select: text; -webkit-user-select: text; cursor: text; }
-${P} .dga-pick-surface.dga-tap-mode { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: pointer; }
-${P} .dga-text-mark { padding: 1px 0; border-radius: 4px; background: color-mix(in srgb, var(--dga-c, #8b5cf6) 24%, transparent); box-decoration-break: clone; -webkit-box-decoration-break: clone; cursor: pointer; }
-${P} .dga-text-mark.is-active { background: color-mix(in srgb, var(--dga-c, #8b5cf6) 44%, transparent); box-shadow: 0 0 0 1px var(--dga-c, #8b5cf6); }
-${P} .dga-text-mark.is-selected { outline: 2px solid rgba(255, 255, 255, 0.9); outline-offset: 1px; }
+${P} .dga-pick-surface { padding: 10px 13px 14px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(0, 0, 0, 0.18); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.95rem; line-height: 1.75; user-select: text; -webkit-user-select: text; cursor: text; }
+${P} .dga-text-mark { padding: 1px 0; border-radius: 4px; background: color-mix(in srgb, var(--dga-c, #8b5cf6) 24%, transparent); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
 ${P} .dga-pending { border-bottom: 2px dashed rgba(255, 255, 255, 0.75); }
 ${P} .dga-text-mark.is-pending, ${P} .dga-pending { background: rgba(255, 255, 255, 0.14); }
-${P} .dga-tap-caret { display: inline-block; width: 0; height: 1.15em; vertical-align: -0.2em; border-left: 2px solid #ffd166; position: relative; }
-${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em; left: -3px; padding: 0 5px; border-radius: 4px; background: #ffd166; color: #221a00; font-size: 0.7rem; line-height: 1.5; white-space: nowrap; }
 ${P} .dga-nav-backdrop { position: absolute; inset: 0; z-index: 3; display: flex; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-nav-drawer { width: 250px; max-width: 84%; height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 22px 12px 16px; background: var(--SmartThemeBlurTintColor, #1b1d24); border-right: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 12px 0 40px rgba(0, 0, 0, 0.45); animation: dga-nav-in 0.18s ease-out; }
 @keyframes dga-nav-in { from { transform: translateX(-28px); opacity: 0; } to { transform: none; opacity: 1; } }
@@ -5265,7 +5074,11 @@ ${P} .dga-bind-item-head .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4
 ${P} .dga-bind-item-head .dga-icon-btn { width: 34px; min-width: 34px; min-height: 34px; border-radius: 9px; font-size: 1.05rem; line-height: 1; }
 ${P} .dga-stepper { display: flex; align-items: center; gap: 8px; }
 ${P} .dga-stepper .dga-btn { flex: 0 0 auto; min-height: 36px; padding: 6px 12px; font-size: 0.82rem; }
-${P} .dga-stepper-mid { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; text-align: center; }
+${P} .dga-stepper-mid { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; text-align: center; padding: 3px 6px; border-radius: 9px; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-stepper-mid:hover, ${P} .dga-stepper-mid:focus-visible { background: rgba(255, 255, 255, 0.08); outline: 2px solid var(--SmartThemeQuoteColor, #7c6cf0); outline-offset: 1px; }
+${P} .dga-stepper-edit { font-size: 0.72rem; opacity: 0.6; }
+${P} .dga-segbar.is-focus { animation: dga-focus-in 1.6s ease-out; }
+@keyframes dga-focus-in { 0% { box-shadow: 0 0 0 4px rgba(124, 108, 240, 0.55); } 70% { box-shadow: 0 0 0 4px rgba(124, 108, 240, 0.35); } 100% { box-shadow: none; } }
 ${P} .dga-stepper-stage { font-size: 0.86rem; font-weight: 700; color: var(--SmartThemeQuoteColor, #b8a7ff); }
 ${P} .dga-stepper-name { font-size: 0.78rem; opacity: 0.65; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 ${P} .dga-stepper-bar { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.10); overflow: hidden; }

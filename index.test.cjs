@@ -943,7 +943,7 @@ function findButton(node, prefix) {
     return null;
 }
 
-test('选区模式界面：拖选前言分配给第一阶段，正文立刻重建并标脏', async () => {
+test('分段界面：拖选前言分配给第一段，正文立刻重建并标脏', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     // mock Range：toString() 量出从正文开头到端点的字数，也就是选区偏移
     documentRef.createRange = () => {
@@ -1006,34 +1006,162 @@ test('选区模式界面：拖选前言分配给第一阶段，正文立刻重�
     await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await uiCore.refresh();
     const panel = documentRef.getElementById(PANEL_ID);
-    const pickTab = panel.querySelector('.dga-mode-pick');
-    assert.ok(pickTab, '编辑器要有“选区划分”模式按钮');
-    pickTab.listeners.click[0]();
+    assert.ok(panel.querySelector('.dga-mode-seg'), '编辑器第一档是「分段」');
+    assert.ok(panel.querySelector('.dga-mode-raw'), '编辑器第二档是「编辑原文」');
 
     let surface = panel.querySelector('.dga-pick-surface');
-    assert.ok(surface, '选区模式要把正文铺成连续文字');
-    assert.match(surface.textContent, /前言介绍\n\n第一幕正文/);
+    assert.ok(surface, '分段视图要把正文铺成连续文字');
+    assert.equal(collectByClass(surface, 'dga-segbar', []).length, 1, '第一段的标题条内联在正文流里');
     const texts = collectTextNodes(surface, []);
-    assert.equal(texts[0].textContent, '前言介绍\n\n', '前言和分隔符在第一个文本节点里（未分配，没有底色）');
+    assert.equal(texts[0].textContent, '前言介绍\n\n', '未分配的前言和分隔符在第一个文本节点里（没有底色）');
+    // 标题条带 data-dga-skip：它的文字（含 ↑↓ 按钮）不能算进选区文本流，
+    // textOffsetTo 就是按这条契约跳过整棵子树的。
+    const flowText = node => {
+        if (node.nodeType === 3) return node.textContent;
+        if (node.getAttribute && node.getAttribute('data-dga-skip') != null) return '';
+        return (node.children || []).map(flowText).join('');
+    };
+    assert.equal(flowText(surface), '前言介绍\n\n第一幕正文', '标题条的文字不进选区文本流，正文保持连续');
 
     selection.select(texts[0], 0, texts[0], 4);
     surface.listeners.mousedown[0]();
     surface.listeners.mouseup[0]();
-    assert.match(panel.querySelector('.dga-pick-bar-text').textContent, /已准备 1 段/, '拖选后选区栏要显示待分配数量');
+    assert.match(panel.querySelector('.dga-pick-bar-text').textContent, /已选 1 段 · 4 字/, '拖选后分配栏要显示待分配的数量');
     assert.equal(selection.rangeCount, 0, '捕获后系统选区要清掉，改由我们的底色显示');
 
-    const assign = findButton(panel, '分配给');
-    assert.ok(assign, '选区栏要有分配按钮');
-    assign.listeners.click[0]();
+    const bar = panel.querySelector('.dga-pick-bar');
+    const select = findTag(bar, 'SELECT');
+    assert.ok(select, '分配栏要有归属下拉，取代原来的「分配给」按钮');
+    const stageOption = select.children.find(option => /第 1 段/.test(option.textContent));
+    assert.ok(stageOption, '归属下拉要列出各个分段');
+    select.value = stageOption.getAttribute('value');
+    select.listeners.change[0]({ target: select });
+
     surface = panel.querySelector('.dga-pick-surface');
-    const firstSpan = surface.children[0];
-    assert.ok(firstSpan.classList && firstSpan.classList.contains('dga-text-mark'), '分配后前言要包进第一幕的底色');
-    assert.match(firstSpan.textContent, /前言介绍/);
+    const mark = collectByClass(surface, 'dga-text-mark', [])[0];
+    assert.ok(mark, '分配后前言要包进第一段的底色');
+    assert.match(mark.textContent, /前言介绍/);
     const subtitle = panel.querySelector('.dga-head-text').children[1];
     assert.match(subtitle.textContent, /未保存/, '分配是结构性修改，头部要提示未保存');
     assert.deepEqual(errors, []);
 });
 
+
+// ---------------------------------------------------------------
+// v2.28 划分阶段重构：分段/编辑原文两档，标题条内联，分配栏管归属与新建
+// ---------------------------------------------------------------
+
+test('分段视图：从选中文字新建阶段，弹层确认后还能退回未分配', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '开头介绍\n\n正片内容', enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const selection = {
+        rangeCount: 0,
+        isCollapsed: true,
+        native: null,
+        getRangeAt() { return this.native; },
+        removeAllRanges() { this.rangeCount = 0; this.isCollapsed = true; this.native = null; },
+        select(startNode, startOffset, endNode, endOffset) {
+            this.native = { startContainer: startNode, startOffset, endContainer: endNode, endOffset };
+            this.rangeCount = 1;
+            this.isCollapsed = false;
+        },
+    };
+    const logs = [];
+    const errors = [];
+    const sandbox = {
+        Buffer,
+        console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
+        TavernHelper: helper,
+        document: documentRef,
+        getComputedStyle: () => ({ display: 'none', visibility: 'hidden' }),
+        setTimeout: () => 0,
+        clearTimeout: () => {},
+        innerWidth: 390,
+        innerHeight: 844,
+        matchMedia: () => ({ matches: false }),
+        getSelection: () => selection,
+    };
+    vm.runInNewContext(source, sandbox, { filename: 'index.js' });
+    const uiCore = sandbox.DynamicGuideAssistantCore;
+    await new Promise(setImmediate);
+    await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await uiCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const assign = value => {
+        const select = findTag(panel().querySelector('.dga-pick-bar'), 'SELECT');
+        select.value = value;
+        select.listeners.change[0]({ target: select });
+    };
+
+    // 初始：一个标题都没有 = 整篇都是未分配，没有任何标题条
+    let surface = panel().querySelector('.dga-pick-surface');
+    assert.equal(collectByClass(surface, 'dga-segbar', []).length, 0, '刚开始不分段，全部文字都是未分配');
+    assert.match(panel().textContent, /还没有分段/, '要提示用户自己划');
+
+    // 拖开头四个字 → 从选中文字建一个新阶段（名字取选中文字）
+    const first = collectTextNodes(surface, [])[0];
+    assert.equal(first.textContent, '开头介绍\n\n正片内容');
+    selection.select(first, 0, first, 4);
+    surface.listeners.mousedown[0]();
+    surface.listeners.mouseup[0]();
+    assert.match(panel().querySelector('.dga-pick-bar-text').textContent, /已选 1 段 · 4 字/);
+    assign('__new-stage');
+
+    surface = panel().querySelector('.dga-pick-surface');
+    const bars = collectByClass(surface, 'dga-segbar', []);
+    assert.equal(bars.length, 1, '新建的阶段要立刻变成内联标题条');
+    assert.match(bars[0].textContent, /开头介绍/);
+    const sheet = panel().querySelector('.dga-sheet');
+    assert.ok(sheet, '新建后要直接打开属性弹层让用户确认名称');
+    assert.match(findTag(sheet, 'H3').textContent, /修改「开头介绍」/);
+    assert.equal(findButton(sheet, '删除') ? true : false, true, '弹层要有删除出口');
+    findButton(sheet, '取消').listeners.click[0]();
+
+    // 再把这个阶段的文字选一遍，改成「未分配」→ 文字退回去，阶段消失
+    const mark = collectByClass(panel(), 'dga-text-mark', [])[0];
+    assert.ok(mark, '第一段的文字要有底色');
+    const markText = mark.children.find(child => child.nodeType === 3);
+    selection.select(markText, 0, markText, markText.textContent.length);
+    const freshSurface = panel().querySelector('.dga-pick-surface');
+    freshSurface.listeners.mousedown[0]();
+    freshSurface.listeners.mouseup[0]();
+    assign('__unassigned');
+
+    surface = panel().querySelector('.dga-pick-surface');
+    assert.equal(collectByClass(surface, 'dga-segbar', []).length, 0, '退回未分配后阶段消失');
+    assert.equal(collectByClass(surface, 'dga-text-mark', []).length, 0, '底色一并去掉');
+    assert.deepEqual(errors, []);
+});
+
+test('小卡步进器中间那块是划分阶段的入口，点进去落在当前段', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二\n\n## 第三幕\n正文三', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: { version: 2, bindings: [{ worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' }] },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    // 用 publicApi 推进到第二段再刷新，保证卡片显示的是第 2 / 3 段
+    await sandbox.DynamicGuideAssistantCore.next();
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+
+    const mid = panel().querySelector('.dga-stepper-mid');
+    assert.ok(mid, '小卡步进器中间那块就是划分阶段的入口');
+    assert.match(mid.textContent, /第 2 \/ 3 段/);
+    assert.match(mid.textContent, /划分 ›/, '要有「划分」的可见提示');
+    await mid.listeners.click[0]();
+
+    const focused = collectByClass(panel(), 'is-focus', []);
+    assert.equal(focused.length, 1, '落在小卡当前的段上，只高亮那一段');
+    assert.match(focused[0].textContent, /第二幕/);
+    assert.ok(panel().querySelector('.dga-mode-seg'), '点进去打开的是「分段」视图');
+    assert.deepEqual(errors, []);
+});
 
 // ---------------------------------------------------------------
 // v2.27 认领模型：绑定即变常驻小卡，＋/－/删除模式这层行管理取消
@@ -1187,7 +1315,7 @@ test('选区模式重建保留常驻的前后位置，开关可以切换', () =>
     assert.equal(flipped.blocks.find(item => item.kind === 'always').aboveStages, true, '开关切到上面后重建排在阶段之前');
 });
 
-test('看分段界面：标题卡的下移按钮交换阶段顺序且不打开弹层', async () => {
+test('分段界面：标题条的下移按钮交换阶段顺序且不打开弹层', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
     state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
@@ -1202,13 +1330,13 @@ test('看分段界面：标题卡的下移按钮交换阶段顺序且不打开�
         (node.children || []).forEach(child => findAll(child, cls, out));
         return out;
     };
-    let cards = findAll(panel, 'dga-heading', []);
+    let cards = findAll(panel, 'dga-segbar', []);
     assert.equal(cards.length, 2);
     assert.match(cards[0].textContent, /第一幕/);
     const down = findButton(cards[0], '↓');
-    assert.ok(down, '第一张标题卡要有下移按钮');
+    assert.ok(down, '第一张标题条要有下移按钮');
     down.listeners.click[0]({ stopPropagation() {} });
-    cards = findAll(panel, 'dga-heading', []);
+    cards = findAll(panel, 'dga-segbar', []);
     assert.match(cards[0].textContent, /第二幕/, '第二幕被换到上面');
     assert.match(cards[1].textContent, /第一幕/);
     assert.equal(panel.querySelector('.dga-sheet'), null, '点搬移按钮不能打开标题弹层');
