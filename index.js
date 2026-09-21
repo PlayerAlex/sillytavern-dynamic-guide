@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.20
+     * 动态指导助手 v2.21
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.20';
+    const VERSION = '2.21';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3575,7 +3575,7 @@
             setMessage('已导出当前草稿的提示词段。', 'success');
         }, { ghost: true });
 
-        const back = () => { ui.view = 'manager'; ui.judgePromptDraft = null; render(); };
+        const back = () => { ui.view = 'guide'; ui.judgePromptDraft = null; render(); };
         return [
             header('判断AI提示词', '判断AI · 提示词段与输出规则', back, '返回'),
             el('div', { class: 'dga-body' },
