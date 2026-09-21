@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.11.2
+     * 动态指导助手 v2.12
      *
      * 这个文件分三部分：
      *   一、核心：纯函数。把世界书正文解析成阶段，按进度挑出要发的内容；
@@ -26,7 +26,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.11.2';
+    const VERSION = '2.12';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -399,6 +399,7 @@
             stageName: parsed.stages[index] ? parsed.stages[index].name : '',
             lastCompletionMessageId: old.lastCompletionMessageId == null ? null : old.lastCompletionMessageId,
             lastCompletionFingerprint: old.lastCompletionFingerprint || '',
+            lastJudgeCheckedId: old.lastJudgeCheckedId == null ? null : old.lastJudgeCheckedId,
             updatedAt: old.updatedAt || new Date().toISOString(),
         };
     }
@@ -1365,6 +1366,11 @@
         }
         // 裁判选用的本地 API 预设名；空字符串 = 使用酒馆当前 API。
         if (settings.judgePreset != null && typeof settings.judgePreset !== 'string') settings.judgePreset = String(settings.judgePreset);
+        // 裁判检查频率：每 N 层（条 AI 回复）检查一次，非法值回退 1（每层都查）。
+        if (settings.judgeInterval != null) {
+            const n = Math.floor(Number(settings.judgeInterval));
+            settings.judgeInterval = Number.isFinite(n) && n >= 1 ? n : 1;
+        }
         // v2.9 起裁判统一由酒馆助手 generateRaw 调用；清除旧数据库相关配置。
         delete settings.judgeEngine;
         delete settings.judgeApiPresets;
@@ -1658,7 +1664,8 @@
             || left.stageIndex !== right.stageIndex
             || left.stageName !== right.stageName
             || left.lastCompletionMessageId !== right.lastCompletionMessageId
-            || left.lastCompletionFingerprint !== right.lastCompletionFingerprint;
+            || left.lastCompletionFingerprint !== right.lastCompletionFingerprint
+            || left.lastJudgeCheckedId !== right.lastJudgeCheckedId;
     }
 
     // ---------------------------------------------------------------
@@ -2027,6 +2034,7 @@
                 ? context.state.lastCompletionMessageId
                 : settings.messageId,
             lastCompletionFingerprint: settings.fingerprint || context.state.lastCompletionFingerprint,
+            lastJudgeCheckedId: context.state.lastJudgeCheckedId == null ? null : context.state.lastJudgeCheckedId,
             updatedAt: new Date().toISOString(),
         };
         await writeStateFor(context.key, next);
@@ -2078,6 +2086,7 @@
             stageName: parsed.stages[0].name,
             lastCompletionMessageId: null,
             lastCompletionFingerprint: '',
+            lastJudgeCheckedId: null,
             updatedAt: new Date().toISOString(),
         });
         // 立刻按最新绑定列表同步镜像，不用等下一次事件。
@@ -2230,6 +2239,13 @@
         return /^\s*YES\b/i.test(raw);
     }
 
+    // 裁判检查频率（数据库填表同款「每 N 层」频率制）：每 N 条 AI 回复检查一次；
+    // 缺省/非法值回退 1 = 每层都查。
+    function judgeCheckInterval(settings) {
+        const n = Math.floor(Number(settings && settings.judgeInterval));
+        return Number.isFinite(n) && n >= 1 ? n : 1;
+    }
+
     async function recentHistoryText(messageId, count) {
         const getChatMessages = api('getChatMessages', false);
         if (!getChatMessages || messageId == null) return '';
@@ -2328,6 +2344,10 @@
         if (context.state.lastCompletionMessageId === messageId) return;
         if (judgeState.running.has(context.key)) return;
         const settings = config && config.settings ? config.settings : {};
+        // 检查频率：每 N 层（条 AI 回复）查一次，数据库填表同款频率制；首次检查立即执行。
+        const interval = judgeCheckInterval(settings);
+        if (interval > 1 && context.state.lastJudgeCheckedId != null
+            && Number(messageId) - Number(context.state.lastJudgeCheckedId) < interval) return;
         const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
         const preset = presetName ? findJudgeApiPreset(presetName) : null;
         if (presetName && !preset) {
@@ -2354,6 +2374,8 @@
             const history = await recentHistoryText(messageId, 6);
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
             const text = await askJudge(messages, preset);
+            // 本次检查已发生：记录检查楼层，「每 N 层」从这里重新计数（无论结论是 YES 还是 NO）。
+            await writeStateFor(context.key, { ...context.state, lastJudgeCheckedId: messageId });
             if (!judgeSaysYes(text)) return;
             // 防误判守卫：裁判是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
             // 这些情况下这次 YES 已经过期，必须放弃推进。
@@ -2735,7 +2757,7 @@
             ),
             el('div', { class: 'dga-nav-group-title' }, '页面'),
             el('div', { class: 'dga-nav-group' },
-                item('管理', 'manager'),
+                item('仪表盘', 'manager'),
                 item('API', 'api'),
                 item('划分阶段', 'editor', !ui.editor),
             ),
@@ -3181,6 +3203,37 @@
             mode === 'judge' ? field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
                 saveSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '裁判改用酒馆主 API');
             })) : null,
+            mode === 'judge' ? (() => {
+                // 数据库填表同款频率制：每层 / 每 2 层 / 每 3 层 / 每 5 层 / 自定义。
+                const interval = judgeCheckInterval(settings);
+                const presets = [1, 2, 3, 5];
+                const selectValue = presets.includes(interval) ? String(interval) : 'custom';
+                const intervalInput = el('input', {
+                    class: 'dga-input', type: 'number', min: 1, step: 1,
+                    onchange: event => {
+                        const n = Math.floor(Number(event.target.value));
+                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
+                        saveSettings({ judgeInterval: safe }, safe === 1 ? '裁判改为每层检查' : `裁判改为每 ${safe} 层检查一次`);
+                    },
+                });
+                intervalInput.value = String(interval);
+                return field('多久检查一次（正文之后自动触发）', el('div', { class: 'dga-two-col' },
+                    selectControl([
+                        { value: '1', label: '每层检查' },
+                        { value: '2', label: '每 2 层检查一次' },
+                        { value: '3', label: '每 3 层检查一次' },
+                        { value: '5', label: '每 5 层检查一次' },
+                        { value: 'custom', label: '自定义…' },
+                    ], selectValue, value => {
+                        if (value === 'custom') {
+                            saveSettings({ judgeInterval: presets.includes(interval) ? 4 : interval }, '裁判检查频率：自定义');
+                        } else {
+                            saveSettings({ judgeInterval: Number(value) }, value === '1' ? '裁判改为每层检查' : `裁判改为每 ${value} 层检查一次`);
+                        }
+                    }),
+                    selectValue === 'custom' ? intervalInput : null,
+                ), '每条 AI 回复（正文）算一层：正文一到就自动静默检查当前阶段是否完成，够 N 层才问一次裁判，不用手动点。');
+            })() : null,
             mode === 'judge' && presetList.length === 0
                 ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
                 : null,

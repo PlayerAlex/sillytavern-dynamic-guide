@@ -1278,6 +1278,48 @@ test('后台裁判档：自定义提示词段按序组装并替换占位符', as
 });
 
 
+test('后台裁判档：每 2 层检查一次——首次立即查，之后到层才问、问过重新计数', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgeInterval: 2 },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const laterMessages = [
+        { message_id: 6, role: 'assistant', message: '第六层的回复。' },
+        { message_id: 7, role: 'assistant', message: '第七层的回复。' },
+    ];
+    const { state, helper } = multiWorld(books, { config, messages: [message, ...laterMessages], lastMessageId: 7 });
+    let calls = 0;
+    helper.generateRaw = async () => { calls += 1; return 'NO'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const bindingState = () => state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+
+    await state.events.get('message_received')(5);
+    assert.equal(calls, 1, '首次检查立即执行');
+    assert.equal(bindingState().lastJudgeCheckedId, 5, '检查楼层要记录');
+
+    await state.events.get('message_received')(6);
+    assert.equal(calls, 1, '第 6 层不到间隔，不问裁判');
+
+    await state.events.get('message_received')(7);
+    assert.equal(calls, 2, '第 7 层到间隔（7-5>=2），再问一次');
+    assert.equal(bindingState().lastJudgeCheckedId, 7, '问过之后重新计数');
+    assert.deepEqual(run.errors, []);
+});
+
+test('裁判检查频率归一化：非法值回退每层', () => {
+    const zero = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeInterval: 0 } });
+    assert.equal(zero.settings.judgeInterval, 1, '0 回退每层');
+    const bad = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeInterval: 'abc' } });
+    assert.equal(bad.settings.judgeInterval, 1, '非数字回退每层');
+    const three = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeInterval: '3' } });
+    assert.equal(three.settings.judgeInterval, 3, '字符串数字正常保留');
+});
+
 test('后台裁判档：裁判回答 NO 时不推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
