@@ -1036,6 +1036,104 @@ test('选区模式界面：拖选前言分配给第一阶段，正文立刻重�
 
 
 // ---------------------------------------------------------------
+// v2.27 认领模型：绑定即变常驻小卡，＋/－/删除模式这层行管理取消
+// ---------------------------------------------------------------
+
+function findTag(node, tag) {
+    if (node.tagName === tag) return node;
+    for (const child of node.children || []) {
+        const found = findTag(child, tag);
+        if (found) return found;
+    }
+    return null;
+}
+
+function collectByClass(node, name, out) {
+    if (node.classList && node.classList.contains(name)) out.push(node);
+    (node.children || []).forEach(child => collectByClass(child, name, out));
+    return out;
+}
+
+// 假 DOM 里 option 的 value 是属性、不是属性值（select.value 才是直接赋值的属性）。
+const optionsOf = select => (select.children || []).filter(item => item.tagName === 'OPTION');
+const optionValue = option => option.getAttribute('value');
+
+// 启动到「动态指导」页：世界书里两个已分阶段的条目，绑定列表为空。
+async function bootGuidePage() {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const outline = { uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: true };
+    const props = { uid: 2, name: '道具规则', content: '## 第一幕\n道具正文', enabled: true };
+    const { state, helper } = helperFor(outline);
+    state.entries.push(props);
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const booted = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    return { documentRef, state, helper, errors: booted.errors, panel };
+}
+
+test('认领模型：绑定后待绑行当场让位，条目变成常驻小卡并高亮一次', async () => {
+    const run = await bootGuidePage();
+    const row = run.panel().querySelector('.dga-add-row');
+    assert.ok(row, '动态指导页要有待绑行');
+    const select = findTag(row, 'SELECT');
+    const options = optionsOf(select);
+    assert.equal(optionValue(options[0]), '', '待选行第一个选项是占位');
+    assert.match(options[1].textContent, /大纲/, '默认要自动挑一个可绑条目');
+    assert.equal(select.value, optionValue(options[1]), '进页面时待选行已经有默认选中项');
+
+    const bind = findButton(row, '绑定');
+    assert.equal(bind.textContent, '绑定');
+    assert.ok(!Object.prototype.hasOwnProperty.call(bind.attributes, 'disabled'), '已分阶段的条目可以直接绑');
+    await bind.listeners.click[0]();
+
+    const panel = run.panel();
+    const cards = collectByClass(panel, 'dga-bind-item', []);
+    assert.equal(cards.length, 1, '绑定后条目要立刻变成常驻小卡');
+    assert.ok(cards[0].classList.contains('is-new'), '刚绑的小卡要带一次入场高亮');
+    assert.match(cards[0].textContent, /大纲/);
+    assert.match(cards[0].textContent, /测试世界书/);
+
+    const unbind = cards[0].querySelector('.dga-icon-danger');
+    assert.ok(unbind, '小卡上要有常驻的解绑按钮，不再依赖删除模式');
+    assert.equal(unbind.textContent, '×');
+
+    const freshRow = run.panel().querySelector('.dga-add-row');
+    assert.equal(findTag(freshRow, 'SELECT').value, '', '待绑行要被认领清空，好接着连绑下一条');
+    assert.match(optionsOf(findTag(freshRow, 'SELECT'))[1].textContent, /已绑定/, '下拉里已绑条目要标成已绑定');
+    assert.equal(collectByClass(run.panel(), 'dga-add-row-actions', []).length, 0, '＋/－ 行管理这层要取消');
+    assert.deepEqual(run.errors, []);
+});
+
+test('认领模型：连绑第二个条目，高亮跟着新小卡走', async () => {
+    const run = await bootGuidePage();
+    await findButton(run.panel().querySelector('.dga-add-row'), '绑定').listeners.click[0]();
+
+    const select = findTag(run.panel().querySelector('.dga-add-row'), 'SELECT');
+    const second = optionsOf(select).find(item => /道具规则/.test(item.textContent));
+    assert.ok(second, '第二个条目要留在待选列表里');
+    select.value = optionValue(second);
+    select.listeners.change[0]({ target: select });
+
+    const row = run.panel().querySelector('.dga-add-row');
+    const bind = findButton(row, '绑定');
+    assert.equal(bind.textContent, '绑定', '换一个没绑过的条目，按钮要回到可点的「绑定」');
+    await bind.listeners.click[0]();
+
+    const cards = collectByClass(run.panel(), 'dga-bind-item', []);
+    assert.equal(cards.length, 2, '两条绑定要各自一张常驻小卡');
+    assert.match(cards[0].textContent, /大纲/);
+    assert.match(cards[1].textContent, /道具规则/);
+    assert.ok(!cards[0].classList.contains('is-new'), '高亮只留给刚绑的那一条');
+    assert.ok(cards[1].classList.contains('is-new'));
+    assert.equal(findTag(run.panel().querySelector('.dga-add-row'), 'SELECT').value, '', '连绑第二条后待绑行再次清空');
+    assert.deepEqual(run.errors, []);
+});
+
+// ---------------------------------------------------------------
 // v2.3 顺序编辑：整块上移/下移；常驻写在阶段之前 = 注入排在阶段内容之前
 // ---------------------------------------------------------------
 

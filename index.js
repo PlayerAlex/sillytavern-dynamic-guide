@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.26
+     * 动态指导助手 v2.27
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.26';
+    const VERSION = '2.27';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2260,8 +2260,10 @@
         return next;
     }
 
-    async function addBinding(worldbookName, entry, options) {
-        const settings = options || {};
+    // 绑定（v2.27）：不再弹确认框——绑定是非破坏性的，随时可以在小卡上点 × 解绑
+    // 回退，而弹窗会让「连绑多条」变成反复确认。条目会被关闭这件事写在卡片提示
+    // 与运行日志里；解绑（会删掉当前聊天进度）仍然保留二次确认。
+    async function addBinding(worldbookName, entry) {
         if (!worldbookName || !entry) throw new Error('请先选择世界书和大纲条目。');
         const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
         if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
@@ -2279,14 +2281,6 @@
         };
         const key = bindingKey(candidate);
         const existing = config.bindings.some(item => bindingKey(item) === key);
-        if (settings.confirm !== false) {
-            const accepted = hostWindow.confirm(
-                `${existing ? '重新添加' : '添加'}“${entryName(fresh)}”为指导条目？\n\n`
-                + `共 ${parsed.stages.length} 个阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。\n`
-                + '添加后会关闭这个条目，避免整份大纲直接发给 AI；当前聊天从第一段开始。',
-            );
-            if (!accepted) return false;
-        }
         await disableEntry(worldbookName, fresh.uid, entryName(fresh));
         const bindings = existing
             ? config.bindings.map(item => (bindingKey(item) === key ? { ...item, ...candidate } : item))
@@ -2771,9 +2765,10 @@
         selectedWorldbook: '',
         entries: [],
         entryError: '',
-        addEntryRows: null,
-        // 绑定行删除模式（v2.25）：开启后每行前面出红减号，点哪个删哪行
-        addRowDeleteMode: false,
+        // 添加行只有一个待绑位置（v2.27 认领模型）：null = 还没初始化，会自动挑一个可绑条目
+        addEntryKey: null,
+        // 刚绑定成功的那条（v2.27）：小卡入场高亮一次，让用户看见条目搬到了哪里
+        justBoundKey: '',
         snapshot: null,
         contextError: '',
         editor: null,
@@ -2947,6 +2942,9 @@
         const oldBody = shell.querySelector('.dga-body');
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
         shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
+        // 新绑定小卡的入场高亮只播一次（v2.27）：节点已经带上 is-new，这里立刻清掉
+        // 标记，下次因为别的操作重渲染时不会重播动画。
+        ui.justBoundKey = '';
         shell.classList.toggle('dga-busy', ui.busy);
         const body = shell.querySelector('.dga-body');
         if (body) body.scrollTop = scrollTop;
@@ -3009,14 +3007,14 @@
                 ui.entryError = `读取世界书失败：${error.message || String(error)}`;
             }
         }
-        // 多行绑定（v2.24）：刷新时逐行清理——还存在的行保留，第一行失效时
-        // 自动挑一个可绑的条目，其余失效行清空待选。
+        // 添加行只有一个待绑位置（v2.27 认领模型）：选中项还在世界书里就保留；
+        // 绑定成功后这一行会被认领清空（''），此处不能再自动补选，否则刚绑的条目
+        // 会跳回待选行；只有 null（首次进入、刚换世界书）才自动挑一个可绑条目。
         const rowKeys = ui.entries.map((entry, index) => entryKey(entry, index));
-        const rows = Array.isArray(ui.addEntryRows) && ui.addEntryRows.length ? ui.addEntryRows : [''];
-        ui.addEntryRows = rows.map((key, index) => {
-            if (key && rowKeys.includes(key)) return key;
-            return index === 0 ? pickEntryKey(settings.entryKey || '') : '';
-        });
+        const kept = ui.addEntryKey && rowKeys.includes(ui.addEntryKey) ? ui.addEntryKey : null;
+        if (kept) ui.addEntryKey = kept;
+        else if (ui.addEntryKey == null) ui.addEntryKey = pickEntryKey(settings.entryKey || '');
+        else ui.addEntryKey = '';
     }
 
     function pickEntryKey(requested) {
@@ -3027,12 +3025,11 @@
         return keys[0] || '';
     }
 
-    // 绑定行状态：null/空时初始化为一行（自动挑一个可绑条目）。
-    function addRowKeys() {
-        if (!Array.isArray(ui.addEntryRows) || ui.addEntryRows.length === 0) {
-            ui.addEntryRows = [pickEntryKey('')];
-        }
-        return ui.addEntryRows;
+    // 认领（v2.27）：绑定成功后待绑行当场让位——清空选择、把刚绑的那条点亮一次。
+    // 与 addBinding 分开写，是因为这里只动界面态，绑定本身仍然照旧落盘。
+    function claimAddRow(key) {
+        ui.addEntryKey = '';
+        ui.justBoundKey = key || '';
     }
 
     function bindingForEntry(worldbookName, entry) {
@@ -3050,7 +3047,7 @@
         marks.push(parsed.stages.length > 0
             ? `${parsed.stages.length} 段${parsed.addons.length ? `、${parsed.addons.length} 附加` : ''}`
             : '未分阶段');
-        if (bindingForEntry(ui.selectedWorldbook, entry)) marks.push('已添加');
+        if (bindingForEntry(ui.selectedWorldbook, entry)) marks.push('已绑定');
         else if (entryIsDisabled(entry)) marks.push('已关闭');
         return `${name}（${marks.join(' · ')}）`;
     }
@@ -3364,7 +3361,7 @@
             const requestHeadersArea = el('textarea', { class: 'dga-input', rows: 2, placeholder: 'X-Custom-Header: value', oninput: bindText('requestHeaders') });
             requestHeadersArea.value = draft.requestHeaders;
             formChildren.push(
-                field('接口协议', formatSelect, '决定上游端点与请求/响应变形，默认兼容 OpenAI。原版酒馆把 Claude/Gemini 映射到服务端原生协议源（端点填协议根即可，自动补 /v1 或剥版本段），OpenAI Responses 回退兼容 OpenAI；纯原生端点下「加载模型」可能失败，可手填模型名。'),
+                field('接口协议', formatSelect, '决定端点与请求/响应变形，默认兼容 OpenAI。Claude/Gemini 映射到原生协议源（端点填协议根，自动补 /v1 或剥版本段）；原生端点可能拉不到模型，可手填。'),
                 field('端点(基础URL)', apiurlInput),
                 field('API 密钥', keyInput),
                 field('模型名', modelInput),
@@ -3373,19 +3370,19 @@
                     ? field('模型列表', el('div', { class: 'dga-model-pick' },
                         el('div', { class: 'dga-model-pick-arrow', text: '⬇ 模型拉到了，点下面的下拉框选一个' }),
                         modelListSelect,
-                    ), '选中后会自动填进上面的「模型名」，填完也可以再手改。')
+                    ), '选中后自动填进「模型名」，仍可手改。')
                     : null,
                 el('div', { class: 'dga-two-col' },
                     field('最大回复长度', maxTokensInput),
                     field('温度', temperatureInput)),
-                field('附加主体参数', bodyParamsArea, 'SillyTavern custom_include_body，填写 YAML object，会合并到最终模型请求体。'),
-                field('排除主体参数', excludeBodyArea, '会转换为 SillyTavern custom_exclude_body，从最终模型请求体删除指定字段。'),
-                field('提示词后处理', postProcessingSelect, '默认严格（与旧版本行为一致）。未选择=不带该字段原样透传消息，可保留提示词组中 system 段的角色。'),
-                field('附加请求标头', requestHeadersArea, '每行一个 Header: Value，追加到请求头中。'),
+                field('附加主体参数', bodyParamsArea, '写入 custom_include_body（YAML object），合并进请求体。'),
+                field('排除主体参数', excludeBodyArea, '写入 custom_exclude_body，从请求体删掉指定字段。'),
+                field('提示词后处理', postProcessingSelect, '默认严格。未选择 = 原样透传消息，保留 system 段角色。'),
+                field('附加请求标头', requestHeadersArea, '每行一个 Header: Value。'),
             );
         } else if (draft.connection === 'tavern') {
             formChildren.push(
-                field('酒馆预设', tavernSelect, '选项来自酒馆的连接管理器（Connection Manager） profiles。'),
+                field('酒馆预设', tavernSelect, '来自酒馆连接管理器的 profiles。'),
                 el('div', { class: 'dga-inline-action' }, refreshProfilesBtn),
                 el('div', { class: 'dga-two-col' },
                     field('最大回复长度', maxTokensInput),
@@ -3397,9 +3394,9 @@
             header('API', 'API 预设管理', () => { ui.view = 'manager'; render(); }, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
-                muted('完整预设只保存在当前浏览器 localStorage（本机明文），不依赖数据库插件、不随角色卡导出；共享设备请勿保存敏感密钥。'),
+                muted('预设只存本机 localStorage（明文），不随角色卡导出；共享设备别存密钥。'),
                 card('当前 API 预设',
-                    list.length === 0 ? el('div', { class: 'dga-msg', 'data-type': 'warning' }, '暂无可用 API 预设，点右侧「＋」新建。') : null,
+                    list.length === 0 ? el('div', { class: 'dga-msg', 'data-type': 'warning' }, '暂无预设，点右侧「＋」新建。') : null,
                     el('div', { class: 'dga-api-select-row' }, presetSelect, newBtn, deleteBtn),
                 ),
                 ui.apiFormMode !== 'empty' ? card(ui.apiFormMode === 'create' ? '新建预设' : `预设配置 · ${ui.apiDraftOriginalName}`,
@@ -3551,12 +3548,12 @@
             header('判断AI提示词', '判断AI · 提示词段', back, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
-                muted('每段选一个角色按顺序发送；占位符：{{stage}} {{prompt}} {{condition}} {{history}}。结论优先读 <结论> 标签，没标签时看开头是不是 YES。'),
-                useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在使用旧版自定义提问（按 system + 单个 user 段生效）。在本页点「保存」会自动转成提示词段，旧模板内容已放进 user 段。') : null,
+                muted('每段选角色、按顺序发送。占位符：{{stage}} {{prompt}} {{condition}} {{history}}；结论优先读 <结论>，没标签看开头是不是 YES。'),
+                useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在用旧版自定义提问。点「保存」会转成提示词段，旧模板已放进 user 段。') : null,
                 card('提示词段',
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最上方插入', () => insertAt('top'), { ghost: true })),
                     ...items,
-                    segments.length === 0 ? muted('暂无提示词段。用上方按钮添加，或点「恢复默认提示词」。') : null,
+                    segments.length === 0 ? muted('暂无提示词段，用上方按钮添加或恢复默认。') : null,
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
                 ),
                 el('div', { class: 'dga-api-actions' },
@@ -3660,7 +3657,7 @@
                 ),
                 rows.length
                     ? el('div', { class: 'dga-log-list' }, ...rows)
-                    : muted('暂无日志。判断AI检查、阶段推进、绑定变更、拉取模型等都会记在这里；关掉面板日志不清空，刷新页面才清空。'),
+                    : muted('暂无日志。判断AI检查、阶段推进、绑定变更都会记在这里；关面板不清空，刷新页面才清空。'),
             ),
         ];
     }
@@ -3732,7 +3729,7 @@
         stageItem.onAction = () => { ui.view = 'guide'; ui.navOpen = false; enterGuidePage(); render(); };
 
         return card('运行概览',
-            muted('这里显示当前聊天的运行状态；只有标为「需要处理」的项目才影响使用。'),
+            muted('这里显示当前聊天的运行状态；只看标为「需要处理」的项目。'),
             el('div', { class: 'dga-health-list' }, healthItem(apiItem), healthItem(stageItem), healthItem(logItem)),
         );
     }
@@ -3754,9 +3751,9 @@
         const config = ui.snapshot ? ui.snapshot.config : null;
         const settings = config && config.settings ? config.settings : {};
         const basicChildren = [
-            toggleRow('开启流式输出', '开启后，支持流式的文本生成会边生成边返回；关闭后会等完整结果返回。（酒馆预设通道不支持流式）', settings.streamingEnabled === true,
+            toggleRow('开启流式输出', '开启后边生成边返回；酒馆预设通道不支持流式。', settings.streamingEnabled === true,
                 checked => saveGuideSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
-            muted('进入下一段的方式（手动 / 标记 / 判断AI）与判断AI的详细设置都在「动态指导」页的「如何判断？」卡。'),
+            muted('进入下一段的方式与判断AI设置都在「动态指导」页的「如何判断？」卡。'),
         ];
         // 页签（数据库 AcuSegmentedControl 版式）：基础设置 / 暂未开放。
         const tab = ui.settingsTab === 'other' ? 'other' : 'basic';
@@ -3787,10 +3784,10 @@
             })),
         ];
         if (mode !== 'judge') {
-            children.push(muted('手动模式只能手点「下一段」；标记判断由正文 AI 自己定时机。切成「判断AI」后，这里会出现 API 预设、检查频率等设置。'));
+            children.push(muted('切成「判断AI」后，这里会出现 API 预设与检查频率。'));
             return card('如何判断？', ...children);
         }
-        const presetOptions = [{ value: '', label: '酒馆主 API（不使用 API 预设）' }]
+        const presetOptions = [{ value: '', label: '酒馆主 API（不用预设）' }]
             .concat(presetList.map(item => ({ value: item.name, label: item.name })));
         children.push(
             field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
@@ -3810,12 +3807,12 @@
                     },
                 });
                 intervalInput.value = String(interval);
-                return field('多久检查一次（正文之后自动触发）', el('div', { class: 'dga-two-col' },
+                return field('多久检查一次', el('div', { class: 'dga-two-col' },
                     selectControl([
-                        { value: '1', label: '每层检查' },
-                        { value: '2', label: '每 2 层检查一次' },
-                        { value: '3', label: '每 3 层检查一次' },
-                        { value: '5', label: '每 5 层检查一次' },
+                        { value: '1', label: '每层' },
+                        { value: '2', label: '每 2 层' },
+                        { value: '3', label: '每 3 层' },
+                        { value: '5', label: '每 5 层' },
                         { value: 'custom', label: '自定义…' },
                     ], selectValue, value => {
                         if (value === 'custom') {
@@ -3825,7 +3822,7 @@
                         }
                     }),
                     selectValue === 'custom' ? intervalInput : null,
-                ), '正文一到就自动检查，够 N 层才问一次判断AI。');
+                ), '每 N 层才问一次判断AI。');
             })(),
             (() => {
                 // 判断时参考最近几段角色回复：只看 AI 正文，用户消息一律不发送。
@@ -3841,9 +3838,9 @@
                     },
                 });
                 countInput.value = String(count);
-                return field('判断时参考几段角色回复', el('div', { class: 'dga-two-col' },
+                return field('参考几段回复', el('div', { class: 'dga-two-col' },
                     selectControl([
-                        { value: '1', label: '只看最新 1 段（默认）' },
+                        { value: '1', label: '最新 1 段' },
                         { value: '2', label: '最近 2 段' },
                         { value: '3', label: '最近 3 段' },
                         { value: '6', label: '最近 6 段' },
@@ -3856,14 +3853,12 @@
                         }
                     }),
                     selectValue === 'custom' ? countInput : null,
-                ), '只看 AI 正文，用户消息不发送；选 2 段以上会带更早回复。');
+                ), '只看 AI 正文，不含用户消息。');
             })(),
             presetList.length === 0
-                ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
+                ? muted('还没有预设：去「API」页新建，或直接用酒馆主 API。')
                 : null,
-            el('div', { class: 'dga-inline-action' },
-                btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
-                el('span', { class: 'dga-muted', text: '提示词段在独立页面编辑。' })),
+            btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
         );
         return card('如何判断？', ...children);
     }
@@ -3927,24 +3922,24 @@
                     el('span', { class: 'dga-rule-count', text: rules.length ? `${rules.length} 条` : '暂无' })),
                 open ? el('div', { class: 'dga-rule-body' },
                     ...rows,
-                    rules.length === 0 ? el('div', { class: 'dga-rule-empty', text: '暂无规则，点击下方按钮添加。' }) : null,
+                    rules.length === 0 ? el('div', { class: 'dga-rule-empty', text: '暂无规则。' }) : null,
                     el('div', { class: 'dga-rule-add' }, btn(`＋ ${addLabel}`, () => { rules.push({ start: '', end: '' }); render(); }, { ghost: true }))) : null);
         };
         const result = ui.judgeRuleTestResult;
         return card('提取 / 排除规则',
-            muted('发送前过滤角色回复，解析结论前也会再过滤一次判断AI输出。提取 = 只留「开始~结束」之间（取最后命中）；排除 = 删掉该区间。留空 = 不过滤。例：排除 <think>→</think> 可削思维链。开始和结束都填上会自动保存。'),
-            ruleGroup('extract', '提取规则', '提取开始边界', '提取结束边界', '添加提取规则'),
-            ruleGroup('exclude', '排除规则', '排除开始边界', '排除结束边界', '添加排除规则'),
+            muted('提取 = 只留区间内（取最后命中）；排除 = 删掉区间。留空不过滤，两栏都填会自动保存。'),
+            ruleGroup('extract', '提取规则', '开始边界', '结束边界', '添加'),
+            ruleGroup('exclude', '排除规则', '开始边界', '结束边界', '添加'),
             el('div', { class: 'dga-rule-tester' },
-                el('div', { class: 'dga-rule-tester-title', text: '规则测试：用当前规则试跑一段文字' }),
+                el('div', { class: 'dga-rule-tester-title', text: '规则测试' }),
                 el('textarea', {
                     class: 'dga-input', rows: 3,
-                    placeholder: '把一段角色回复（或判断AI输出）粘到这里…',
+                    placeholder: '粘贴一段文字试跑…',
                     text: ui.judgeRuleTestText || '',
                     onchange: event => { ui.judgeRuleTestText = event.target.value; },
                 }),
                 el('div', { class: 'dga-rule-tester-actions' },
-                    btn('填入最近一次判断AI输出', () => {
+                    btn('填入最近输出', () => {
                         ui.judgeRuleTestText = judgeRuntime.lastRaw;
                         render();
                     }, { ghost: true, disabled: !judgeRuntime.lastRaw }),
@@ -3962,15 +3957,17 @@
                             class: `dga-verdict ${result.yes ? 'is-yes' : 'is-no'}`,
                             text: result.yes ? '结论：YES（会推进）' : '结论：NO（不推进）',
                         }),
-                        el('span', { class: 'dga-muted', text: `${result.hasTag ? '命中 <结论> 标签' : '没有 <结论> 标签，按开头判断'}${result.changed ? ' · 规则改变了输出' : ' · 输出未被规则改变'}` }),
+                        el('span', { class: 'dga-muted', text: `${result.hasTag ? '命中 <结论>' : '无 <结论>，按开头判断'}${result.changed ? ' · 输出已改' : ' · 输出未变'}` }),
                     ),
                     el('pre', { class: 'dga-rule-tester-filtered', text: result.filtered.length > 2000 ? `${result.filtered.slice(0, 2000)}\n…（共 ${result.filtered.length} 字，已截断）` : result.filtered }),
                 ) : null),
         );
     }
 
-    // 一条已绑定的常驻小卡（v2.26）：条目名 + 世界书名 + 解绑，下面是段数
-    // 步进器小前端——上一段 / 当前段 + 阶段名 + 进度条 / 下一段。
+    // 一条已绑定的常驻小卡（v2.27 认领模型）：条目名 + 世界书名 + 常驻 × 解绑，
+    // 下面是段数步进器小前端——上一段 / 当前段 + 阶段名 + 进度条 / 下一段。
+    // × 常驻在卡上，不再需要先开删除模式才能解绑；刚绑上的那条
+    // （ui.justBoundKey）带一次入场高亮，让用户看见条目搬到了哪里。
     function boundItemCard(context) {
         const total = context.parsed.stages.length;
         const stageIndex = context.state.stageIndex;
@@ -3978,25 +3975,24 @@
         const usable = !context.legacy && total > 0;
         const move = (label, target) => runAction(label, async () => {
             const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
-            if (!fresh || fresh.broken) throw new Error('这条绑定现在不可用。');
+            if (!fresh || fresh.broken) throw new Error('这条绑定不可用。');
             return moveToIndex(fresh, target);
         });
         const percent = total > 0 ? Math.round(Math.min(stageIndex, total) / total * 100) : 0;
-        const stageText = total === 0 ? '未分段' : (finished ? `全部 ${total} 段已完成` : `第 ${stageIndex + 1} / ${total} 段`);
-        const nameText = total === 0 ? '用「划分阶段」分好阶段后才会发送指导'
-            : (finished ? '之后不再发送指导' : (context.stage ? context.stage.name : ''));
-        return el('div', { class: 'dga-bind-item' },
+        const stageText = total === 0 ? '未分段' : (finished ? `全部 ${total} 段完成` : `第 ${stageIndex + 1} / ${total} 段`);
+        const nameText = total === 0 ? '分好阶段后才会发送'
+            : (finished ? '不再发送指导' : (context.stage ? context.stage.name : ''));
+        return el('div', { class: `dga-bind-item${ui.justBoundKey === context.key ? ' is-new' : ''}` },
             el('div', { class: 'dga-bind-item-head' },
-                ui.addRowDeleteMode ? el('button', {
-                    type: 'button', class: 'dga-icon-btn dga-icon-danger', title: '删除这条绑定（会先弹确认）', 'aria-label': '删除这条绑定',
-                    onclick: () => runAction('移出绑定', () => unbindEntry(context.key)),
-                }, '－') : null,
                 el('div', { class: 'dga-heading-text' },
                     el('b', { text: entryName(context.entry) }),
                     el('small', { text: context.worldbookName })),
-                btn('解绑', () => runAction('移出绑定', () => unbindEntry(context.key)), { ghost: true })),
+                el('button', {
+                    type: 'button', class: 'dga-icon-btn dga-icon-danger', title: '解绑（会先弹确认）', 'aria-label': `解绑 ${entryName(context.entry)}`,
+                    onclick: () => runAction('移出绑定', () => unbindEntry(context.key)),
+                }, '×')),
             context.legacy
-                ? messageBar({ type: 'warning', text: '这个条目还是旧版（1.x）的划分，转换前不会显示指导。' })
+                ? messageBar({ type: 'warning', text: '旧版（1.x）划分，转换前不发送。' })
                 : null,
             el('div', { class: 'dga-stepper' },
                 btn('‹ 上一段', () => move('切换到上一段', stageIndex - 1), { ghost: true, disabled: !usable || stageIndex <= 0 }),
@@ -4010,106 +4006,83 @@
         );
     }
 
-    // 绑定世界书（v2.26 重排）：已绑定条目常驻小卡列表（步进器 + 解绑，只要有
-    // 绑定就一直显示）→ 选择一个世界书 → 绑定一个或多个条目（＋ 加行；－ 为
-    // 删除模式：每行前面出红减号，点哪个删哪行；已绑定小卡的红减号 = 解绑，
-    // unbindEntry 自带确认弹窗即二级提示）。
+    // 绑定世界书（v2.27 认领模型）：已绑定条目常驻小卡（步进器 + 常驻 × 解绑，
+    // 只要有绑定就一直显示）→ 选择一个世界书 → 一个待绑行。选中条目点「绑定」后
+    // 这一行当场被认领（清空待选），条目立刻变成上面的常驻小卡并高亮一次；
+    // 想连绑多条就接着选下一个，不再需要 ＋/－ 与删除模式这层行管理。
     function addCard() {
         const children = [];
         const contexts = ui.snapshot ? ui.snapshot.contexts : [];
         const boundContexts = contexts.filter(item => !item.broken);
         const brokenContexts = contexts.filter(item => item.broken);
         if (boundContexts.length > 0) {
-            children.push(muted('已绑定的条目'));
+            children.push(muted('已绑定'));
             boundContexts.forEach(context => children.push(boundItemCard(context)));
         }
         // 失效绑定（条目被删或改名）：给一个解绑出口。
         brokenContexts.forEach(context => {
             children.push(el('div', { class: 'dga-add-row-sub' },
-                el('span', { class: 'dga-muted', text: `↳ 「${(context.binding && context.binding.entryName) || '未知条目'}」的绑定已失效（条目被删或改名）` }),
+                el('span', { class: 'dga-muted', text: `↳ 「${(context.binding && context.binding.entryName) || '未知条目'}」已失效（条目被删或改名）` }),
                 btn('解绑', () => runAction('移出绑定', () => unbindEntry(context.key)), { ghost: true }),
             ));
         });
         if (ui.worldbookNames.length === 0) {
-            children.push(messageBar({ type: 'warning', text: '没有找到任何世界书。请先给角色绑定一个世界书，并把大纲写进一个条目里。' }));
+            children.push(messageBar({ type: 'warning', text: '没有世界书。先给角色绑定一本，并把大纲写进条目。' }));
             return card('绑定世界书', ...children);
         }
-        if (ui.boundNames.length === 0) children.push(muted('没检测到这个角色绑定的世界书，下面列出的是全部世界书。'));
-        children.push(field('选择一个世界书', selectControl(
+        if (ui.boundNames.length === 0) children.push(muted('角色没绑定世界书，这里列出全部。'));
+        children.push(field('世界书', selectControl(
             ui.worldbookNames.map(name => ({ value: name, label: name })),
             ui.selectedWorldbook,
             value => runAction('切换世界书', async () => {
                 ui.selectedWorldbook = value;
-                ui.addEntryRows = null;
-                ui.addRowDeleteMode = false;
+                // 换世界书：待绑行置 null，让刷新按新世界书自动挑一个可绑条目。
+                ui.addEntryKey = null;
             }),
         )));
         const entryOptions = ui.entries.length > 0
-            ? [{ value: '', label: '还未选择条目' }]
+            ? [{ value: '', label: '请选择条目' }]
                 .concat(ui.entries.map((entry, index) => ({ value: entryKey(entry, index), label: entryLabel(entry) })))
             : [{ value: '', label: ui.entryError || '这个世界书里没有条目' }];
         const entryAt = key => {
             const index = ui.entries.findIndex((entry, position) => entryKey(entry, position) === key);
             return index >= 0 ? ui.entries[index] : null;
         };
-        const rowsState = addRowKeys();
-        children.push(muted('绑定一个或多个条目'));
-        // 删除模式（v2.25）：点底部 － 后每行前面出红减号，点哪个删哪行。
-        // 已绑定的条目常驻在上方小卡列表，删除走小卡上的红减号/解绑（自带确认）。
-        const removeRow = index => {
-            rowsState.splice(index, 1);
-            if (rowsState.length === 0) rowsState.push('');
-            if (rowsState.length <= 1) ui.addRowDeleteMode = false;
-            render();
-        };
-        rowsState.forEach((key, index) => {
-            const entry = key ? entryAt(key) : null;
-            const legacy = Boolean(entry && hasLegacyLayout(entry));
-            const parsed = entry && !legacy ? parseOutline(entry.content) : null;
-            const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
-            children.push(el('div', { class: 'dga-add-row' },
-                ui.addRowDeleteMode ? el('button', {
-                    type: 'button', class: 'dga-icon-btn dga-icon-danger', title: '删除这一行', 'aria-label': '删除这一行',
-                    onclick: () => removeRow(index),
-                }, '－') : null,
-                selectControl(entryOptions, key, value => { rowsState[index] = value; render(); }),
-                btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
-                    ghost: true, disabled: !entry || legacy,
+        const addKey = ui.addEntryKey || '';
+        const entry = addKey ? entryAt(addKey) : null;
+        const legacy = Boolean(entry && hasLegacyLayout(entry));
+        const parsed = entry && !legacy ? parseOutline(entry.content) : null;
+        const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
+        children.push(muted('条目'));
+        children.push(el('div', { class: 'dga-add-row' },
+            selectControl(entryOptions, addKey, value => { ui.addEntryKey = value; render(); }),
+            btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
+                ghost: true, disabled: !entry || legacy,
+            }),
+            binding
+                ? btn('已绑定', () => {}, { disabled: true, ghost: true })
+                : btn('绑定', () => runAction('添加指导条目', async () => {
+                    const done = await addBinding(ui.selectedWorldbook, entry);
+                    // 认领：这一行当场让位给上面的常驻小卡（并点亮一次）。
+                    if (done) claimAddRow(bindingKey({ worldbookName: ui.selectedWorldbook, entryUid: entry.uid, entryName: entryName(entry) }));
+                    return done;
+                }), {
+                    primary: Boolean(parsed) && parsed.stages.length > 0,
+                    disabled: !entry || legacy || !parsed || parsed.stages.length === 0,
                 }),
-                binding
-                    ? btn('已绑定', () => {}, { disabled: true, ghost: true })
-                    : btn('绑定', () => runAction('添加指导条目', () => addBinding(ui.selectedWorldbook, entry)), {
-                        primary: Boolean(parsed) && parsed.stages.length > 0,
-                        disabled: !entry || legacy || !parsed || parsed.stages.length === 0,
-                    }),
-            ));
-            if (entry && legacy) {
-                children.push(
-                    messageBar({ type: 'warning', text: '这个条目带有旧版（1.x）的阶段划分。新版直接把阶段写在正文里，需要先转换一次。' }),
-                    btn('转换成新版格式', () => runAction('转换旧版划分', () => convertLegacyEntry(entry)), { primary: true }),
-                );
-                return;
-            }
-            if (entry && parsed && parsed.stages.length === 0 && !binding) {
-                children.push(muted('↳ 这个条目还没有分阶段：先点「划分阶段」，再绑定。'));
-            }
-        });
-        children.push(el('div', { class: 'dga-add-row-actions' },
-            el('button', {
-                type: 'button', class: 'dga-icon-btn', title: '再绑定一个条目', 'aria-label': '再绑定一个条目',
-                onclick: () => { rowsState.push(''); render(); },
-            }, '＋'),
-            el('button', {
-                type: 'button',
-                class: `dga-icon-btn${ui.addRowDeleteMode ? ' dga-icon-danger' : ''}`,
-                title: ui.addRowDeleteMode ? '退出删除模式' : '删除行：每行前面会出现红减号',
-                'aria-label': '删除行模式',
-                onclick: () => { ui.addRowDeleteMode = !ui.addRowDeleteMode; render(); },
-            }, '－'),
-            el('span', { class: 'dga-muted', text: ui.addRowDeleteMode
-                ? '点行前的红减号删除对应行；已绑定小卡的红减号 = 解绑（会先弹确认）。'
-                : '绑定后原条目会被关闭，AI 只看到当前阶段；已绑定的条目常驻显示在上方。' }),
         ));
+        if (entry && legacy) {
+            children.push(
+                messageBar({ type: 'warning', text: '旧版（1.x）划分，需要先转换一次。' }),
+                btn('转换成新版格式', () => runAction('转换旧版划分', () => convertLegacyEntry(entry)), { primary: true }),
+            );
+        } else if (binding) {
+            children.push(muted('↳ 已绑定，就在上面的小卡里；解绑点 ×。'));
+        } else if (entry && parsed && parsed.stages.length === 0) {
+            children.push(muted('↳ 还没分阶段：先「划分阶段」，再绑定。'));
+        } else {
+            children.push(muted('绑定后条目会被关闭，AI 只看到当前阶段。'));
+        }
         return card('绑定世界书', ...children);
     }
 
@@ -4244,10 +4217,10 @@
             mode === 'doc' && hasHeadings ? muted('点段落设开头 · 点标题改名或改条件') : null,
         );
         const helpText = mode === 'raw'
-            ? '这里是世界书条目的原文，可以直接改：增删文字、调整顺序、自己写“## 阶段名”都行。回到“看分段”会重新按标题分段。'
+            ? '直接改条目原文：增删、调序、自己写「## 阶段名」都行。回「看分段」会重新按标题分段。'
             : mode === 'pick'
-                ? '先点下面的一个分段，再在正文上拖选一段文字，点“分配给”它。触屏不好拖选时，用“点选头尾”点两下也行。没分配的文字留在最前面，不会发给 AI。'
-                : '想怎么分就怎么分：点一个段落设成某一阶段的开头，点标题改名、改条件、并入别的阶段或删掉。也可以切到“编辑原文”直接改正文。';
+                ? '先点一个分段，再拖选文字后点「分配给」；不好拖就用「点选头尾」点两下。没分配的文字留在最前面。'
+                : '点段落设成某阶段的开头；点标题可改名、改条件、并入或删除。也可切「编辑原文」直接改。';
         const pickStages = mode === 'pick' && editor.pick ? editor.pick.stages.length : 0;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
@@ -4483,7 +4456,7 @@
         if (sheet.kind === 'stage') {
             const completion = el('textarea', {
                 rows: 2,
-                placeholder: '例如：两人完成第一次正式交谈。留空=手动点“下一段”；填“自动”=AI 自己判断。',
+                placeholder: '例：两人完成第一次正式交谈。留空 = 手动，填「自动」= AI 自己判断。',
                 oninput: event => { sheet.completion = event.target.value; },
             });
             completion.value = sheet.completion;
@@ -4505,7 +4478,7 @@
                     render();
                 })));
             }
-            box.append(muted('附加内容不占进度，只在指定的几段里一起发给 AI，适合物品、地点规则、秘密。'));
+            box.append(muted('不占进度，只在指定几段里一起发送。'));
         }
         if (sheet.kind === 'merged') {
             if (stages.length === 0) {
@@ -4518,7 +4491,7 @@
                     render();
                 })));
             }
-            box.append(muted('这段文字会和那个阶段一起发给 AI，但它自己不占进度：一个阶段就能吃掉几段不连续的内容。'));
+            box.append(muted('和那个阶段一起发送，自己不占进度——一个阶段能吃掉几段不连续的内容。'));
         }
         if (sheet.kind === 'always') box.append(muted('这部分会在每一段都发给 AI。'));
         if (sheet.kind === 'note') box.append(muted('这部分只给作者自己看，不会发给 AI。'));
@@ -5040,7 +5013,7 @@
         if (!owner) return null;
         if (owner.kind === 'always') {
             return el('div', { class: 'dga-pick-settings' },
-                muted('常驻提示：每一段都会发给 AI。把文字分配到这里即可。'),
+                muted('常驻提示：每段都会发送。'),
                 btn(pick.alwaysTop ? '位置：排在阶段内容之前（点我改到之后）' : '位置：排在阶段内容之后（点我改到之前）', () => {
                     pick.alwaysTop = !pick.alwaysTop;
                     pick.stale = true;
@@ -5048,7 +5021,7 @@
                 }, { ghost: true }));
         }
         if (owner.kind === 'note') {
-            return el('div', { class: 'dga-pick-settings' }, muted('备注：只给自己看，不会发给 AI。把文字分配到这里即可。'));
+            return el('div', { class: 'dga-pick-settings' }, muted('备注：只给自己看，不发送。'));
         }
         const box = el('div', { class: 'dga-pick-settings' });
         const nameInput = el('input', { type: 'text', maxlength: 60 });
@@ -5065,7 +5038,7 @@
         if (owner.kind === 'stage') {
             const completion = el('textarea', {
                 rows: 2,
-                placeholder: '例如：两人完成第一次正式交谈。留空=手动点“下一段”；填“自动”=AI 自己判断。',
+                placeholder: '例：两人完成第一次正式交谈。留空 = 手动，填「自动」= AI 自己判断。',
             });
             completion.value = owner.completion;
             completion.addEventListener('input', event => {
@@ -5077,7 +5050,7 @@
             const sorted = sortedStages(pick);
             const options = sorted.map((stage, index) => ({ value: stage.name, label: `第 ${index + 1} 段 · ${stage.name}` }));
             if (options.length === 0) {
-                box.append(muted('还没有剧情阶段。先点“+ 阶段”，再给附加内容选生效范围。'));
+                box.append(muted('先点「+ 阶段」，再给附加内容选生效范围。'));
             } else {
                 if (!options.some(option => option.value === owner.from)) owner.from = options[0].value;
                 if (!options.some(option => option.value === owner.to)) owner.to = owner.from;
@@ -5280,14 +5253,16 @@ ${P} .dga-two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1f
 ${P} .dga-add-row { display: flex; gap: 8px; align-items: center; }
 ${P} .dga-add-row select { flex: 1 1 auto; min-width: 0; }
 ${P} .dga-add-row .dga-btn { flex: 0 0 auto; min-height: 36px; padding: 5px 12px; font-size: 0.82rem; }
-${P} .dga-add-row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 ${P} .dga-add-row-sub { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 0.78rem; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 12px; background: rgba(255, 255, 255, 0.04); }
+${P} .dga-bind-item.is-new { border-color: var(--SmartThemeQuoteColor, #7c6cf0); animation: dga-bind-in 1.4s ease-out; }
+@keyframes dga-bind-in { 0% { opacity: 0; transform: translateY(-6px); box-shadow: 0 0 0 3px rgba(124, 108, 240, 0.45); } 60% { opacity: 1; transform: none; box-shadow: 0 0 0 3px rgba(124, 108, 240, 0.30); } 100% { opacity: 1; transform: none; box-shadow: none; } }
 ${P} .dga-bind-item-head { display: flex; align-items: center; gap: 8px; }
 ${P} .dga-bind-item-head .dga-heading-text { flex: 1 1 auto; min-width: 0; }
 ${P} .dga-bind-item-head .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 12px; font-size: 0.78rem; }
+${P} .dga-bind-item-head .dga-icon-btn { width: 34px; min-width: 34px; min-height: 34px; border-radius: 9px; font-size: 1.05rem; line-height: 1; }
 ${P} .dga-stepper { display: flex; align-items: center; gap: 8px; }
 ${P} .dga-stepper .dga-btn { flex: 0 0 auto; min-height: 36px; padding: 6px 12px; font-size: 0.82rem; }
 ${P} .dga-stepper-mid { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; text-align: center; }
@@ -5571,7 +5546,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         next,
         previous,
         reset,
-        add: (worldbookName, entry, options) => addBinding(worldbookName, entry, options),
+        add: (worldbookName, entry) => addBinding(worldbookName, entry),
         unbind: (key, options) => unbindEntry(key, options),
         getCurrentSnapshot: loadContexts,
         diagnose: collectDiagnostics,
