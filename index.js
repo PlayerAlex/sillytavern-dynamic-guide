@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.18
+     * 动态指导助手 v2.19
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.18';
+    const VERSION = '2.19';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2959,7 +2959,7 @@
         const shell = panel.querySelector('.dga-shell');
         const oldBody = shell.querySelector('.dga-body');
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
-        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : renderManager())))));
+        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
         shell.classList.toggle('dga-busy', ui.busy);
         const body = shell.querySelector('.dga-body');
         if (body) body.scrollTop = scrollTop;
@@ -3063,19 +3063,29 @@
     // ---------------------------------------------------------------
 
     function renderManager() {
-        const snapshot = ui.snapshot;
-        const contexts = snapshot ? snapshot.contexts : [];
         const body = el('div', { class: 'dga-body' },
             messageBar(),
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             statusCard(),
             settingsCard(),
+        );
+        return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
+    }
+
+    // 动态指导页（v2.19 起独立成页，不再堆在仪表盘）：每条绑定一张卡片，
+    // 下面是添加指导条目与诊断；没有绑定时显示三步上手。
+    function renderGuidePage() {
+        const snapshot = ui.snapshot;
+        const contexts = snapshot ? snapshot.contexts : [];
+        const body = el('div', { class: 'dga-body' },
+            messageBar(),
+            ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             ...contexts.map(boundCard),
             contexts.length === 0 ? guideCard() : null,
             addCard(),
             diagnosticsCard(),
         );
-        return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
+        return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回'), body];
     }
 
     // 目录抽屉：复刻 shujuku 新版 Sidebar——品牌区（方块标 + 标题 + 版本副标）、
@@ -3112,6 +3122,7 @@
             el('div', { class: 'dga-nav-group-title' }, '页面'),
             el('div', { class: 'dga-nav-group' },
                 item('仪表盘', 'manager'),
+                item('动态指导', 'guide'),
                 item('API', 'api'),
                 item('运行日志', 'logs'),
                 item('划分阶段', 'editor', !ui.editor),
@@ -3788,6 +3799,8 @@
                 : { kind: 'ok', icon: '✓', title: '运行日志', summary: '本次会话没有记录到错误或警告。', badge: '无报错', badgeKind: 'ok' };
         logItem.actionLabel = '查看日志';
         logItem.onAction = () => { ui.view = 'logs'; ui.navOpen = false; render(); };
+        stageItem.actionLabel = '查看指导';
+        stageItem.onAction = () => { ui.view = 'guide'; ui.navOpen = false; render(); };
 
         return card('运行概览',
             muted('这里显示当前聊天的运行状态；只有标为「需要处理」的项目才影响使用。'),
@@ -4172,7 +4185,7 @@
     function closeEditor(force) {
         if (!force && editorUnsaved(ui.editor) && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
         discardEditor();
-        ui.view = 'manager';
+        ui.view = 'guide';
         render();
     }
 
@@ -5088,7 +5101,7 @@
         editor.dirty = false;
         if (bindAfter) {
             await addBinding(editor.worldbookName, saved, { confirm: false });
-            ui.view = 'manager';
+            ui.view = 'guide';
             discardEditor();
             await refresh({ worldbookName: editor.worldbookName, entryKey: entryKey(saved, 0) });
             setMessage('已保存并添加。当前聊天从第一段开始。', 'success');
