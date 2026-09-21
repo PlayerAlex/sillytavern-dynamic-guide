@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.31
+     * 动态指导助手 v2.32
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.31';
+    const VERSION = '2.32';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1629,13 +1629,14 @@
         });
     }
 
-    // 配置存哪（v2.32，开发者模式里切）：
-    //   'user' = 只本机：跟 API 预设同一层（localStorage），换任何卡都在，也不会跟着卡跑到别人那里。
-    //   'card' = 跟角色卡：额外把一份**脱敏**配置写进世界书的「（动态指导·配置）」条目，随卡分发。
-    // 两档都照旧写一份到角色变量，读取按「本机档 → 角色变量 → 世界书配置条目」逐级回退，
-    // 所以切档、旧卡、别人发的卡都不会丢配置。
+    // 配置存哪（开发者模式里切）：
+    //   'user' = 只本机，并且按角色卡分开：存在这台浏览器的 localStorage，键里带当前卡的头像文件名。
+    //            换一张卡就读另一份，不会把 A 卡的绑定带到 B 卡，也不会跟着卡发给别人。
+    //   'card' = 跟角色卡：额外把一份脱敏配置写进这张卡绑定的世界书里的「（动态指导·配置）」条目。
+    // 两档都照旧写一份到当前角色的角色变量。读取按「这张卡的本机档 → 角色变量 → 这张卡的世界书配置条目」回退。
+    // 认不出当前是哪张卡时不读写本机档，避免退回成全库共用的一份。
     const CONFIG_STORAGE_KEY = 'dynamic-guide-assistant:config-storage:v1';
-    const LOCAL_CONFIG_KEY = 'dynamic-guide-assistant:config:v1';
+    const LOCAL_CONFIG_PREFIX = 'dynamic-guide-assistant:config:v2:';
     // 世界书里的配置条目：关着的，只给插件读，永远不进 AI 上下文，也不参与关键词触发。
     const CONFIG_ENTRY_NAME = '（动态指导·配置）';
 
@@ -1685,21 +1686,45 @@
         return ui.devMode;
     }
 
-    function readLocalConfig() {
-        const storage = presetStorage();
-        if (!storage) return null;
+    // 同一张卡的稳定身份：优先用头像文件名（酒馆里每张卡唯一），没有才退回名字。
+    function characterScopeId(card) {
+        if (!card || typeof card !== 'object') return '';
+        const data = card.data && typeof card.data === 'object' ? card.data : {};
+        const avatar = cleanName(card.avatar || data.avatar);
+        if (avatar) return `avatar:${avatar}`;
+        const name = cleanName(card.name || data.name);
+        return name ? `name:${name}` : '';
+    }
+
+    async function currentScopeId() {
         try {
-            const raw = storage.getItem(LOCAL_CONFIG_KEY);
+            return characterScopeId(await currentCharacter());
+        } catch (error) {
+            return '';
+        }
+    }
+
+    function localConfigStorageKey(scopeId) {
+        return scopeId ? `${LOCAL_CONFIG_PREFIX}${scopeId}` : '';
+    }
+
+    async function readLocalConfig() {
+        const storage = presetStorage();
+        const key = localConfigStorageKey(await currentScopeId());
+        if (!storage || !key) return null;
+        try {
+            const raw = storage.getItem(key);
             return raw ? JSON.parse(raw) : null;
         } catch (error) {
             return null;
         }
     }
 
-    function writeLocalConfig(config) {
+    async function writeLocalConfig(config) {
         const storage = presetStorage();
-        if (!storage) return;
-        try { storage.setItem(LOCAL_CONFIG_KEY, JSON.stringify(config)); } catch (error) { /* 同上 */ }
+        const key = localConfigStorageKey(await currentScopeId());
+        if (!storage || !key) return;
+        try { storage.setItem(key, JSON.stringify(config)); } catch (error) { /* 同上 */ }
     }
 
     // 跟卡走的那一份必须脱敏：judgePreset 只是本机 localStorage 里某个预设的名字，
@@ -1710,11 +1735,17 @@
         return { version: 2, bindings: (config && config.bindings) || [], settings };
     }
 
+    async function currentBoundWorldbooks() {
+        try {
+            return await boundWorldbookNames(await currentCharacter());
+        } catch (error) {
+            return [];
+        }
+    }
+
     async function readCardConfig() {
-        let names = [];
-        try { names = await allWorldbookNames(); } catch (error) { return null; }
-        const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
-        for (const worldbookName of Array.from(new Set([...bound, ...names]))) {
+        const bound = await currentBoundWorldbooks();
+        for (const worldbookName of bound) {
             try {
                 const entry = worldbookEntries(await getWorldbook(worldbookName)).find(item => entryName(item) === CONFIG_ENTRY_NAME);
                 if (!entry) continue;
@@ -1725,10 +1756,22 @@
         return null;
     }
 
+    // 配置条目只给插件读：关掉，并清掉从模板克隆来的关键词和常驻开关，避免被重新打开后发给 AI。
+    function sealConfigEntry(entry) {
+        entry.enabled = false;
+        entry.disable = true;
+        entry.constant = false;
+        entry.selective = false;
+        entry.keys = [];
+        entry.key = [];
+        entry.secondary_keys = [];
+        entry.keysecondary = [];
+        return entry;
+    }
+
     async function writeCardConfig(config) {
-        const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
-        const names = await allWorldbookNames().catch(() => []);
-        const target = ((config.bindings || [])[0] || {}).worldbookName || bound[0] || names[0] || '';
+        const bound = await currentBoundWorldbooks();
+        const target = ((config.bindings || [])[0] || {}).worldbookName || bound[0] || '';
         if (!target) return false;
         const payload = JSON.stringify(configForCard(config), null, 2);
         await updateWorldbook(target, worldbook => {
@@ -1736,22 +1779,19 @@
             const existing = list.find(item => entryName(item) === CONFIG_ENTRY_NAME);
             if (existing) {
                 existing.content = payload;
-                existing.enabled = false;
-                if ('disable' in existing) existing.disable = true;
+                sealConfigEntry(existing);
                 return worldbook;
             }
             // 克隆同一本世界书里已有条目的字段形态，保证是被酒馆认得的完整条目；然后强制关闭。
-            const template = list.find(entry => !entryName(entry).endsWith(MIRROR_SUFFIX)) || {};
-            const entry = {
+            const template = list.find(entry => !entryName(entry).endsWith(MIRROR_SUFFIX) && entryName(entry) !== CONFIG_ENTRY_NAME) || {};
+            const entry = sealConfigEntry({
                 ...template,
                 uid: freshUid(worldbook),
                 comment: CONFIG_ENTRY_NAME,
                 name: CONFIG_ENTRY_NAME,
                 title: CONFIG_ENTRY_NAME,
                 content: payload,
-                enabled: false,
-            };
-            if ('disable' in entry) entry.disable = true;
+            });
             addEntryToWorldbook(worldbook, entry);
             return worldbook;
         });
@@ -1760,7 +1800,7 @@
 
     async function readRawConfig() {
         if (configStorageMode() === 'user') {
-            const local = readLocalConfig();
+            const local = await readLocalConfig();
             if (local && Array.isArray(local.bindings)) return local;
         }
         const fromCharacter = await readRootField('character', 'config');
@@ -1770,7 +1810,7 @@
 
     async function writeConfig(config) {
         await writeRootField('character', 'config', config);
-        if (configStorageMode() === 'user') writeLocalConfig(config);
+        if (configStorageMode() === 'user') await writeLocalConfig(config);
         else await writeCardConfig(config);
         return config;
     }
@@ -2389,7 +2429,10 @@
             const lines = String(stage.prompt || '').split('\n')
                 .map(line => line.trim())
                 .filter(line => line.length >= 4);
-            const score = lines.filter(line => text.includes(line)).length;
+            let score = lines.filter(line => text.includes(line)).length;
+            const name = String(stage.name || '').trim();
+            // 镜像正文带「当前阶段：阶段名」。正文太短、按行对不上时，用阶段名把进度对齐。
+            if (name && text.includes(`当前阶段：${name}`)) score += 100;
             if (score > bestScore) {
                 bestScore = score;
                 best = index;
@@ -2401,7 +2444,8 @@
     async function recoverBindings() {
         const config = await readConfig();
         const known = new Set(config.bindings.map(item => bindingKey(item)));
-        const names = await allWorldbookNames();
+        // 只扫当前这张卡绑定的世界书。扫全库会把别的卡的镜像收进这张卡的配置。
+        const names = await currentBoundWorldbooks();
         const recovered = [];
         for (const worldbookName of names) {
             let entries = [];
@@ -3552,23 +3596,23 @@
                 card('配置存哪',
                     muted('决定绑定列表与判断AI设置存在哪里。普通使用不需要动这里。'),
                     field('存放位置', selectControl([
-                        { value: 'user', label: '只本机（换任何卡都在，不跟卡走）' },
+                        { value: 'user', label: '只本机（按这张卡分开，不跟卡走）' },
                         { value: 'card', label: '跟角色卡走（随卡分发）' },
                     ], mode, value => {
                         setConfigStorageMode(value);
                         setMessage(value === 'card'
                             ? '已改为跟角色卡走：下次保存会写一份脱敏配置到世界书的「（动态指导·配置）」条目。'
-                            : '已改为只本机：配置存在本机，不随卡分发。', 'success');
+                            : '已改为只本机：配置存在这台浏览器里，并且只属于当前这张卡。', 'success');
                         render();
                     })),
                     muted(mode === 'card'
                         ? '跟卡走的那份会剔除 API 预设名（它指向本机的密钥），API 预设本体从来不进配置。世界书里那个配置条目是关着的，永远不发给 AI。'
-                        : '与 API 预设同一层，换任何角色卡都在；也不会跟着卡跑到别人那里。'),
+                        : '存在这台浏览器里，按角色卡分开。换一张卡就看不到上一张卡的绑定，也不会跟着卡发给别人。'),
                 ),
                 card('当前状态',
                     muted(`存放位置：${mode === 'card' ? '跟角色卡走' : '只本机'}`),
                     muted(`绑定条目：${bindings.length} 条`),
-                    muted('读取顺序：本机档 → 角色变量 → 世界书配置条目。三级回退，所以切档、旧卡、别人发的卡都不会丢配置。'),
+                    muted('读取顺序：这张卡的本机档 → 角色变量 → 这张卡的世界书配置条目。换卡、切档、别人发来的卡都按各自的那一份读。'),
                 ),
             )];
     }
@@ -6157,7 +6201,8 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
             // 换聊天后进度不同：镜像内容按新聊天的进度重新对齐（镜像在世界书里，不按聊天隔离）。
-            LogModule.info('事件', '切换聊天，按新聊天的进度重新对齐镜像');
+            LogModule.info('事件', '切换聊天，按当前角色卡重新对齐绑定和镜像');
+            await recoverBindings();
             await syncMirrors('normal');
             const doc = hostDocument();
             const panel = doc && doc.getElementById(PANEL_ID);

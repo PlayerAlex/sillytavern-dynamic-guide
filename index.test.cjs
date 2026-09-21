@@ -1055,7 +1055,8 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
 test('跨卡导入自愈：有镜像没绑定，启动时按镜像重建绑定并对齐进度', async () => {
     const outline = { uid: 1, name: '大纲', content: '## 第一幕\n第一幕正文\n\n## 第二幕\n第二幕正文', enabled: false };
     const { state, helper } = helperFor(outline);
-    helper.getWorldbookNames = () => ['测试世界书'];
+    helper.getWorldbookNames = () => ['测试世界书', '别人的世界书'];
+    helper.getCharWorldbookNames = () => ['测试世界书'];
     // 模拟导入别人的卡：世界书带着镜像条目过来了，绑定配置（角色变量）没跟过来
     state.entries.push({ uid: 9, name: '大纲（动态指导）', content: '## 当前阶段\n第二幕正文', enabled: true });
     state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
@@ -1077,11 +1078,92 @@ test('跨卡导入自愈：没有镜像就不重建（用户主动解绑过的�
     const outline = { uid: 1, name: '大纲', content: '## 第一幕\n正文一', enabled: true };
     const { state, helper } = helperFor(outline);
     helper.getWorldbookNames = () => ['测试世界书'];
+    helper.getCharWorldbookNames = () => ['测试世界书'];
     state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
     const run = load(helper);
     await new Promise(setImmediate);
     assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings.length, 0,
         '没有镜像说明用户没绑过或已解绑，不能凭空重建');
+    assert.deepEqual(run.errors, []);
+});
+
+test('跨卡导入自愈：别的卡的世界书里有镜像，也不收进当前卡', async () => {
+    const books = {
+        当前卡: [{ uid: 1, name: '大纲', content: '## 第一幕\n当前卡正文', enabled: true }],
+        别人的卡: [
+            { uid: 2, name: '大纲', content: '## 第一幕\n别人的正文超过四字', enabled: false },
+            { uid: 9, name: '大纲（动态指导）', content: '## 当前阶段：第一幕\n别人的正文超过四字', enabled: true },
+        ],
+    };
+    const { state, helper } = multiWorld(books, { config: { version: 2, bindings: [] } });
+    helper.getCharWorldbookNames = () => ['当前卡'];
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings.length, 0,
+        '没有绑到当前角色身上的世界书，不能因为库里有镜像就被接管');
+    assert.equal(state.books['别人的卡'].length, 2, '别人的镜像要原样留着');
+    assert.deepEqual(run.errors, []);
+});
+
+test('只本机配置按角色卡分开，换卡看不到上一张卡的绑定', async () => {
+    const storage = memoryStorage({ 'dynamic-guide-assistant:config-storage:v1': 'user' });
+    const books = {
+        甲书: [
+            { uid: 1, name: '大纲', content: '## 第一幕\n甲卡正文超过四字', enabled: false },
+            { uid: 9, name: '大纲（动态指导）', content: '## 当前阶段：第一幕\n甲卡正文超过四字', enabled: true },
+        ],
+        乙书: [{ uid: 1, name: '大纲', content: '## 第一幕\n乙卡正文超过四字', enabled: true }],
+    };
+    let card = { name: '甲', avatar: 'a.png' };
+    let bound = ['甲书'];
+    const { state, helper } = multiWorld(books, { config: { version: 2, bindings: [] } });
+    helper.getCharData = () => card;
+    helper.getCharWorldbookNames = () => bound.slice();
+    const run = load(helper, { localStorage: storage });
+    await new Promise(setImmediate);
+
+    const keyA = 'dynamic-guide-assistant:config:v2:avatar:a.png';
+    const savedA = JSON.parse(storage.getItem(keyA));
+    assert.equal(savedA.bindings.length, 1, '甲卡的绑定要写进甲卡自己的本机档');
+    assert.equal(savedA.bindings[0].worldbookName, '甲书');
+    assert.equal(storage.getItem('dynamic-guide-assistant:config:v1'), null, '不再写全库共用的旧本机档');
+
+    card = { name: '乙', avatar: 'b.png' };
+    bound = ['乙书'];
+    state.variables.character = { $dynamicGuideAssistant: { config: { version: 2, bindings: [] } } };
+    await state.events.get('chat_changed')();
+    const snap = await run.core.getCurrentSnapshot();
+    assert.equal(snap.config.bindings.length, 0, '乙卡没有自己的绑定，不该看到甲卡的');
+    assert.equal(JSON.parse(storage.getItem(keyA)).bindings[0].worldbookName, '甲书', '换卡不能改掉甲卡已经存下的本机档');
+    assert.equal(storage.getItem('dynamic-guide-assistant:config:v2:avatar:b.png'), null, '乙卡没有新绑定，不该凭空写出一份本机档');
+    assert.deepEqual(run.errors, []);
+});
+
+test('跟角色卡走时，配置条目关掉且不带关键词，短正文靠阶段名对齐', async () => {
+    const storage = memoryStorage({ 'dynamic-guide-assistant:config-storage:v1': 'card' });
+    const books = {
+        甲书: [
+            { uid: 1, name: '大纲', content: '## 开场\n走\n\n## 离开\n跑', enabled: false, keys: ['大纲'], constant: true },
+            { uid: 9, name: '大纲（动态指导）', content: '## 当前阶段：离开\n跑', enabled: true, keys: ['大纲'] },
+        ],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: { version: 2, bindings: [], settings: { judgePreset: '密钥名', autoAdvance: 'off' } },
+    });
+    helper.getCharData = () => ({ name: '甲', avatar: 'a.png' });
+    helper.getCharWorldbookNames = () => ['甲书'];
+    const run = load(helper, { localStorage: storage });
+    await new Promise(setImmediate);
+    const configEntry = state.books.甲书.find(item => (item.name || item.comment) === '（动态指导·配置）');
+    assert.ok(configEntry, '配置条目要写进当前卡绑定的世界书');
+    assert.equal(configEntry.enabled, false);
+    assert.equal(configEntry.disable, true);
+    assert.equal(configEntry.constant, false);
+    assert.equal(JSON.stringify(configEntry.keys), '[]');
+    const parsed = JSON.parse(configEntry.content);
+    assert.equal(parsed.settings.judgePreset, undefined, '写进世界书的配置要去掉 API 预设名');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('甲书', 1)].stageIndex, 1,
+        '正文太短时要按「当前阶段：阶段名」对齐，而不是退回第一段');
     assert.deepEqual(run.errors, []);
 });
 
