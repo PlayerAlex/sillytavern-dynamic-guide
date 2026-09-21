@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.24
+     * 动态指导助手 v2.25
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.24';
+    const VERSION = '2.25';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2347,16 +2347,6 @@
         return true;
     }
 
-    async function disableEntryNow(key) {
-        const all = await loadContexts();
-        const context = all.contexts.find(item => item.key === key && !item.broken);
-        if (!context) throw new Error('这条绑定现在不可用。');
-        await disableEntry(context.worldbookName, context.entry.uid, entryName(context.entry));
-        context.entryEnabled = false;
-        notify(`已关闭“${entryName(context.entry)}”。`, 'success');
-        return true;
-    }
-
     function messageIdFromArgs(args) {
         for (const value of args) {
             if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -2775,7 +2765,6 @@
         navOpen: false,
         busy: false,
         message: null,
-        openPreviews: {},
         characterName: '当前角色',
         boundNames: [],
         worldbookNames: [],
@@ -2783,6 +2772,8 @@
         entries: [],
         entryError: '',
         addEntryRows: null,
+        // 绑定行删除模式（v2.25）：开启后每行前面出红减号，点哪个删哪行
+        addRowDeleteMode: false,
         snapshot: null,
         contextError: '',
         editor: null,
@@ -3079,16 +3070,14 @@
     }
 
     // 动态指导页（v2.19 起独立成页，不再堆在仪表盘；v2.23 按手稿重排）：
-    // 每条绑定一张卡片 → 绑定世界书（多行绑定）→ 如何判断（判断模式 +
-    // 判断AI设置）→ 提取/排除规则 + 规则测试。顶部只留错误条（v2.24 起
-    // 成功/提示类绿条不在本页显示）。
+    // 绑定世界书（多行绑定，行内显示当前段 + 上一段/下一段 + 解绑）→
+    // 如何判断（判断模式 + 判断AI设置）→ 提取/排除规则 + 规则测试。
+    // 顶部只留错误条（v2.24 起成功/提示类绿条不在本页显示）；
+    // v2.25 起独立绑定卡片区删除，功能并入绑定世界书卡的行内。
     function renderGuidePage() {
-        const snapshot = ui.snapshot;
-        const contexts = snapshot ? snapshot.contexts : [];
         const body = el('div', { class: 'dga-body' },
             ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
-            ...contexts.map(boundCard),
             addCard(),
             judgeSettingsCard(),
             guideRulesCard(),
@@ -3980,100 +3969,6 @@
         );
     }
 
-    // 一条绑定一张卡：条目名、走到哪一段、上一段/下一段，外加一排不常用的操作。
-    function boundCard(context) {
-        if (context.broken) {
-            return card(null,
-                el('div', { class: 'dga-bound-head' },
-                    el('div', { class: 'dga-heading-text' },
-                        el('b', { text: (context.binding && context.binding.entryName) || '未知条目' }),
-                        el('small', { text: (context.binding && context.binding.worldbookName) || '' }))),
-                messageBar({ type: 'error', text: context.error }),
-                btn('移出这条绑定', () => runAction('移出绑定', () => unbindEntry(context.key)), { danger: true }),
-            );
-        }
-        const total = context.parsed.stages.length;
-        const index = context.state.stageIndex;
-        const finished = total > 0 && index >= total;
-        const usable = !context.legacy && total > 0;
-        const move = (label, target, confirmText) => runAction(label, async () => {
-            if (confirmText && !hostWindow.confirm(confirmText)) return false;
-            const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
-            if (!fresh || fresh.broken) throw new Error('这条绑定现在不可用。');
-            return moveToIndex(fresh, target);
-        });
-
-        const details = el('details', {
-            class: 'dga-fold',
-            open: Boolean(ui.openPreviews[context.key]),
-            ontoggle: event => { ui.openPreviews[context.key] = event.target.open; },
-        }, el('summary', { text: '现在发给 AI 的内容' }));
-        const parts = [];
-        if (context.stage && usable) {
-            parts.push(`【${context.stage.name}】\n${context.stage.prompt}`);
-            context.addons.forEach(item => parts.push(`【附加：${item.name}】\n${item.prompt}`));
-            if (context.stage.completion) {
-                parts.push(`【进入下一段的条件（由 AI 判断）】\n${context.stage.completion}`);
-            } else if (context.stage.autoComplete) {
-                parts.push('【进入下一段】\n自动判断：AI 自己判断时机。');
-            } else if (context.autoAdvance === 'marker') {
-                parts.push('【进入下一段】\nAI 判断时机（标记判断档）。');
-            } else if (context.autoAdvance === 'judge') {
-                parts.push('【进入下一段】\n判断AI（每条回复多问一次）。');
-            } else {
-                parts.push('【进入下一段】\n没有写完成条件，只能手动点“下一段”。');
-            }
-        } else {
-            parts.push('现在不发送任何指导。');
-        }
-        details.append(el('pre', { class: 'dga-pre', text: parts.join('\n\n') }));
-        details.append(muted(`显示位置：镜像条目「${mirrorNameFor(entryName(context.entry))}」，${positionText(context.entry.position)}，与原条目同序`));
-        if (context.parsed.warnings.length > 0) {
-            details.append(messageBar({ type: 'warning', text: context.parsed.warnings.join('\n') }));
-        }
-
-        const tag = context.legacy ? '旧版'
-            : (total === 0 ? '未分段' : (finished ? '已完成' : `第 ${index + 1} 段`));
-        return card(null,
-            el('div', { class: 'dga-bound-head' },
-                el('div', { class: 'dga-heading-text' },
-                    el('b', { text: entryName(context.entry) }),
-                    el('small', { text: context.worldbookName })),
-                el('span', {
-                    class: 'dga-tag',
-                    style: { '--dga-c': context.stage && usable ? context.stage.color : '#6b7280' },
-                    text: tag,
-                })),
-            context.legacy
-                ? messageBar({ type: 'warning', text: '这个条目还是旧版（1.x）的划分，转换前不会显示指导。在下面选中它，点“转换成新版格式”。' })
-                : null,
-            !context.legacy && total === 0
-                ? messageBar({ type: 'warning', text: '这个条目还没有分阶段，暂时不会显示指导。在下面选中它，点“划分阶段”。' })
-                : null,
-            usable ? el('div', {
-                class: 'dga-stage-name',
-                text: finished ? `全部 ${total} 段已完成，之后不再发送指导` : `第 ${index + 1} 段 · 共 ${total} 段 — ${context.stage.name}`,
-            }) : null,
-            context.entryEnabled ? messageBar({
-                type: 'warning',
-                text: '这个条目现在是打开状态，整份大纲可能会直接发给 AI。下次生成前会自动关闭它，也可以现在手动关。',
-            }) : null,
-            context.entryEnabled
-                ? btn('立即关闭条目', () => runAction('关闭条目', () => disableEntryNow(context.key)), { danger: true })
-                : null,
-            row(
-                btn('上一段', () => move('切换到上一段', index - 1), { disabled: !usable || index <= 0 }),
-                btn('下一段', () => move('切换到下一段', index + 1), { primary: true, disabled: !usable || index >= total }),
-            ),
-            details,
-            row(
-                btn('重新划分', () => runAction('打开编辑器', () => openEditorAt(context.worldbookName, context.entry), { refresh: false }), { ghost: true }),
-                btn('回到第一段', () => move('重置进度', 0, '把这个聊天的进度重置到第一段？'), { ghost: true, disabled: !usable || index === 0 }),
-                btn('移出', () => runAction('移出绑定', () => unbindEntry(context.key)), { ghost: true }),
-            ),
-        );
-    }
-
     // 绑定世界书（v2.24 按手稿改多行）：选一个世界书，下面一行一个条目——
     // 每行「条目下拉 + 划分阶段 + 绑定」，底部 ＋/－ 增删行，可一次绑多个条目；
     // 已绑定的行在下方显示这条绑定当前走到哪一段。
@@ -4090,6 +3985,7 @@
             value => runAction('切换世界书', async () => {
                 ui.selectedWorldbook = value;
                 ui.addEntryRows = null;
+                ui.addRowDeleteMode = false;
             }),
         )));
         const entryOptions = ui.entries.length > 0
@@ -4102,18 +3998,44 @@
         };
         const rowsState = addRowKeys();
         children.push(muted('绑定一个或多个条目'));
+        // 删除模式（v2.25）：点底部 － 后每行前面出红减号，点哪个删哪行；
+        // 已绑定的行删除 = 同时解绑，unbindEntry 自带确认弹窗（二级提示），取消则行保留。
+        const removeRow = index => {
+            const rowKey = rowsState[index];
+            const rowEntry = rowKey ? entryAt(rowKey) : null;
+            const rowBinding = rowEntry ? bindingForEntry(ui.selectedWorldbook, rowEntry) : null;
+            if (rowBinding) {
+                runAction('移出绑定', async () => {
+                    const done = await unbindEntry(bindingKey(rowBinding));
+                    if (done === false) return false;
+                    rowsState.splice(index, 1);
+                    if (rowsState.length === 0) rowsState.push('');
+                    if (rowsState.length <= 1) ui.addRowDeleteMode = false;
+                    return true;
+                });
+                return;
+            }
+            rowsState.splice(index, 1);
+            if (rowsState.length === 0) rowsState.push('');
+            if (rowsState.length <= 1) ui.addRowDeleteMode = false;
+            render();
+        };
         rowsState.forEach((key, index) => {
             const entry = key ? entryAt(key) : null;
             const legacy = Boolean(entry && hasLegacyLayout(entry));
             const parsed = entry && !legacy ? parseOutline(entry.content) : null;
             const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
             children.push(el('div', { class: 'dga-add-row' },
+                ui.addRowDeleteMode ? el('button', {
+                    type: 'button', class: 'dga-icon-btn dga-icon-danger', title: '删除这一行', 'aria-label': '删除这一行',
+                    onclick: () => removeRow(index),
+                }, '－') : null,
                 selectControl(entryOptions, key, value => { rowsState[index] = value; render(); }),
                 btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
                     ghost: true, disabled: !entry || legacy,
                 }),
                 binding
-                    ? btn('已绑定', () => {}, { disabled: true })
+                    ? btn('解绑', () => runAction('移出绑定', () => unbindEntry(bindingKey(binding))), { ghost: true })
                     : btn('绑定', () => runAction('添加指导条目', () => addBinding(ui.selectedWorldbook, entry)), {
                         primary: Boolean(parsed) && parsed.stages.length > 0,
                         disabled: !entry || legacy || !parsed || parsed.stages.length === 0,
@@ -4126,19 +4048,38 @@
                 );
                 return;
             }
-            // 当前段落显示：挂在每个对应绑定条目的下面。
+            // 当前段落显示 + 上一段/下一段：挂在每个对应绑定条目的下面（v2.25
+            // 起独立绑定卡删除，手动推进的按钮也挪到行内）。
             const context = binding && ui.snapshot
                 ? ui.snapshot.contexts.find(item => item.key === bindingKey(binding)) : null;
             if (context && !context.broken) {
                 const total = context.parsed.stages.length;
                 const stageIndex = context.state.stageIndex;
                 const finished = total > 0 && stageIndex >= total;
-                children.push(muted(finished
-                    ? `↳ 全部 ${total} 段已完成，之后不再发送指导`
-                    : `↳ 当前：第 ${stageIndex + 1} 段 · 共 ${total} 段${context.stage ? ` — ${context.stage.name}` : ''}`));
+                const usable = !context.legacy && total > 0;
+                const move = (label, target) => runAction(label, async () => {
+                    const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
+                    if (!fresh || fresh.broken) throw new Error('这条绑定现在不可用。');
+                    return moveToIndex(fresh, target);
+                });
+                children.push(el('div', { class: 'dga-add-row-sub' },
+                    el('span', { class: 'dga-muted', text: finished
+                        ? `↳ 全部 ${total} 段已完成，之后不再发送指导`
+                        : `↳ 当前：第 ${stageIndex + 1} 段 · 共 ${total} 段${context.stage ? ` — ${context.stage.name}` : ''}` }),
+                    btn('上一段', () => move('切换到上一段', stageIndex - 1), { ghost: true, disabled: !usable || stageIndex <= 0 }),
+                    btn('下一段', () => move('切换到下一段', stageIndex + 1), { ghost: true, primary: usable && !finished, disabled: !usable || stageIndex >= total }),
+                ));
             } else if (entry && parsed && parsed.stages.length === 0) {
                 children.push(muted('↳ 这个条目还没有分阶段：先点「划分阶段」，再绑定。'));
             }
+        });
+        // 失效绑定（条目被删或改名）：独立绑定卡已删，这里给一个解绑出口。
+        const brokenContexts = ui.snapshot ? ui.snapshot.contexts.filter(item => item.broken) : [];
+        brokenContexts.forEach(context => {
+            children.push(el('div', { class: 'dga-add-row-sub' },
+                el('span', { class: 'dga-muted', text: `↳ 「${(context.binding && context.binding.entryName) || '未知条目'}」的绑定已失效（条目被删或改名）` }),
+                btn('解绑', () => runAction('移出绑定', () => unbindEntry(context.key)), { ghost: true }),
+            ));
         });
         children.push(el('div', { class: 'dga-add-row-actions' },
             el('button', {
@@ -4146,11 +4087,15 @@
                 onclick: () => { rowsState.push(''); render(); },
             }, '＋'),
             el('button', {
-                type: 'button', class: 'dga-icon-btn', title: '移除最后一行', 'aria-label': '移除最后一行',
-                disabled: rowsState.length <= 1,
-                onclick: () => { if (rowsState.length > 1) { rowsState.pop(); render(); } },
+                type: 'button',
+                class: `dga-icon-btn${ui.addRowDeleteMode ? ' dga-icon-danger' : ''}`,
+                title: ui.addRowDeleteMode ? '退出删除模式' : '删除行：每行前面会出现红减号',
+                'aria-label': '删除行模式',
+                onclick: () => { ui.addRowDeleteMode = !ui.addRowDeleteMode; render(); },
             }, '－'),
-            el('span', { class: 'dga-muted', text: '绑定后原条目会被关闭，AI 只看到当前阶段；点绑定卡上的「移出」恢复全文。' }),
+            el('span', { class: 'dga-muted', text: ui.addRowDeleteMode
+                ? '点每行前面的红减号删除对应行；已绑定的会先弹确认（删除即解绑）。'
+                : '绑定后原条目会被关闭，AI 只看到当前阶段；已绑定的行可点「解绑」恢复全文。' }),
         ));
         return card('绑定世界书', ...children);
     }
@@ -5226,10 +5171,7 @@ ${P} .dga-tab-bar { display: flex; border: 1px solid rgba(255, 255, 255, 0.14); 
 ${P} .dga-tab { flex: 1; padding: 8px 0; background: transparent; border: none; color: inherit; font: inherit; font-size: 0.86rem; cursor: pointer; opacity: 0.6; min-height: 36px; }
 ${P} .dga-tab.is-on { background: rgba(255, 255, 255, 0.10); opacity: 1; font-weight: 600; }
 ${P} .dga-big { font-size: 1.45rem; font-weight: 700; line-height: 1.25; }
-${P} .dga-stage-name { font-size: 1.05rem; font-weight: 600; color: var(--SmartThemeQuoteColor, #b8a7ff); overflow-wrap: anywhere; }
 ${P} .dga-muted, ${P} .dga-help { margin: 0; font-size: 0.88rem; opacity: 0.7; }
-${P} .dga-bound-head { display: flex; align-items: center; gap: 10px; }
-${P} .dga-bound-head .dga-heading-text { flex: 1 1 auto; }
 ${P} .dga-row { display: flex; gap: 8px; flex-wrap: wrap; }
 ${P} .dga-row > .dga-btn { flex: 1 1 30%; }
 ${P} .dga-btn { min-height: 44px; padding: 10px 14px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.07); color: inherit; font: inherit; font-weight: 600; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
@@ -5248,12 +5190,6 @@ ${P} .dga-msg { padding: 10px 12px; border-radius: 11px; font-size: 0.9rem; whit
 ${P} .dga-msg[data-type="success"] { background: rgba(60, 190, 120, 0.14); border-color: rgba(60, 190, 120, 0.35); }
 ${P} .dga-msg[data-type="warning"] { background: rgba(245, 170, 50, 0.14); border-color: rgba(245, 170, 50, 0.38); }
 ${P} .dga-msg[data-type="error"] { background: rgba(240, 80, 80, 0.14); border-color: rgba(240, 80, 80, 0.4); }
-${P} .dga-pre { margin: 0; padding: 10px 12px; border-radius: 11px; background: rgba(0, 0, 0, 0.28); font: inherit; font-size: 0.88rem; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }
-${P} .dga-fold > summary { cursor: pointer; font-weight: 600; list-style: none; padding: 2px 0; }
-${P} .dga-fold > summary::-webkit-details-marker { display: none; }
-${P} .dga-fold > summary::after { content: ' ▾'; opacity: 0.6; }
-${P} .dga-fold[open] > summary::after { content: ' ▴'; }
-${P} .dga-fold > *:not(summary) { margin-top: 10px; }
 ${P} .dga-doc { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 ${P} .dga-toolbar .dga-btn { flex: 0 0 auto; min-height: 40px; padding: 8px 12px; }
@@ -5332,6 +5268,9 @@ ${P} .dga-add-row { display: flex; gap: 8px; align-items: center; }
 ${P} .dga-add-row select { flex: 1 1 auto; min-width: 0; }
 ${P} .dga-add-row .dga-btn { flex: 0 0 auto; min-height: 36px; padding: 5px 12px; font-size: 0.82rem; }
 ${P} .dga-add-row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+${P} .dga-add-row-sub { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
+${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 0.78rem; }
 ${P} .dga-api-actions { display: flex; justify-content: flex-end; gap: 8px; }
 ${P} .dga-api-actions .dga-btn { flex: 0 1 auto; min-height: 40px; padding: 8px 16px; }
 ${P} .dga-field-hint { font-size: 0.78rem; opacity: 0.6; line-height: 1.5; }
