@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.21
+     * 动态指导助手 v2.22
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.21';
+    const VERSION = '2.22';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3126,7 +3126,6 @@
                 item('动态指导', 'guide'),
                 item('API', 'api'),
                 item('运行日志', 'logs'),
-                item('划分阶段', 'editor', !ui.editor),
             ),
         ));
         return backdrop;
