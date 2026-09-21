@@ -1734,7 +1734,7 @@ test('判断AI档：自定义提示词段按序组装并替换占位符', async 
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))), ['system', 'assistant', 'user_input']);
     assert.match(ordered[0].content, /^规则：只判断 甲一$/, 'system 段里占位符要替换');
     assert.match(ordered[1].content, /这一轮的回复/, 'assistant 段里的 {{history}} 也要替换');
-    assert.equal(verdicts[0].user_input, '阶段=甲一 条件=没有写完成条件：本阶段要演的内容都演完、剧情自然该往下走了，就算完成。', '最后一条 user 段作为 user_input');
+    assert.equal(verdicts[0].user_input, '阶段=甲一 条件=没有写完成条件。只核对「本阶段要演的内容」里写出的具体情节是否都已在正文里发生；感觉该往下走不算完成。', '最后一条 user 段作为 user_input');
     assert.deepEqual(run.errors, []);
 });
 
