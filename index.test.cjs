@@ -1801,3 +1801,104 @@ test('运行日志：环形缓冲超过 500 条丢最旧', () => {
     assert.equal(log.count(), 500);
     assert.equal(log.list()[0].message, '第 10 条', '最旧的 10 条必须被丢弃');
 });
+
+
+// ---------------------------------------------------------------
+// v2.14：规则语义对齐数据库（发送前过滤角色消息）+ 输出留痕 + 规则预览
+// ---------------------------------------------------------------
+
+test('判断AI档：提取规则在发送前逐条过滤角色消息，用户消息原样发送', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', extractRules: [{ start: '<content>', end: '</content>' }] },
+    };
+    const messages = [
+        { message_id: 3, role: 'user', message: '用户的话不带任何标签' },
+        { message_id: 4, role: 'assistant', message: '<content>雨夜的正文</content>\n状态栏：HP 100 / SAN 50' },
+        { message_id: 5, role: 'assistant', message: '这一轮的回复。<content>最新正文</content>' },
+    ];
+    const { state, helper } = multiWorld(books, { config, messages, lastMessageId: 5 });
+    const verdicts = [];
+    helper.generateRaw = async options => { verdicts.push(options); return '<结论>NO</结论>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(verdicts.length, 1);
+    const sent = String(verdicts[0].user_input);
+    assert.match(sent, /雨夜的正文/, '角色消息 <content> 里的正文要发出去');
+    assert.match(sent, /最新正文/);
+    assert.doesNotMatch(sent, /状态栏|HP 100/, '角色消息 <content> 外的部分不能发出去');
+    assert.doesNotMatch(sent, /这一轮的回复。/, '<content> 前面的闲聊也要被滤掉');
+    assert.match(sent, /用户：用户的话不带任何标签/, '用户消息没有标签也要原样发送');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：排除规则在发送前削掉角色消息里的思维链', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<think>', end: '</think>' }] },
+    };
+    const messages = [
+        { message_id: 5, role: 'assistant', message: '<think>内心嘀咕一堆</think>看得见的正文' },
+    ];
+    const { state, helper } = multiWorld(books, { config, messages, lastMessageId: 5 });
+    const verdicts = [];
+    helper.generateRaw = async options => { verdicts.push(options); return '<结论>NO</结论>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    const sent = String(verdicts[0].user_input);
+    assert.match(sent, /看得见的正文/);
+    assert.doesNotMatch(sent, /内心嘀咕/, '角色消息里的 <think> 段发送前就要被削掉');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI留痕：最近一次原始输出、过滤结果与结论都可在测试钩子上读到', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<think>', end: '</think>' }] },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const rawOutput = '<think>先写 NO 试试</think>\n<结论>YES</结论>';
+    helper.generateRaw = async () => rawOutput;
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    const runtime = run.core.getJudgeRuntime();
+    assert.equal(runtime.lastRaw, rawOutput, '留痕要保存未过滤的原始输出');
+    assert.equal(runtime.lastFiltered, '<结论>YES</结论>', '留痕要保存过滤后的文本');
+    assert.equal(runtime.lastYes, true);
+    assert.ok(runtime.lastAt > 0, '留痕要有时间戳');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, '过滤后 YES 要推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('规则预览：changed / hasTag / yes 三个字段都正确', () => {
+    const untouched = core.previewJudgeOutput('<结论>YES</结论>', {});
+    assert.deepEqual(plain(untouched), { filtered: '<结论>YES</结论>', changed: false, yes: true, hasTag: true });
+    const extracted = core.previewJudgeOutput('啰嗦\n<结论>NO</结论>\n尾巴', { extractRules: [{ start: '<结论>', end: '</结论>' }] });
+    assert.equal(extracted.filtered, '<结论>NO</结论>');
+    assert.equal(extracted.changed, true);
+    assert.equal(extracted.yes, false);
+    assert.equal(extracted.hasTag, true);
+    const noTag = core.previewJudgeOutput('没有标签的普通回答', {});
+    assert.equal(noTag.hasTag, false);
+    assert.equal(noTag.yes, false);
+    const empty = core.previewJudgeOutput('', { excludeRules: [{ start: '<a>', end: '</a>' }] });
+    assert.equal(empty.filtered, '');
+    assert.equal(empty.changed, false);
+});

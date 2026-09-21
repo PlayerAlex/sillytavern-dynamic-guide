@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.13
+     * 动态指导助手 v2.14
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.13';
+    const VERSION = '2.14';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2371,6 +2371,9 @@
     // running 集合防止同一绑定并发判断AI；判断AI结果一律只信一次，失败不重试。
     const judgeState = { running: new Set() };
 
+    // 最近一次判断AI调用的留痕（v2.14）：只存内存，给规则测试器「填入最近一次输出」用。
+    const judgeRuntime = { lastRaw: '', lastFiltered: '', lastAt: 0, lastYes: null };
+
     // 判断AI提示词：抄数据库（shujuku）剧情推进页的「提示词段」结构，每段可选
     // system / user / assistant 角色。默认模板用数据库填表格式：标签化输出契约 +
     // assistant 预确认段 + 【】分区上下文（判断规则直接写在上下文段末尾），
@@ -2449,14 +2452,29 @@
         return /^\s*YES\b/i.test(raw);
     }
 
-    // 判断AI输出过滤（v2.13）：先按提取规则截取、再按排除规则删除（与数据库顺序一致），
-    // 在解析 <结论> 之前执行；规则为空 = 原文直通。
-    function applyJudgeOutputRules(text, settings) {
+    // 边界规则应用（v2.13 输出侧 / v2.14 起对齐数据库：同时作用于发送前的最近剧情）。
+    // 先按提取规则截取、再按排除规则删除（与数据库顺序一致）；规则为空 = 原文直通。
+    function applyBoundaryRules(text, settings) {
         const source = settings && typeof settings === 'object' ? settings : {};
         return RuleModule.apply(text, {
             extractRules: source.extractRules,
             excludeRules: source.excludeRules,
         });
+    }
+    // 兼容别名：v2.13 公开的名字。
+    const applyJudgeOutputRules = applyBoundaryRules;
+
+    // 规则测试器用的预览（v2.14）：给定任意样例文本和一组规则（可以是未保存的草稿），
+    // 返回过滤结果 + 解析结论，UI 直接展示，不用真跑剧情就能调规则。
+    function previewJudgeOutput(text, settings) {
+        const raw = String(text == null ? '' : text);
+        const filtered = applyBoundaryRules(raw, settings);
+        return {
+            filtered,
+            changed: filtered !== raw,
+            yes: judgeSaysYes(filtered),
+            hasTag: /<结论>[\s\S]*?<\/结论>/i.test(filtered),
+        };
     }
 
     // 判断AI检查频率（数据库填表同款「每 N 层」频率制）：每 N 条 AI 回复检查一次；
@@ -2466,7 +2484,9 @@
         return Number.isFinite(n) && n >= 1 ? n : 1;
     }
 
-    async function recentHistoryText(messageId, count) {
+    // 最近剧情：与数据库填表规则同一语义——提取/排除规则在「发送前」逐条作用于
+    // 角色（非用户）消息；用户消息永远原样发送。过滤后为空的消息整条丢弃。
+    async function recentHistoryText(messageId, count, settings) {
         const getChatMessages = api('getChatMessages', false);
         if (!getChatMessages || messageId == null) return '';
         const start = Math.max(0, Number(messageId) - count + 1);
@@ -2474,7 +2494,10 @@
         if (!Array.isArray(messages)) return '';
         return messages.map(item => {
             const role = item && item.role === 'user' ? '用户' : (item && item.role === 'assistant' ? '角色' : '系统');
-            const text = String((item && item.message) || '').replace(COMPLETE_MARKER_RE, '').trim();
+            let text = String((item && item.message) || '').replace(COMPLETE_MARKER_RE, '').trim();
+            if (text && item && item.role !== 'user' && settings) {
+                text = applyBoundaryRules(text, settings).trim();
+            }
             return text ? `${role}：${text}` : '';
         }).filter(Boolean).join('\n\n');
     }
@@ -2595,7 +2618,8 @@
             const condition = stage.completion
                 ? stage.completion
                 : '没有写完成条件：本阶段要演的内容都演完、剧情自然该往下走了，就算完成。';
-            const history = await recentHistoryText(messageId, 6);
+            // 提取/排除规则先作用于最近剧情（数据库同款：发送前逐条过滤角色消息）。
+            const history = await recentHistoryText(messageId, 6, settings);
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：开始检查阶段「${stage.name}」（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
@@ -2603,11 +2627,17 @@
             // 本次检查已发生：记录检查楼层，「每 N 层」从这里重新计数（无论结论是 YES 还是 NO）。
             await writeStateFor(context.key, { ...context.state, lastJudgeCheckedId: messageId });
             // 先过提取/排除规则（数据库填表同款），削掉思维链等噪声后再解析结论。
-            const filtered = applyJudgeOutputRules(text, settings);
-            if (filtered !== String(text || '')) {
-                LogModule.debug('判断AI', `输出过滤生效：${String(text || '').length} → ${filtered.length} 字`);
-            }
+            const filtered = applyBoundaryRules(text, settings);
             const yes = judgeSaysYes(filtered);
+            // 留痕最近一次调用（只存内存）：规则测试器可以一键填入这份原始输出。
+            judgeRuntime.lastRaw = String(text || '');
+            judgeRuntime.lastFiltered = filtered;
+            judgeRuntime.lastAt = Date.now();
+            judgeRuntime.lastYes = yes;
+            LogModule.debug('判断AI', `原始输出（${judgeRuntime.lastRaw.length} 字）：${judgeRuntime.lastRaw.slice(0, 500)}`);
+            if (filtered !== judgeRuntime.lastRaw) {
+                LogModule.debug('判断AI', `输出过滤生效：${judgeRuntime.lastRaw.length} → ${filtered.length} 字`);
+            }
             LogModule.info('判断AI', `「${bindingLabel}」阶段「${stage.name}」结论：${yes ? 'YES（演完了）' : 'NO（继续）'}，耗时 ${Date.now() - startedAt} ms`);
             if (!yes) return;
             // 防误判守卫：判断AI是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
@@ -2712,8 +2742,12 @@
         judgePromptDraftSnapshot: '',
         // 提示词页「提取/排除规则」分组的展开态（默认折叠，对齐 AcuRulePairList）
         judgePromptRulesOpen: { extract: false, exclude: false },
-        // 运行日志页：等级筛选
+        // 规则测试器（v2.14）：样例文本与最近一次试跑结果
+        judgeRuleTestText: '',
+        judgeRuleTestResult: null,
+        // 运行日志页：等级 + 标签筛选
         logLevelFilter: 'all',
+        logTagFilter: 'all',
     };
 
     function el(tag, attrs, ...children) {
@@ -3464,10 +3498,62 @@
                     segments.length === 0 ? muted('暂无提示词段。用上方按钮添加，或点「恢复默认提示词」。') : null,
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
                 ),
-                card('输出过滤 · 提取 / 排除规则',
-                    muted('和数据库填表规则一样：作用于判断AI的输出文本，在解析 <结论> 之前先提取、后排除。提取规则只保留「开始边界~结束边界」之间的内容（含边界，取最后一处命中，多条用空行拼接；一条都没命中就不过滤）；排除规则删掉「开始边界~结束边界」区间（含边界，支持嵌套）。边界匹配不区分大小写；留空 = 不过滤。常用来削掉思维链，比如排除规则 <think> → </think>。'),
+                card('提取 / 排除规则（上下文过滤）',
+                    muted('和数据库填表规则一样：在发送前逐条过滤最近剧情里的角色消息（用户消息原样发送），同样的规则在解析 <结论> 前也会对判断AI的输出再过滤一次（没有命中边界时原样保留，无副作用）。提取规则只保留「开始边界~结束边界」之间的内容（含边界，取最后一处命中，多条用空行拼接；一条都没命中就不过滤）；排除规则删掉「开始边界~结束边界」区间（含边界，支持嵌套）。边界匹配不区分大小写；留空 = 不过滤。例如角色回复用 <content> 包正文时，加提取规则 <content> → </content>，判断AI就只看得到正文；排除规则 <think> → </think> 可削掉思维链。'),
+                    el('div', { class: 'dga-rule-quick' },
+                        btn('＋ 排除思维链 <think>', () => {
+                            const rule = { start: '<think>', end: '</think>' };
+                            const list = draft.excludeRules;
+                            if (!list.some(item => item.start === rule.start && item.end === rule.end)) list.push(rule);
+                            ui.judgePromptRulesOpen.exclude = true;
+                            render();
+                        }, { ghost: true }),
+                        btn('＋ 只留 <结论> 段', () => {
+                            const rule = { start: '<结论>', end: '</结论>' };
+                            const list = draft.extractRules;
+                            if (!list.some(item => item.start === rule.start && item.end === rule.end)) list.push(rule);
+                            ui.judgePromptRulesOpen.extract = true;
+                            render();
+                        }, { ghost: true }),
+                    ),
                     ruleGroup('extract', 'extractRules', '提取规则', '提取开始边界', '提取结束边界', '添加提取规则'),
                     ruleGroup('exclude', 'excludeRules', '排除规则', '排除开始边界', '排除结束边界', '添加排除规则'),
+                    (() => {
+                        // 规则测试器（v2.14）：用当前草稿里的规则试跑一段样例输出，
+                        // 直接看过滤结果和解析出的结论；可一键填入最近一次判断AI的真实输出。
+                        const result = ui.judgeRuleTestResult;
+                        return el('div', { class: 'dga-rule-tester' },
+                            el('div', { class: 'dga-rule-tester-title', text: '测试规则（用当前草稿，不保存也生效）' }),
+                            el('textarea', {
+                                class: 'dga-input', rows: 3,
+                                placeholder: '把一段角色回复（或判断AI输出）粘到这里…',
+                                text: ui.judgeRuleTestText || '',
+                                onchange: event => { ui.judgeRuleTestText = event.target.value; },
+                            }),
+                            el('div', { class: 'dga-rule-tester-actions' },
+                                btn('填入最近一次判断AI输出', () => {
+                                    ui.judgeRuleTestText = judgeRuntime.lastRaw;
+                                    render();
+                                }, { ghost: true, disabled: !judgeRuntime.lastRaw }),
+                                btn('测试', () => {
+                                    ui.judgeRuleTestResult = previewJudgeOutput(ui.judgeRuleTestText, {
+                                        extractRules: draft.extractRules,
+                                        excludeRules: draft.excludeRules,
+                                    });
+                                    render();
+                                }, { ghost: true, disabled: !(ui.judgeRuleTestText || '').trim() }),
+                            ),
+                            result ? el('div', { class: 'dga-rule-tester-result' },
+                                el('div', { class: 'dga-rule-tester-verdict' },
+                                    el('span', {
+                                        class: `dga-verdict ${result.yes ? 'is-yes' : 'is-no'}`,
+                                        text: result.yes ? '结论：YES（会推进）' : '结论：NO（不推进）',
+                                    }),
+                                    el('span', { class: 'dga-muted', text: `${result.hasTag ? '命中 <结论> 标签' : '没有 <结论> 标签，按开头判断'}${result.changed ? ' · 规则改变了输出' : ' · 输出未被规则改变'}` }),
+                                ),
+                                el('pre', { class: 'dga-rule-tester-filtered', text: result.filtered.length > 2000 ? `${result.filtered.slice(0, 2000)}\n…（共 ${result.filtered.length} 字，已截断）` : result.filtered }),
+                            ) : null);
+                    })(),
                 ),
                 el('div', { class: 'dga-api-actions' },
                     btn('导入', () => importInput.click(), { ghost: true }),
@@ -3505,12 +3591,19 @@
         }
         const all = LogModule.list();
         const filter = ui.logLevelFilter || 'all';
-        const filtered = filter === 'all' ? all : all.filter(entry => entry.level === filter);
+        const tagFilter = ui.logTagFilter || 'all';
+        const filtered = all.filter(entry => (filter === 'all' || entry.level === filter)
+            && (tagFilter === 'all' || entry.tag === tagFilter));
+        // 等级统计行（v2.14）
+        const counts = { debug: 0, info: 0, warn: 0, error: 0 };
+        all.forEach(entry => { counts[entry.level] = (counts[entry.level] || 0) + 1; });
+        const statsText = `共 ${all.length} 条 · 信息 ${counts.info} · 警告 ${counts.warn} · 错误 ${counts.error}${counts.debug ? ` · 调试 ${counts.debug}` : ''}`;
         const formatTime = timestamp => {
             const date = new Date(timestamp);
             const pad = value => String(value).padStart(2, '0');
             return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
         };
+        const formatLine = entry => `${formatTime(entry.time)} [${LOG_LEVEL_LABELS[entry.level] || entry.level}] [${entry.tag}] ${entry.message}`;
         const rows = filtered.slice().reverse().map(entry => el('div', { class: `dga-log-row dga-log-${entry.level}` },
             el('span', { class: 'dga-log-time', text: formatTime(entry.time) }),
             el('span', { class: `dga-log-level dga-log-level-${entry.level}`, text: LOG_LEVEL_LABELS[entry.level] || entry.level }),
@@ -3518,7 +3611,7 @@
             el('span', { class: 'dga-log-text', text: entry.message })));
         const back = () => { ui.view = 'manager'; render(); };
         return [
-            header('运行日志', `共 ${all.length} 条 · 上限 500 · 只存内存`, back, '返回'),
+            header('运行日志', `${statsText} · 上限 500 · 只存内存`, back, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 el('div', { class: 'dga-log-toolbar' },
@@ -3529,6 +3622,11 @@
                         { value: 'error', label: '错误' },
                         { value: 'debug', label: '调试' },
                     ], filter, value => { ui.logLevelFilter = value; render(); }),
+                    selectControl(
+                        [{ value: 'all', label: '全部标签' }].concat(LogModule.tags().map(tag => ({ value: tag, label: tag }))),
+                        tagFilter,
+                        value => { ui.logTagFilter = value; render(); },
+                    ),
                     el('label', { class: 'dga-log-debug-toggle' },
                         el('input', {
                             type: 'checkbox', checked: LogModule.isDebugEnabled(),
@@ -3536,8 +3634,23 @@
                         }),
                         '采集调试日志'),
                     btn('复制', () => {
-                        const text = filtered.map(entry => `${formatTime(entry.time)} [${LOG_LEVEL_LABELS[entry.level] || entry.level}] [${entry.tag}] ${entry.message}`).join('\n');
-                        copyText(text);
+                        copyText(filtered.map(formatLine).join('\n'));
+                    }, { ghost: true, disabled: filtered.length === 0 }),
+                    btn('导出', () => {
+                        const win = hostWindow();
+                        const blob = new win.Blob([filtered.map(formatLine).join('\n')], { type: 'text/plain;charset=utf-8' });
+                        const url = win.URL.createObjectURL(blob);
+                        const stamp = new Date();
+                        const pad = value => String(value).padStart(2, '0');
+                        const link = el('a', {
+                            href: url,
+                            download: `动态指导助手-运行日志-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.txt`,
+                        });
+                        hostDocument().body.appendChild(link);
+                        link.click();
+                        link.remove();
+                        win.setTimeout(() => win.URL.revokeObjectURL(url), 1000);
+                        setMessage(`已导出 ${filtered.length} 条日志。`, 'success');
                     }, { ghost: true, disabled: filtered.length === 0 }),
                     btn('清空', () => { LogModule.clear(); render(); }, { ghost: true, disabled: all.length === 0 }),
                 ),
@@ -4968,6 +5081,18 @@ ${P} .dga-rule-sep { flex-shrink: 0; font-size: 0.75rem; opacity: 0.55; }
 ${P} .dga-rule-empty { padding: 8px; text-align: center; font-size: 0.78rem; opacity: 0.55; }
 ${P} .dga-rule-add { display: flex; }
 ${P} .dga-rule-add .dga-btn { min-height: 36px; padding: 6px 14px; font-size: 0.85rem; }
+${P} .dga-rule-quick { display: flex; gap: 8px; flex-wrap: wrap; }
+${P} .dga-rule-quick .dga-btn { min-height: 34px; padding: 5px 12px; font-size: 0.8rem; }
+${P} .dga-rule-tester { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px dashed rgba(255, 255, 255, 0.16); border-radius: 11px; }
+${P} .dga-rule-tester-title { font-size: 0.82rem; font-weight: 600; opacity: 0.75; }
+${P} .dga-rule-tester-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+${P} .dga-rule-tester-actions .dga-btn { min-height: 34px; padding: 5px 12px; font-size: 0.8rem; }
+${P} .dga-rule-tester-result { display: flex; flex-direction: column; gap: 6px; }
+${P} .dga-rule-tester-verdict { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+${P} .dga-verdict { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; }
+${P} .dga-verdict.is-yes { background: rgba(34, 197, 94, 0.2); color: #7ce7a2; }
+${P} .dga-verdict.is-no { background: rgba(239, 68, 68, 0.18); color: #ff9b9b; }
+${P} .dga-rule-tester-filtered { margin: 0; padding: 8px 10px; border-radius: 8px; background: rgba(0, 0, 0, 0.28); font-family: monospace; font-size: 0.76rem; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; }
 ${P} .dga-log-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 ${P} .dga-log-toolbar select { flex: 0 1 140px; min-height: 38px; }
 ${P} .dga-log-debug-toggle { display: flex; align-items: center; gap: 6px; font-size: 0.82rem; opacity: 0.8; cursor: pointer; }
@@ -5187,6 +5312,9 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         judgeMessagesFor,
         judgeSaysYes,
         applyJudgeOutputRules,
+        applyBoundaryRules,
+        previewJudgeOutput,
+        getJudgeRuntime: () => ({ ...judgeRuntime }),
         normalizeRulePairs: RuleModule.normalize,
         log: LogModule,
         pickLoad,
