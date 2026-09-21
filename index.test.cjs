@@ -1417,13 +1417,17 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.equal(verdicts[0].should_silence, true, '判断AI请求必须静默');
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'assistant', 'user_input'], '默认段列表要按 系统/预确认/上下文 顺序映射');
+        ['system', 'user', 'assistant', 'user_input'], '默认四段：系统 / 规则 / 预确认 / 案例（案例即 user_input）');
     assert.match(ordered[0].content, /<结论>YES 或 NO<\/结论>/, '系统段要给出填表标签输出契约');
-    assert.match(ordered[1].content, /收到/, '第二段是 assistant 预确认（抄数据库 ACK 段）');
-    assert.match(String(verdicts[0].user_input), /【当前阶段】\n甲一/, '上下文段要带阶段名');
-    assert.match(String(verdicts[0].user_input), /甲一正文/, '上下文段要带阶段正文');
-    assert.match(String(verdicts[0].user_input), /这一轮的回复/, '上下文段要带最近剧情');
-    assert.match(String(verdicts[0].user_input), /现在填表/, '判断规则收尾在上下文段末尾（无独立最终注入）');
+    assert.match(ordered[0].content, /格式示例/, '系统段要带一条填好的格式示例');
+    assert.match(ordered[1].content, /【判断规则】/, '第二段是判断规则（与案例数据分开）');
+    assert.match(ordered[1].content, /判例对照/, '规则段要带一对正反判例');
+    assert.match(ordered[2].content, /收到/, '第三段是 assistant 预确认（抄数据库 ACK 段）');
+    assert.match(String(verdicts[0].user_input), /【当前阶段】\n甲一/, '案例段要带阶段名');
+    assert.match(String(verdicts[0].user_input), /甲一正文/, '案例段要带阶段正文');
+    assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案例段要带最近剧情');
+    assert.match(String(verdicts[0].user_input), /现在填表/, '案例段以「现在填表」收尾（无独立最终注入）');
+    assert.doesNotMatch(ordered[1].content, /\{\{/, '默认段里的占位符都要被替换');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
     await state.events.get('message_received')(5);
@@ -1661,11 +1665,13 @@ test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
     assert.equal(cmCalls[0].profileId, '酒馆代理A');
     assert.equal(cmCalls[0].maxTokens, 16);
     assert.equal(cmCalls[0].messages[0].role, 'system');
-    assert.equal(cmCalls[0].messages[1].role, 'assistant', '第二段是 assistant 预确认');
-    assert.equal(cmCalls[0].messages[2].role, 'user');
-    assert.match(cmCalls[0].messages[2].content, /这一轮的回复/);
-    assert.match(cmCalls[0].messages[2].content, /现在填表/, '判断规则收尾在上下文段末尾');
-    assert.equal(cmCalls[0].messages.length, 3, '不再有独立的最终注入消息');
+    assert.equal(cmCalls[0].messages[1].role, 'user', '第二段是判断规则');
+    assert.match(cmCalls[0].messages[1].content, /【判断规则】/);
+    assert.equal(cmCalls[0].messages[2].role, 'assistant', '第三段是 assistant 预确认');
+    assert.equal(cmCalls[0].messages[3].role, 'user');
+    assert.match(cmCalls[0].messages[3].content, /这一轮的回复/);
+    assert.match(cmCalls[0].messages[3].content, /现在填表/, '案例段以「现在填表」收尾');
+    assert.equal(cmCalls[0].messages.length, 4, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
@@ -1712,9 +1718,10 @@ test('判断AI档：自定义 API 预设直连酒馆后端 generate 端点', asy
     assert.equal(body.custom_prompt_post_processing, 'strict');
     assert.equal(body.stream, false);
     assert.equal(body.messages[0].role, 'system');
-    assert.equal(body.messages[1].role, 'assistant', '第二段是 assistant 预确认');
-    assert.match(body.messages[2].content, /这一轮的回复/);
-    assert.equal(body.messages.length, 3, '不再有独立的最终注入消息');
+    assert.equal(body.messages[1].role, 'user', '第二段是判断规则');
+    assert.equal(body.messages[2].role, 'assistant', '第三段是 assistant 预确认');
+    assert.match(body.messages[3].content, /这一轮的回复/);
+    assert.equal(body.messages.length, 4, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
 });

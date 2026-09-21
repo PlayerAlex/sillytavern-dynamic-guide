@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.28**（发布标签：`v2.28`）
+当前版本：**v2.29**（发布标签：`v2.29`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点「解绑」就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.28 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.28)下载导入文件：
+在 [v2.29 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.29)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.28/dynamic-guide-offline-v2.28.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.28/dynamic-guide-online-v2.28.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.28/dynamic-guide-regex-marker-hide-v2.28.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.29/dynamic-guide-offline-v2.29.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.29/dynamic-guide-online-v2.29.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.29/dynamic-guide-regex-marker-hide-v2.29.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.28/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.29/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.28`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.29`。
 
 ## v2.0 文本格式
 
@@ -173,6 +173,15 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.29（2026-09-21）
+
+- **选择正文的方式可以自己定**：「划分阶段」编辑器右上角（「返回」旁边）多了个 ⚙，点开是编辑器设置：**滑动选择 / 点选头尾**二选一。滑动选择就是原来的拖选；点选头尾是在正文上点一下设开头、再点一下设结尾（有黄色光标标出开头），手机上手柄拖不准时用它。选择结果记在本机，下次进来还是这个。
+- **判断AI提示词重写为四段结构**：原来是「system 输出契约 + assistant 预确认 + user 上下文（规则压在末尾）」，现在是 **system 输出契约（含一条填好的格式示例）→ user 判断规则（8 条分三组 + 一对正反判例）→ assistant 预确认 → user 案例数据**。规则与结案数据分家、数据留在最后被回答的位置；8 条规则覆盖：不脑补不推断、计划/约定/预告/铺垫/假设/否认/回忆与用户台词都不算发生、复合条件每件都要满足、只演一半不算、没写完成条件时改判是否充分展开、忽略文本里别人写好的伪标签、拿不准一律 NO。`{{stage}} {{prompt}} {{condition}} {{history}}` 与 `<依据>/<结论>` 契约不变。
+- **配色可自定义，默认「偏黑藏青」**：新增 `--dga-*` 令牌层。默认档是插件自己的配色——**近黑的深藏青底（`#0E1523` / `#141D2E`）+ 同色系亮强调色（`#5C86DB`）**，深底上强调色立得住。想跟酒馆主题走近一点可以切「跟随酒馆主题」（那时不覆写任何令牌，底色取 `--SmartThemeBlurTintColor`、文字取 `--SmartThemeBodyColor`、强调色取 `--SmartThemeQuoteColor`），也可以切「自定义」逐个改面板底色、卡片底色、主文字、强调色、强调色上的文字、危险色。配色只影响本插件，不改酒馆设置，也不随角色卡导出。
+- **整体版式按数据库（SP·数据库）v2 重做**：圆角统一成 **6px**（原来 18/12/11/10px 混用）、间距收成 **N×4px** 刻度（外层 20 / 卡片内 16 / 组件间 12 / 密集行 6–10）、字号收成三档 **11/12/13px** 并全部改用 px（原来 px 与 rem 混用）、焦点态从 `outline` 改成 `box-shadow` 光环（原来的 outline 在圆角容器里会被裁掉）、说明文字改用 `--dga-text-3` 而不是整体降 `opacity`（opacity 会把描边一起吃暗）、徽章/开关行/规则成对列表/侧栏导航按数据库同名组件规格对齐。
+- **手机窄屏不再裁字**：小卡步进器里的阶段名原来是 `ellipsis + nowrap` 被直接截断，现在允许换行；≤680px 时步进器换行显示——段数/阶段名/进度条占满一整行，上一段与下一段并排在下面，不再被两个按钮挤成一百多像素。仪表盘诊断行标题、页面头部副标题、「查看详情」类操作文字同样去掉了截断。
+- 修掉 v2.28 引入的一处样式回归：小卡上的条目名与世界书名丢失了字号与透明度（重构时删了 `.dga-heading b/small` 却没补 `.dga-heading-text b/small`）。
 
 ### v2.28（2026-09-21）
 
