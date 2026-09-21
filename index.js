@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.22
+     * 动态指导助手 v2.23
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.22';
+    const VERSION = '2.23';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2156,7 +2156,8 @@
     }
 
     // 把链路逐项体检一遍：环境、接口、事件、绑定，以及每条绑定的镜像条目
-    // 是否存在、内容是否与当前阶段一致。结果给面板上的「诊断」卡用，也挂在 publicApi 上。
+    // 是否存在、内容是否与当前阶段一致。面板上的诊断卡已在 v2.23 删除，
+    // 这份能力仍挂在 publicApi.diagnose 上，供外部排障与自动化测试使用。
     async function collectDiagnostics() {
         const rows = [];
         const push = (label, ok, detail) => rows.push({ label, ok: Boolean(ok), detail: String(detail == null ? '' : detail) });
@@ -2230,12 +2231,6 @@
             push('读取绑定列表', false, error.message || String(error));
         }
         return rows;
-    }
-
-    function diagnosticsText(rows) {
-        const lines = [`动态指导助手 v${VERSION} 诊断报告`];
-        rows.forEach(row => lines.push(`${row.ok ? '✅' : '❌'} ${row.label}${row.detail ? `：${row.detail}` : ''}`));
-        return lines.join('\n');
     }
 
     async function moveToIndex(context, target, options) {
@@ -2791,7 +2786,6 @@
         snapshot: null,
         contextError: '',
         editor: null,
-        diagnosis: null,
         // API 页草稿态（对齐 shujuku ApiConfigPanel 的 draft/snapshot/formMode）
         apiFormMode: 'empty',
         apiDraft: null,
@@ -2804,8 +2798,10 @@
         // 判断AI提示词二级页草稿态（draft/snapshot 脏检查，对齐 shujuku 提示词抽屉）
         judgePromptDraft: null,
         judgePromptDraftSnapshot: '',
-        // 提示词页「提取/排除规则」分组的展开态（默认折叠，对齐 AcuRulePairList）
-        judgePromptRulesOpen: { extract: false, exclude: false },
+        // 动态指导页「提取/排除规则」分组的展开态（默认折叠，对齐 AcuRulePairList）
+        guideRulesOpen: { extract: false, exclude: false },
+        // 动态指导页规则行本地态（null = 还没从设置读取；半填的行只存在这里）
+        guideRuleRows: null,
         // 规则测试器（v2.14）：样例文本与最近一次试跑结果
         judgeRuleTestText: '',
         judgeRuleTestResult: null,
@@ -3072,8 +3068,9 @@
         return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
     }
 
-    // 动态指导页（v2.19 起独立成页，不再堆在仪表盘）：每条绑定一张卡片，
-    // 下面是添加指导条目与诊断；没有绑定时显示三步上手。
+    // 动态指导页（v2.19 起独立成页，不再堆在仪表盘；v2.23 按手稿重排）：
+    // 每条绑定一张卡片 → 绑定世界书（添加指导条目）→ 如何判断（判断模式 +
+    // 判断AI设置）→ 提取/排除规则 + 规则测试。没有绑定时显示三步上手。
     function renderGuidePage() {
         const snapshot = ui.snapshot;
         const contexts = snapshot ? snapshot.contexts : [];
@@ -3082,9 +3079,9 @@
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             ...contexts.map(boundCard),
             contexts.length === 0 ? guideCard() : null,
-            judgeSettingsCard(),
             addCard(),
-            diagnosticsCard(),
+            judgeSettingsCard(),
+            guideRulesCard(),
         );
         return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回'), body];
     }
@@ -3095,6 +3092,7 @@
         const go = view => {
             if (view === 'editor' && !ui.editor) return;
             if (view === 'api') enterApiPage();
+            if (view === 'guide') enterGuidePage();
             ui.view = view;
             ui.navOpen = false;
             render();
@@ -3123,8 +3121,8 @@
             el('div', { class: 'dga-nav-group-title' }, '页面'),
             el('div', { class: 'dga-nav-group' },
                 item('仪表盘', 'manager'),
-                item('动态指导', 'guide'),
                 item('API', 'api'),
+                item('动态指导', 'guide'),
                 item('运行日志', 'logs'),
             ),
         ));
@@ -3178,6 +3176,12 @@
     function enterApiPage() {
         ui.apiTavernProfiles = readTavernConnectionProfiles();
         syncApiDraft();
+    }
+
+    // 进入动态指导页前的状态复位：规则行重新从设置读取
+    // （提示词页的导入会直接改写规则设置，本地行态不能接着用）。
+    function enterGuidePage() {
+        ui.guideRuleRows = null;
     }
 
     function renderApiPage() {
@@ -3410,19 +3414,16 @@
         ];
     }
 
-    // 判断AI提示词二级页（从管理页设置卡「判断AI提示词…」进入）：仿数据库剧情推进页的
+    // 判断AI提示词二级页（从动态指导页「判断AI提示词…」进入）：仿数据库剧情推进页的
     // 提示词段编辑 + 提示词抽屉的草稿/保存语义——编辑只改草稿，点「保存」才写入设置；
     // 支持一键导入/导出 JSON、放弃修改与恢复默认。旧版 judgePrompt 单模板仍生效，
     // 在本页保存一次即自动转成段结构。
+    // （v2.23 起提取/排除规则挪到动态指导页直接生效，不再进这份草稿。）
     function syncJudgePromptDraft() {
         const config = ui.snapshot ? ui.snapshot.config : null;
         const settings = config && config.settings ? config.settings : {};
         const segments = judgeMessageSpecs(settings).map(seg => ({ role: seg.role, content: seg.content }));
-        ui.judgePromptDraft = {
-            segments,
-            extractRules: RuleModule.normalize(settings.extractRules),
-            excludeRules: RuleModule.normalize(settings.excludeRules),
-        };
+        ui.judgePromptDraft = { segments };
         ui.judgePromptDraftSnapshot = JSON.stringify(ui.judgePromptDraft);
     }
 
@@ -3471,39 +3472,6 @@
                 onchange: event => { patchAt(index, { content: event.target.value }); touch(); },
             })));
 
-        // 提取/排除规则分组：复刻数据库 AcuRulePairList——默认折叠、头部带条数，
-        // 每行「开始边界 → 结束边界 + 删除」，底部添加按钮。编辑进同一草稿，随「保存」生效。
-        const ruleGroup = (groupKey, fieldName, label, startPlaceholder, endPlaceholder, addLabel) => {
-            const openState = ui.judgePromptRulesOpen || (ui.judgePromptRulesOpen = { extract: false, exclude: false });
-            const open = Boolean(openState[groupKey]);
-            const rules = Array.isArray(draft[fieldName]) ? draft[fieldName] : (draft[fieldName] = []);
-            const setRules = next => { draft[fieldName] = next; render(); };
-            const patchRule = (index, patch) => setRules(rules.map((rule, position) => (position === index ? { ...rule, ...patch } : rule)));
-            const rows = rules.map((rule, index) => el('div', { class: 'dga-rule-row' },
-                el('input', {
-                    class: 'dga-input', type: 'text', placeholder: startPlaceholder, value: rule.start,
-                    onchange: event => patchRule(index, { start: event.target.value }),
-                }),
-                el('span', { class: 'dga-rule-sep', text: '→' }),
-                el('input', {
-                    class: 'dga-input', type: 'text', placeholder: endPlaceholder, value: rule.end,
-                    onchange: event => patchRule(index, { end: event.target.value }),
-                }),
-                iconBtn('✕', '删除此规则', () => setRules(rules.filter((rule, position) => position !== index)), { danger: true })));
-            return el('div', { class: 'dga-rule-group' },
-                el('button', {
-                    type: 'button', class: 'dga-rule-head', 'aria-expanded': open ? 'true' : 'false',
-                    onclick: () => { openState[groupKey] = !open; render(); },
-                },
-                    el('span', { class: `dga-rule-chevron${open ? ' is-open' : ''}`, text: '▸' }),
-                    el('span', { class: 'dga-rule-label', text: label }),
-                    el('span', { class: 'dga-rule-count', text: rules.length ? `${rules.length} 条` : '暂无' })),
-                open ? el('div', { class: 'dga-rule-body' },
-                    ...rows,
-                    rules.length === 0 ? el('div', { class: 'dga-rule-empty', text: '暂无规则，点击下方按钮添加。' }) : null,
-                    el('div', { class: 'dga-rule-add' }, btn(`＋ ${addLabel}`, () => setRules([...rules, { start: '', end: '' }]), { ghost: true }))) : null);
-        };
-
         const saveDraft = () => runAction('保存判断AI提示词', async () => {
             const fresh = await readConfig();
             fresh.settings = { ...(fresh.settings || {}) };
@@ -3512,12 +3480,6 @@
                 .map(seg => ({ role: seg.role, content: String(seg.content || '') }));
             fresh.settings.judgePrompt = '';
             delete fresh.settings.judgeFinalPrompt;
-            const extractRules = RuleModule.normalize(draft.extractRules);
-            const excludeRules = RuleModule.normalize(draft.excludeRules);
-            if (extractRules.length) fresh.settings.extractRules = extractRules;
-            else delete fresh.settings.extractRules;
-            if (excludeRules.length) fresh.settings.excludeRules = excludeRules;
-            else delete fresh.settings.excludeRules;
             await writeConfig(fresh);
             ui.judgePromptDraftSnapshot = JSON.stringify(ui.judgePromptDraft);
             return true;
@@ -3542,13 +3504,24 @@
                         }));
                     if (!cleaned.length) throw new Error('文件里没有可用的提示词段。');
                     draft.segments = cleaned;
-                    // 兼容旧导出文件：没有规则字段时保留当前草稿里的规则。
-                    if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
-                        if (parsed.extractRules != null) draft.extractRules = RuleModule.normalize(parsed.extractRules);
-                        if (parsed.excludeRules != null) draft.excludeRules = RuleModule.normalize(parsed.excludeRules);
+                    // 规则现在挂在动态指导页、改了立即生效，所以导入时直接写入设置，
+                    // 不进提示词草稿。旧导出文件没有规则字段时不动现有规则。
+                    let ruleNote = '';
+                    if (!Array.isArray(parsed) && parsed && typeof parsed === 'object'
+                        && (parsed.extractRules != null || parsed.excludeRules != null)) {
+                        const extractRules = RuleModule.normalize(parsed.extractRules);
+                        const excludeRules = RuleModule.normalize(parsed.excludeRules);
+                        const fresh = await readConfig();
+                        fresh.settings = { ...(fresh.settings || {}) };
+                        if (extractRules.length) fresh.settings.extractRules = extractRules;
+                        else delete fresh.settings.extractRules;
+                        if (excludeRules.length) fresh.settings.excludeRules = excludeRules;
+                        else delete fresh.settings.excludeRules;
+                        await writeConfig(fresh);
+                        ui.guideRuleRows = null;
+                        ruleNote = `，${extractRules.length + excludeRules.length} 条输出规则已直接生效`;
                     }
-                    const ruleCount = draft.extractRules.length + draft.excludeRules.length;
-                    setMessage(`已导入 ${cleaned.length} 个提示词段${ruleCount ? `、${ruleCount} 条输出规则` : ''}；点「保存」后生效。`, 'success');
+                    setMessage(`已导入 ${cleaned.length} 个提示词段${ruleNote}；提示词段点「保存」后生效。`, 'success');
                     render();
                 } catch (error) {
                     setMessage(`导入判断AI提示词失败：${error.message || error}`, 'error');
@@ -3561,8 +3534,8 @@
             const payload = {
                 type: 'dynamic-guide-judge-prompt', version: 1,
                 segments: draft.segments,
-                extractRules: RuleModule.normalize(draft.extractRules),
-                excludeRules: RuleModule.normalize(draft.excludeRules),
+                extractRules: RuleModule.normalize(settings.extractRules),
+                excludeRules: RuleModule.normalize(settings.excludeRules),
             };
             const blob = new win.Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
             const url = win.URL.createObjectURL(blob);
@@ -3574,9 +3547,9 @@
             setMessage('已导出当前草稿的提示词段。', 'success');
         }, { ghost: true });
 
-        const back = () => { ui.view = 'guide'; ui.judgePromptDraft = null; render(); };
+        const back = () => { ui.view = 'guide'; ui.judgePromptDraft = null; enterGuidePage(); render(); };
         return [
-            header('判断AI提示词', '判断AI · 提示词段与输出规则', back, '返回'),
+            header('判断AI提示词', '判断AI · 提示词段', back, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 muted('每段选一个角色按顺序发送；占位符：{{stage}} {{prompt}} {{condition}} {{history}}。结论优先读 <结论> 标签，没标签时看开头是不是 YES。'),
@@ -3586,49 +3559,6 @@
                     ...items,
                     segments.length === 0 ? muted('暂无提示词段。用上方按钮添加，或点「恢复默认提示词」。') : null,
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
-                ),
-                card('提取 / 排除规则（上下文过滤）',
-                    muted('发送前过滤角色回复，解析结论前也会再过滤一次判断AI输出。提取 = 只留「开始~结束」之间（取最后命中）；排除 = 删掉该区间。留空 = 不过滤。例：排除 <think>→</think> 可削思维链。'),
-                    ruleGroup('extract', 'extractRules', '提取规则', '提取开始边界', '提取结束边界', '添加提取规则'),
-                    ruleGroup('exclude', 'excludeRules', '排除规则', '排除开始边界', '排除结束边界', '添加排除规则'),
-                ),
-                card('规则测试',
-                    (() => {
-                        // 规则测试器（v2.14）：用当前草稿里的规则试跑一段样例输出，
-                        // 直接看过滤结果和解析出的结论；可一键填入最近一次判断AI的真实输出。
-                        const result = ui.judgeRuleTestResult;
-                        return el('div', { class: 'dga-rule-tester' },
-                            el('div', { class: 'dga-rule-tester-title', text: '用当前草稿试跑，不保存也生效' }),
-                            el('textarea', {
-                                class: 'dga-input', rows: 3,
-                                placeholder: '把一段角色回复（或判断AI输出）粘到这里…',
-                                text: ui.judgeRuleTestText || '',
-                                onchange: event => { ui.judgeRuleTestText = event.target.value; },
-                            }),
-                            el('div', { class: 'dga-rule-tester-actions' },
-                                btn('填入最近一次判断AI输出', () => {
-                                    ui.judgeRuleTestText = judgeRuntime.lastRaw;
-                                    render();
-                                }, { ghost: true, disabled: !judgeRuntime.lastRaw }),
-                                btn('测试', () => {
-                                    ui.judgeRuleTestResult = previewJudgeOutput(ui.judgeRuleTestText, {
-                                        extractRules: draft.extractRules,
-                                        excludeRules: draft.excludeRules,
-                                    });
-                                    render();
-                                }, { ghost: true, disabled: !(ui.judgeRuleTestText || '').trim() }),
-                            ),
-                            result ? el('div', { class: 'dga-rule-tester-result' },
-                                el('div', { class: 'dga-rule-tester-verdict' },
-                                    el('span', {
-                                        class: `dga-verdict ${result.yes ? 'is-yes' : 'is-no'}`,
-                                        text: result.yes ? '结论：YES（会推进）' : '结论：NO（不推进）',
-                                    }),
-                                    el('span', { class: 'dga-muted', text: `${result.hasTag ? '命中 <结论> 标签' : '没有 <结论> 标签，按开头判断'}${result.changed ? ' · 规则改变了输出' : ' · 输出未被规则改变'}` }),
-                                ),
-                                el('pre', { class: 'dga-rule-tester-filtered', text: result.filtered.length > 2000 ? `${result.filtered.slice(0, 2000)}\n…（共 ${result.filtered.length} 字，已截断）` : result.filtered }),
-                            ) : null);
-                    })(),
                 ),
                 el('div', { class: 'dga-api-actions' },
                     btn('导入', () => importInput.click(), { ghost: true }),
@@ -3800,7 +3730,7 @@
         logItem.actionLabel = '查看日志';
         logItem.onAction = () => { ui.view = 'logs'; ui.navOpen = false; render(); };
         stageItem.actionLabel = '查看指导';
-        stageItem.onAction = () => { ui.view = 'guide'; ui.navOpen = false; render(); };
+        stageItem.onAction = () => { ui.view = 'guide'; ui.navOpen = false; enterGuidePage(); render(); };
 
         return card('运行概览',
             muted('这里显示当前聊天的运行状态；只有标为「需要处理」的项目才影响使用。'),
@@ -3848,20 +3778,27 @@
         );
     }
 
-    // 「动态指导」页的判断AI设置卡（v2.20 从仪表盘挪入）：API 预设 / 多久检查一次 /
-    // 参考几段角色回复 / 判断AI提示词入口。只有「判断AI」档才显示具体设置。
+    // 「动态指导」页的「如何判断？」卡（v2.23 按手稿重排）：判断模式（手动/标记/判断AI）
+    // 放在最上面；只有切到「判断AI」档才会出现 API 预设、多久检查一次、参考几段
+    // 角色回复与判断AI提示词入口（v2.20 从仪表盘挪入）。
     function judgeSettingsCard() {
         const config = ui.snapshot ? ui.snapshot.config : null;
         const mode = autoAdvanceMode(config);
         const settings = config && config.settings ? config.settings : {};
         const presetList = readJudgeApiPresets();
+        const modeOptions = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
+        const children = [
+            field('判断模式', selectControl(modeOptions, mode, value => {
+                saveGuideSettings({ autoAdvance: value }, `判断模式已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
+            })),
+        ];
         if (mode !== 'judge') {
-            return card('判断AI',
-                muted('当前不是「判断AI」档。在仪表盘「开关」里把进入下一段的方式切成「判断AI」后，这里的设置才会生效。'));
+            children.push(muted('手动模式只能手点「下一段」；标记判断由正文 AI 自己定时机。切成「判断AI」后，这里会出现 API 预设、检查频率等设置。'));
+            return card('如何判断？', ...children);
         }
         const presetOptions = [{ value: '', label: '酒馆主 API（不使用 API 预设）' }]
             .concat(presetList.map(item => ({ value: item.name, label: item.name })));
-        return card('判断AI',
+        children.push(
             field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
                 saveGuideSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '判断AI改用酒馆主 API');
             })),
@@ -3932,7 +3869,109 @@
                 : null,
             el('div', { class: 'dga-inline-action' },
                 btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
-                el('span', { class: 'dga-muted', text: '提示词与规则在独立页面。' })),
+                el('span', { class: 'dga-muted', text: '提示词段在独立页面编辑。' })),
+        );
+        return card('如何判断？', ...children);
+    }
+
+    // 「动态指导」页的「提取 / 排除规则 + 规则测试」卡（v2.23 从提示词二级页搬入）：
+    // 规则开始/结束都填上就立刻写入设置生效，不再走提示词草稿；只填了一半的行
+    // 留在内存里，重新进页面时再从设置读取。测试器用当前规则试跑，可一键填入
+    // 最近一次判断AI的真实输出。
+    function guideRulesCard() {
+        const config = ui.snapshot ? ui.snapshot.config : null;
+        const settings = config && config.settings ? config.settings : {};
+        const rowsState = ui.guideRuleRows || (ui.guideRuleRows = { extract: null, exclude: null });
+        const openState = ui.guideRulesOpen || (ui.guideRulesOpen = { extract: false, exclude: false });
+        const fieldFor = key => (key === 'extract' ? 'extractRules' : 'excludeRules');
+        const currentRows = key => {
+            if (!rowsState[key]) rowsState[key] = RuleModule.normalize(settings[fieldFor(key)]).map(rule => ({ ...rule }));
+            return rowsState[key];
+        };
+        const persist = key => runAction('保存输出规则', async () => {
+            const fresh = await readConfig();
+            fresh.settings = { ...(fresh.settings || {}) };
+            const normalized = RuleModule.normalize(rowsState[key]);
+            if (normalized.length) fresh.settings[fieldFor(key)] = normalized;
+            else delete fresh.settings[fieldFor(key)];
+            await writeConfig(fresh);
+            return true;
+        }, { success: '输出规则已保存' });
+        const iconBtn = (label, title, onclick) => el('button', {
+            type: 'button', class: 'dga-icon-btn dga-icon-danger', title, 'aria-label': title,
+            disabled: Boolean(ui.busy), onclick,
+        }, label);
+        // 规则分组：复刻数据库 AcuRulePairList——默认折叠、头部带条数，
+        // 每行「开始边界 → 结束边界 + 删除」，底部添加按钮。改了立即生效。
+        const ruleGroup = (key, label, startPlaceholder, endPlaceholder, addLabel) => {
+            const open = Boolean(openState[key]);
+            const rules = currentRows(key);
+            const patchRule = (index, patch) => {
+                rules[index] = { ...rules[index], ...patch };
+                const row = rules[index];
+                if (String(row.start || '').trim() && String(row.end || '').trim()) persist(key);
+                else render();
+            };
+            const rows = rules.map((rule, index) => el('div', { class: 'dga-rule-row' },
+                el('input', {
+                    class: 'dga-input', type: 'text', placeholder: startPlaceholder, value: rule.start,
+                    onchange: event => patchRule(index, { start: event.target.value }),
+                }),
+                el('span', { class: 'dga-rule-sep', text: '→' }),
+                el('input', {
+                    class: 'dga-input', type: 'text', placeholder: endPlaceholder, value: rule.end,
+                    onchange: event => patchRule(index, { end: event.target.value }),
+                }),
+                iconBtn('✕', '删除此规则', () => { rules.splice(index, 1); persist(key); })));
+            return el('div', { class: 'dga-rule-group' },
+                el('button', {
+                    type: 'button', class: 'dga-rule-head', 'aria-expanded': open ? 'true' : 'false',
+                    onclick: () => { openState[key] = !open; render(); },
+                },
+                    el('span', { class: `dga-rule-chevron${open ? ' is-open' : ''}`, text: '▸' }),
+                    el('span', { class: 'dga-rule-label', text: label }),
+                    el('span', { class: 'dga-rule-count', text: rules.length ? `${rules.length} 条` : '暂无' })),
+                open ? el('div', { class: 'dga-rule-body' },
+                    ...rows,
+                    rules.length === 0 ? el('div', { class: 'dga-rule-empty', text: '暂无规则，点击下方按钮添加。' }) : null,
+                    el('div', { class: 'dga-rule-add' }, btn(`＋ ${addLabel}`, () => { rules.push({ start: '', end: '' }); render(); }, { ghost: true }))) : null);
+        };
+        const result = ui.judgeRuleTestResult;
+        return card('提取 / 排除规则',
+            muted('发送前过滤角色回复，解析结论前也会再过滤一次判断AI输出。提取 = 只留「开始~结束」之间（取最后命中）；排除 = 删掉该区间。留空 = 不过滤。例：排除 <think>→</think> 可削思维链。开始和结束都填上会自动保存。'),
+            ruleGroup('extract', '提取规则', '提取开始边界', '提取结束边界', '添加提取规则'),
+            ruleGroup('exclude', '排除规则', '排除开始边界', '排除结束边界', '添加排除规则'),
+            el('div', { class: 'dga-rule-tester' },
+                el('div', { class: 'dga-rule-tester-title', text: '规则测试：用当前规则试跑一段文字' }),
+                el('textarea', {
+                    class: 'dga-input', rows: 3,
+                    placeholder: '把一段角色回复（或判断AI输出）粘到这里…',
+                    text: ui.judgeRuleTestText || '',
+                    onchange: event => { ui.judgeRuleTestText = event.target.value; },
+                }),
+                el('div', { class: 'dga-rule-tester-actions' },
+                    btn('填入最近一次判断AI输出', () => {
+                        ui.judgeRuleTestText = judgeRuntime.lastRaw;
+                        render();
+                    }, { ghost: true, disabled: !judgeRuntime.lastRaw }),
+                    btn('测试', () => {
+                        ui.judgeRuleTestResult = previewJudgeOutput(ui.judgeRuleTestText, {
+                            extractRules: currentRows('extract'),
+                            excludeRules: currentRows('exclude'),
+                        });
+                        render();
+                    }, { ghost: true, disabled: !(ui.judgeRuleTestText || '').trim() }),
+                ),
+                result ? el('div', { class: 'dga-rule-tester-result' },
+                    el('div', { class: 'dga-rule-tester-verdict' },
+                        el('span', {
+                            class: `dga-verdict ${result.yes ? 'is-yes' : 'is-no'}`,
+                            text: result.yes ? '结论：YES（会推进）' : '结论：NO（不推进）',
+                        }),
+                        el('span', { class: 'dga-muted', text: `${result.hasTag ? '命中 <结论> 标签' : '没有 <结论> 标签，按开头判断'}${result.changed ? ' · 规则改变了输出' : ' · 输出未被规则改变'}` }),
+                    ),
+                    el('pre', { class: 'dga-rule-tester-filtered', text: result.filtered.length > 2000 ? `${result.filtered.slice(0, 2000)}\n…（共 ${result.filtered.length} 字，已截断）` : result.filtered }),
+                ) : null),
         );
     }
 
@@ -4030,7 +4069,8 @@
         );
     }
 
-    // 添加区：两个下拉选条目，然后“划分阶段”或“添加为指导条目”。
+    // 绑定世界书（添加区）：两个下拉选条目，然后“划分阶段”或“添加为指导条目”。
+    // v2.23 删掉「刷新」「运行诊断」按钮（诊断能力仍挂在 publicApi.diagnose 上）。
     function addCard() {
         const selected = selectedEntry();
         const legacy = Boolean(selected && hasLegacyLayout(selected));
@@ -4082,30 +4122,7 @@
             }),
         ));
         children.push(muted('添加后原条目会被关闭，AI 在它原来的位置只能看到当前阶段；点卡片上的「移出」恢复全文。'));
-        children.push(row(
-            btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }),
-            btn('运行诊断', () => runAction('诊断', async () => {
-                ui.diagnosis = await collectDiagnostics();
-            }), { ghost: true }),
-        ));
-        return card('添加指导条目', ...children);
-    }
-
-    // 诊断卡：逐项体检环境和镜像同步状态，结果可以一键复制发给别人排查。
-    function diagnosticsCard() {
-        if (!ui.diagnosis) return null;
-        const rows = ui.diagnosis;
-        const failed = rows.filter(row => !row.ok).length;
-        return card('运行诊断',
-            muted(failed === 0
-                ? `${rows.length} 项全部通过。提示词查看器里找「（动态指导）」条目就能看到当前阶段，位置与原条目一致。还是看不到的话，把这份报告发给作者。`
-                : `${rows.length} 项里有 ${failed} 项不通过。把这份报告复制下来发给作者。`),
-            el('pre', { class: 'dga-diag' }, diagnosticsText(rows)),
-            btn('复制诊断报告', () => runAction('复制诊断报告', async () => {
-                const copied = await copyText(diagnosticsText(rows));
-                notify(copied ? '诊断报告已复制' : '复制失败：浏览器拦了剪贴板。请直接选中上面的报告文本，长按或 Ctrl+C 复制。', copied ? 'success' : 'error');
-            }), { ghost: true }),
-        );
+        return card('绑定世界书', ...children);
     }
 
     // 脚本跑在 iframe 里，document 没焦点时 navigator.clipboard.writeText 会抛
@@ -4205,6 +4222,7 @@
         if (!force && editorUnsaved(ui.editor) && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
         discardEditor();
         ui.view = 'guide';
+        enterGuidePage();
         render();
     }
 
@@ -5121,6 +5139,7 @@
         if (bindAfter) {
             await addBinding(editor.worldbookName, saved, { confirm: false });
             ui.view = 'guide';
+            enterGuidePage();
             discardEditor();
             await refresh({ worldbookName: editor.worldbookName, entryKey: entryKey(saved, 0) });
             setMessage('已保存并添加。当前聊天从第一段开始。', 'success');
@@ -5236,7 +5255,6 @@ ${P} .dga-move-wrap { display: flex; flex-direction: column; gap: 3px; flex: 0 0
 ${P} .dga-move { width: 32px; min-height: 26px; padding: 0; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.18); background: rgba(255, 255, 255, 0.06); color: inherit; font: inherit; font-size: 0.82rem; line-height: 1; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-move:hover { background: rgba(255, 255, 255, 0.14); }
 ${P} .dga-move:disabled { opacity: 0.25; cursor: default; }
-${P} .dga-diag { margin: 0; padding: 10px 12px; max-height: 260px; overflow: auto; border-radius: 10px; background: rgba(0, 0, 0, 0.28); font-size: 0.78rem; line-height: 1.6; white-space: pre-wrap; word-break: break-all; user-select: text; }
 ${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 0.82rem; opacity: 0.6; }
 ${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 ${P} .dga-seg-btn { min-height: 40px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit; cursor: pointer; }
