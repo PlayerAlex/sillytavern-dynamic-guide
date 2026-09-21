@@ -1105,7 +1105,7 @@ test('跨卡导入自愈：别的卡的世界书里有镜像，也不收进当�
     assert.deepEqual(run.errors, []);
 });
 
-test('只本机配置按角色卡分开，换卡看不到上一张卡的绑定', async () => {
+test('绑定记在角色变量里，换卡不串，也不另存一份本机档', async () => {
     const storage = memoryStorage({ 'dynamic-guide-assistant:config-storage:v1': 'user' });
     const books = {
         甲书: [
@@ -1122,20 +1122,19 @@ test('只本机配置按角色卡分开，换卡看不到上一张卡的绑定',
     const run = load(helper, { localStorage: storage });
     await new Promise(setImmediate);
 
-    const keyA = 'dynamic-guide-assistant:config:v2:avatar:a.png';
-    const savedA = JSON.parse(storage.getItem(keyA));
-    assert.equal(savedA.bindings.length, 1, '甲卡的绑定要写进甲卡自己的本机档');
-    assert.equal(savedA.bindings[0].worldbookName, '甲书');
-    assert.equal(storage.getItem('dynamic-guide-assistant:config:v1'), null, '不再写全库共用的旧本机档');
+    const cardA = state.variables.character.$dynamicGuideAssistant.config;
+    assert.equal(cardA.bindings.length, 1, '甲卡的绑定写在甲卡自己的角色变量里');
+    assert.equal(cardA.bindings[0].worldbookName, '甲书');
+    assert.equal(storage.getItem('dynamic-guide-assistant:config:v2:avatar:a.png'), null, '不再按头像另存一份绑定');
+    assert.equal(state.books.甲书.some(item => (item.name || item.comment) === '（动态指导·配置）'), false, '只本机不把绑定写进世界书');
 
     card = { name: '乙', avatar: 'b.png' };
     bound = ['乙书'];
     state.variables.character = { $dynamicGuideAssistant: { config: { version: 2, bindings: [] } } };
     await state.events.get('chat_changed')();
     const snap = await run.core.getCurrentSnapshot();
-    assert.equal(snap.config.bindings.length, 0, '乙卡没有自己的绑定，不该看到甲卡的');
-    assert.equal(JSON.parse(storage.getItem(keyA)).bindings[0].worldbookName, '甲书', '换卡不能改掉甲卡已经存下的本机档');
-    assert.equal(storage.getItem('dynamic-guide-assistant:config:v2:avatar:b.png'), null, '乙卡没有新绑定，不该凭空写出一份本机档');
+    assert.equal(snap.config.bindings.length, 0, '乙卡的角色变量是空的，不该看到甲卡的绑定');
+    assert.equal(cardA.bindings[0].worldbookName, '甲书', '换卡不能改掉甲卡已经记下的绑定');
     assert.deepEqual(run.errors, []);
 });
 
@@ -1510,6 +1509,8 @@ async function bootGuidePage() {
     const panel = () => documentRef.getElementById(PANEL_ID);
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
+    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '二级页左上角不放导航');
+    assert.equal(panel().querySelector('.dga-close').textContent, '×', '二级页右上角是简化的 ×');
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
 

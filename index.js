@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.35
+     * 动态指导助手 v2.36
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.35';
+    const VERSION = '2.36';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1630,11 +1630,12 @@
     }
 
     // 配置存哪（开发者模式里切）：
-    //   'user' = 只本机，并且按角色卡分开：存在这台浏览器的 localStorage，键里带当前卡的头像文件名。
-    //            换一张卡就读另一份，不会把 A 卡的绑定带到 B 卡，也不会跟着卡发给别人。
-    //   'card' = 跟角色卡：额外把一份脱敏配置写进这张卡绑定的世界书里的「（动态指导·配置）」条目。
-    // 两档都照旧写一份到当前角色的角色变量。读取按「这张卡的本机档 → 角色变量 → 这张卡的世界书配置条目」回退。
-    // 认不出当前是哪张卡时不读写本机档，避免退回成全库共用的一份。
+    //   绑定的正本永远是当前角色的角色变量。酒馆换卡时这份变量跟着换，所以天然按卡分开，
+    //   不再用头像文件名在 localStorage 里另存一份（那份会和角色变量打架，改头像还会丢）。
+    //   'user' = 只本机：只写角色变量，不写世界书。分享卡时不带绑定。
+    //   'card' = 跟角色卡：角色变量之外，再把一份脱敏配置写进世界书的「（动态指导·配置）」条目。
+    //            导入的人如果没有角色变量，就从这条读回来。
+    //   v2.32 按头像存过的本机档只在角色变量还没有配置时读一次，用来迁移。
     const CONFIG_STORAGE_KEY = 'dynamic-guide-assistant:config-storage:v1';
     const LOCAL_CONFIG_PREFIX = 'dynamic-guide-assistant:config:v2:';
     // 世界书里的配置条目：关着的，只给插件读，永远不进 AI 上下文，也不参与关键词触发。
@@ -1800,19 +1801,20 @@
     }
 
     async function readRawConfig() {
-        if (configStorageMode() === 'user') {
-            const local = await readLocalConfig();
-            if (local && Array.isArray(local.bindings)) return local;
-        }
         const fromCharacter = await readRootField('character', 'config');
         if (fromCharacter) return fromCharacter;
-        return readCardConfig();
+        if (configStorageMode() === 'card') {
+            const fromCard = await readCardConfig();
+            if (fromCard) return fromCard;
+        }
+        const legacy = await readLocalConfig();
+        if (legacy && Array.isArray(legacy.bindings)) return legacy;
+        return null;
     }
 
     async function writeConfig(config) {
         await writeRootField('character', 'config', config);
-        if (configStorageMode() === 'user') await writeLocalConfig(config);
-        else await writeCardConfig(config);
+        if (configStorageMode() === 'card') await writeCardConfig(config);
         return config;
     }
     const readRawState = () => readRootField('chat', 'state');
@@ -3393,10 +3395,12 @@
         ui.message = text ? { text, type: type || 'info' } : null;
     }
 
-    // 标题栏：☰ 目录 / 标题 / [可选操作] / 关闭。第五个参数给编辑器塞设置齿轮（v2.29）。
-    function header(title, subtitle, onclose, closeLabel, extra) {
+    // 标题栏。仪表盘：☰ 目录 / 标题 / 外观齿轮 / ×。
+    // 二级页（subpage）：左上角不放导航，右上角只留一个 ×，点它回到上一页。
+    function header(title, subtitle, onclose, closeLabel, extra, options) {
+        const subpage = Boolean(options && options.subpage);
         return el('header', { class: 'dga-head' },
-            el('button', {
+            subpage ? null : el('button', {
                 type: 'button',
                 class: 'dga-btn dga-ghost dga-nav-toggle',
                 'aria-label': '打开目录',
@@ -3409,9 +3413,9 @@
             el('button', {
                 type: 'button',
                 class: 'dga-btn dga-ghost dga-close',
-                'aria-label': closeLabel || '关闭',
+                'aria-label': subpage ? '返回' : (closeLabel || '关闭'),
                 onclick: onclose,
-            }, closeLabel || '×'),
+            }, subpage ? '×' : (closeLabel || '×')),
         );
     }
 
@@ -3606,29 +3610,29 @@
     function renderDevPage() {
         const mode = configStorageMode();
         const bindings = (ui.snapshot && ui.snapshot.config && ui.snapshot.config.bindings) || [];
-        return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回'),
+        return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 card('配置存哪',
                     muted('决定绑定列表与判断AI设置存在哪里。普通使用不需要动这里。'),
                     field('存放位置', selectControl([
-                        { value: 'user', label: '只本机（按这张卡分开，不跟卡走）' },
+                        { value: 'user', label: '只本机（记在这张卡上，不写入世界书）' },
                         { value: 'card', label: '跟角色卡走（随卡分发）' },
                     ], mode, value => {
                         setConfigStorageMode(value);
                         setMessage(value === 'card'
                             ? '已改为跟角色卡走：下次保存会写一份脱敏配置到世界书的「（动态指导·配置）」条目。'
-                            : '已改为只本机：配置存在这台浏览器里，并且只属于当前这张卡。', 'success');
+                            : '已改为只本机：绑定只记在这张角色卡的角色变量里，不写入世界书。', 'success');
                         render();
                     })),
                     muted(mode === 'card'
                         ? '跟卡走的那份会剔除 API 预设名（它指向本机的密钥），API 预设本体从来不进配置。世界书里那个配置条目是关着的，永远不发给 AI。'
-                        : '存在这台浏览器里，按角色卡分开。换一张卡就看不到上一张卡的绑定，也不会跟着卡发给别人。'),
+                        : '记在这张角色卡的角色变量里。换一张卡就换一份变量，不会串到别的卡，也不会写进世界书跟卡分享。'),
                 ),
                 card('当前状态',
                     muted(`存放位置：${mode === 'card' ? '跟角色卡走' : '只本机'}`),
                     muted(`绑定条目：${bindings.length} 条`),
-                    muted('读取顺序：这张卡的本机档 → 角色变量 → 这张卡的世界书配置条目。换卡、切档、别人发来的卡都按各自的那一份读。'),
+                    muted('正本是这张卡的角色变量。跟卡走时，角色变量空了才会读世界书里的配置条目。'),
                 ),
             )];
     }
@@ -3693,7 +3697,7 @@
             judgeSettingsCard(),
             guideRulesCard(),
         );
-        return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回'), body];
+        return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true }), body];
     }
 
     // 目录抽屉：复刻 shujuku 新版 Sidebar——品牌区（方块标 + 标题 + 版本副标）、
@@ -4012,7 +4016,7 @@
                 ui.apiReturnView = '';
                 ui.view = back;
                 render();
-            }, '返回'),
+            }, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 muted('预设只存本机 localStorage（明文），不随角色卡导出；共享设备别存密钥。'),
@@ -4166,7 +4170,7 @@
 
         const back = () => { ui.view = 'guide'; ui.judgePromptDraft = null; enterGuidePage(); render(); };
         return [
-            header('判断AI提示词', '判断AI · 提示词段', back, '返回'),
+            header('判断AI提示词', '判断AI · 提示词段', back, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 muted('每段选角色、按顺序发送。占位符：{{stage}} {{prompt}} {{condition}} {{history}}；结论优先读 <结论>，没标签看开头是不是 YES。'),
@@ -4233,7 +4237,7 @@
             el('span', { class: 'dga-log-text', text: entry.message })));
         const back = () => { ui.view = 'manager'; render(); };
         return [
-            header('运行日志', `${statsText} · 上限 500 · 只存内存`, back, '返回'),
+            header('运行日志', `${statsText} · 上限 500 · 只存内存`, back, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 el('div', { class: 'dga-log-toolbar' },
@@ -4895,7 +4899,7 @@
             onclick: () => { ui.editorTip = !ui.editorTip; render(); },
         }, '⚙');
         const parts = [
-            header('划分阶段', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear),
+            header('划分阶段', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear, { subpage: true }),
             body,
             foot,
         ];
