@@ -1171,7 +1171,7 @@ test('标记判断档给没有完成条件的阶段镜像附通用判断指令',
 });
 
 
-test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进', async () => {
+test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1187,8 +1187,8 @@ test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进'
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.equal(verdicts.length, 1, 'judge 档没有标记也要问一次裁判');
-    assert.equal(verdicts[0].should_silence, true, '裁判请求必须静默');
+    assert.equal(verdicts.length, 1, 'judge 档没有标记也要问一次判断AI');
+    assert.equal(verdicts[0].should_silence, true, '判断AI请求必须静默');
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
         ['system', 'assistant', 'user_input'], '默认段列表要按 系统/预确认/上下文 顺序映射');
@@ -1206,7 +1206,7 @@ test('后台裁判档：YES 推进、NO 不推进、同一消息不重复推进'
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：填表标签结论优先——<结论>YES</结论> 推进、NO 不推进', async () => {
+test('判断AI档：填表标签结论优先——<结论>YES</结论> 推进、NO 不推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1225,7 +1225,7 @@ test('后台裁判档：填表标签结论优先——<结论>YES</结论> 推�
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：标签里 NO 不推进，即使正文提到 YES', async () => {
+test('判断AI档：标签里 NO 不推进，即使正文提到 YES', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1245,7 +1245,7 @@ test('后台裁判档：标签里 NO 不推进，即使正文提到 YES', async 
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：自定义提示词段按序组装并替换占位符', async () => {
+test('判断AI档：自定义提示词段按序组装并替换占位符', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1278,7 +1278,7 @@ test('后台裁判档：自定义提示词段按序组装并替换占位符', as
 });
 
 
-test('后台裁判档：每 2 层检查一次——首次立即查，之后到层才问、问过重新计数', async () => {
+test('判断AI档：每 2 层检查一次——首次立即查，之后到层才问、问过重新计数', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1303,7 +1303,7 @@ test('后台裁判档：每 2 层检查一次——首次立即查，之后到�
     assert.equal(bindingState().lastJudgeCheckedId, 5, '检查楼层要记录');
 
     await state.events.get('message_received')(6);
-    assert.equal(calls, 1, '第 6 层不到间隔，不问裁判');
+    assert.equal(calls, 1, '第 6 层不到间隔，不问判断AI');
 
     await state.events.get('message_received')(7);
     assert.equal(calls, 2, '第 7 层到间隔（7-5>=2），再问一次');
@@ -1311,7 +1311,7 @@ test('后台裁判档：每 2 层检查一次——首次立即查，之后到�
     assert.deepEqual(run.errors, []);
 });
 
-test('裁判检查频率归一化：非法值回退每层', () => {
+test('判断AI检查频率归一化：非法值回退每层', () => {
     const zero = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeInterval: 0 } });
     assert.equal(zero.settings.judgeInterval, 1, '0 回退每层');
     const bad = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeInterval: 'abc' } });
@@ -1320,7 +1320,7 @@ test('裁判检查频率归一化：非法值回退每层', () => {
     assert.equal(three.settings.judgeInterval, 3, '字符串数字正常保留');
 });
 
-test('后台裁判档：裁判回答 NO 时不推进', async () => {
+test('判断AI档：判断AI回答 NO 时不推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1340,7 +1340,7 @@ test('后台裁判档：裁判回答 NO 时不推进', async () => {
     assert.deepEqual(run.errors, []);
 });
 
-test('手动推进档不调用后台裁判', async () => {
+test('手动推进档不调用判断AI', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1355,13 +1355,13 @@ test('手动推进档不调用后台裁判', async () => {
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.equal(called, 0, 'off 档没有标记时不能发起裁判请求');
+    assert.equal(called, 0, 'off 档没有标记时不能发起判断AI请求');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0);
     assert.deepEqual(run.errors, []);
 });
 
 
-test('后台裁判档：自定义提问模板替换占位符后发出', async () => {
+test('判断AI档：自定义提问模板替换占位符后发出', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1387,7 +1387,7 @@ test('后台裁判档：自定义提问模板替换占位符后发出', async ()
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：酒馆预设连接走酒馆连接管理器', async () => {
+test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1435,13 +1435,13 @@ test('后台裁判档：酒馆预设连接走酒馆连接管理器', async () =>
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：自定义 API 预设直连酒馆后端 generate 端点', async () => {
+test('判断AI档：自定义 API 预设直连酒馆后端 generate 端点', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
         bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgePreset: '自定义裁判' },
+        settings: { autoAdvance: 'judge', judgePreset: '自定义判断AI' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
@@ -1454,7 +1454,7 @@ test('后台裁判档：自定义 API 预设直连酒馆后端 generate 端点',
     };
     const localStorage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
-            name: '自定义裁判', connection: 'custom', customApiFormat: 'openai_compat',
+            name: '自定义判断AI', connection: 'custom', customApiFormat: 'openai_compat',
             apiurl: 'https://api.example.com/v1', key: 'sk-secret', model: 'judge-model',
             maxTokens: 20, temperature: 0,
         }]),
@@ -1484,7 +1484,7 @@ test('后台裁判档：自定义 API 预设直连酒馆后端 generate 端点',
     assert.deepEqual(run.errors, []);
 });
 
-test('后台裁判档：选择不存在的本机预设时不调用 generateRaw', async () => {
+test('判断AI档：选择不存在的本机预设时不调用 generateRaw', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
@@ -1506,13 +1506,13 @@ test('后台裁判档：选择不存在的本机预设时不调用 generateRaw',
     assert.deepEqual(run.errors, []);
 });
 
-test('本机裁判 API 预设：连接方式、接口协议与数值字段', () => {
+test('本机判断AI API 预设：连接方式、接口协议与数值字段', () => {
     assert.deepEqual(plain(core.normalizeJudgeApiPreset({
-        name: ' 自定义裁判 ', connection: 'custom', customApiFormat: 'claude_messages',
+        name: ' 自定义判断AI ', connection: 'custom', customApiFormat: 'claude_messages',
         apiurl: ' https://api.example.com/v1 ', key: 'sk-x', model: ' m1 ',
         maxTokens: '24', temperature: '0.3', bodyParams: 'top_k: 50',
     })), {
-        name: '自定义裁判', connection: 'custom', customApiFormat: 'claude_messages',
+        name: '自定义判断AI', connection: 'custom', customApiFormat: 'claude_messages',
         apiurl: 'https://api.example.com/v1', key: 'sk-x', model: 'm1',
         maxTokens: 24, temperature: 0.3, bodyParams: 'top_k: 50',
         excludeBodyParams: '', requestHeaders: '', promptPostProcessing: 'strict', tavernProfile: '',
@@ -1555,7 +1555,7 @@ test('API 预设请求体：OpenAI 兼容协议走 custom 源', () => {
     assert.equal(body.temperature, 1, '缺省温度对齐数据库 1');
 });
 
-test('本机裁判 API 预设：缺省数值回退数据库默认 60000 / 1', () => {
+test('本机判断AI API 预设：缺省数值回退数据库默认 60000 / 1', () => {
     const preset = plain(core.normalizeJudgeApiPreset({ name: '裸预设', connection: 'main' }));
     assert.equal(preset.maxTokens, 60000, '最大回复长度缺省 60000（同数据库）');
     assert.equal(preset.temperature, 1, '温度缺省 1（同数据库）');
@@ -1648,4 +1648,156 @@ test('v1 预设迁移：type=proxy → tavern，type=current → main', () => {
     assert.equal(list[0].connection, 'tavern');
     assert.equal(list[0].tavernProfile, '酒馆代理A');
     assert.equal(list[1].connection, 'main');
+});
+
+
+// ---------------------------------------------------------------
+// v2.13：输出提取/排除规则（复刻数据库填表规则）+ 运行日志
+// ---------------------------------------------------------------
+
+test('规则归一化：去空白、丢残缺项与非对象项、去重', () => {
+    const rules = core.normalizeRulePairs([
+        { start: ' <a> ', end: ' </a> ' },
+        { start: '', end: 'x' },
+        { start: 'y' },
+        '字符串项',
+        null,
+        { start: '<a>', end: '</a>' },
+        { start: '<b>', end: '</b>' },
+    ]);
+    assert.deepEqual(plain(rules), [{ start: '<a>', end: '</a>' }, { start: '<b>', end: '</b>' }]);
+});
+
+test('提取规则：取最后一处命中且含边界，多条拼接，未命中回退原文', () => {
+    const text = '闲聊\n<结论>YES</结论>\n中间\n<结论>NO</结论>\n尾巴';
+    const once = core.applyJudgeOutputRules(text, { extractRules: [{ start: '<结论>', end: '</结论>' }] });
+    assert.equal(once, '<结论>NO</结论>', '取最后一处命中（含边界本身）');
+    const miss = core.applyJudgeOutputRules(text, { extractRules: [{ start: '<没有>', end: '</没有>' }] });
+    assert.equal(miss, text, '一条都没命中就返回原文');
+    const multi = core.applyJudgeOutputRules('前<a>1</a>中<b>2</b>后', {
+        extractRules: [{ start: '<a>', end: '</a>' }, { start: '<b>', end: '</b>' }],
+    });
+    assert.equal(multi, '<a>1</a>\n\n<b>2</b>', '多条规则的结果用空行拼接');
+});
+
+test('排除规则：删区间含边界、支持嵌套、压空行、不区分大小写', () => {
+    const nested = '开头\n<think>第一层<think>第二层</think>结束</think>\n\n\n\n结尾';
+    const out = core.applyJudgeOutputRules(nested, { excludeRules: [{ start: '<think>', end: '</think>' }] });
+    assert.equal(out, '开头\n\n结尾', '嵌套区间整体删除，3 个以上换行压成 2 个');
+    const ci = core.applyJudgeOutputRules('前<Think>x</THINK>后', { excludeRules: [{ start: '<think>', end: '</think>' }] });
+    assert.equal(ci, '前后', '边界匹配不区分大小写');
+    assert.equal(core.applyJudgeOutputRules(nested, {}), nested, '没有规则 = 原文直通');
+});
+
+test('先提取后排除：与数据库（shujuku）顺序一致', () => {
+    const out = core.applyJudgeOutputRules('噪音<a>保留<cut>删我</cut>就好</a>噪音', {
+        extractRules: [{ start: '<a>', end: '</a>' }],
+        excludeRules: [{ start: '<cut>', end: '</cut>' }],
+    });
+    assert.equal(out, '<a>保留就好</a>');
+});
+
+test('normalizeConfig 清洗提取/排除规则：合法保留、整列无效删字段', () => {
+    const normalized = core.normalizeConfig({
+        version: 2,
+        bindings: [],
+        settings: {
+            autoAdvance: 'judge',
+            extractRules: [{ start: ' <结论> ', end: ' </结论> ' }, { start: '', end: 'x' }, 'bad'],
+            excludeRules: [],
+        },
+    });
+    assert.deepEqual(plain(normalized.settings.extractRules), [{ start: '<结论>', end: '</结论>' }]);
+    assert.equal('excludeRules' in normalized.settings, false, '整列无效就删字段（不过滤）');
+    const absent = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge' } });
+    assert.equal('extractRules' in absent.settings, false, '没配过规则不能凭空加字段');
+});
+
+test('判断AI档：排除规则削掉思维链后读到真正的 YES', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<think>', end: '</think>' }] },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    // 输出开头是思维链里的 NO；削掉 <think> 段之后开头才是 YES。
+    helper.generateRaw = async () => '<think>我拿不准，先写 NO 试试</think>\nYES';
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(core.judgeSaysYes('<think>我拿不准，先写 NO 试试</think>\nYES'), false, '不过滤时开头是 <think>，判不出 YES');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, '排除规则生效后必须推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：提取规则取最后一处 <结论>，盖过草稿里的旧结论', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', extractRules: [{ start: '<结论>', end: '</结论>' }] },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    // 草稿里先写了一个 <结论>NO</结论>，最终结论才是 YES；提取规则只取最后一处。
+    helper.generateRaw = async () => '<结论>NO</结论>\n（上面是草稿，作废）\n<结论>YES</结论>';
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(core.judgeSaysYes('<结论>NO</结论>\n（上面是草稿，作废）\n<结论>YES</结论>'), false, '不过滤时只读第一个标签，会误判 NO');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, '提取规则生效后必须推进');
+    const judgeLogs = run.core.log.list().filter(entry => entry.tag === '判断AI');
+    assert.ok(judgeLogs.some(entry => /YES/.test(entry.message)), '运行日志里要有判断AI的结论记录');
+    assert.deepEqual(run.errors, []);
+});
+
+test('运行日志：写入字段完整、标签收集、清空', () => {
+    const run = load();
+    const log = run.core.log;
+    log._resetForTesting();
+    log.info('判断AI', '结论：YES');
+    log.warn('提醒', '预设丢失');
+    log.error('API', '拉取失败', new Error('boom'));
+    const all = log.list();
+    assert.equal(all.length, 3);
+    assert.deepEqual([...all].map(entry => entry.level), ['info', 'warn', 'error']);
+    assert.equal(all[0].tag, '判断AI');
+    assert.match(all[2].message, /Error: boom/);
+    assert.ok(all.every(entry => entry.id > 0 && entry.time > 0), '每条都要有自增 id 和时间戳');
+    assert.deepEqual(plain(log.tags()), ['API', '提醒', '判断AI'].sort());
+    log.clear();
+    assert.equal(log.count(), 0);
+});
+
+test('运行日志：debug 默认不采集，开启后采集；订阅实时通知、退订生效', () => {
+    const run = load();
+    const log = run.core.log;
+    log._resetForTesting();
+    log.debug('同步', '镜像同步完成');
+    assert.equal(log.count(), 0, 'debug 默认不写缓冲');
+    const seen = [];
+    const unsubscribe = log.subscribe(entry => seen.push(entry));
+    log.setDebugEnabled(true);
+    log.debug('同步', '镜像同步完成');
+    log.info('系统', '已加载');
+    assert.equal(log.count(), 2);
+    assert.deepEqual(seen.map(entry => entry.level), ['debug', 'info']);
+    unsubscribe();
+    log.info('系统', '再来一条');
+    assert.equal(seen.length, 2, '退订后不再通知');
+});
+
+test('运行日志：环形缓冲超过 500 条丢最旧', () => {
+    const run = load();
+    const log = run.core.log;
+    log._resetForTesting();
+    for (let index = 0; index < 510; index += 1) log.info('测试', `第 ${index} 条`);
+    assert.equal(log.count(), 500);
+    assert.equal(log.list()[0].message, '第 10 条', '最旧的 10 条必须被丢弃');
 });
