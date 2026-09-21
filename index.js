@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.23
+     * 动态指导助手 v2.24
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.23';
+    const VERSION = '2.24';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2782,7 +2782,7 @@
         selectedWorldbook: '',
         entries: [],
         entryError: '',
-        selectedEntryKey: '',
+        addEntryRows: null,
         snapshot: null,
         contextError: '',
         editor: null,
@@ -3018,7 +3018,14 @@
                 ui.entryError = `读取世界书失败：${error.message || String(error)}`;
             }
         }
-        ui.selectedEntryKey = pickEntryKey(settings.entryKey || ui.selectedEntryKey);
+        // 多行绑定（v2.24）：刷新时逐行清理——还存在的行保留，第一行失效时
+        // 自动挑一个可绑的条目，其余失效行清空待选。
+        const rowKeys = ui.entries.map((entry, index) => entryKey(entry, index));
+        const rows = Array.isArray(ui.addEntryRows) && ui.addEntryRows.length ? ui.addEntryRows : [''];
+        ui.addEntryRows = rows.map((key, index) => {
+            if (key && rowKeys.includes(key)) return key;
+            return index === 0 ? pickEntryKey(settings.entryKey || '') : '';
+        });
     }
 
     function pickEntryKey(requested) {
@@ -3029,9 +3036,12 @@
         return keys[0] || '';
     }
 
-    function selectedEntry() {
-        const index = ui.entries.findIndex((entry, position) => entryKey(entry, position) === ui.selectedEntryKey);
-        return index >= 0 ? ui.entries[index] : null;
+    // 绑定行状态：null/空时初始化为一行（自动挑一个可绑条目）。
+    function addRowKeys() {
+        if (!Array.isArray(ui.addEntryRows) || ui.addEntryRows.length === 0) {
+            ui.addEntryRows = [pickEntryKey('')];
+        }
+        return ui.addEntryRows;
     }
 
     function bindingForEntry(worldbookName, entry) {
@@ -3069,16 +3079,16 @@
     }
 
     // 动态指导页（v2.19 起独立成页，不再堆在仪表盘；v2.23 按手稿重排）：
-    // 每条绑定一张卡片 → 绑定世界书（添加指导条目）→ 如何判断（判断模式 +
-    // 判断AI设置）→ 提取/排除规则 + 规则测试。没有绑定时显示三步上手。
+    // 每条绑定一张卡片 → 绑定世界书（多行绑定）→ 如何判断（判断模式 +
+    // 判断AI设置）→ 提取/排除规则 + 规则测试。顶部只留错误条（v2.24 起
+    // 成功/提示类绿条不在本页显示）。
     function renderGuidePage() {
         const snapshot = ui.snapshot;
         const contexts = snapshot ? snapshot.contexts : [];
         const body = el('div', { class: 'dga-body' },
-            messageBar(),
+            ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             ...contexts.map(boundCard),
-            contexts.length === 0 ? guideCard() : null,
             addCard(),
             judgeSettingsCard(),
             guideRulesCard(),
@@ -3749,20 +3759,15 @@
         }, { success });
     }
 
-    // 仪表盘「开关」卡（v2.20 起只放通用项：流式输出 + 自动推进三档；
-    // 判断AI的 API 预设/频率/段数/提示词都挪到了「动态指导」页）。
+    // 仪表盘「开关」卡（v2.24 起只放流式输出：判断模式三档挪到「动态指导」页的
+    // 「如何判断？」卡，判断AI的 API 预设/频率/段数/提示词也都在那边）。
     function settingsCard() {
         const config = ui.snapshot ? ui.snapshot.config : null;
-        const mode = autoAdvanceMode(config);
         const settings = config && config.settings ? config.settings : {};
-        const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const basicChildren = [
             toggleRow('开启流式输出', '开启后，支持流式的文本生成会边生成边返回；关闭后会等完整结果返回。（酒馆预设通道不支持流式）', settings.streamingEnabled === true,
                 checked => saveGuideSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
-            field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
-                saveGuideSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
-            })),
-            muted('手动推进只能手点「下一段」；标记判断由正文 AI 自己定时机；判断AI用一次静默小请求判定。阶段写「完成：自动」可跨档开 AI 判断。判断AI的详细设置在「动态指导」页。'),
+            muted('进入下一段的方式（手动 / 标记 / 判断AI）与判断AI的详细设置都在「动态指导」页的「如何判断？」卡。'),
         ];
         // 页签（数据库 AcuSegmentedControl 版式）：基础设置 / 暂未开放。
         const tab = ui.settingsTab === 'other' ? 'other' : 'basic';
@@ -4069,59 +4074,84 @@
         );
     }
 
-    // 绑定世界书（添加区）：两个下拉选条目，然后“划分阶段”或“添加为指导条目”。
-    // v2.23 删掉「刷新」「运行诊断」按钮（诊断能力仍挂在 publicApi.diagnose 上）。
+    // 绑定世界书（v2.24 按手稿改多行）：选一个世界书，下面一行一个条目——
+    // 每行「条目下拉 + 划分阶段 + 绑定」，底部 ＋/－ 增删行，可一次绑多个条目；
+    // 已绑定的行在下方显示这条绑定当前走到哪一段。
     function addCard() {
-        const selected = selectedEntry();
-        const legacy = Boolean(selected && hasLegacyLayout(selected));
-        const parsed = selected && !legacy ? parseOutline(selected.content) : null;
-        const selectedBinding = selected ? bindingForEntry(ui.selectedWorldbook, selected) : null;
         const children = [];
-
         if (ui.worldbookNames.length === 0) {
             children.push(messageBar({ type: 'warning', text: '没有找到任何世界书。请先给角色绑定一个世界书，并把大纲写进一个条目里。' }));
-        } else {
-            if (ui.boundNames.length === 0) children.push(muted('没检测到这个角色绑定的世界书，下面列出的是全部世界书。'));
-            children.push(field('世界书', selectControl(
-                ui.worldbookNames.map(name => ({ value: name, label: name })),
-                ui.selectedWorldbook,
-                value => runAction('切换世界书', async () => {
-                    ui.selectedWorldbook = value;
-                    ui.selectedEntryKey = '';
+            return card('绑定世界书', ...children);
+        }
+        if (ui.boundNames.length === 0) children.push(muted('没检测到这个角色绑定的世界书，下面列出的是全部世界书。'));
+        children.push(field('选择一个世界书', selectControl(
+            ui.worldbookNames.map(name => ({ value: name, label: name })),
+            ui.selectedWorldbook,
+            value => runAction('切换世界书', async () => {
+                ui.selectedWorldbook = value;
+                ui.addEntryRows = null;
+            }),
+        )));
+        const entryOptions = ui.entries.length > 0
+            ? [{ value: '', label: '还未选择条目' }]
+                .concat(ui.entries.map((entry, index) => ({ value: entryKey(entry, index), label: entryLabel(entry) })))
+            : [{ value: '', label: ui.entryError || '这个世界书里没有条目' }];
+        const entryAt = key => {
+            const index = ui.entries.findIndex((entry, position) => entryKey(entry, position) === key);
+            return index >= 0 ? ui.entries[index] : null;
+        };
+        const rowsState = addRowKeys();
+        children.push(muted('绑定一个或多个条目'));
+        rowsState.forEach((key, index) => {
+            const entry = key ? entryAt(key) : null;
+            const legacy = Boolean(entry && hasLegacyLayout(entry));
+            const parsed = entry && !legacy ? parseOutline(entry.content) : null;
+            const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
+            children.push(el('div', { class: 'dga-add-row' },
+                selectControl(entryOptions, key, value => { rowsState[index] = value; render(); }),
+                btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
+                    ghost: true, disabled: !entry || legacy,
                 }),
-            )));
-            const entryOptions = ui.entries.length > 0
-                ? ui.entries.map((entry, index) => ({ value: entryKey(entry, index), label: entryLabel(entry) }))
-                : [{ value: '', label: ui.entryError || '这个世界书里没有条目' }];
-            children.push(field('条目', selectControl(entryOptions, ui.selectedEntryKey, value => {
-                ui.selectedEntryKey = value;
-                render();
-            })));
-        }
-
-        if (selected && legacy) {
-            children.push(
-                messageBar({ type: 'warning', text: '这个条目带有旧版（1.x）的阶段划分。新版直接把阶段写在正文里，需要先转换一次。' }),
-                btn('转换成新版格式', () => runAction('转换旧版划分', convertSelectedLegacy), { primary: true }),
-            );
-        } else if (selected && parsed) {
-            children.push(muted(parsed.stages.length > 0
-                ? `这个条目有 ${parsed.stages.length} 个阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。`
-                : '这个条目还没有分阶段。'));
-        }
-
-        children.push(row(
-            btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, selected), { refresh: false }), {
-                primary: !selectedBinding && Boolean(parsed) && parsed.stages.length === 0,
-                disabled: !selected || legacy,
-            }),
-            btn(selectedBinding ? '重新添加（进度归零）' : '添加为指导条目',
-                () => runAction('添加指导条目', () => addBinding(ui.selectedWorldbook, selected)), {
-                primary: Boolean(parsed) && parsed.stages.length > 0 && !selectedBinding,
-                disabled: !selected || legacy || !parsed || parsed.stages.length === 0,
-            }),
+                binding
+                    ? btn('已绑定', () => {}, { disabled: true })
+                    : btn('绑定', () => runAction('添加指导条目', () => addBinding(ui.selectedWorldbook, entry)), {
+                        primary: Boolean(parsed) && parsed.stages.length > 0,
+                        disabled: !entry || legacy || !parsed || parsed.stages.length === 0,
+                    }),
+            ));
+            if (entry && legacy) {
+                children.push(
+                    messageBar({ type: 'warning', text: '这个条目带有旧版（1.x）的阶段划分。新版直接把阶段写在正文里，需要先转换一次。' }),
+                    btn('转换成新版格式', () => runAction('转换旧版划分', () => convertLegacyEntry(entry)), { primary: true }),
+                );
+                return;
+            }
+            // 当前段落显示：挂在每个对应绑定条目的下面。
+            const context = binding && ui.snapshot
+                ? ui.snapshot.contexts.find(item => item.key === bindingKey(binding)) : null;
+            if (context && !context.broken) {
+                const total = context.parsed.stages.length;
+                const stageIndex = context.state.stageIndex;
+                const finished = total > 0 && stageIndex >= total;
+                children.push(muted(finished
+                    ? `↳ 全部 ${total} 段已完成，之后不再发送指导`
+                    : `↳ 当前：第 ${stageIndex + 1} 段 · 共 ${total} 段${context.stage ? ` — ${context.stage.name}` : ''}`));
+            } else if (entry && parsed && parsed.stages.length === 0) {
+                children.push(muted('↳ 这个条目还没有分阶段：先点「划分阶段」，再绑定。'));
+            }
+        });
+        children.push(el('div', { class: 'dga-add-row-actions' },
+            el('button', {
+                type: 'button', class: 'dga-icon-btn', title: '再绑定一个条目', 'aria-label': '再绑定一个条目',
+                onclick: () => { rowsState.push(''); render(); },
+            }, '＋'),
+            el('button', {
+                type: 'button', class: 'dga-icon-btn', title: '移除最后一行', 'aria-label': '移除最后一行',
+                disabled: rowsState.length <= 1,
+                onclick: () => { if (rowsState.length > 1) { rowsState.pop(); render(); } },
+            }, '－'),
+            el('span', { class: 'dga-muted', text: '绑定后原条目会被关闭，AI 只看到当前阶段；点绑定卡上的「移出」恢复全文。' }),
         ));
-        children.push(muted('添加后原条目会被关闭，AI 在它原来的位置只能看到当前阶段；点卡片上的「移出」恢复全文。'));
         return card('绑定世界书', ...children);
     }
 
@@ -4158,19 +4188,7 @@
         return false;
     }
 
-    function guideCard() {
-        return card('三步上手',
-            el('ol', { class: 'dga-steps' },
-                el('li', {}, '在角色绑定的世界书里新建一个条目，把完整大纲写进去，用空行分开各段。'),
-                el('li', {}, '在下面选中这个条目，点“划分阶段”：点一个段落把它设成某一阶段的开头，也可以切到“编辑原文”直接改正文。'),
-                el('li', {}, '点“保存并添加”。之后每次聊天，AI 只会收到当前这一段的内容。'),
-            ),
-            muted('可同时添加多个条目，各自独立推进。也可以直接在正文里写「## 阶段名」分段；写「合并到：阶段名」把这段并进已有阶段。'),
-        );
-    }
-
-    async function convertSelectedLegacy() {
-        const entry = selectedEntry();
+    async function convertLegacyEntry(entry) {
         const layout = entry ? readLegacyLayout(entry) : null;
         if (!layout) throw new Error('这个条目没有旧版划分。');
         const content = convertLegacyLayout(entry.content, layout);
@@ -5236,7 +5254,6 @@ ${P} .dga-fold > summary::-webkit-details-marker { display: none; }
 ${P} .dga-fold > summary::after { content: ' ▾'; opacity: 0.6; }
 ${P} .dga-fold[open] > summary::after { content: ' ▴'; }
 ${P} .dga-fold > *:not(summary) { margin-top: 10px; }
-${P} .dga-steps { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-doc { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 ${P} .dga-toolbar .dga-btn { flex: 0 0 auto; min-height: 40px; padding: 8px 12px; }
@@ -5311,6 +5328,10 @@ ${P} .dga-api-select-row select { width: 100%; }
 ${P} .dga-inline-action { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 ${P} .dga-inline-action .dga-btn { flex: 0 0 auto; min-height: 40px; padding: 8px 14px; }
 ${P} .dga-two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+${P} .dga-add-row { display: flex; gap: 8px; align-items: center; }
+${P} .dga-add-row select { flex: 1 1 auto; min-width: 0; }
+${P} .dga-add-row .dga-btn { flex: 0 0 auto; min-height: 36px; padding: 5px 12px; font-size: 0.82rem; }
+${P} .dga-add-row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 ${P} .dga-api-actions { display: flex; justify-content: flex-end; gap: 8px; }
 ${P} .dga-api-actions .dga-btn { flex: 0 1 auto; min-height: 40px; padding: 8px 16px; }
 ${P} .dga-field-hint { font-size: 0.78rem; opacity: 0.6; line-height: 1.5; }
