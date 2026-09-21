@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.14
+     * 动态指导助手 v2.15
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.14';
+    const VERSION = '2.15';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1569,6 +1569,11 @@
             const n = Math.floor(Number(settings.judgeInterval));
             settings.judgeInterval = Number.isFinite(n) && n >= 1 ? n : 1;
         }
+        // 判断时参考最近几段角色回复（v2.15）：只看 AI 正文，非法值回退 1（只看最新一段）。
+        if (settings.judgeHistoryCount != null) {
+            const n = Math.floor(Number(settings.judgeHistoryCount));
+            settings.judgeHistoryCount = Number.isFinite(n) && n >= 1 ? n : 1;
+        }
         // 判断AI输出的提取/排除规则（v2.13）：数据库填表同款 {start,end} 边界对；
         // 非法项丢弃，整列为空时删字段（= 不过滤，原文直通）。
         ['extractRules', 'excludeRules'].forEach(field => {
@@ -2484,22 +2489,35 @@
         return Number.isFinite(n) && n >= 1 ? n : 1;
     }
 
-    // 最近剧情：与数据库填表规则同一语义——提取/排除规则在「发送前」逐条作用于
-    // 角色（非用户）消息；用户消息永远原样发送。过滤后为空的消息整条丢弃。
+    // 判断时参考的最近剧情段数（v2.15）：只看 AI 发的正文，默认 1 = 只判断最新一条角色回复；
+    // 选 2 以上会带上更早的角色回复（用户消息永远不发送）。缺省/非法值回退 1。
+    function judgeHistoryCount(settings) {
+        const n = Math.floor(Number(settings && settings.judgeHistoryCount));
+        return Number.isFinite(n) && n >= 1 ? n : 1;
+    }
+
+    // 最近剧情（v2.15 语义）：只取 AI 发的正文——用户消息、系统消息一律不发给判断AI。
+    // count = 参考最近几段角色回复（默认 1 = 只判断最新一段）；窗口按 count 放大，
+    // 防止用户连发时凑不够段数。提取/排除规则在发送前逐段作用于角色消息（数据库同款），
+    // 过滤后为空的消息整条丢弃。
     async function recentHistoryText(messageId, count, settings) {
         const getChatMessages = api('getChatMessages', false);
         if (!getChatMessages || messageId == null) return '';
-        const start = Math.max(0, Number(messageId) - count + 1);
+        const want = Math.max(1, Math.floor(Number(count)) || 1);
+        const windowSize = Math.min(Math.max(want * 4, 10), 100);
+        const start = Math.max(0, Number(messageId) - windowSize + 1);
         const messages = await Promise.resolve(getChatMessages(`${start}-${messageId}`, { include_swipes: false }));
         if (!Array.isArray(messages)) return '';
-        return messages.map(item => {
-            const role = item && item.role === 'user' ? '用户' : (item && item.role === 'assistant' ? '角色' : '系统');
-            let text = String((item && item.message) || '').replace(COMPLETE_MARKER_RE, '').trim();
-            if (text && item && item.role !== 'user' && settings) {
-                text = applyBoundaryRules(text, settings).trim();
-            }
-            return text ? `${role}：${text}` : '';
-        }).filter(Boolean).join('\n\n');
+        return messages
+            .filter(item => item && item.role === 'assistant' && typeof item.message === 'string')
+            .slice(-want)
+            .map(item => {
+                let text = String(item.message || '').replace(COMPLETE_MARKER_RE, '').trim();
+                if (text && settings) text = applyBoundaryRules(text, settings).trim();
+                return text ? `角色：${text}` : '';
+            })
+            .filter(Boolean)
+            .join('\n\n');
     }
 
     // 「酒馆预设」连接：走酒馆连接管理器（对齐 shujuku sendConnectionManagerRequest_ACU），
@@ -2618,8 +2636,8 @@
             const condition = stage.completion
                 ? stage.completion
                 : '没有写完成条件：本阶段要演的内容都演完、剧情自然该往下走了，就算完成。';
-            // 提取/排除规则先作用于最近剧情（数据库同款：发送前逐条过滤角色消息）。
-            const history = await recentHistoryText(messageId, 6, settings);
+            // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
+            const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：开始检查阶段「${stage.name}」（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
@@ -3499,7 +3517,7 @@
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
                 ),
                 card('提取 / 排除规则（上下文过滤）',
-                    muted('和数据库填表规则一样：在发送前逐条过滤最近剧情里的角色消息（用户消息原样发送），同样的规则在解析 <结论> 前也会对判断AI的输出再过滤一次（没有命中边界时原样保留，无副作用）。提取规则只保留「开始边界~结束边界」之间的内容（含边界，取最后一处命中，多条用空行拼接；一条都没命中就不过滤）；排除规则删掉「开始边界~结束边界」区间（含边界，支持嵌套）。边界匹配不区分大小写；留空 = 不过滤。例如角色回复用 <content> 包正文时，加提取规则 <content> → </content>，判断AI就只看得到正文；排除规则 <think> → </think> 可削掉思维链。'),
+                    muted('和数据库填表规则一样：只看 AI 最新正文（用户消息不发送），提取/排除规则在发送前逐段过滤角色回复，同样的规则在解析 <结论> 前也会对判断AI的输出再过滤一次（没有命中边界时原样保留，无副作用）。提取规则只保留「开始边界~结束边界」之间的内容（含边界，取最后一处命中，多条用空行拼接；一条都没命中就不过滤）；排除规则删掉「开始边界~结束边界」区间（含边界，支持嵌套）。边界匹配不区分大小写；留空 = 不过滤。例如角色回复用 <content> 包正文时，加提取规则 <content> → </content>，判断AI就只看得到正文；排除规则 <think> → </think> 可削掉思维链。'),
                     el('div', { class: 'dga-rule-quick' },
                         btn('＋ 排除思维链 <think>', () => {
                             const rule = { start: '<think>', end: '</think>' };
@@ -3714,6 +3732,37 @@
                     }),
                     selectValue === 'custom' ? intervalInput : null,
                 ), '每条 AI 回复（正文）算一层：正文一到就自动静默检查当前阶段是否完成，够 N 层才问一次判断AI，不用手动点。');
+            })() : null,
+            mode === 'judge' ? (() => {
+                // 判断时参考最近几段角色回复：只看 AI 正文，用户消息一律不发送。
+                const count = judgeHistoryCount(settings);
+                const presets = [1, 2, 3, 6];
+                const selectValue = presets.includes(count) ? String(count) : 'custom';
+                const countInput = el('input', {
+                    class: 'dga-input', type: 'number', min: 1, step: 1,
+                    onchange: event => {
+                        const n = Math.floor(Number(event.target.value));
+                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
+                        saveSettings({ judgeHistoryCount: safe }, safe === 1 ? '判断时只看最新 1 段角色回复' : `判断时参考最近 ${safe} 段角色回复`);
+                    },
+                });
+                countInput.value = String(count);
+                return field('判断时参考几段角色回复', el('div', { class: 'dga-two-col' },
+                    selectControl([
+                        { value: '1', label: '只看最新 1 段（默认）' },
+                        { value: '2', label: '最近 2 段' },
+                        { value: '3', label: '最近 3 段' },
+                        { value: '6', label: '最近 6 段' },
+                        { value: 'custom', label: '自定义…' },
+                    ], selectValue, value => {
+                        if (value === 'custom') {
+                            saveSettings({ judgeHistoryCount: presets.includes(count) ? 4 : count }, '判断参考段数：自定义');
+                        } else {
+                            saveSettings({ judgeHistoryCount: Number(value) }, value === '1' ? '判断时只看最新 1 段角色回复' : `判断时参考最近 ${value} 段角色回复`);
+                        }
+                    }),
+                    selectValue === 'custom' ? countInput : null,
+                ), '只取 AI 发的正文，用户消息不会发给判断AI；选 2 段以上会同时带上更早的角色回复做参考。');
             })() : null,
             mode === 'judge' && presetList.length === 0
                 ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')

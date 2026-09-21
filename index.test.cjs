@@ -1320,6 +1320,15 @@ test('判断AI检查频率归一化：非法值回退每层', () => {
     assert.equal(three.settings.judgeInterval, 3, '字符串数字正常保留');
 });
 
+test('判断参考段数归一化：非法值回退 1 段', () => {
+    const zero = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeHistoryCount: 0 } });
+    assert.equal(zero.settings.judgeHistoryCount, 1, '0 回退 1 段');
+    const bad = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeHistoryCount: 'abc' } });
+    assert.equal(bad.settings.judgeHistoryCount, 1, '非数字回退 1 段');
+    const three = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge', judgeHistoryCount: '3' } });
+    assert.equal(three.settings.judgeHistoryCount, 3, '字符串数字正常保留');
+});
+
 test('判断AI档：判断AI回答 NO 时不推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
@@ -1807,13 +1816,13 @@ test('运行日志：环形缓冲超过 500 条丢最旧', () => {
 // v2.14：规则语义对齐数据库（发送前过滤角色消息）+ 输出留痕 + 规则预览
 // ---------------------------------------------------------------
 
-test('判断AI档：提取规则在发送前逐条过滤角色消息，用户消息原样发送', async () => {
+test('判断AI档：提取规则发送前过滤角色回复，用户消息不发送（参考 2 段）', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
         bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', extractRules: [{ start: '<content>', end: '</content>' }] },
+        settings: { autoAdvance: 'judge', judgeHistoryCount: 2, extractRules: [{ start: '<content>', end: '</content>' }] },
     };
     const messages = [
         { message_id: 3, role: 'user', message: '用户的话不带任何标签' },
@@ -1829,12 +1838,40 @@ test('判断AI档：提取规则在发送前逐条过滤角色消息，用户消
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1);
     const sent = String(verdicts[0].user_input);
-    assert.match(sent, /雨夜的正文/, '角色消息 <content> 里的正文要发出去');
+    assert.match(sent, /雨夜的正文/, '参考 2 段时较早的角色回复正文也要发出去');
     assert.match(sent, /最新正文/);
     assert.doesNotMatch(sent, /状态栏|HP 100/, '角色消息 <content> 外的部分不能发出去');
     assert.doesNotMatch(sent, /这一轮的回复。/, '<content> 前面的闲聊也要被滤掉');
-    assert.match(sent, /用户：用户的话不带任何标签/, '用户消息没有标签也要原样发送');
+    assert.doesNotMatch(sent, /用户：|用户的话/, '用户消息一律不发给判断AI');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：默认只看 AI 最新 1 段正文，更早的角色回复不发送', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const messages = [
+        { message_id: 3, role: 'user', message: '用户输入' },
+        { message_id: 4, role: 'assistant', message: '上一轮的旧正文' },
+        { message_id: 5, role: 'assistant', message: '本轮最新正文' },
+    ];
+    const { state, helper } = multiWorld(books, { config, messages, lastMessageId: 5 });
+    const verdicts = [];
+    helper.generateRaw = async options => { verdicts.push(options); return '<结论>NO</结论>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(verdicts.length, 1);
+    const sent = String(verdicts[0].user_input);
+    assert.match(sent, /本轮最新正文/, '最新一段角色正文必须发送');
+    assert.doesNotMatch(sent, /上一轮的旧正文/, '默认只发最新 1 段，旧的角色回复不发送');
+    assert.doesNotMatch(sent, /用户：|用户输入/, '用户消息一律不发给判断AI');
     assert.deepEqual(run.errors, []);
 });
 
