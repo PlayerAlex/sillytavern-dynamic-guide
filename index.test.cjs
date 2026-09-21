@@ -1048,6 +1048,118 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
 
 
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// v2.30 分段不得改动原文顺序：只换归属，不动先后
+// ---------------------------------------------------------------
+
+const rangeOf = (pick, quote) => {
+    const start = pick.text.indexOf(quote);
+    return { start, end: start + quote.length };
+};
+
+test('分段不动原文顺序：后面的行先归属，前面的行再标常驻，顺序不变', () => {
+    // 先把第二行分给一个阶段，再把第一行标成常驻 —— 以前常驻会被强制排到阶段之后，两行就对调了
+    let pick = core.pickLoad(core.parseOutline('第一行\n\n第二行'));
+    pick.stages.push({ id: 's1', kind: 'stage', name: '第一幕', completion: '', ranges: [], color: '#111111' });
+    assert.ok(core.pickAssign(pick, 's1', [rangeOf(pick, '第二行')]), '把第二行分给阶段');
+    pick = core.pickLoad(core.parseOutline(core.pickBuild(pick)));
+    assert.ok(core.pickAssign(pick, 'always', [rangeOf(pick, '第一行')]), '把第一行标成常驻');
+
+    const built = core.pickBuild(pick);
+    const after = core.pickLoad(core.parseOutline(built));
+    assert.ok(after.text.indexOf('第一行') < after.text.indexOf('第二行'),
+        `原文顺序必须保持，实际正文：${JSON.stringify(built)}`);
+});
+
+test('分段不动原文顺序：两行先后都标常驻，顺序不变', () => {
+    let pick = core.pickLoad(core.parseOutline('第一行\n\n第二行'));
+    assert.ok(core.pickAssign(pick, 'always', [rangeOf(pick, '第二行')]), '先把第二行标常驻');
+    pick = core.pickLoad(core.parseOutline(core.pickBuild(pick)));
+    assert.ok(core.pickAssign(pick, 'always', [rangeOf(pick, '第一行')]), '再把第一行标常驻');
+
+    const built = core.pickBuild(pick);
+    const after = core.pickLoad(core.parseOutline(built));
+    assert.ok(after.text.indexOf('第一行') < after.text.indexOf('第二行'),
+        `两行都标常驻也要保持顺序，实际正文：${JSON.stringify(built)}`);
+});
+
+test('分段不动原文顺序：附加文字排在阶段之前时，重建后仍留在前面', () => {
+    // 附加以前一律写在所有阶段之后，所以排在阶段前的附加会被搬到后面
+    const pick = core.pickLoad(core.parseOutline('## 第一幕\n正文一\n\n## 道具 [附加]\n从：第一幕\n到：第一幕\n道具正文'));
+    const built = core.pickBuild(pick);
+    assert.ok(built.indexOf('正文一') < built.indexOf('道具正文'),
+        `附加要留在原位，实际正文：${JSON.stringify(built)}`);
+
+    // 反过来：附加写在阶段之前，重建后也不许掉到后面
+    const before = core.pickBuild(core.pickLoad(core.parseOutline('## 道具 [附加]\n从：第一幕\n到：第一幕\n道具正文\n\n## 第一幕\n正文一')));
+    assert.ok(before.indexOf('道具正文') < before.indexOf('正文一'),
+        `常驻顺序要跟文字位置走，实际正文：${JSON.stringify(before)}`);
+});
+
+test('未分配的文字仍收在最前面当前言（夹在中间会被解析成上一块的正文，那就发给 AI 了）', () => {
+    const pick = core.pickLoad(core.parseOutline('还没想好的开头\n\n## 第一幕\n正文一'));
+    const built = core.pickBuild(pick);
+    assert.ok(built.startsWith('还没想好的开头'), `未分配文字要当前言，实际：${JSON.stringify(built)}`);
+    assert.equal(core.parseOutline(built).stages[0].prompt, '正文一', '前言不能混进阶段的正文');
+});
+
+// ---------------------------------------------------------------
+// v2.30 一键生成完成条件：走判断AI的 API 设置，结果写回弹层草稿
+// ---------------------------------------------------------------
+
+test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写回草稿', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n他们在雨夜互相介绍。\n\n## 第二幕\n第二幕正文', enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const calls = [];
+    helper.generateRaw = async options => { calls.push(options); return '完成：两人完成第一次正式交谈。'; };
+    const logs = [];
+    const errors = [];
+    const sandbox = {
+        Buffer,
+        console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
+        TavernHelper: helper,
+        document: documentRef,
+        getComputedStyle: () => ({ display: 'none', visibility: 'hidden' }),
+        setTimeout: () => 0,
+        clearTimeout: () => {},
+        innerWidth: 390,
+        innerHeight: 844,
+        matchMedia: () => ({ matches: false }),
+    };
+    vm.runInNewContext(source, sandbox, { filename: 'index.js' });
+    const uiCore = sandbox.DynamicGuideAssistantCore;
+    await new Promise(setImmediate);
+    await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await uiCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+
+    // 点第一段的标题条 → 打开属性弹层
+    const bar = collectByClass(panel(), 'dga-segbar', [])[0];
+    assert.ok(bar, '分段视图要有一张标题条');
+    bar.listeners.click[0]();
+    const sheet = panel().querySelector('.dga-sheet');
+    assert.ok(sheet, '点标题条要打开属性弹层');
+
+    const generate = findButton(sheet, 'AI 生成');
+    assert.ok(generate, '完成条件旁边要有「AI 生成」按钮');
+    await generate.listeners.click[0]();
+
+    assert.equal(calls.length, 1, '要点一次生成请求');
+    const sent = JSON.stringify(calls[0]);
+    assert.match(sent, /完成条件的作者|完成条件作者/, 'system 段要是完成条件作者的契约');
+    assert.match(sent, /第一幕/, '要把阶段名带进提示词');
+    assert.match(sent, /他们在雨夜互相介绍/, '要把这一段正文当依据带进去');
+    assert.match(sent, /拒绝空泛|抽象判词/, '提示词要禁掉空泛判词');
+    assert.doesNotMatch(sent, /\{\{/, '生成提示词里的占位符要全部替换');
+
+    const area = findTag(panel().querySelector('.dga-sheet'), 'TEXTAREA');
+    assert.ok(area, '弹层里要还有完成条件输入框');
+    assert.equal(area.value, '两人完成第一次正式交谈。', '生成结果要洗掉「完成：」前缀后写回草稿');
+    assert.deepEqual(errors, []);
+});
+
+// ---------------------------------------------------------------
 // v2.28 划分阶段重构：分段/编辑原文两档，标题条内联，分配栏管归属与新建
 // ---------------------------------------------------------------
 
