@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.17
+     * 动态指导助手 v2.18
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.17';
+    const VERSION = '2.18';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1314,7 +1314,7 @@
     // 自定义连接的判断AI请求体（复刻 shujuku buildCustomApiRequestBody_ACU 的非流式形态）。
     // 接口协议映射原版酒馆：claude_messages→claude、gemini_interactions→makersuite（原生协议源），
     // openai_compat / openai_responses→custom（ST 无 Responses 后端，回退 /chat/completions）。
-    function buildJudgeCustomRequestBody(messages, preset) {
+    function buildJudgeCustomRequestBody(messages, preset, streaming) {
         const sourceByFormat = {
             openai_compat: 'custom',
             openai_responses: 'custom',
@@ -1334,7 +1334,8 @@
             model: String(preset.model || '').replace(/^models\//, ''),
             max_tokens: preset.maxTokens != null ? preset.maxTokens : 60000,
             temperature: preset.temperature != null ? preset.temperature : 1,
-            stream: false,
+            // 流式输出（v2.18，数据库 streamingEnabled 同款）：开启后酒馆后端返回 SSE。
+            stream: Boolean(streaming),
             chat_completion_source: chatCompletionSource,
             group_names: [],
             include_reasoning: false,
@@ -1574,6 +1575,8 @@
             const n = Math.floor(Number(settings.judgeHistoryCount));
             settings.judgeHistoryCount = Number.isFinite(n) && n >= 1 ? n : 1;
         }
+        // 流式输出（v2.18，数据库 streamingEnabled 同款）：只认布尔，缺省 false。
+        if (settings.streamingEnabled != null) settings.streamingEnabled = settings.streamingEnabled === true;
         // 判断AI输出的提取/排除规则（v2.13）：数据库填表同款 {start,end} 边界对；
         // 非法项丢弃，整列为空时删字段（= 不过滤，原文直通）。
         ['extractRules', 'excludeRules'].forEach(field => {
@@ -2543,28 +2546,70 @@
     // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
     // （复刻 shujuku 的自定义 API 调用，附加主体/排除参数/请求标头/提示词后处理全部生效）。
     // messages 为完整段列表（含最终注入）。
-    async function askJudgeViaCustomApi(messages, preset) {
+    // 从 OpenAI 形态 JSON 里取正文（自定义通道非流式/流式归一化都走这里）。
+    function judgeTextFromJson(data) {
+        const choice = data && Array.isArray(data.choices) && data.choices[0];
+        return String((choice && choice.message && choice.message.content)
+            || (choice && choice.text)
+            || (data && data.content)
+            || (data && data.text)
+            || '');
+    }
+
+    // 流式响应（SSE）聚合（v2.18）：OpenAI 形态 choices[0].delta.content 与
+    // Claude 原生 content_block_delta 都认（对齐数据库「流式 Claude 为原样 Anthropic SSE」），
+    // [DONE] 结束，半包/注释行忽略。返回拼接出的完整文本。
+    function parseJudgeSseText(raw) {
+        let text = '';
+        String(raw || '').split(/\r?\n/).forEach(line => {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) return;
+            const payload = trimmed.slice(5).trim();
+            if (!payload || payload === '[DONE]') return;
+            try {
+                const chunk = JSON.parse(payload);
+                const choice = chunk && Array.isArray(chunk.choices) && chunk.choices[0];
+                if (choice && choice.delta && typeof choice.delta.content === 'string') text += choice.delta.content;
+                else if (choice && typeof choice.text === 'string') text += choice.text;
+                else if (chunk && chunk.type === 'content_block_delta' && chunk.delta && typeof chunk.delta.text === 'string') text += chunk.delta.text;
+            } catch (error) {
+                // 非 JSON 的 data 行（心跳、注释）跳过。
+            }
+        });
+        return text;
+    }
+
+    async function askJudgeViaCustomApi(messages, preset, streaming) {
         const response = await hostFetch('/api/backends/chat-completions/generate', {
             method: 'POST',
             headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify(buildJudgeCustomRequestBody(messages, preset)),
+            body: JSON.stringify(buildJudgeCustomRequestBody(messages, preset, streaming)),
         });
         if (!response.ok) {
             const detail = await response.text();
             throw new Error(`自定义 API 请求失败：${response.status} ${response.statusText || ''}${detail ? `。详情：${detail}` : ''}`.trim());
         }
+        // 流式：后端可能返回 SSE，也可能归一化成 JSON——两种都认。
+        if (streaming) {
+            const raw = await response.text();
+            try {
+                const text = judgeTextFromJson(JSON.parse(raw));
+                if (text) return text;
+            } catch (error) {
+                // 不是 JSON，按 SSE 聚合。
+            }
+            const text = parseJudgeSseText(raw);
+            if (!text) throw new Error('自定义 API 返回无效响应（流式但没有正文）。');
+            return text;
+        }
         const data = await response.json();
-        const choice = data && Array.isArray(data.choices) && data.choices[0];
-        const text = (choice && choice.message && choice.message.content)
-            || (choice && choice.text)
-            || (data && data.content)
-            || (data && data.text)
-            || '';
+        const text = judgeTextFromJson(data);
         if (!text) throw new Error('自定义 API 返回无效响应（没有正文）。');
-        return String(text);
+        return text;
     }
 
-    async function askJudge(messages, preset) {
+    async function askJudge(messages, preset, settings) {
+        const streaming = Boolean(settings && settings.streamingEnabled);
         if (preset && preset.connection === 'tavern') {
             if (!preset.tavernProfile) {
                 throw new Error(`API 预设「${preset.name}」没有选择酒馆预设。`);
@@ -2575,7 +2620,7 @@
             if (!preset.apiurl || !preset.model) {
                 throw new Error(`API 预设「${preset.name}」缺少端点(基础URL)或模型名。`);
             }
-            return askJudgeViaCustomApi(messages, preset);
+            return askJudgeViaCustomApi(messages, preset, streaming);
         }
         // 酒馆主 API（或无预设）：走酒馆助手 generateRaw。
         // 段列表映射为 ordered_prompts 条目，最后一条 user 消息作为 user_input（最终注入）。
@@ -2590,6 +2635,7 @@
         const request = {
             user_input: userInput,
             should_silence: true,
+            should_stream: streaming,
             max_chat_history: 0,
             ordered_prompts: ordered,
         };
@@ -2641,7 +2687,7 @@
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：开始检查阶段「${stage.name}」（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
-            const text = await askJudge(messages, preset);
+            const text = await askJudge(messages, preset, settings);
             // 本次检查已发生：记录检查楼层，「每 N 层」从这里重新计数（无论结论是 YES 还是 NO）。
             await writeStateFor(context.key, { ...context.state, lastJudgeCheckedId: messageId });
             // 先过提取/排除规则（数据库填表同款），削掉思维链等噪声后再解析结论。
@@ -2819,6 +2865,19 @@
             el('span', { text: label }),
             control,
             hint ? el('small', { class: 'dga-field-hint', text: hint }) : null);
+    }
+
+    // 开关行（v2.18，复刻数据库 DashboardToggleRow）：标题 + 右侧开关 + 下方常驻描述。
+    function toggleRow(label, description, checked, onchange) {
+        const input = el('input', { type: 'checkbox', class: 'dga-switch', role: 'switch', 'aria-label': label });
+        input.checked = Boolean(checked);
+        input.disabled = ui.busy;
+        input.addEventListener('change', event => onchange(event.target.checked));
+        return el('div', { class: 'dga-toggle-row' },
+            el('div', { class: 'dga-toggle-head' },
+                el('span', { class: 'dga-toggle-label', text: label }),
+                input),
+            description ? el('p', { class: 'dga-toggle-desc', text: description }) : null);
     }
 
     function selectControl(options, value, onchange) {
@@ -3666,41 +3725,73 @@
         ];
     }
 
-    // 仪表盘顶部状态卡（v2.17，按用户手稿版式）：三行「左标签右值」——
-    // API 设置（当前判断AI用的预设，点击进 API 页）、当前显示（第一条绑定走到哪段）、
-    // 运行日志（有警告/错误就显示条数，点击进日志页）。
+    // 仪表盘顶部「运行概览」卡（v2.18，复刻数据库 DashboardPage 健康项版式）：
+    // 每行 = 图标圆块 + 标题/摘要 + 右侧徽章（可带跳转按钮）。
+    // 三行：API（当前预设状态）、当前显示（第一条绑定走到哪段）、运行日志（报错统计）。
     function statusCard() {
         const snapshot = ui.snapshot;
         const contexts = snapshot ? snapshot.contexts : [];
-        const { name: presetName } = currentJudgePreset();
+        const { name: presetName, preset } = currentJudgePreset();
         const first = contexts[0];
-        let stageText = '未添加指导条目';
-        if (first && first.broken) stageText = '绑定异常';
-        else if (first && first.parsed) {
+
+        const healthItem = ({ kind, icon, title, summary, badge, badgeKind, actionLabel, onAction }) =>
+            el('article', { class: `dga-health-item is-${kind}` },
+                el('div', { class: 'dga-health-icon', 'aria-hidden': 'true', text: icon }),
+                el('div', { class: 'dga-health-body' },
+                    el('strong', { text: title }),
+                    el('p', { text: summary })),
+                el('div', { class: 'dga-health-side' },
+                    el('span', { class: `dga-badge is-${badgeKind}`, text: badge }),
+                    actionLabel ? el('button', {
+                        type: 'button', class: 'dga-health-action', onclick: onAction,
+                    }, `${actionLabel} →`) : null));
+
+        // ── API：预设缺失/字段不全 = 需要处理；否则已配置。
+        let apiItem;
+        if (presetName && !preset) {
+            apiItem = { kind: 'error', icon: '×', title: 'API', summary: `选中的 API 预设「${presetName}」已不存在，判断AI将改用酒馆主 API。`, badge: '需要处理', badgeKind: 'error' };
+        } else if (preset && preset.connection === 'custom' && (!preset.apiurl || !preset.model)) {
+            apiItem = { kind: 'error', icon: '×', title: 'API', summary: `API 预设「${presetName}」缺少端点或模型名，还不能发起请求。`, badge: '未配置', badgeKind: 'error' };
+        } else if (preset && preset.connection === 'tavern' && !preset.tavernProfile) {
+            apiItem = { kind: 'error', icon: '×', title: 'API', summary: `API 预设「${presetName}」未选择酒馆连接预设。`, badge: '未配置', badgeKind: 'error' };
+        } else {
+            apiItem = { kind: 'ok', icon: '✓', title: 'API', summary: `目前 API 是：${presetName || '酒馆主 API'}。`, badge: '已配置', badgeKind: 'ok' };
+        }
+        apiItem.actionLabel = '配置 API';
+        apiItem.onAction = () => { enterApiPage(); ui.view = 'api'; ui.navOpen = false; render(); };
+
+        // ── 当前显示：第一条绑定走到哪段。
+        let stageItem;
+        if (!first) {
+            stageItem = { kind: 'idle', icon: '–', title: '当前显示', summary: '还没有添加指导条目。', badge: '未添加', badgeKind: 'idle' };
+        } else if (first.broken) {
+            stageItem = { kind: 'error', icon: '×', title: '当前显示', summary: String(first.error || '绑定异常。'), badge: '需要处理', badgeKind: 'error' };
+        } else {
             const total = first.parsed.stages.length;
             const index = first.state.stageIndex;
-            stageText = total > 0 && index >= total
-                ? '全部阶段已完成'
-                : `第 ${index + 1} 段 · ${first.stage ? first.stage.name : '—'}`;
-            if (contexts.length > 1) stageText += `（共 ${contexts.length} 条绑定）`;
+            const done = total > 0 && index >= total;
+            stageItem = {
+                kind: 'ok', icon: '✓', title: '当前显示',
+                summary: (done ? '全部阶段已完成。' : `第 ${index + 1} 段 · ${first.stage ? first.stage.name : '—'}。`)
+                    + (contexts.length > 1 ? ` 共 ${contexts.length} 条绑定。` : ''),
+                badge: done ? '已完成' : '正常', badgeKind: 'ok',
+            };
         }
+
+        // ── 运行日志：报错统计，有错误优先显示。
         const counts = { warn: 0, error: 0 };
         LogModule.list().forEach(entry => { if (counts[entry.level] != null) counts[entry.level] += 1; });
-        const logText = counts.error ? `错误 ${counts.error} 条`
-            : counts.warn ? `警告 ${counts.warn} 条` : '正常';
-        const statRow = (label, value, onclick) => {
-            const inner = [
-                el('span', { class: 'dga-stat-label', text: label }),
-                el('span', { class: 'dga-stat-value', text: value }),
-            ];
-            return onclick
-                ? el('button', { type: 'button', class: 'dga-stat-row is-link', onclick }, ...inner)
-                : el('div', { class: 'dga-stat-row' }, ...inner);
-        };
-        return el('section', { class: 'dga-card dga-stat' },
-            statRow('API 设置', `目前 API 是：${presetName || '酒馆主 API'}`, () => { enterApiPage(); ui.view = 'api'; ui.navOpen = false; render(); }),
-            statRow('当前显示', stageText, null),
-            statRow('运行日志', logText, () => { ui.view = 'logs'; ui.navOpen = false; render(); }),
+        const logItem = counts.error
+            ? { kind: 'error', icon: '×', title: '运行日志', summary: `本次会话累计 ${counts.error} 条错误、${counts.warn} 条警告，点右侧查看详情。`, badge: `${counts.error} 条报错`, badgeKind: 'error' }
+            : counts.warn
+                ? { kind: 'warning', icon: '!', title: '运行日志', summary: `没有错误；有 ${counts.warn} 条警告，一般不影响使用。`, badge: '无报错', badgeKind: 'ok' }
+                : { kind: 'ok', icon: '✓', title: '运行日志', summary: '本次会话没有记录到错误或警告。', badge: '无报错', badgeKind: 'ok' };
+        logItem.actionLabel = '查看日志';
+        logItem.onAction = () => { ui.view = 'logs'; ui.navOpen = false; render(); };
+
+        return card('运行概览',
+            muted('这里显示当前聊天的运行状态；只有标为「需要处理」的项目才影响使用。'),
+            el('div', { class: 'dga-health-list' }, healthItem(apiItem), healthItem(stageItem), healthItem(logItem)),
         );
     }
 
@@ -3721,6 +3812,8 @@
             return true;
         }, { success });
         const basicChildren = [
+            toggleRow('开启流式输出', '开启后，支持流式的文本生成会边生成边返回；关闭后会等完整结果返回。（酒馆预设通道不支持流式）', settings.streamingEnabled === true,
+                checked => saveSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
             field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
                 saveSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
@@ -3797,14 +3890,15 @@
                 el('span', { class: 'dga-muted', text: '提示词与规则在独立页面。' })) : null,
             muted('手动推进只能手点「下一段」；标记判断由正文 AI 自己定时机；判断AI用一次静默小请求判定。阶段写「完成：自动」可跨档开 AI 判断。'),
         ];
-        // 页签（v2.17 手稿版式）：基础设置 / 暂未开放。
+        // 页签（数据库 AcuSegmentedControl 版式）：基础设置 / 暂未开放。
         const tab = ui.settingsTab === 'other' ? 'other' : 'basic';
         const tabBtn = (key, label) => el('button', {
             type: 'button', role: 'tab', 'aria-selected': tab === key ? 'true' : 'false',
             class: `dga-tab${tab === key ? ' is-on' : ''}`,
             onclick: () => { ui.settingsTab = key; render(); },
         }, label);
-        return card(null,
+        return card('开关',
+            muted('基础设置：当前聊天中可随时开关的功能。'),
             el('div', { class: 'dga-tab-bar', role: 'tablist' }, tabBtn('basic', '基础设置'), tabBtn('other', '暂未开放')),
             ...(tab === 'basic' ? basicChildren : [muted('暂未开放。')]),
         );
@@ -5033,14 +5127,32 @@ ${P} .dga-foot { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px s
 ${P} .dga-foot .dga-btn { flex: 1 1 0; }
 ${P} .dga-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 14px; background: rgba(255, 255, 255, 0.045); border: 1px solid rgba(255, 255, 255, 0.08); }
 ${P} .dga-card h3 { margin: 0; font-size: 0.9rem; font-weight: 600; opacity: 0.75; }
-${P} .dga-stat { gap: 0; padding: 6px 14px; }
-${P} .dga-stat-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 2px; }
-${P} .dga-stat-row + .dga-stat-row { border-top: 1px solid rgba(255, 255, 255, 0.08); }
-${P} button.dga-stat-row { width: 100%; background: none; border: none; color: inherit; font: inherit; cursor: pointer; text-align: left; }
-${P} button.dga-stat-row + .dga-stat-row { border-top: 1px solid rgba(255, 255, 255, 0.08); }
-${P} button.dga-stat-row:hover .dga-stat-value { opacity: 1; text-decoration: underline; }
-${P} .dga-stat-label { font-size: 0.9rem; font-weight: 600; opacity: 0.8; flex: 0 0 auto; }
-${P} .dga-stat-value { font-size: 0.88rem; opacity: 0.7; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+${P} .dga-health-list { display: flex; flex-direction: column; gap: 10px; }
+${P} .dga-health-item { display: grid; grid-template-columns: 30px minmax(0, 1fr) max-content; column-gap: 10px; row-gap: 8px; align-items: center; padding: 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 11px; background: rgba(255, 255, 255, 0.03); }
+${P} .dga-health-item.is-error { border-color: rgba(255, 107, 107, 0.45); }
+${P} .dga-health-icon { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: rgba(255, 255, 255, 0.07); opacity: 0.75; font-size: 0.9rem; font-weight: 700; }
+${P} .dga-health-item.is-ok .dga-health-icon { color: #7fd88f; background: rgba(127, 216, 143, 0.12); opacity: 1; }
+${P} .dga-health-item.is-warning .dga-health-icon { color: #ffd479; background: rgba(255, 212, 121, 0.12); opacity: 1; }
+${P} .dga-health-item.is-error .dga-health-icon { color: #ff8a8a; background: rgba(255, 138, 138, 0.12); opacity: 1; }
+${P} .dga-health-body { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+${P} .dga-health-body strong { font-size: 0.88rem; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+${P} .dga-health-body p { margin: 0; font-size: 0.78rem; opacity: 0.65; line-height: 1.5; overflow-wrap: anywhere; }
+${P} .dga-health-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; justify-self: end; }
+${P} .dga-badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.72rem; font-weight: 600; background: rgba(255, 255, 255, 0.08); opacity: 0.85; white-space: nowrap; }
+${P} .dga-badge.is-ok { color: #7fd88f; background: rgba(127, 216, 143, 0.12); opacity: 1; }
+${P} .dga-badge.is-error { color: #ff8a8a; background: rgba(255, 138, 138, 0.14); opacity: 1; }
+${P} .dga-badge.is-idle { opacity: 0.55; }
+${P} .dga-health-action { background: none; border: none; color: inherit; font: inherit; font-size: 0.76rem; opacity: 0.7; cursor: pointer; padding: 2px 0; white-space: nowrap; }
+${P} .dga-health-action:hover { opacity: 1; text-decoration: underline; }
+${P} .dga-toggle-row { display: flex; flex-direction: column; gap: 4px; }
+${P} .dga-toggle-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+${P} .dga-toggle-label { font-size: 0.9rem; font-weight: 500; }
+${P} .dga-toggle-desc { margin: 0; font-size: 0.76rem; line-height: 1.5; opacity: 0.6; }
+${P} .dga-switch { appearance: none; -webkit-appearance: none; width: 38px; height: 22px; border-radius: 999px; background: rgba(255, 255, 255, 0.14); position: relative; cursor: pointer; flex: 0 0 auto; transition: background 0.15s ease; margin: 0; }
+${P} .dga-switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: rgba(255, 255, 255, 0.85); transition: left 0.15s ease; }
+${P} .dga-switch:checked { background: var(--SmartThemeQuoteColor, #7a68c8); }
+${P} .dga-switch:checked::after { left: 19px; }
+${P} .dga-switch:disabled { opacity: 0.5; cursor: not-allowed; }
 ${P} .dga-tab-bar { display: flex; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 10px; overflow: hidden; }
 ${P} .dga-tab { flex: 1; padding: 8px 0; background: transparent; border: none; color: inherit; font: inherit; font-size: 0.86rem; cursor: pointer; opacity: 0.6; min-height: 36px; }
 ${P} .dga-tab.is-on { background: rgba(255, 255, 255, 0.10); opacity: 1; font-weight: 600; }
@@ -5401,6 +5513,8 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         normalizeExcludeBodyParams,
         normalizeNativeProxyBase,
         buildJudgeCustomRequestBody,
+        judgeTextFromJson,
+        parseJudgeSseText,
         fetchAvailableModels,
         readTavernConnectionProfiles,
         judgeMessagesFor,

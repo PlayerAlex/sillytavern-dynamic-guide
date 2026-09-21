@@ -1939,3 +1939,96 @@ test('规则预览：changed / hasTag / yes 三个字段都正确', () => {
     assert.equal(empty.filtered, '');
     assert.equal(empty.changed, false);
 });
+
+test('流式输出归一化：只认布尔，其余回退 false', () => {
+    const on = core.normalizeConfig({ version: 2, bindings: [], settings: { streamingEnabled: true } });
+    assert.equal(on.settings.streamingEnabled, true);
+    const truthy = core.normalizeConfig({ version: 2, bindings: [], settings: { streamingEnabled: 'yes' } });
+    assert.equal(truthy.settings.streamingEnabled, false, '非布尔真值也要回退 false');
+    const off = core.normalizeConfig({ version: 2, bindings: [], settings: { streamingEnabled: 1 } });
+    assert.equal(off.settings.streamingEnabled, false);
+});
+
+test('SSE 聚合：OpenAI delta、Claude content_block_delta、[DONE] 与噪声行', () => {
+    const openai = 'data: {"choices":[{"delta":{"content":"<结"}}]}\n\ndata: {"choices":[{"delta":{"content":"论>YES</结"}}]}\n\ndata: {"choices":[{"delta":{"content":"论>"}}]}\n\ndata: [DONE]\n';
+    assert.equal(core.parseJudgeSseText(openai), '<结论>YES</结论>');
+    const claude = 'data: {"type":"content_block_delta","delta":{"text":"YES"}}\ndata: [DONE]\n';
+    assert.equal(core.parseJudgeSseText(claude), 'YES');
+    const noise = ': 心跳\n\ndata: 不是json\n\ndata: {"choices":[{"delta":{}}]}\n';
+    assert.equal(core.parseJudgeSseText(noise), '', '噪声行不产生文本');
+});
+
+test('判断AI档：流式开启后自定义连接 stream=true 且聚合 SSE 响应', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', judgePreset: '自定义判断AI', streamingEnabled: true },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const sse = 'data: {"choices":[{"delta":{"content":"<结论>NO"}}]}\n\ndata: {"choices":[{"delta":{"content":"</结论>"}}]}\n\ndata: [DONE]\n';
+    const fetches = [];
+    const fetchMock = async (url, options) => {
+        fetches.push({ url, options });
+        return { ok: true, status: 200, text: async () => sse, json: async () => { throw new Error('流式不该走 json()'); } };
+    };
+    const localStorage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
+            name: '自定义判断AI', connection: 'custom', customApiFormat: 'openai_compat',
+            apiurl: 'https://api.example.com/v1', key: 'sk-secret', model: 'judge-model',
+        }]),
+    });
+    const run = load(helper, { localStorage, fetch: fetchMock });
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(fetches.length, 1);
+    const body = JSON.parse(fetches[0].options.body);
+    assert.equal(body.stream, true, '开启流式后请求体 stream=true');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'SSE 聚合出 NO 不推进');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：流式开启后酒馆主 API 通道带 should_stream', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', streamingEnabled: true },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const calls = [];
+    helper.generateRaw = async options => { calls.push(options); return 'NO'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].should_stream, true, '流式开启后 generateRaw 带 should_stream');
+    assert.equal(calls[0].should_silence, true, '静默标记不受影响');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：流式关闭（默认）主 API 通道 should_stream=false', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const calls = [];
+    helper.generateRaw = async options => { calls.push(options); return 'NO'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    await state.events.get('message_received')(5);
+    assert.equal(calls[0].should_stream, false, '默认不流式');
+    assert.deepEqual(run.errors, []);
+});
