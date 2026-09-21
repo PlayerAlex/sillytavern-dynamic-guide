@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.33
+     * 动态指导助手 v2.34
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.33';
+    const VERSION = '2.34';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1732,6 +1732,7 @@
     function configForCard(config) {
         const settings = { ...((config && config.settings) || {}) };
         delete settings.judgePreset;
+        delete settings.conditionPreset;
         return { version: 2, bindings: (config && config.bindings) || [], settings };
     }
 
@@ -1877,6 +1878,12 @@
         }
         // 判断AI选用的本地 API 预设名；空字符串 = 使用酒馆当前 API。
         if (settings.judgePreset != null && typeof settings.judgePreset !== 'string') settings.judgePreset = String(settings.judgePreset);
+        if (settings.conditionPreset != null && typeof settings.conditionPreset !== 'string') settings.conditionPreset = String(settings.conditionPreset);
+        ['conditionSystemPrompt', 'conditionUserPrompt'].forEach(field => {
+            if (settings[field] == null) return;
+            if (typeof settings[field] !== 'string') settings[field] = String(settings[field]);
+            if (!settings[field].trim()) delete settings[field];
+        });
         // 判断AI检查频率：每 N 层（条 AI 回复）检查一次，非法值回退 1（每层都查）。
         if (settings.judgeInterval != null) {
             const n = Math.floor(Number(settings.judgeInterval));
@@ -2854,12 +2861,13 @@
     // 没写完成条件时交给判断AI的标准。不能写成「充分展开就算完成」，否则几乎每层都会被放行。
     const JUDGE_EMPTY_CONDITION = '没有写完成条件。只核对「本阶段要演的内容」里写出的具体情节是否都已在正文里发生；感觉该往下走不算完成。';
 
-    // 一键生成完成条件：写成以后能对照正文打勾的完成态，不是把这一段现在的剧情再摘要一遍。
+    // 一键生成「什么时候进入下一段」。这行以后会被判断AI逐件核对，所以必须是一道窄闸门，
+    // 不是剧情摘要，也不是文笔要求。
     const DEFAULT_CONDITION_SYSTEM_PROMPT = [
-        '你是剧情阶段的完成条件作者。你只写一行：这一段演到哪个可以核对的结果，才允许进入下一段。',
+        '你是剧情阶段的完成条件作者。你只写一行闸门：判断AI以后会把正文拆开来核对这行，每一件都发生了才允许进入下一段。',
         '你不写剧情、不续写、不解释、不加标题、不加引号、不加「完成：」。',
         '',
-        '只输出这一行，20 到 60 字。',
+        '只输出这一行，16 到 40 字。',
     ].join('\n');
 
     const DEFAULT_CONDITION_USER_PROMPT = [
@@ -2870,15 +2878,32 @@
         '{{prompt}}',
         '',
         '【写法要求】',
-        '写成一句完成态，供以后对照正文核对。不要把这一段现在已经写了什么再讲一遍。',
-        '1. 写正文里看得见的动作或结果，例如「两人互相报了名字，并约好下一次见面」。',
-        '2. 拒绝空泛与套话：不要出现「推动剧情发展」「加深羁绊」「深化关系」「气氛到位」「大战一触即发」这类抽象判词。',
-        '3. 不写心理、评价、比喻。读者要能只看正文就判断这句话真假。',
-        '4. 这一段有好几件事时，只写标志收尾的那一件，不要列清单。',
+        '写成这一段收束时，读者能在正文里看见的那一个结果。不要把这一段现在已经写了什么再讲一遍。',
+        '1. 只留一件标志收尾的事。过程、铺垫、气氛不要写进这行，写进去就会变成必须逐件发生的硬条件。',
+        '2. 写看得见的动作或结果，例如「两人互相报了名字，并约好下一次见面」。',
+        '3. 拒绝空泛与套话：不要出现「推动剧情发展」「加深羁绊」「深化关系」「气氛到位」「关系更进一步」这类抽象判词。',
+        '4. 不写心理、评价、比喻、原句对白、精确次数。那些一核对就会把阶段卡住。',
         '5. 用陈述句。不用「当……时」「如果……」。不要复述阶段名。',
         '',
         '只输出这一行完成条件：',
     ].join('\n');
+
+    function conditionPromptPair(settings) {
+        const source = settings && typeof settings === 'object' ? settings : {};
+        const system = typeof source.conditionSystemPrompt === 'string' && source.conditionSystemPrompt.trim()
+            ? source.conditionSystemPrompt
+            : DEFAULT_CONDITION_SYSTEM_PROMPT;
+        const user = typeof source.conditionUserPrompt === 'string' && source.conditionUserPrompt.trim()
+            ? source.conditionUserPrompt
+            : DEFAULT_CONDITION_USER_PROMPT;
+        return { system, user };
+    }
+
+    function fillConditionPrompt(template, stageName, body) {
+        return String(template || '')
+            .replace(/\{\{\s*stage\s*\}\}/g, stageName)
+            .replace(/\{\{\s*prompt\s*\}\}/g, body || '（这一段还没有正文，只能按阶段名推断）');
+    }
 
     function fillJudgePlaceholders(template, stage, condition, history) {
         return String(template || '')
@@ -3251,6 +3276,9 @@
         // 编辑器偏好（v2.29）：正文选择方式 drag=滑动选择 / tap=点选头尾；null = 还没从本机读取
         editorPrefs: null,
         editorTip: false,
+        conditionPromptOpen: false,
+        conditionPromptDraft: null,
+        apiReturnView: '',
         editor: null,
         // 外观配色（v2.29）：null = 还没从本机读取；'tavern' 档不覆写任何令牌
         appearance: null,
@@ -3413,6 +3441,8 @@
             },
             onkeydown: event => {
                 if (event.key !== 'Escape') return;
+                if (ui.view === 'editor' && ui.conditionPromptOpen) { ui.conditionPromptOpen = false; render(); return; }
+                if (ui.view === 'editor' && ui.editorTip) { ui.editorTip = false; render(); return; }
                 if (ui.view === 'editor' && ui.editor && ui.editor.sheet) closeSheet();
                 else closePanel();
             },
@@ -3977,7 +4007,12 @@
         }
 
         return [
-            header('API', 'API 预设管理', () => { ui.view = 'manager'; render(); }, '返回'),
+            header('API', 'API 预设管理', () => {
+                const back = ui.apiReturnView || 'manager';
+                ui.apiReturnView = '';
+                ui.view = back;
+                render();
+            }, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 muted('预设只存本机 localStorage（明文），不随角色卡导出；共享设备别存密钥。'),
@@ -4864,7 +4899,8 @@
             body,
             foot,
         ];
-        if (ui.editorTip) parts.push(renderEditorTip());
+        if (ui.conditionPromptOpen) parts.push(renderConditionPromptDialog());
+        else if (ui.editorTip) parts.push(renderEditorTip());
         if (editor.sheet) parts.push(renderSheet(editor.sheet));
         return parts;
     }
@@ -4890,6 +4926,14 @@
         box.append(muted(mode === 'tap'
             ? '在正文上点一下设开头，再点一下设结尾，两点之间的文字进入待分配。'
             : '在正文上拖选文字，松手后进入待分配；手机上不好拖就换成「点选头尾」。'));
+        box.append(el('div', { class: 'dga-tip-actions' },
+            btn('自定义生成提示词', () => {
+                ui.conditionPromptDraft = null;
+                ui.editorTip = false;
+                ui.conditionPromptOpen = true;
+                render();
+            }, { ghost: true })));
+        box.append(muted('「AI 生成」用的提示词和 API 预设在这里改，和判断AI的提示词分开。'));
         box.append(el('div', { class: 'dga-tip-actions' },
             btn('完成', () => { ui.editorTip = false; render(); }, { primary: true })));
         backdrop.append(box);
@@ -5034,22 +5078,99 @@
         render();
     }
 
-    // 一键生成完成条件（v2.30）：走判断AI那套 API 设置（没设预设就落到酒馆主 API），
-    // 结果只写进弹层草稿，等用户点「保存修改」才落盘。
+    function openConditionApiPage() {
+        ui.apiReturnView = 'editor';
+        ui.conditionPromptOpen = false;
+        ui.editorTip = false;
+        enterApiPage();
+        ui.view = 'api';
+        render();
+    }
+
+    function renderConditionPromptDialog() {
+        const settings = ui.snapshot && ui.snapshot.config && ui.snapshot.config.settings
+            ? ui.snapshot.config.settings
+            : {};
+        if (!ui.conditionPromptDraft) {
+            const pair = conditionPromptPair(settings);
+            ui.conditionPromptDraft = {
+                system: pair.system,
+                user: pair.user,
+                preset: typeof settings.conditionPreset === 'string' ? settings.conditionPreset : '',
+            };
+        }
+        const draft = ui.conditionPromptDraft;
+        const options = [{ value: '', label: '酒馆主 API' }]
+            .concat(readJudgeApiPresets().map(item => ({ value: item.name, label: item.name })));
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg dga-tip-bg',
+            onclick: event => {
+                if (event.target === backdrop) { ui.conditionPromptOpen = false; render(); }
+            },
+        });
+        const system = el('textarea', {
+            class: 'dga-input', rows: 5,
+            oninput: event => { draft.system = event.target.value; },
+        });
+        system.value = draft.system;
+        const user = el('textarea', {
+            class: 'dga-input', rows: 8,
+            oninput: event => { draft.user = event.target.value; },
+        });
+        user.value = draft.user;
+        const box = el('div', { class: 'dga-tip dga-tip-wide', role: 'dialog', 'aria-label': '生成提示词' },
+            el('h4', { text: '生成提示词' }),
+            muted('「AI 生成」只用这里的提示词和 API 预设。可用 {{stage}} {{prompt}}。预设本体仍在 API 页，密钥不跟卡走。'),
+            field('生成用的 API', selectControl(options, draft.preset, value => {
+                draft.preset = value;
+            })),
+            el('div', { class: 'dga-tip-actions' },
+                btn('管理 API 预设', () => openConditionApiPage(), { ghost: true })),
+            field('系统提示词', system),
+            field('用户提示词', user),
+            el('div', { class: 'dga-tip-actions' },
+                btn('恢复默认', () => {
+                    ui.conditionPromptDraft = {
+                        system: DEFAULT_CONDITION_SYSTEM_PROMPT,
+                        user: DEFAULT_CONDITION_USER_PROMPT,
+                        preset: draft.preset,
+                    };
+                    render();
+                }, { ghost: true }),
+                btn('保存', () => runAction('保存生成提示词', async () => {
+                    const fresh = await readConfig();
+                    const next = { ...(fresh.settings || {}) };
+                    const systemText = String(draft.system || '');
+                    const userText = String(draft.user || '');
+                    if (systemText.trim() && systemText.trim() !== DEFAULT_CONDITION_SYSTEM_PROMPT.trim()) next.conditionSystemPrompt = systemText;
+                    else delete next.conditionSystemPrompt;
+                    if (userText.trim() && userText.trim() !== DEFAULT_CONDITION_USER_PROMPT.trim()) next.conditionUserPrompt = userText;
+                    else delete next.conditionUserPrompt;
+                    next.conditionPreset = String(draft.preset || '');
+                    fresh.settings = next;
+                    await writeConfig(fresh);
+                    if (ui.snapshot && ui.snapshot.config) ui.snapshot.config.settings = next;
+                    ui.conditionPromptOpen = false;
+                    return true;
+                }, { success: '生成提示词已保存。' }), { primary: true }),
+                btn('关闭', () => { ui.conditionPromptOpen = false; render(); }, { ghost: true })),
+        );
+        backdrop.append(box);
+        return backdrop;
+    }
+
+    // 一键生成完成条件：用齿轮里保存的提示词和 API 预设（没选预设就用酒馆主 API）。
+    // 和判断AI的预设互不影响。结果只写进弹层草稿，等用户点「保存修改」才落盘。
     async function generateCondition(sheet, area) {
         const config = ui.snapshot && ui.snapshot.config ? ui.snapshot.config : await readConfig();
         const settings = config && config.settings ? config.settings : {};
-        const preset = findJudgeApiPreset(settings.judgePreset || '');
+        const preset = findJudgeApiPreset(typeof settings.conditionPreset === 'string' ? settings.conditionPreset : '');
         const owner = sheet.owner;
         const body = ownerBodyText(owner);
+        const pair = conditionPromptPair(settings);
         const messages = [
-            { role: 'system', content: DEFAULT_CONDITION_SYSTEM_PROMPT },
-            {
-                role: 'user',
-                content: DEFAULT_CONDITION_USER_PROMPT
-                    .replace(/\{\{\s*stage\s*\}\}/g, owner.name)
-                    .replace(/\{\{\s*prompt\s*\}\}/g, body || '（这一段还没有正文，只能按阶段名推断）'),
-            },
+            { role: 'system', content: fillConditionPrompt(pair.system, owner.name, body) },
+            { role: 'user', content: fillConditionPrompt(pair.user, owner.name, body) },
         ];
         const line = cleanConditionText(await askJudge(messages, preset, settings));
         if (!line) throw new Error('AI 没有返回可用的完成条件，请重试，或直接手写。');
@@ -5057,6 +5178,17 @@
         if (area) area.value = line;
         LogModule.info('生成', `为阶段「${owner.name}」生成完成条件：${line}`);
         return true;
+    }
+
+    function conditionGenerateHint(owner) {
+        const settings = ui.snapshot && ui.snapshot.config && ui.snapshot.config.settings
+            ? ui.snapshot.config.settings
+            : {};
+        const name = typeof settings.conditionPreset === 'string' ? settings.conditionPreset.trim() : '';
+        const via = name ? `API 预设「${name}」` : '酒馆主 API';
+        return ownerBodyText(owner)
+            ? `用${via}生成，依据这一段的正文。提示词在右上角齿轮里改。`
+            : `用${via}生成；这一段还没有正文，只能按阶段名推断。`;
     }
 
     // 一个属主名下的正文（生成完成条件时拿它当依据）。
@@ -5126,9 +5258,7 @@
                 }), { ghost: true }),
                 el('span', {
                     class: 'dga-muted',
-                    text: ownerBodyText(sheet.owner)
-                        ? '按「判断AI」的 API 设置生成，依据这一段的正文。'
-                        : '按「判断AI」的 API 设置生成；这一段还没有正文，只能按阶段名推断。',
+                    text: conditionGenerateHint(sheet.owner),
                 })));
         }
         if (sheet.kind === 'addon') {

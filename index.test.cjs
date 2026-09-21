@@ -1148,7 +1148,7 @@ test('跟角色卡走时，配置条目关掉且不带关键词，短正文靠�
         ],
     };
     const { state, helper } = multiWorld(books, {
-        config: { version: 2, bindings: [], settings: { judgePreset: '密钥名', autoAdvance: 'off' } },
+        config: { version: 2, bindings: [], settings: { judgePreset: '密钥名', conditionPreset: '生成预设', autoAdvance: 'off' } },
     });
     helper.getCharData = () => ({ name: '甲', avatar: 'a.png' });
     helper.getCharWorldbookNames = () => ['甲书'];
@@ -1162,6 +1162,7 @@ test('跟角色卡走时，配置条目关掉且不带关键词，短正文靠�
     assert.equal(JSON.stringify(configEntry.keys), '[]');
     const parsed = JSON.parse(configEntry.content);
     assert.equal(parsed.settings.judgePreset, undefined, '写进世界书的配置要去掉 API 预设名');
+    assert.equal(parsed.settings.conditionPreset, undefined, '生成用的 API 预设名也不跟卡走');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('甲书', 1)].stageIndex, 1,
         '正文太短时要按「当前阶段：阶段名」对齐，而不是退回第一段');
     assert.deepEqual(run.errors, []);
@@ -1275,6 +1276,84 @@ test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写�
     const area = findTag(panel().querySelector('.dga-sheet'), 'TEXTAREA');
     assert.ok(area, '弹层里要还有完成条件输入框');
     assert.equal(area.value, '两人完成第一次正式交谈。', '生成结果要洗掉「完成：」前缀后写回草稿');
+    assert.deepEqual(errors, []);
+});
+
+test('齿轮里可以改生成提示词，并单独选 API 预设', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n他们在雨夜互相介绍。', enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [], settings: {} } };
+    const storage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([
+            { name: '生成专用', connection: 'main', maxTokens: 60000, temperature: 1 },
+        ]),
+    });
+    const calls = [];
+    helper.generateRaw = async options => { calls.push(options); return '两人约好明天再见面。'; };
+    const logs = [];
+    const errors = [];
+    const sandbox = {
+        Buffer,
+        console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
+        TavernHelper: helper,
+        document: documentRef,
+        localStorage: storage,
+        getComputedStyle: () => ({ display: 'none', visibility: 'hidden' }),
+        setTimeout: () => 0,
+        clearTimeout: () => {},
+        innerWidth: 390,
+        innerHeight: 844,
+        matchMedia: () => ({ matches: false }),
+    };
+    vm.runInNewContext(source, sandbox, { filename: 'index.js' });
+    const uiCore = sandbox.DynamicGuideAssistantCore;
+    await new Promise(setImmediate);
+    await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await uiCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const findAttr = (node, name, value) => {
+        if (node.getAttribute && node.getAttribute(name) === value) return node;
+        for (const child of node.children || []) {
+            const found = findAttr(child, name, value);
+            if (found) return found;
+        }
+        return null;
+    };
+    const gear = findAttr(panel(), 'aria-label', '编辑器设置');
+    assert.ok(gear, '编辑器右上角要有齿轮');
+    gear.listeners.click[0]();
+    const custom = findButton(panel(), '自定义生成提示词');
+    assert.ok(custom, '齿轮里要有自定义生成提示词');
+    custom.listeners.click[0]();
+    const dialog = findAttr(panel(), 'aria-label', '生成提示词');
+    assert.ok(dialog, '点按钮要打开生成提示词');
+    assert.ok(findButton(dialog, '管理 API 预设'), '这里要能去改 API 预设');
+    const areas = [];
+    const walk = node => {
+        if (node.tagName === 'TEXTAREA') areas.push(node);
+        (node.children || []).forEach(walk);
+    };
+    walk(dialog);
+    assert.equal(areas.length, 2, '系统提示词和用户提示词各一块');
+    areas[0].value = '你是剧情阶段的完成条件作者。只写自定义闸门。';
+    areas[0].listeners.input[0]({ target: areas[0] });
+    const select = findTag(dialog, 'SELECT');
+    const option = select.children.find(item => item.textContent === '生成专用');
+    assert.ok(option, '下拉里要有本机 API 预设');
+    select.value = option.getAttribute('value');
+    select.listeners.change[0]({ target: select });
+    await findButton(dialog, '保存').listeners.click[0]();
+    const saved = state.variables.character.$dynamicGuideAssistant.config.settings;
+    assert.equal(saved.conditionPreset, '生成专用');
+    assert.match(saved.conditionSystemPrompt, /自定义闸门/);
+
+    const bar = collectByClass(panel(), 'dga-segbar', [])[0];
+    bar.listeners.click[0]();
+    await findButton(panel().querySelector('.dga-sheet'), 'AI 生成').listeners.click[0]();
+    const sent = JSON.stringify(calls[0]);
+    assert.match(sent, /自定义闸门/, '生成要使用刚保存的提示词');
+    assert.match(sent, /他们在雨夜互相介绍/);
+    assert.doesNotMatch(sent, /\{\{/);
     assert.deepEqual(errors, []);
 });
 
