@@ -1049,6 +1049,43 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
 
 // ---------------------------------------------------------------
 // ---------------------------------------------------------------
+// v2.31 跨卡导入自愈：世界书里有镜像但绑定没跟过来时，启动自动接管
+// ---------------------------------------------------------------
+
+test('跨卡导入自愈：有镜像没绑定，启动时按镜像重建绑定并对齐进度', async () => {
+    const outline = { uid: 1, name: '大纲', content: '## 第一幕\n第一幕正文\n\n## 第二幕\n第二幕正文', enabled: false };
+    const { state, helper } = helperFor(outline);
+    helper.getWorldbookNames = () => ['测试世界书'];
+    // 模拟导入别人的卡：世界书带着镜像条目过来了，绑定配置（角色变量）没跟过来
+    state.entries.push({ uid: 9, name: '大纲（动态指导）', content: '## 当前阶段\n第二幕正文', enabled: true });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const run = load(helper);
+    await new Promise(setImmediate);
+
+    const bindings = state.variables.character.$dynamicGuideAssistant.config.bindings;
+    assert.equal(bindings.length, 1, '要把「有镜像没绑定」的条目接管成一条绑定');
+    assert.equal(bindings[0].entryName, '大纲');
+    assert.equal(bindings[0].entryUid, 1);
+    assert.equal(bindings[0].worldbookName, '测试世界书');
+    const chatState = state.variables.chat.$dynamicGuideAssistant.state;
+    assert.equal(chatState.bindings[keyOf('测试世界书', 1)].stageIndex, 1, '按镜像内容对齐到第二幕');
+    assert.match(run.logs.join('\n'), /自动接管/, '要在运行日志里留痕');
+    assert.deepEqual(run.errors, []);
+});
+
+test('跨卡导入自愈：没有镜像就不重建（用户主动解绑过的不该被重新绑上）', async () => {
+    const outline = { uid: 1, name: '大纲', content: '## 第一幕\n正文一', enabled: true };
+    const { state, helper } = helperFor(outline);
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings.length, 0,
+        '没有镜像说明用户没绑过或已解绑，不能凭空重建');
+    assert.deepEqual(run.errors, []);
+});
+
+// ---------------------------------------------------------------
 // v2.30 分段不得改动原文顺序：只换归属，不动先后
 // ---------------------------------------------------------------
 

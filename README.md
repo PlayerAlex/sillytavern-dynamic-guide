@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.30**（发布标签：`v2.30`）
+当前版本：**v2.31**（发布标签：`v2.31`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点「解绑」就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.30 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.30)下载导入文件：
+在 [v2.31 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.31)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.30/dynamic-guide-offline-v2.30.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.30/dynamic-guide-online-v2.30.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.30/dynamic-guide-regex-marker-hide-v2.30.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.31/dynamic-guide-offline-v2.31.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.31/dynamic-guide-online-v2.31.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.31/dynamic-guide-regex-marker-hide-v2.31.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.30/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.31/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.30`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.31`。
 
 ## v2.0 文本格式
 
@@ -173,6 +173,15 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.31（2026-09-22）
+
+- **跨卡导入会自己接上**：别人发来的角色卡会带上世界书，但绑定列表存在角色变量里，不一定跟卡一起过来。世界书里如果已经有「条目名（动态指导）」镜像、当前却没有对应绑定，启动时会按镜像名找回原条目、重建绑定，并拿镜像正文去对阶段正文，对齐到现在这一段（对不上就从第一段开始）。主动解绑会把镜像一起删掉，所以刚解绑的条目不会被重新绑上。
+- **配置可以选择存在哪**：仪表盘「开关」里原来的「暂未开放」改成「高级设置」。打开「开发者模式」之后，左侧导航会多出一页「开发者模式」，在那里切换存放位置。
+  - **只本机**（默认）：和 API 预设同一层，存在这台浏览器里。换任何角色卡都还在，也不会跟着卡发给别人。绑过 A 卡再打开 B 卡时，仍会看到那条绑定，失效时显示「绑定已失效」，可以解绑。
+  - **跟角色卡走**：额外把一份配置写进当前世界书的「（动态指导·配置）」条目。这个条目是关着的，不发给 AI，也不参与关键词。写出去之前会去掉 API 预设名（它只是本机某个预设的名字，预设本体里的地址和密钥本来就不在配置里）。
+  - 两档都会再写一份到角色变量。读取顺序是本机档 → 角色变量 → 世界书配置条目，所以换档、旧卡、别人发来的卡都还能读到配置。
+- **外观收进右上角**：仪表盘上的「外观」卡挪到标题栏右上角的 🎨，点开才是配色面板，不再占正文位置。仪表盘标题改成「仪表盘」，不再把插件名再写一遍（插件名仍在左侧导航里）。默认配色仍是偏黑藏青。
 
 ### v2.30（2026-09-21）
 

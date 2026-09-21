@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.30
+     * 动态指导助手 v2.31
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.30';
+    const VERSION = '2.31';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1629,8 +1629,151 @@
         });
     }
 
-    const readRawConfig = () => readRootField('character', 'config');
-    const writeConfig = config => writeRootField('character', 'config', config);
+    // 配置存哪（v2.32，开发者模式里切）：
+    //   'user' = 只本机：跟 API 预设同一层（localStorage），换任何卡都在，也不会跟着卡跑到别人那里。
+    //   'card' = 跟角色卡：额外把一份**脱敏**配置写进世界书的「（动态指导·配置）」条目，随卡分发。
+    // 两档都照旧写一份到角色变量，读取按「本机档 → 角色变量 → 世界书配置条目」逐级回退，
+    // 所以切档、旧卡、别人发的卡都不会丢配置。
+    const CONFIG_STORAGE_KEY = 'dynamic-guide-assistant:config-storage:v1';
+    const LOCAL_CONFIG_KEY = 'dynamic-guide-assistant:config:v1';
+    // 世界书里的配置条目：关着的，只给插件读，永远不进 AI 上下文，也不参与关键词触发。
+    const CONFIG_ENTRY_NAME = '（动态指导·配置）';
+
+    function configStorageMode() {
+        const storage = presetStorage();
+        if (!storage) return 'user';
+        try {
+            return storage.getItem(CONFIG_STORAGE_KEY) === 'card' ? 'card' : 'user';
+        } catch (error) {
+            return 'user';
+        }
+    }
+
+    function setConfigStorageMode(mode) {
+        const storage = presetStorage();
+        if (storage) {
+            try { storage.setItem(CONFIG_STORAGE_KEY, mode === 'card' ? 'card' : 'user'); } catch (error) { /* 存不了就只用内存 */ }
+        }
+        return configStorageMode();
+    }
+
+    // 开发者模式（v2.32）：本机偏好。打开后左侧导航会多出一页「开发者模式」，
+    // 作者向设置（配置存哪等）都放那里，普通用户不会看到。
+    const DEV_MODE_KEY = 'dynamic-guide-assistant:dev-mode:v1';
+
+    function readDevMode() {
+        const storage = presetStorage();
+        if (!storage) return false;
+        try {
+            return storage.getItem(DEV_MODE_KEY) === '1';
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function devModeOn() {
+        if (ui.devMode == null) ui.devMode = readDevMode();
+        return Boolean(ui.devMode);
+    }
+
+    function setDevMode(on) {
+        ui.devMode = Boolean(on);
+        const storage = presetStorage();
+        if (storage) {
+            try { storage.setItem(DEV_MODE_KEY, ui.devMode ? '1' : '0'); } catch (error) { /* 存不了就只用内存 */ }
+        }
+        return ui.devMode;
+    }
+
+    function readLocalConfig() {
+        const storage = presetStorage();
+        if (!storage) return null;
+        try {
+            const raw = storage.getItem(LOCAL_CONFIG_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function writeLocalConfig(config) {
+        const storage = presetStorage();
+        if (!storage) return;
+        try { storage.setItem(LOCAL_CONFIG_KEY, JSON.stringify(config)); } catch (error) { /* 同上 */ }
+    }
+
+    // 跟卡走的那一份必须脱敏：judgePreset 只是本机 localStorage 里某个预设的名字，
+    // 而 API 预设本体（端点 / API Key / 模型）从来就不在配置里。分享卡绝不能把密钥带出去。
+    function configForCard(config) {
+        const settings = { ...((config && config.settings) || {}) };
+        delete settings.judgePreset;
+        return { version: 2, bindings: (config && config.bindings) || [], settings };
+    }
+
+    async function readCardConfig() {
+        let names = [];
+        try { names = await allWorldbookNames(); } catch (error) { return null; }
+        const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
+        for (const worldbookName of Array.from(new Set([...bound, ...names]))) {
+            try {
+                const entry = worldbookEntries(await getWorldbook(worldbookName)).find(item => entryName(item) === CONFIG_ENTRY_NAME);
+                if (!entry) continue;
+                const parsed = JSON.parse(String(entry.content || '{}'));
+                if (parsed && Array.isArray(parsed.bindings)) return parsed;
+            } catch (error) { /* 读不了、不是 JSON，都跳过 */ }
+        }
+        return null;
+    }
+
+    async function writeCardConfig(config) {
+        const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
+        const names = await allWorldbookNames().catch(() => []);
+        const target = ((config.bindings || [])[0] || {}).worldbookName || bound[0] || names[0] || '';
+        if (!target) return false;
+        const payload = JSON.stringify(configForCard(config), null, 2);
+        await updateWorldbook(target, worldbook => {
+            const list = worldbookEntries(worldbook);
+            const existing = list.find(item => entryName(item) === CONFIG_ENTRY_NAME);
+            if (existing) {
+                existing.content = payload;
+                existing.enabled = false;
+                if ('disable' in existing) existing.disable = true;
+                return worldbook;
+            }
+            // 克隆同一本世界书里已有条目的字段形态，保证是被酒馆认得的完整条目；然后强制关闭。
+            const template = list.find(entry => !entryName(entry).endsWith(MIRROR_SUFFIX)) || {};
+            const entry = {
+                ...template,
+                uid: freshUid(worldbook),
+                comment: CONFIG_ENTRY_NAME,
+                name: CONFIG_ENTRY_NAME,
+                title: CONFIG_ENTRY_NAME,
+                content: payload,
+                enabled: false,
+            };
+            if ('disable' in entry) entry.disable = true;
+            addEntryToWorldbook(worldbook, entry);
+            return worldbook;
+        });
+        return true;
+    }
+
+    async function readRawConfig() {
+        if (configStorageMode() === 'user') {
+            const local = readLocalConfig();
+            if (local && Array.isArray(local.bindings)) return local;
+        }
+        const fromCharacter = await readRootField('character', 'config');
+        if (fromCharacter) return fromCharacter;
+        return readCardConfig();
+    }
+
+    async function writeConfig(config) {
+        await writeRootField('character', 'config', config);
+        if (configStorageMode() === 'user') writeLocalConfig(config);
+        else await writeCardConfig(config);
+        return config;
+    }
     const readRawState = () => readRootField('chat', 'state');
 
     function bindingKey(binding) {
@@ -2229,6 +2372,90 @@
     }
 
     // 绑定坏了（条目被删或改名）时，把可能残留的镜像清掉，避免旧阶段内容继续发给 AI。
+    // 绑定自愈（v2.31）：跨卡分发时绑定配置（角色变量）不一定跟得过来，但世界书会跟过来，
+    // 而镜像「X（动态指导）」就在世界书里。于是会出现「有镜像、没绑定」的局面 —— 那种情况下
+    // 插件完全不认识这个镜像：不更新它、不删它、也不提示，AI 会一直看到冻结的那一段。
+    // 这里扫一遍世界书，按镜像反推原条目并重建绑定，让「导入卡就能用」成立。
+    // 不会误认用户主动解绑的条目：移出绑定会把镜像一起删掉，所以没镜像就不会被重新绑上。
+    const MIRROR_SUFFIX = '（动态指导）';
+
+    // 从镜像正文反推当前是第几段：拿各阶段的正文行去比对镜像内容，命中行最多的那个就是当前段。
+    function stageIndexFromMirror(mirror, parsed) {
+        const text = normalizeText(String((mirror && mirror.content) || ''));
+        if (!text || !parsed.stages.length) return 0;
+        let best = 0;
+        let bestScore = 0;
+        parsed.stages.forEach((stage, index) => {
+            const lines = String(stage.prompt || '').split('\n')
+                .map(line => line.trim())
+                .filter(line => line.length >= 4);
+            const score = lines.filter(line => text.includes(line)).length;
+            if (score > bestScore) {
+                bestScore = score;
+                best = index;
+            }
+        });
+        return bestScore > 0 ? best : 0;
+    }
+
+    async function recoverBindings() {
+        const config = await readConfig();
+        const known = new Set(config.bindings.map(item => bindingKey(item)));
+        const names = await allWorldbookNames();
+        const recovered = [];
+        for (const worldbookName of names) {
+            let entries = [];
+            try {
+                entries = worldbookEntries(await getWorldbook(worldbookName));
+            } catch (error) {
+                continue;
+            }
+            const mirrors = entries.filter(entry => entryName(entry).endsWith(MIRROR_SUFFIX));
+            for (const mirror of mirrors) {
+                const sourceName = entryName(mirror).slice(0, -MIRROR_SUFFIX.length);
+                if (!sourceName) continue;
+                const source = entries.find(entry => entryName(entry) === sourceName && !sameUid(entry.uid, mirror.uid));
+                if (!source) continue;
+                const byUid = `${worldbookName}#uid:${String(source.uid)}`;
+                const byName = `${worldbookName}#name:${sourceName}`;
+                if (known.has(byUid) || known.has(byName)) continue;
+                if (hasLegacyLayout(source)) continue;
+                const parsed = parseOutline(source.content);
+                if (parsed.stages.length === 0) continue;
+                const candidate = {
+                    worldbookName,
+                    entryUid: source.uid,
+                    entryName: sourceName,
+                    boundAt: new Date().toISOString(),
+                };
+                config.bindings.push(candidate);
+                known.add(bindingKey(candidate));
+                recovered.push({ candidate, mirror, parsed });
+            }
+        }
+        if (recovered.length === 0) return 0;
+        await writeConfig({ version: 2, bindings: config.bindings, settings: config.settings || {} });
+        // 进度：这份聊天还没有这条绑定的进度时才写，且按镜像内容对齐到当前段（对不上就从第一段开始）。
+        const existing = await readState(config).catch(() => ({}));
+        for (const item of recovered) {
+            const key = bindingKey(item.candidate);
+            if (!existing || existing[key]) continue;
+            const index = stageIndexFromMirror(item.mirror, item.parsed);
+            await writeStateFor(key, {
+                stageIndex: index,
+                stageName: item.parsed.stages[index] ? item.parsed.stages[index].name : '',
+                lastCompletionMessageId: null,
+                lastCompletionFingerprint: '',
+                lastJudgeCheckedId: null,
+                updatedAt: new Date().toISOString(),
+            });
+        }
+        const labels = recovered.map(item => `「${item.candidate.entryName}」`).join('、');
+        LogModule.info('自愈', `发现 ${recovered.length} 个「${MIRROR_SUFFIX}」镜像条目没有绑定，已自动接管：${labels}`);
+        notify(`已自动接管 ${labels} 的「${MIRROR_SUFFIX}」镜像并重建绑定。`, 'success');
+        return recovered.length;
+    }
+
     async function removeOrphanMirror(binding) {
         const mirrorName = mirrorNameFor(binding.entryName || '');
         const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
@@ -3019,6 +3246,9 @@
         // 运行日志页：等级 + 标签筛选
         logLevelFilter: 'all',
         logTagFilter: 'all',
+        // 开发者模式（v2.32）：null = 还没从本机读取；外观面板展开态
+        devMode: null,
+        appearanceOpen: false,
     };
 
     function el(tag, attrs, ...children) {
@@ -3170,7 +3400,7 @@
         const shell = panel.querySelector('.dga-shell');
         const oldBody = shell.querySelector('.dga-body');
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
-        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
+        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : (ui.view === 'dev' ? renderDevPage() : (ui.view === 'guide' ? renderGuidePage() : renderManager())))))));
         // 新绑定小卡的入场高亮只播一次（v2.27）：节点已经带上 is-new，这里立刻清掉
         // 标记，下次因为别的操作重渲染时不会重播动画。
         ui.justBoundKey = '';
@@ -3298,17 +3528,63 @@
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             statusCard(),
             settingsCard(),
-            appearanceCard(),
         );
-        return [header(SCRIPT_NAME, `v${VERSION} · ${ui.characterName}`, closePanel), body];
+        // 外观齿轮（v2.32）：和数据库一样收在右上角，点开才出配色面板，不占正文位置。
+        const gear = el('button', {
+            type: 'button',
+            class: `dga-btn dga-ghost dga-gear${ui.appearanceOpen ? ' is-on' : ''}`,
+            'aria-label': '外观',
+            title: '外观',
+            onclick: () => { ui.appearanceOpen = !ui.appearanceOpen; render(); },
+        }, '🎨');
+        const parts = [header('仪表盘', `v${VERSION} · ${ui.characterName}`, closePanel, '×', gear), body];
+        if (ui.appearanceOpen) parts.push(renderAppearancePanel());
+        return parts;
     }
 
-    // 仪表盘「外观」卡（v2.29）：配色只影响这个插件，不改酒馆设置。
-    // 默认档跟随酒馆主题 —— 那时一个令牌都不覆写，全走样式表里的 SmartTheme 映射。
-    function appearanceCard() {
+    // 开发者模式页（v2.32）：作者向设置。导航里只在这个模式下才出现。
+    function renderDevPage() {
+        const mode = configStorageMode();
+        const bindings = (ui.snapshot && ui.snapshot.config && ui.snapshot.config.bindings) || [];
+        return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回'),
+            el('div', { class: 'dga-body' },
+                messageBar(),
+                card('配置存哪',
+                    muted('决定绑定列表与判断AI设置存在哪里。普通使用不需要动这里。'),
+                    field('存放位置', selectControl([
+                        { value: 'user', label: '只本机（换任何卡都在，不跟卡走）' },
+                        { value: 'card', label: '跟角色卡走（随卡分发）' },
+                    ], mode, value => {
+                        setConfigStorageMode(value);
+                        setMessage(value === 'card'
+                            ? '已改为跟角色卡走：下次保存会写一份脱敏配置到世界书的「（动态指导·配置）」条目。'
+                            : '已改为只本机：配置存在本机，不随卡分发。', 'success');
+                        render();
+                    })),
+                    muted(mode === 'card'
+                        ? '跟卡走的那份会剔除 API 预设名（它指向本机的密钥），API 预设本体从来不进配置。世界书里那个配置条目是关着的，永远不发给 AI。'
+                        : '与 API 预设同一层，换任何角色卡都在；也不会跟着卡跑到别人那里。'),
+                ),
+                card('当前状态',
+                    muted(`存放位置：${mode === 'card' ? '跟角色卡走' : '只本机'}`),
+                    muted(`绑定条目：${bindings.length} 条`),
+                    muted('读取顺序：本机档 → 角色变量 → 世界书配置条目。三级回退，所以切档、旧卡、别人发的卡都不会丢配置。'),
+                ),
+            )];
+    }
+
+    // 外观面板（v2.32 从仪表盘卡片挪到右上角齿轮）：配色只影响这个插件，不改酒馆设置。
+    // 默认档是插件自己的「偏黑藏青」；'tavern' 档不覆写任何令牌，全走样式表里的 SmartTheme 映射。
+    function renderAppearancePanel() {
         const state = ui.appearance || (ui.appearance = readAppearance());
         const options = APPEARANCE_PRESETS.map(item => ({ value: item.id, label: item.name }))
             .concat([{ value: 'custom', label: '自定义' }]);
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg dga-tip-bg',
+            onclick: event => {
+                if (event.target === backdrop) { ui.appearanceOpen = false; render(); }
+            },
+        });
         const pickers = APPEARANCE_COLORS.map(item => {
             const input = el('input', {
                 type: 'color',
@@ -3325,7 +3601,8 @@
                 el('span', { class: 'dga-color-cell-text', text: item.label }),
                 input);
         });
-        return card('外观',
+        const box = el('div', { class: 'dga-tip dga-tip-wide', role: 'dialog', 'aria-label': '外观' },
+            el('h4', { text: '外观' }),
             muted('配色只影响这个插件，不改酒馆设置，也不随角色卡导出。'),
             field('配色', selectControl(options, state.preset, value => {
                 writeAppearance(value === 'custom'
@@ -3336,7 +3613,11 @@
             state.preset === 'custom'
                 ? el('div', { class: 'dga-color-grid' }, ...pickers)
                 : null,
+            el('div', { class: 'dga-tip-actions' },
+                btn('完成', () => { ui.appearanceOpen = false; render(); }, { primary: true })),
         );
+        backdrop.append(box);
+        return backdrop;
     }
 
     // 动态指导页（v2.19 起独立成页，不再堆在仪表盘；v2.23 按手稿重排）：
@@ -3393,6 +3674,8 @@
                 item('API', 'api'),
                 item('动态指导', 'guide'),
                 item('运行日志', 'logs'),
+                // 开发者模式（v2.32）：只有打开了才出现在导航里。
+                devModeOn() ? item('开发者模式', 'dev') : null,
             ),
         ));
         return backdrop;
@@ -4027,17 +4310,24 @@
             toggleRow('开启流式输出', '开启后边生成边返回；酒馆预设通道不支持流式。', settings.streamingEnabled === true,
                 checked => saveGuideSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
         ];
-        // 页签（数据库 AcuSegmentedControl 版式）：基础设置 / 暂未开放。
-        const tab = ui.settingsTab === 'other' ? 'other' : 'basic';
+        const advancedChildren = [
+            // 开发者模式（v2.32）：打开后左侧导航多一页「开发者模式」，作者向设置都放那里。
+            toggleRow('开发者模式', '打开后左侧导航会多出「开发者模式」页：配置存哪、以及后续的作者向设置都放在那里。',
+                devModeOn(), checked => { setDevMode(checked); render(); }),
+        ];
+        // 页签（数据库 AcuSegmentedControl 版式）：基础设置 / 高级设置。
+        const tab = ui.settingsTab === 'advanced' ? 'advanced' : 'basic';
         const tabBtn = (key, label) => el('button', {
             type: 'button', role: 'tab', 'aria-selected': tab === key ? 'true' : 'false',
             class: `dga-tab${tab === key ? ' is-on' : ''}`,
             onclick: () => { ui.settingsTab = key; render(); },
         }, label);
         return card('开关',
-            muted('基础设置：当前聊天中可随时开关的功能。'),
-            el('div', { class: 'dga-tab-bar', role: 'tablist' }, tabBtn('basic', '基础设置'), tabBtn('other', '暂未开放')),
-            ...(tab === 'basic' ? basicChildren : [muted('暂未开放。')]),
+            muted(tab === 'basic'
+                ? '基础设置：当前聊天中可随时开关的功能。'
+                : '高级设置：面向作者与排障，普通使用不需要动。'),
+            el('div', { class: 'dga-tab-bar', role: 'tablist' }, tabBtn('basic', '基础设置'), tabBtn('advanced', '高级设置')),
+            ...(tab === 'basic' ? basicChildren : advancedChildren),
         );
     }
 
@@ -5469,6 +5759,7 @@ ${P} .dga-gear.is-on { background: var(--dga-hover); }
 ${P} .dga-tip-bg { align-items: center; padding: 20px; }
 ${P} .dga-tip { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; padding: 16px; border-radius: var(--dga-radius-md); background: var(--dga-bg-1); border: 1px solid var(--dga-border-2); box-shadow: var(--dga-shadow); }
 ${P} .dga-tip h4 { margin: 0; font-size: 13px; }
+${P} .dga-tip-wide { max-width: 420px; max-height: 86%; overflow-y: auto; }
 ${P} .dga-tip-actions { display: flex; justify-content: flex-end; gap: 8px; }
 ${P} .dga-tip-actions .dga-btn { min-height: 38px; padding: 7px 16px; }
 ${P} .dga-busy .dga-body, ${P} .dga-busy .dga-foot { opacity: 0.6; pointer-events: none; }
@@ -5838,6 +6129,8 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
     // 镜像条目存在世界书里、跨重载有效，第一次生成前同步完即可。
     runEventTask('准备指导', async () => {
         await clearLegacyInjections();
+        // 先自愈再同步：导入别人的卡时绑定可能没跟过来，只有镜像跟过来了。
+        await recoverBindings();
         await syncMirrors('startup');
     });
 
