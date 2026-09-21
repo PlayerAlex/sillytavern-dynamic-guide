@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.19
+     * 动态指导助手 v2.20
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.19';
+    const VERSION = '2.20';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3082,6 +3082,7 @@
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             ...contexts.map(boundCard),
             contexts.length === 0 ? guideCard() : null,
+            judgeSettingsCard(),
             addCard(),
             diagnosticsCard(),
         );
@@ -3808,100 +3809,31 @@
         );
     }
 
-    // 全局「自动推进」三档设置。marker / judge 改变镜像里是否附通用判断指令，切换后必须重同步镜像。
-    function settingsCard() {
-        const config = ui.snapshot ? ui.snapshot.config : null;
-        const mode = autoAdvanceMode(config);
-        const settings = config && config.settings ? config.settings : {};
-        const presetList = readJudgeApiPresets();
-        const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
-        const presetOptions = [{ value: '', label: '酒馆主 API（不使用 API 预设）' }]
-            .concat(presetList.map(item => ({ value: item.name, label: item.name })));
-        const saveSettings = (patch, success) => runAction('修改自动推进设置', async () => {
+    // 改设置的公共入口：写回角色变量并重同步镜像（自动推进/判断AI相关设置都走这里）。
+    function saveGuideSettings(patch, success) {
+        return runAction('修改自动推进设置', async () => {
             const fresh = await readConfig();
             fresh.settings = { ...(fresh.settings || {}), ...patch };
             await writeConfig(fresh);
             await syncMirrors('normal');
             return true;
         }, { success });
+    }
+
+    // 仪表盘「开关」卡（v2.20 起只放通用项：流式输出 + 自动推进三档；
+    // 判断AI的 API 预设/频率/段数/提示词都挪到了「动态指导」页）。
+    function settingsCard() {
+        const config = ui.snapshot ? ui.snapshot.config : null;
+        const mode = autoAdvanceMode(config);
+        const settings = config && config.settings ? config.settings : {};
+        const options = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const basicChildren = [
             toggleRow('开启流式输出', '开启后，支持流式的文本生成会边生成边返回；关闭后会等完整结果返回。（酒馆预设通道不支持流式）', settings.streamingEnabled === true,
-                checked => saveSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
+                checked => saveGuideSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
             field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
-                saveSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
+                saveGuideSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
-            mode === 'judge' ? field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
-                saveSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '判断AI改用酒馆主 API');
-            })) : null,
-            mode === 'judge' ? (() => {
-                // 数据库填表同款频率制：每层 / 每 2 层 / 每 3 层 / 每 5 层 / 自定义。
-                const interval = judgeCheckInterval(settings);
-                const presets = [1, 2, 3, 5];
-                const selectValue = presets.includes(interval) ? String(interval) : 'custom';
-                const intervalInput = el('input', {
-                    class: 'dga-input', type: 'number', min: 1, step: 1,
-                    onchange: event => {
-                        const n = Math.floor(Number(event.target.value));
-                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
-                        saveSettings({ judgeInterval: safe }, safe === 1 ? '判断AI改为每层检查' : `判断AI改为每 ${safe} 层检查一次`);
-                    },
-                });
-                intervalInput.value = String(interval);
-                return field('多久检查一次（正文之后自动触发）', el('div', { class: 'dga-two-col' },
-                    selectControl([
-                        { value: '1', label: '每层检查' },
-                        { value: '2', label: '每 2 层检查一次' },
-                        { value: '3', label: '每 3 层检查一次' },
-                        { value: '5', label: '每 5 层检查一次' },
-                        { value: 'custom', label: '自定义…' },
-                    ], selectValue, value => {
-                        if (value === 'custom') {
-                            saveSettings({ judgeInterval: presets.includes(interval) ? 4 : interval }, '判断AI检查频率：自定义');
-                        } else {
-                            saveSettings({ judgeInterval: Number(value) }, value === '1' ? '判断AI改为每层检查' : `判断AI改为每 ${value} 层检查一次`);
-                        }
-                    }),
-                    selectValue === 'custom' ? intervalInput : null,
-                ), '正文一到就自动检查，够 N 层才问一次判断AI。');
-            })() : null,
-            mode === 'judge' ? (() => {
-                // 判断时参考最近几段角色回复：只看 AI 正文，用户消息一律不发送。
-                const count = judgeHistoryCount(settings);
-                const presets = [1, 2, 3, 6];
-                const selectValue = presets.includes(count) ? String(count) : 'custom';
-                const countInput = el('input', {
-                    class: 'dga-input', type: 'number', min: 1, step: 1,
-                    onchange: event => {
-                        const n = Math.floor(Number(event.target.value));
-                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
-                        saveSettings({ judgeHistoryCount: safe }, safe === 1 ? '判断时只看最新 1 段角色回复' : `判断时参考最近 ${safe} 段角色回复`);
-                    },
-                });
-                countInput.value = String(count);
-                return field('判断时参考几段角色回复', el('div', { class: 'dga-two-col' },
-                    selectControl([
-                        { value: '1', label: '只看最新 1 段（默认）' },
-                        { value: '2', label: '最近 2 段' },
-                        { value: '3', label: '最近 3 段' },
-                        { value: '6', label: '最近 6 段' },
-                        { value: 'custom', label: '自定义…' },
-                    ], selectValue, value => {
-                        if (value === 'custom') {
-                            saveSettings({ judgeHistoryCount: presets.includes(count) ? 4 : count }, '判断参考段数：自定义');
-                        } else {
-                            saveSettings({ judgeHistoryCount: Number(value) }, value === '1' ? '判断时只看最新 1 段角色回复' : `判断时参考最近 ${value} 段角色回复`);
-                        }
-                    }),
-                    selectValue === 'custom' ? countInput : null,
-                ), '只看 AI 正文，用户消息不发送；选 2 段以上会带更早回复。');
-            })() : null,
-            mode === 'judge' && presetList.length === 0
-                ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
-                : null,
-            mode === 'judge' ? el('div', { class: 'dga-inline-action' },
-                btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
-                el('span', { class: 'dga-muted', text: '提示词与规则在独立页面。' })) : null,
-            muted('手动推进只能手点「下一段」；标记判断由正文 AI 自己定时机；判断AI用一次静默小请求判定。阶段写「完成：自动」可跨档开 AI 判断。'),
+            muted('手动推进只能手点「下一段」；标记判断由正文 AI 自己定时机；判断AI用一次静默小请求判定。阶段写「完成：自动」可跨档开 AI 判断。判断AI的详细设置在「动态指导」页。'),
         ];
         // 页签（数据库 AcuSegmentedControl 版式）：基础设置 / 暂未开放。
         const tab = ui.settingsTab === 'other' ? 'other' : 'basic';
@@ -3914,6 +3846,94 @@
             muted('基础设置：当前聊天中可随时开关的功能。'),
             el('div', { class: 'dga-tab-bar', role: 'tablist' }, tabBtn('basic', '基础设置'), tabBtn('other', '暂未开放')),
             ...(tab === 'basic' ? basicChildren : [muted('暂未开放。')]),
+        );
+    }
+
+    // 「动态指导」页的判断AI设置卡（v2.20 从仪表盘挪入）：API 预设 / 多久检查一次 /
+    // 参考几段角色回复 / 判断AI提示词入口。只有「判断AI」档才显示具体设置。
+    function judgeSettingsCard() {
+        const config = ui.snapshot ? ui.snapshot.config : null;
+        const mode = autoAdvanceMode(config);
+        const settings = config && config.settings ? config.settings : {};
+        const presetList = readJudgeApiPresets();
+        if (mode !== 'judge') {
+            return card('判断AI',
+                muted('当前不是「判断AI」档。在仪表盘「开关」里把进入下一段的方式切成「判断AI」后，这里的设置才会生效。'));
+        }
+        const presetOptions = [{ value: '', label: '酒馆主 API（不使用 API 预设）' }]
+            .concat(presetList.map(item => ({ value: item.name, label: item.name })));
+        return card('判断AI',
+            field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
+                saveGuideSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '判断AI改用酒馆主 API');
+            })),
+            (() => {
+                // 数据库填表同款频率制：每层 / 每 2 层 / 每 3 层 / 每 5 层 / 自定义。
+                const interval = judgeCheckInterval(settings);
+                const presets = [1, 2, 3, 5];
+                const selectValue = presets.includes(interval) ? String(interval) : 'custom';
+                const intervalInput = el('input', {
+                    class: 'dga-input', type: 'number', min: 1, step: 1,
+                    onchange: event => {
+                        const n = Math.floor(Number(event.target.value));
+                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
+                        saveGuideSettings({ judgeInterval: safe }, safe === 1 ? '判断AI改为每层检查' : `判断AI改为每 ${safe} 层检查一次`);
+                    },
+                });
+                intervalInput.value = String(interval);
+                return field('多久检查一次（正文之后自动触发）', el('div', { class: 'dga-two-col' },
+                    selectControl([
+                        { value: '1', label: '每层检查' },
+                        { value: '2', label: '每 2 层检查一次' },
+                        { value: '3', label: '每 3 层检查一次' },
+                        { value: '5', label: '每 5 层检查一次' },
+                        { value: 'custom', label: '自定义…' },
+                    ], selectValue, value => {
+                        if (value === 'custom') {
+                            saveGuideSettings({ judgeInterval: presets.includes(interval) ? 4 : interval }, '判断AI检查频率：自定义');
+                        } else {
+                            saveGuideSettings({ judgeInterval: Number(value) }, value === '1' ? '判断AI改为每层检查' : `判断AI改为每 ${value} 层检查一次`);
+                        }
+                    }),
+                    selectValue === 'custom' ? intervalInput : null,
+                ), '正文一到就自动检查，够 N 层才问一次判断AI。');
+            })(),
+            (() => {
+                // 判断时参考最近几段角色回复：只看 AI 正文，用户消息一律不发送。
+                const count = judgeHistoryCount(settings);
+                const presets = [1, 2, 3, 6];
+                const selectValue = presets.includes(count) ? String(count) : 'custom';
+                const countInput = el('input', {
+                    class: 'dga-input', type: 'number', min: 1, step: 1,
+                    onchange: event => {
+                        const n = Math.floor(Number(event.target.value));
+                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
+                        saveGuideSettings({ judgeHistoryCount: safe }, safe === 1 ? '判断时只看最新 1 段角色回复' : `判断时参考最近 ${safe} 段角色回复`);
+                    },
+                });
+                countInput.value = String(count);
+                return field('判断时参考几段角色回复', el('div', { class: 'dga-two-col' },
+                    selectControl([
+                        { value: '1', label: '只看最新 1 段（默认）' },
+                        { value: '2', label: '最近 2 段' },
+                        { value: '3', label: '最近 3 段' },
+                        { value: '6', label: '最近 6 段' },
+                        { value: 'custom', label: '自定义…' },
+                    ], selectValue, value => {
+                        if (value === 'custom') {
+                            saveGuideSettings({ judgeHistoryCount: presets.includes(count) ? 4 : count }, '判断参考段数：自定义');
+                        } else {
+                            saveGuideSettings({ judgeHistoryCount: Number(value) }, value === '1' ? '判断时只看最新 1 段角色回复' : `判断时参考最近 ${value} 段角色回复`);
+                        }
+                    }),
+                    selectValue === 'custom' ? countInput : null,
+                ), '只看 AI 正文，用户消息不发送；选 2 段以上会带更早回复。');
+            })(),
+            presetList.length === 0
+                ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
+                : null,
+            el('div', { class: 'dga-inline-action' },
+                btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
+                el('span', { class: 'dga-muted', text: '提示词与规则在独立页面。' })),
         );
     }
 
