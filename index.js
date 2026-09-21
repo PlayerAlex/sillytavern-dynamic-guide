@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.15
+     * 动态指导助手 v2.16
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.15';
+    const VERSION = '2.16';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3508,7 +3508,7 @@
             header('判断AI提示词', '判断AI · 提示词段与输出规则', back, '返回'),
             el('div', { class: 'dga-body' },
                 messageBar(),
-                muted('每段可选 SYSTEM / USER / ASSISTANT 角色，按顺序发给判断AI；占位符 {{stage}} {{prompt}} {{condition}} {{history}} 在每段里都可用。判断AI结论优先读 <结论> 标签，模型没按格式输出时看回答开头是不是 YES。'),
+                muted('每段选一个角色按顺序发送；占位符：{{stage}} {{prompt}} {{condition}} {{history}}。结论优先读 <结论> 标签，没标签时看开头是不是 YES。'),
                 useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在使用旧版自定义提问（按 system + 单个 user 段生效）。在本页点「保存」会自动转成提示词段，旧模板内容已放进 user 段。') : null,
                 card('提示词段',
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最上方插入', () => insertAt('top'), { ghost: true })),
@@ -3517,31 +3517,17 @@
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
                 ),
                 card('提取 / 排除规则（上下文过滤）',
-                    muted('和数据库填表规则一样：只看 AI 最新正文（用户消息不发送），提取/排除规则在发送前逐段过滤角色回复，同样的规则在解析 <结论> 前也会对判断AI的输出再过滤一次（没有命中边界时原样保留，无副作用）。提取规则只保留「开始边界~结束边界」之间的内容（含边界，取最后一处命中，多条用空行拼接；一条都没命中就不过滤）；排除规则删掉「开始边界~结束边界」区间（含边界，支持嵌套）。边界匹配不区分大小写；留空 = 不过滤。例如角色回复用 <content> 包正文时，加提取规则 <content> → </content>，判断AI就只看得到正文；排除规则 <think> → </think> 可削掉思维链。'),
-                    el('div', { class: 'dga-rule-quick' },
-                        btn('＋ 排除思维链 <think>', () => {
-                            const rule = { start: '<think>', end: '</think>' };
-                            const list = draft.excludeRules;
-                            if (!list.some(item => item.start === rule.start && item.end === rule.end)) list.push(rule);
-                            ui.judgePromptRulesOpen.exclude = true;
-                            render();
-                        }, { ghost: true }),
-                        btn('＋ 只留 <结论> 段', () => {
-                            const rule = { start: '<结论>', end: '</结论>' };
-                            const list = draft.extractRules;
-                            if (!list.some(item => item.start === rule.start && item.end === rule.end)) list.push(rule);
-                            ui.judgePromptRulesOpen.extract = true;
-                            render();
-                        }, { ghost: true }),
-                    ),
+                    muted('发送前过滤角色回复，解析结论前也会再过滤一次判断AI输出。提取 = 只留「开始~结束」之间（取最后命中）；排除 = 删掉该区间。留空 = 不过滤。例：排除 <think>→</think> 可削思维链。'),
                     ruleGroup('extract', 'extractRules', '提取规则', '提取开始边界', '提取结束边界', '添加提取规则'),
                     ruleGroup('exclude', 'excludeRules', '排除规则', '排除开始边界', '排除结束边界', '添加排除规则'),
+                ),
+                card('规则测试',
                     (() => {
                         // 规则测试器（v2.14）：用当前草稿里的规则试跑一段样例输出，
                         // 直接看过滤结果和解析出的结论；可一键填入最近一次判断AI的真实输出。
                         const result = ui.judgeRuleTestResult;
                         return el('div', { class: 'dga-rule-tester' },
-                            el('div', { class: 'dga-rule-tester-title', text: '测试规则（用当前草稿，不保存也生效）' }),
+                            el('div', { class: 'dga-rule-tester-title', text: '用当前草稿试跑，不保存也生效' }),
                             el('textarea', {
                                 class: 'dga-input', rows: 3,
                                 placeholder: '把一段角色回复（或判断AI输出）粘到这里…',
@@ -3731,7 +3717,7 @@
                         }
                     }),
                     selectValue === 'custom' ? intervalInput : null,
-                ), '每条 AI 回复（正文）算一层：正文一到就自动静默检查当前阶段是否完成，够 N 层才问一次判断AI，不用手动点。');
+                ), '正文一到就自动检查，够 N 层才问一次判断AI。');
             })() : null,
             mode === 'judge' ? (() => {
                 // 判断时参考最近几段角色回复：只看 AI 正文，用户消息一律不发送。
@@ -3762,15 +3748,15 @@
                         }
                     }),
                     selectValue === 'custom' ? countInput : null,
-                ), '只取 AI 发的正文，用户消息不会发给判断AI；选 2 段以上会同时带上更早的角色回复做参考。');
+                ), '只看 AI 正文，用户消息不发送；选 2 段以上会带更早回复。');
             })() : null,
             mode === 'judge' && presetList.length === 0
                 ? muted('还没有 API 预设。可点左上角目录按钮进入「API」页新建；也可以直接使用酒馆主 API。')
                 : null,
             mode === 'judge' ? el('div', { class: 'dga-inline-action' },
                 btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
-                el('span', { class: 'dga-muted', text: '提示词段（system/user/assistant）、提取/排除规则、导入导出与恢复默认在独立页面里。' })) : null,
-            muted('手动推进：只有写了「完成：」条件的阶段会自动进入下一段；标记判断：正文 AI 自己判断时机；判断AI：通过酒馆助手 generateRaw 静默判定，可使用本机独立 API 预设。单个阶段写「完成：自动」可跨档位开启 AI 判断。'),
+                el('span', { class: 'dga-muted', text: '提示词与规则在独立页面。' })) : null,
+            muted('手动推进只能手点「下一段」；标记判断由正文 AI 自己定时机；判断AI用一次静默小请求判定。阶段写「完成：自动」可跨档开 AI 判断。'),
         );
     }
 
@@ -3919,7 +3905,7 @@
                 disabled: !selected || legacy || !parsed || parsed.stages.length === 0,
             }),
         ));
-        children.push(muted('添加后会关闭这个条目，并在同一本世界书里建一个“（动态指导）”镜像条目：AI 在原条目的位置只能看到当前阶段的切片；想看回全文时点卡片上的“移出”就会删掉镜像、重新打开原条目。'));
+        children.push(muted('添加后原条目会被关闭，AI 在它原来的位置只能看到当前阶段；点卡片上的「移出」恢复全文。'));
         children.push(row(
             btn('刷新', () => runAction('刷新', async () => {}), { ghost: true }),
             btn('运行诊断', () => runAction('诊断', async () => {
@@ -3986,7 +3972,7 @@
                 el('li', {}, '在下面选中这个条目，点“划分阶段”：点一个段落把它设成某一阶段的开头，也可以切到“编辑原文”直接改正文。'),
                 el('li', {}, '点“保存并添加”。之后每次聊天，AI 只会收到当前这一段的内容。'),
             ),
-            muted('可以同时添加好几个条目，各自独立推进。插件会在同一本世界书里维护一个“（动态指导）”镜像条目，内容就是当前阶段，位置、顺序、关键词都和原条目一致，所以 AI 在它原来的位置看到当前这一段。也可以直接在正文里写“## 阶段名”分段；写“合并到：阶段名”可以把这段并进已有阶段。'),
+            muted('可同时添加多个条目，各自独立推进。也可以直接在正文里写「## 阶段名」分段；写「合并到：阶段名」把这段并进已有阶段。'),
         );
     }
 
@@ -5130,9 +5116,7 @@ ${P} .dga-rule-sep { flex-shrink: 0; font-size: 0.75rem; opacity: 0.55; }
 ${P} .dga-rule-empty { padding: 8px; text-align: center; font-size: 0.78rem; opacity: 0.55; }
 ${P} .dga-rule-add { display: flex; }
 ${P} .dga-rule-add .dga-btn { min-height: 36px; padding: 6px 14px; font-size: 0.85rem; }
-${P} .dga-rule-quick { display: flex; gap: 8px; flex-wrap: wrap; }
-${P} .dga-rule-quick .dga-btn { min-height: 34px; padding: 5px 12px; font-size: 0.8rem; }
-${P} .dga-rule-tester { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px dashed rgba(255, 255, 255, 0.16); border-radius: 11px; }
+${P} .dga-rule-tester { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-rule-tester-title { font-size: 0.82rem; font-weight: 600; opacity: 0.75; }
 ${P} .dga-rule-tester-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 ${P} .dga-rule-tester-actions .dga-btn { min-height: 34px; padding: 5px 12px; font-size: 0.8rem; }
