@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.16
+     * 动态指导助手 v2.17
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.16';
+    const VERSION = '2.17';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3009,9 +3009,10 @@
         const body = el('div', { class: 'dga-body' },
             messageBar(),
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
+            statusCard(),
+            settingsCard(),
             ...contexts.map(boundCard),
             contexts.length === 0 ? guideCard() : null,
-            settingsCard(),
             addCard(),
             diagnosticsCard(),
         );
@@ -3665,6 +3666,44 @@
         ];
     }
 
+    // 仪表盘顶部状态卡（v2.17，按用户手稿版式）：三行「左标签右值」——
+    // API 设置（当前判断AI用的预设，点击进 API 页）、当前显示（第一条绑定走到哪段）、
+    // 运行日志（有警告/错误就显示条数，点击进日志页）。
+    function statusCard() {
+        const snapshot = ui.snapshot;
+        const contexts = snapshot ? snapshot.contexts : [];
+        const { name: presetName } = currentJudgePreset();
+        const first = contexts[0];
+        let stageText = '未添加指导条目';
+        if (first && first.broken) stageText = '绑定异常';
+        else if (first && first.parsed) {
+            const total = first.parsed.stages.length;
+            const index = first.state.stageIndex;
+            stageText = total > 0 && index >= total
+                ? '全部阶段已完成'
+                : `第 ${index + 1} 段 · ${first.stage ? first.stage.name : '—'}`;
+            if (contexts.length > 1) stageText += `（共 ${contexts.length} 条绑定）`;
+        }
+        const counts = { warn: 0, error: 0 };
+        LogModule.list().forEach(entry => { if (counts[entry.level] != null) counts[entry.level] += 1; });
+        const logText = counts.error ? `错误 ${counts.error} 条`
+            : counts.warn ? `警告 ${counts.warn} 条` : '正常';
+        const statRow = (label, value, onclick) => {
+            const inner = [
+                el('span', { class: 'dga-stat-label', text: label }),
+                el('span', { class: 'dga-stat-value', text: value }),
+            ];
+            return onclick
+                ? el('button', { type: 'button', class: 'dga-stat-row is-link', onclick }, ...inner)
+                : el('div', { class: 'dga-stat-row' }, ...inner);
+        };
+        return el('section', { class: 'dga-card dga-stat' },
+            statRow('API 设置', `目前 API 是：${presetName || '酒馆主 API'}`, () => { enterApiPage(); ui.view = 'api'; ui.navOpen = false; render(); }),
+            statRow('当前显示', stageText, null),
+            statRow('运行日志', logText, () => { ui.view = 'logs'; ui.navOpen = false; render(); }),
+        );
+    }
+
     // 全局「自动推进」三档设置。marker / judge 改变镜像里是否附通用判断指令，切换后必须重同步镜像。
     function settingsCard() {
         const config = ui.snapshot ? ui.snapshot.config : null;
@@ -3681,7 +3720,7 @@
             await syncMirrors('normal');
             return true;
         }, { success });
-        return card('自动推进',
+        const basicChildren = [
             field('没有写完成条件的阶段怎么进入下一段', selectControl(options, mode, value => {
                 saveSettings({ autoAdvance: value }, `自动推进已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
@@ -3757,6 +3796,17 @@
                 btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
                 el('span', { class: 'dga-muted', text: '提示词与规则在独立页面。' })) : null,
             muted('手动推进只能手点「下一段」；标记判断由正文 AI 自己定时机；判断AI用一次静默小请求判定。阶段写「完成：自动」可跨档开 AI 判断。'),
+        ];
+        // 页签（v2.17 手稿版式）：基础设置 / 暂未开放。
+        const tab = ui.settingsTab === 'other' ? 'other' : 'basic';
+        const tabBtn = (key, label) => el('button', {
+            type: 'button', role: 'tab', 'aria-selected': tab === key ? 'true' : 'false',
+            class: `dga-tab${tab === key ? ' is-on' : ''}`,
+            onclick: () => { ui.settingsTab = key; render(); },
+        }, label);
+        return card(null,
+            el('div', { class: 'dga-tab-bar', role: 'tablist' }, tabBtn('basic', '基础设置'), tabBtn('other', '暂未开放')),
+            ...(tab === 'basic' ? basicChildren : [muted('暂未开放。')]),
         );
     }
 
@@ -4983,6 +5033,17 @@ ${P} .dga-foot { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px s
 ${P} .dga-foot .dga-btn { flex: 1 1 0; }
 ${P} .dga-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 14px; background: rgba(255, 255, 255, 0.045); border: 1px solid rgba(255, 255, 255, 0.08); }
 ${P} .dga-card h3 { margin: 0; font-size: 0.9rem; font-weight: 600; opacity: 0.75; }
+${P} .dga-stat { gap: 0; padding: 6px 14px; }
+${P} .dga-stat-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 2px; }
+${P} .dga-stat-row + .dga-stat-row { border-top: 1px solid rgba(255, 255, 255, 0.08); }
+${P} button.dga-stat-row { width: 100%; background: none; border: none; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+${P} button.dga-stat-row + .dga-stat-row { border-top: 1px solid rgba(255, 255, 255, 0.08); }
+${P} button.dga-stat-row:hover .dga-stat-value { opacity: 1; text-decoration: underline; }
+${P} .dga-stat-label { font-size: 0.9rem; font-weight: 600; opacity: 0.8; flex: 0 0 auto; }
+${P} .dga-stat-value { font-size: 0.88rem; opacity: 0.7; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+${P} .dga-tab-bar { display: flex; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 10px; overflow: hidden; }
+${P} .dga-tab { flex: 1; padding: 8px 0; background: transparent; border: none; color: inherit; font: inherit; font-size: 0.86rem; cursor: pointer; opacity: 0.6; min-height: 36px; }
+${P} .dga-tab.is-on { background: rgba(255, 255, 255, 0.10); opacity: 1; font-weight: 600; }
 ${P} .dga-big { font-size: 1.45rem; font-weight: 700; line-height: 1.25; }
 ${P} .dga-stage-name { font-size: 1.05rem; font-weight: 600; color: var(--SmartThemeQuoteColor, #b8a7ff); overflow-wrap: anywhere; }
 ${P} .dga-muted, ${P} .dga-help { margin: 0; font-size: 0.88rem; opacity: 0.7; }
