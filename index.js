@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.34
+     * 动态指导助手 v2.35
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.34';
+    const VERSION = '2.35';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3596,8 +3596,8 @@
             'aria-label': '外观',
             title: '外观',
             onclick: () => { ui.appearanceOpen = !ui.appearanceOpen; render(); },
-        }, '🎨');
-        const parts = [header('仪表盘', `v${VERSION} · ${ui.characterName}`, closePanel, '×', gear), body];
+        }, '⚙');
+        const parts = [header('仪表盘', null, closePanel, '×', gear), body];
         if (ui.appearanceOpen) parts.push(renderAppearancePanel());
         return parts;
     }
