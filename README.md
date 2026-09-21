@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.25**（发布标签：`v2.25`）
+当前版本：**v2.26**（发布标签：`v2.26`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点「解绑」就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.25 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.25)下载导入文件：
+在 [v2.26 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.26)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.25/dynamic-guide-offline-v2.25.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.25/dynamic-guide-online-v2.25.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.25/dynamic-guide-regex-marker-hide-v2.25.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.26/dynamic-guide-offline-v2.26.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.26/dynamic-guide-online-v2.26.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.26/dynamic-guide-regex-marker-hide-v2.26.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -20,7 +20,7 @@
 4. 在“添加指导条目”里选择世界书与条目。已有 `## 阶段名` 的条目可以直接点“添加为指导条目”；普通大纲先点“划分阶段”。
 5. 在编辑器里点一个段落，填写名称，选择“剧情阶段”，按需填写“什么时候进入下一段（AI 自己判断）”，点“添加标题”。继续给后续阶段设置开头。想直接改文字就切到“编辑原文”。
 6. 点击“保存并添加”。脚本会保存正文、读回校验、关闭来源条目，并让当前聊天从第一段开始。
-7. 每条绑定在「动态指导」页的「绑定世界书」卡里显示为一行：行下方直接显示当前段落（第几段 · 共几段 — 阶段名），用「上一段」「下一段」修正进度；点「解绑」会把条目重新打开并删掉它在当前聊天的进度。
+7. 每条绑定在「动态指导」页的「绑定世界书」卡里常驻显示为一张小卡：条目名 + 段数步进器（上一段 / 当前段 + 阶段名 + 进度条 / 下一段）修正进度；点「解绑」会把条目重新打开并删掉它在当前聊天的进度。
 8. 保存或导出带有该世界书的角色卡。阶段标题和规则就在条目正文中，会随条目一起分享；接收者启用脚本并添加这个条目即可使用。
 
 “保存”只更新条目正文，进度按阶段名自动对上；“保存并添加”或“重新添加”会把当前聊天重置到第一段。修改阶段时若要保留当前聊天进度，使用“保存”。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.25/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.26/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.25`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.26`。
 
 ## v2.0 文本格式
 
@@ -173,6 +173,12 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.26（2026-09-21）
+
+- **已绑定条目常驻显示**：「绑定世界书」卡顶部新增常驻小卡列表——只要绑定还在，就一直显示条目名与世界书名，不再依赖添加行里选没选中它。
+- **上一段 / 下一段步进器小前端**：‹ 上一段 ｜ 第 X / N 段 + 阶段名 + 细进度条 ｜ 下一段 ›，下一段在主色调高亮；全部完成时显示「全部 N 段已完成」。
+- 删除模式同步覆盖常驻小卡：小卡头部的红减号 = 解绑（自带确认弹窗即二级提示）；添加行选了已绑定条目时按钮显示「已绑定」不可重复绑。
 
 ### v2.25（2026-09-21）
 
