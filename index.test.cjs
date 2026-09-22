@@ -1013,7 +1013,7 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
     assert.ok(surface, '分段视图要把正文铺成连续文字');
     assert.equal(collectByClass(surface, 'dga-segbar', []).length, 1, '第一段的标题条内联在正文流里');
     const texts = collectTextNodes(surface, []);
-    assert.equal(texts[0].textContent, '前言介绍\n\n', '未分配的前言和分隔符在第一个文本节点里（没有底色）');
+    assert.equal(texts[0].textContent, '前言介绍\n\n## 第一幕\n', '原文里的标题行留在正文里，不抽走');
     // 标题条带 data-dga-skip：它的文字（含 ↑↓ 按钮）不能算进选区文本流，
     // textOffsetTo 就是按这条契约跳过整棵子树的。
     const flowText = node => {
@@ -1021,7 +1021,7 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
         if (node.getAttribute && node.getAttribute('data-dga-skip') != null) return '';
         return (node.children || []).map(flowText).join('');
     };
-    assert.equal(flowText(surface), '前言介绍\n\n第一幕正文', '标题条的文字不进选区文本流，正文保持连续');
+    assert.equal(flowText(surface), '前言介绍\n\n## 第一幕\n第一幕正文', '标题条的文字不进选区文本流，原文保持连续');
 
     selection.select(texts[0], 0, texts[0], 4);
     surface.listeners.mousedown[0]();
@@ -1514,6 +1514,33 @@ async function bootGuidePage() {
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
 
+test('没有 ## 标题的条目也能绑定，划分不改原文', async () => {
+    const original = '#暑假\n当前还在暑假期间，<user>不需要上课\n#寒假\n当前在寒假期间，<user>不需要上课\n#平时\n当前是正常的学期，在周一到周五期间要上课，周末不需要';
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: true });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    helper.getCharWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const booted = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const bind = findButton(panel().querySelector('.dga-add-row'), '绑定');
+    assert.ok(bind, '选中没有 ## 标题的条目也要有绑定按钮');
+    await bind.listeners.click[0]();
+    assert.equal(state.entries[0].content, original, '绑定不能改原文');
+    await booted.sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', state.entries[0]);
+    await booted.sandbox.DynamicGuideAssistantCore.refresh();
+    const flow = node => {
+        if (node.nodeType === 3) return node.textContent;
+        if (node.getAttribute && node.getAttribute('data-dga-skip') != null) return '';
+        return (node.children || []).map(flow).join('');
+    };
+    assert.equal(flow(panel().querySelector('.dga-pick-surface')), original, '分段视图铺开的就是原文');
+    assert.deepEqual(booted.errors, []);
+});
+
 test('认领模型：绑定后待绑行当场让位，条目变成常驻小卡并高亮一次', async () => {
     const run = await bootGuidePage();
     const row = run.panel().querySelector('.dga-add-row');
@@ -1648,8 +1675,10 @@ test('分段界面：标题条的下移按钮交换阶段顺序且不打开弹�
     assert.ok(down, '第一张标题条要有下移按钮');
     down.listeners.click[0]({ stopPropagation() {} });
     cards = findAll(panel, 'dga-segbar', []);
-    assert.match(cards[0].textContent, /第二幕/, '第二幕被换到上面');
-    assert.match(cards[1].textContent, /第一幕/);
+    assert.match(cards[0].textContent, /第一幕/, '原文里第一幕仍在上面');
+    assert.match(cards[0].textContent, /第 2 段/, '下移只改推进顺序，不搬原文');
+    assert.match(cards[1].textContent, /第二幕/);
+    assert.match(cards[1].textContent, /第 1 段/);
     assert.equal(panel.querySelector('.dga-sheet'), null, '点搬移按钮不能打开标题弹层');
     assert.match(panel.querySelector('.dga-head-text').children[1].textContent, /未保存/);
     assert.deepEqual(errors, []);

@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.36**（发布标签：`v2.36`）
+当前版本：**v2.37**（发布标签：`v2.37`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点「解绑」就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.36 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.36)下载导入文件：
+在 [v2.37 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.37)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.36/dynamic-guide-offline-v2.36.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.36/dynamic-guide-online-v2.36.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.36/dynamic-guide-regex-marker-hide-v2.36.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.37/dynamic-guide-offline-v2.37.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.37/dynamic-guide-online-v2.37.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.37/dynamic-guide-regex-marker-hide-v2.37.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.36/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.37/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.36`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.37`。
 
 ## v2.0 文本格式
 
@@ -173,6 +173,15 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.37（2026-09-22）
+
+- **没有 `##` 标题也能绑定**。选中条目后，「划分阶段」和「绑定」一起出现。可以先绑定，再在小卡上划分。
+- **划分阶段不再改原文**。拖选、新建阶段、↑↓ 调顺序，都不会给原文加字、删字或换位。顺序只决定下一阶段进哪一段，以及镜像里发哪一段。以前被改乱的条目，需要你自己把原文贴回去再分一次。
+- **已分配的文字可以再分配**。再拖选那段文字，选另一个阶段，就会并过去。阶段属性里也可以选「并入」另一个阶段。
+- **「AI 生成」收短并认时间**。寒暑假、学期、周末这类阶段，生成的是「正文已经进入暑假」这种能核对的时间结果，并且把回复长度压到很短，减少干等。
+- **某一段可以到此结束**。阶段属性里选「到此结束」，到了这一段就不再判断要不要进入下一段。
+- **阶段可以循环**。分段视图里打开「循环：开」。走完最后一段之后，下一次会回到第一段。寒暑假那种暑假 → 寒假 → 平时 → 再回暑假，用这个。
 
 ### v2.36（2026-09-22）
 
