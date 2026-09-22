@@ -1995,8 +1995,26 @@ async function bootGuidePage() {
     assert.ok(panel().querySelector('.dga-main'), '右侧是当前页');
     assert.match(panel().querySelector('.dga-split').className, /dga-body/, '宽屏时卡片分成两列');
     assert.equal(panel().querySelector('.dga-close').textContent, '×', '右上角仍是简化的 ×');
+    const nav = panel().querySelector('.dga-panel-nav');
+    assert.ok(nav, '动态指导页顶部有板块跳转');
+    assert.match(nav.textContent, /绑定/);
+    assert.match(nav.textContent, /如何判断/);
+    assert.match(nav.textContent, /提取规则/);
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
+
+test('条目搜索只留下名字对得上的', async () => {
+    const run = await bootGuidePage();
+    const filter = run.panel().querySelector('.dga-entry-filter');
+    assert.ok(filter, '待绑条目上面有搜索框');
+    filter.value = '道具';
+    filter.listeners.input[0]({ target: filter });
+    const select = findTag(run.panel().querySelector('.dga-add-row'), 'SELECT');
+    const labels = optionsOf(select).map(item => item.textContent).join('\n');
+    assert.match(labels, /道具规则/);
+    assert.doesNotMatch(labels, /大纲/);
+    assert.deepEqual(run.errors, []);
+});
 
 test('API、动态指导、运行日志左上角有导航', async () => {
     const run = await bootGuidePage();
@@ -2510,6 +2528,63 @@ test('判断AI档：每 2 层检查一次——首次立即查，之后到层才
     assert.equal(bindingState().lastJudgeCheckedId, 7, '问过之后重新计数');
     await state.events.get('message_received')(7);
     assert.equal(calls, 3, '同一层重新生成要再判断一次');
+    assert.deepEqual(run.errors, []);
+});
+
+test('某一条自己开判断AI时，全局手动也不挡它，并记下上次结论', async () => {
+    const content = '## 暑假\n暑假正文\n\n## 寒假\n寒假正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', advanceMode: 'judge', judgeInterval: 2 }],
+        settings: { autoAdvance: 'off', judgeInterval: 1 },
+    };
+    const kept = core.normalizeConfig(config);
+    assert.equal(kept.bindings[0].advanceMode, 'judge');
+    assert.equal(kept.bindings[0].judgeInterval, 2);
+    const dropped = core.normalizeConfig({ version: 2, bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', advanceMode: 'nope', judgeInterval: 0 }] });
+    assert.equal(dropped.bindings[0].advanceMode, undefined);
+    assert.equal(dropped.bindings[0].judgeInterval, undefined);
+    const { state, helper } = multiWorld(books, {
+        config,
+        messages: [
+            { message_id: 5, role: 'assistant', message: '还在放假。' },
+            { message_id: 6, role: 'assistant', message: '第二天。' },
+        ],
+        lastMessageId: 6,
+    });
+    const sent = [];
+    helper.generateRaw = async options => { sent.push(options); return '<依据>还在暑假</依据>\n<结论>NO</结论>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const bindingState = () => state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+    await state.events.get('message_received')(5);
+    assert.equal(sent.length, 1, '这条自己开了判断AI，全局手动也要查');
+    assert.equal(bindingState().lastJudgeYes, false);
+    assert.match(bindingState().lastJudgeBasis, /暑假/);
+    await state.events.get('message_received')(6);
+    assert.equal(sent.length, 1, '这条自己的间隔是每 2 层，中间那层不问');
+    assert.deepEqual(run.errors, []);
+});
+
+test('某一条改成手动后，全局判断AI不再问它', async () => {
+    const content = '## 暑假\n暑假正文\n\n## 寒假\n寒假正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', advanceMode: 'off' }],
+            settings: { autoAdvance: 'judge' },
+        },
+        messages: [{ message_id: 3, role: 'assistant', message: '一段回复。' }],
+        lastMessageId: 3,
+    });
+    let calls = 0;
+    helper.generateRaw = async () => { calls += 1; return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(3);
+    assert.equal(calls, 0, '这条写成手动后，不跟全局去问判断AI');
     assert.deepEqual(run.errors, []);
 });
 

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.52
+     * 动态指导助手 v2.53
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.52';
+    const VERSION = '2.53';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -599,7 +599,7 @@
         // 开了循环却停在「全部完成」时，进度还记在段数之外，小卡会写成不再发送。
         // 拉回第一段，镜像才能继续发。
         if (parsed.loop && parsed.stages.length > 0 && index >= parsed.stages.length) index = 0;
-        return {
+        const next = {
             stageIndex: index,
             stageName: parsed.stages[index] ? parsed.stages[index].name : '',
             lastCompletionMessageId: old.lastCompletionMessageId == null ? null : old.lastCompletionMessageId,
@@ -608,6 +608,9 @@
             preAdvanceIndex: Number.isInteger(old.preAdvanceIndex) ? old.preAdvanceIndex : null,
             updatedAt: old.updatedAt || new Date().toISOString(),
         };
+        if (old.lastJudgeYes === true || old.lastJudgeYes === false) next.lastJudgeYes = old.lastJudgeYes;
+        if (typeof old.lastJudgeBasis === 'string' && old.lastJudgeBasis) next.lastJudgeBasis = old.lastJudgeBasis.slice(0, 60);
+        return next;
     }
 
     // ---------------------------------------------------------------
@@ -2079,6 +2082,10 @@
             const start = Math.floor(Number(item.startIndex));
             if (Number.isFinite(start) && start > 0) binding.startIndex = start;
             if (item.loop === true) binding.loop = true;
+            const ownMode = item.advanceMode === 'marker' ? 'story' : item.advanceMode;
+            if (['off', 'story', 'judge'].includes(ownMode)) binding.advanceMode = ownMode;
+            const ownInterval = Math.floor(Number(item.judgeInterval));
+            if (Number.isFinite(ownInterval) && ownInterval >= 1) binding.judgeInterval = ownInterval;
             const layout = cleanLayout(item.layout);
             if (layout) binding.layout = layout;
             const key = bindingKey(binding);
@@ -2160,6 +2167,19 @@
         let mode = config && config.settings ? config.settings.autoAdvance : 'off';
         if (mode === 'marker') mode = 'story';
         return ['off', 'story', 'judge'].includes(mode) ? mode : 'off';
+    }
+
+    // 某条绑定没单独写时，跟着页面上的全局设置。
+    function bindingAdvanceMode(binding, config) {
+        const own = binding && binding.advanceMode === 'marker' ? 'story' : (binding && binding.advanceMode);
+        if (['off', 'story', 'judge'].includes(own)) return own;
+        return autoAdvanceMode(config);
+    }
+
+    function bindingJudgeInterval(binding, settings) {
+        const own = Math.floor(Number(binding && binding.judgeInterval));
+        if (Number.isFinite(own) && own >= 1) return own;
+        return judgeCheckInterval(settings);
     }
 
     const AUTO_ADVANCE_LABELS = {
@@ -2944,7 +2964,7 @@
                     parsed,
                     rawState,
                     state,
-                    autoAdvance: autoAdvanceMode(config),
+                    autoAdvance: bindingAdvanceMode(binding, config),
                     stage: parsed.stages[state.stageIndex] || null,
                     addons: activeAddons(parsed, state.stageIndex),
                     entryEnabled: !entryIsDisabled(located.entry),
@@ -3505,6 +3525,8 @@
                 : settings.messageId,
             lastCompletionFingerprint: settings.fingerprint || context.state.lastCompletionFingerprint,
             lastJudgeCheckedId: context.state.lastJudgeCheckedId == null ? null : context.state.lastJudgeCheckedId,
+            ...(context.state.lastJudgeYes === true || context.state.lastJudgeYes === false ? { lastJudgeYes: context.state.lastJudgeYes } : {}),
+            ...(context.state.lastJudgeBasis ? { lastJudgeBasis: context.state.lastJudgeBasis } : {}),
             // 这条消息引起的推进才记下「从哪一段过来」。手动拨进度清掉，避免重新生成退错段。
             preAdvanceIndex: settings.messageId != null ? context.state.stageIndex : null,
             updatedAt: new Date().toISOString(),
@@ -3826,6 +3848,13 @@
         return /^\s*YES\b/i.test(raw);
     }
 
+    function judgeBasisText(text) {
+        const raw = String(text || '');
+        const tag = raw.match(/<依据>\s*([\s\S]*?)<\/依据>/i);
+        const basis = (tag ? tag[1] : raw).replace(/\s+/g, ' ').trim();
+        return basis.slice(0, 60);
+    }
+
     // 边界规则应用（v2.13 输出侧 / v2.14 起对齐数据库：同时作用于发送前的最近剧情）。
     // 先按提取规则截取、再按排除规则删除（与数据库顺序一致）；规则为空 = 原文直通。
     function applyBoundaryRules(text, settings) {
@@ -4016,8 +4045,10 @@
             : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
     }
 
-    async function maybeJudgeAdvance(context, messageId, config) {
+    async function maybeJudgeAdvance(context, messageId, config, options) {
+        const flags = options || {};
         if (!context || context.broken || !context.stage || context.stage.terminal) return;
+        if (!flags.force && context.autoAdvance !== 'judge') return;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到判断AI跳过。
         if (context.state.lastCompletionMessageId === messageId) return;
         if (judgeState.running.has(context.key)) {
@@ -4028,13 +4059,14 @@
             return;
         }
         const settings = config && config.settings ? config.settings : {};
-        // 检查频率：每 N 层（条 AI 回复）查一次，数据库填表同款频率制；首次检查立即执行。
-        const interval = judgeCheckInterval(settings);
+        // 检查频率：每 N 层（条 AI 回复）查一次；这条绑定单独写了就用它的。首次检查立即执行。
+        // 「现在检查」不受间隔限制。
+        const interval = bindingJudgeInterval(context.binding, settings);
         const sinceCheck = context.state.lastJudgeCheckedId == null
             ? null
             : Number(messageId) - Number(context.state.lastJudgeCheckedId);
         // 间隔只跳过「中间那些层」。同一层再来（重新生成）或楼层号倒退，都要重新判断。
-        if (interval > 1 && sinceCheck != null && sinceCheck > 0 && sinceCheck < interval) {
+        if (!flags.force && interval > 1 && sinceCheck != null && sinceCheck > 0 && sinceCheck < interval) {
             LogModule.debug('判断AI', `「${entryName(context.entry)}」第 ${messageId} 层未到检查间隔（每 ${interval} 层），跳过`);
             return;
         }
@@ -4059,7 +4091,9 @@
         const bindingLabel = entryName(context.entry);
         try {
             const stage = context.stage;
-            const condition = stage.completion ? stage.completion : JUDGE_EMPTY_CONDITION;
+            const extra = String(flags.extra || '').trim();
+            let condition = stage.completion ? stage.completion : JUDGE_EMPTY_CONDITION;
+            if (extra) condition = `${condition}\n本次只看这一次的附加要求：${extra}`;
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
             const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
@@ -4070,12 +4104,15 @@
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：开始检查阶段「${stage.name}」（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
             const text = await askJudge(messages, judgePreset, { ...settings, judgeMaxTokens: cap });
-            // 只补检查楼层。判断要等接口，这几秒里用户可能已经点了上一段/下一段，
-            // 不能把开始时的整份进度写回去。
-            await patchStateFor(context.key, { lastJudgeCheckedId: messageId });
             // 先过提取/排除规则（数据库填表同款），削掉思维链等噪声后再解析结论。
+            // 只补检查结果，不把开始时的整份进度写回去。
             const filtered = applyBoundaryRules(text, settings);
             const yes = judgeSaysYes(filtered);
+            await patchStateFor(context.key, {
+                lastJudgeCheckedId: messageId,
+                lastJudgeYes: yes,
+                lastJudgeBasis: judgeBasisText(filtered),
+            });
             // 留痕最近一次调用（只存内存）：规则测试器可以一键填入这份原始输出。
             judgeRuntime.lastRaw = String(text || '');
             judgeRuntime.lastFiltered = filtered;
@@ -4129,9 +4166,11 @@
         LogModule.debug('事件', `收到正文（第 ${messageId} 层）`);
 
         const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
-        const mode = autoAdvanceMode(await readConfig());
+        const config = await readConfig();
+        const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge');
         // 手动推进、随正文 AI 都不另开请求。随正文 AI 的标记写在回复里，这里检测到再推进。
-        if (markers.length === 0 && mode !== 'judge') return;
+        // 只要有一条绑定自己开了判断 AI，就要进来，不必整页都是判断 AI。
+        if (markers.length === 0 && !judgeNeeded) return;
         const all = await loadContexts();
         if (!all.configured) return;
 
@@ -4151,11 +4190,11 @@
             }
         }
 
-        // 判断 AI 才另开一次请求。随正文 AI 只看回复里的标记。
-        if (all.configured && autoAdvanceMode(all.config) === 'judge') {
+        // 判断 AI 才另开一次请求。每条绑定看自己的档，没单独写的跟着全局。
+        if (all.configured && judgeNeeded) {
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
-                if (context.broken || !context.stage) return null;
+                if (context.broken || !context.stage || context.autoAdvance !== 'judge') return null;
                 return maybeJudgeAdvance(context, messageId, fresh.config);
             }));
         }
@@ -4211,6 +4250,10 @@
         // 规则测试器（v2.14）：样例文本与最近一次试跑结果
         judgeRuleTestText: '',
         judgeRuleTestResult: null,
+        // 条目搜索，以及每条小卡「本次附加要求」（只对下一次现在检查生效）
+        entryQuery: '',
+        entryQueryFocus: false,
+        judgeExtras: {},
         // 运行日志页：等级 + 标签筛选
         logLevelFilter: 'all',
         logTagFilter: 'all',
@@ -4391,6 +4434,15 @@
         if (body) body.scrollTop = scrollTop;
         // 只滚面板内部。用 scrollIntoView 会把酒馆页面一起卷走，顶栏会跑出屏幕。
         if (focusTarget) scrollStageIntoView(body, focusTarget);
+        if (ui.entryQueryFocus) {
+            const box = shell.querySelector('.dga-entry-filter');
+            if (box && typeof box.focus === 'function') {
+                box.focus();
+                const end = String(box.value || '').length;
+                if (typeof box.setSelectionRange === 'function') box.setSelectionRange(end, end);
+            }
+            ui.entryQueryFocus = false;
+        }
         ui.renderedView = ui.view;
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
     }
@@ -4430,7 +4482,10 @@
         const [bound, all] = await Promise.all([boundWorldbookNames(card), allWorldbookNames()]);
         ui.characterName = characterName(card);
         ui.boundNames = bound;
-        ui.worldbookNames = bound.length > 0 ? bound : all;
+        const names = [];
+        bound.forEach(name => { if (name && !names.includes(name)) names.push(name); });
+        all.forEach(name => { if (name && !names.includes(name)) names.push(name); });
+        ui.worldbookNames = names;
         try {
             ui.snapshot = await loadContexts();
             ui.contextError = '';
@@ -4439,8 +4494,8 @@
             ui.contextError = error.message || String(error);
         }
         const firstBinding = ui.snapshot && ui.snapshot.config.bindings[0];
-        const wanted = settings.worldbookName || ui.selectedWorldbook || (firstBinding && firstBinding.worldbookName) || '';
-        ui.selectedWorldbook = ui.worldbookNames.includes(wanted) ? wanted : (ui.worldbookNames[0] || '');
+        const wanted = settings.worldbookName || ui.selectedWorldbook || bound[0] || (firstBinding && firstBinding.worldbookName) || '';
+        ui.selectedWorldbook = ui.worldbookNames.includes(wanted) ? wanted : (bound.find(name => ui.worldbookNames.includes(name)) || ui.worldbookNames[0] || '');
         ui.entries = [];
         ui.entryError = '';
         if (ui.selectedWorldbook) {
@@ -4651,14 +4706,41 @@
     // 如何判断（判断模式 + 判断AI设置）→ 提取/排除规则 + 规则测试。
     // 顶部只留错误条（v2.24 起成功/提示类绿条不在本页显示）；
     // v2.25 起独立绑定卡片区删除，功能并入绑定世界书卡的行内。
+    function scrollPanelTo(id) {
+        const doc = hostDocument();
+        const panel = doc && doc.getElementById(PANEL_ID);
+        const body = panel && panel.querySelector('.dga-body');
+        const target = doc && doc.getElementById(id);
+        scrollStageIntoView(body, target);
+    }
+
+    function panelNav(items) {
+        return el('nav', { class: 'dga-panel-nav dga-span', 'aria-label': '页面板块' },
+            ...items.map(item => el('button', {
+                type: 'button',
+                class: 'dga-panel-nav-item',
+                onclick: () => scrollPanelTo(item.id),
+            }, item.label)));
+    }
+
     function renderGuidePage() {
+        const bindCard = addCard();
+        bindCard.id = 'dga-card-bind';
+        const judgeCard = judgeSettingsCard();
+        judgeCard.id = 'dga-card-judge';
         const rules = guideRulesCard();
+        rules.id = 'dga-card-rules';
         rules.classList.add('dga-span');
         const body = el('div', { class: 'dga-body dga-split' },
+            panelNav([
+                { id: 'dga-card-bind', label: '绑定' },
+                { id: 'dga-card-judge', label: '如何判断' },
+                { id: 'dga-card-rules', label: '提取规则' },
+            ]),
             ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
-            addCard(),
-            judgeSettingsCard(),
+            bindCard,
+            judgeCard,
             rules,
         );
         return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }), body];
@@ -5350,6 +5432,36 @@
         }, { success });
     }
 
+    async function updateBinding(key, mutate) {
+        const config = await readConfig();
+        const binding = config.bindings.find(item => bindingKey(item) === key);
+        if (!binding) throw new Error('没有找到这条绑定。');
+        mutate(binding);
+        await writeConfig(config);
+        await syncMirrors('normal');
+        return true;
+    }
+
+    function judgeWaitText(context, config) {
+        if (!context || context.autoAdvance !== 'judge') return '';
+        const settings = config && config.settings ? config.settings : {};
+        const interval = bindingJudgeInterval(context.binding, settings);
+        const checked = context.state.lastJudgeCheckedId;
+        const now = currentMessageId();
+        let wait = interval <= 1 ? '每层都查' : `每 ${interval} 层`;
+        if (checked == null) wait = interval <= 1 ? '每层都查，下一条回复会查' : '还没检查过，下一条回复会查';
+        else if (now != null && interval > 1) {
+            const since = Number(now) - Number(checked);
+            const left = since <= 0 ? interval : interval - since;
+            wait = left <= 0 ? '下一条回复会查' : `还差 ${left} 层`;
+        }
+        const verdict = context.state.lastJudgeYes === true
+            ? '上次 YES'
+            : (context.state.lastJudgeYes === false ? '上次 NO' : '');
+        const basis = context.state.lastJudgeBasis ? `：${context.state.lastJudgeBasis}` : '';
+        return [verdict ? `${verdict}${basis}` : '', wait].filter(Boolean).join(' · ');
+    }
+
     // 仪表盘「开关」卡（v2.24 起只放流式输出：判断模式三档挪到「动态指导」页的
     // 「如何判断？」卡，判断AI的 API 预设/频率/段数/提示词也都在那边）。
     function settingsCard() {
@@ -5390,6 +5502,7 @@
         const presetList = readJudgeApiPresets();
         const modeOptions = ['off', 'story', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const children = [
+            muted('这里是所有条目的默认。某一条想不一样，在它的小卡上改。'),
             field('判断模式', selectControl(modeOptions, mode, value => {
                 saveGuideSettings({ autoAdvance: value }, `判断模式已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
@@ -5637,7 +5750,68 @@
                     primary: usable && !(finished && !context.parsed.loop),
                     disabled: !usable || (!context.parsed.loop && (finished || stageIndex >= total - 1)),
                 })),
+            bindingPace(context),
         );
+    }
+
+    function bindingPace(context) {
+        if (!context || context.legacy || context.broken) return null;
+        const config = ui.snapshot && ui.snapshot.config;
+        const binding = context.binding || {};
+        const globalMode = autoAdvanceMode(config);
+        const ownMode = ['off', 'story', 'judge'].includes(binding.advanceMode) ? binding.advanceMode : '';
+        const modeOptions = [
+            { value: '', label: `跟随全局（${{ off: '手动', story: '随正文', judge: '判断AI' }[globalMode] || '手动'}）` },
+            { value: 'off', label: '这条手动' },
+            { value: 'story', label: '这条随正文' },
+            { value: 'judge', label: '这条判断AI' },
+        ];
+        const children = [
+            field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
+                if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
+                else delete item.advanceMode;
+            }), { success: '已记下这条的判断方式' }))),
+        ];
+        if (context.autoAdvance === 'judge') {
+            const settings = config && config.settings ? config.settings : {};
+            const globalInterval = judgeCheckInterval(settings);
+            const presets = [1, 2, 3, 5];
+            const ownInterval = Math.floor(Number(binding.judgeInterval));
+            const hasOwn = Number.isFinite(ownInterval) && ownInterval >= 1;
+            const intervalOptions = [{ value: '', label: `跟随全局（每 ${globalInterval} 层）` }]
+                .concat(presets.map(n => ({ value: String(n), label: n === 1 ? '每层' : `每 ${n} 层` })));
+            if (hasOwn && !presets.includes(ownInterval)) intervalOptions.push({ value: String(ownInterval), label: `每 ${ownInterval} 层` });
+            children.push(field('这条隔几层', selectControl(intervalOptions, hasOwn ? String(ownInterval) : '', value => runAction('修改这条的检查间隔', () => updateBinding(context.key, item => {
+                const n = Math.floor(Number(value));
+                if (Number.isFinite(n) && n >= 1) item.judgeInterval = n;
+                else delete item.judgeInterval;
+            }), { success: '已记下这条的检查间隔' }))));
+            const wait = judgeWaitText(context, config);
+            if (wait) children.push(el('p', { class: 'dga-judge-status', text: wait }));
+            if (context.stage && !context.stage.terminal) {
+                const extra = el('input', {
+                    class: 'dga-input',
+                    type: 'text',
+                    placeholder: '本次附加要求，只对这一次检查生效',
+                });
+                extra.value = (ui.judgeExtras && ui.judgeExtras[context.key]) || '';
+                extra.addEventListener('input', event => {
+                    ui.judgeExtras[context.key] = event.target.value;
+                });
+                children.push(extra, btn('现在检查', () => runAction('现在检查', async () => {
+                    const loaded = await loadContexts();
+                    const fresh = loaded.contexts.find(item => item.key === context.key);
+                    if (!fresh || fresh.broken || !fresh.stage) throw new Error('这条绑定现在不能检查。');
+                    const messageId = currentMessageId();
+                    if (messageId == null) throw new Error('当前没有可检查的回复。');
+                    const hint = String((ui.judgeExtras && ui.judgeExtras[context.key]) || '').trim();
+                    await maybeJudgeAdvance(fresh, messageId, loaded.config, { force: true, extra: hint });
+                    ui.judgeExtras[context.key] = '';
+                    return true;
+                }, { success: '已检查这一段' }), { ghost: true }));
+            }
+        }
+        return el('div', { class: 'dga-bind-pace' }, ...children);
     }
 
     // 绑定世界书（v2.27 认领模型）：已绑定条目常驻小卡（步进器 + 常驻 × 解绑，
@@ -5665,8 +5839,9 @@
             return card('绑定世界书', ...children);
         }
         if (ui.boundNames.length === 0) children.push(muted('角色没绑定世界书，这里列出全部。'));
+        else children.push(muted('默认打开这张卡的世界书，其他书也在列表里。'));
         children.push(field('世界书', selectControl(
-            ui.worldbookNames.map(name => ({ value: name, label: name })),
+            ui.worldbookNames.map(name => ({ value: name, label: ui.boundNames.includes(name) ? `${name}（角色卡）` : name })),
             ui.selectedWorldbook,
             value => runAction('切换世界书', async () => {
                 ui.selectedWorldbook = value;
@@ -5674,23 +5849,38 @@
                 ui.addEntryKey = null;
             }),
         )));
-        const entryOptions = ui.entries.length > 0
+        const needle = String(ui.entryQuery || '').trim().toLowerCase();
+        const visibleEntries = ui.entries.filter(entry => !needle || entryName(entry).toLowerCase().includes(needle));
+        const entryOptions = visibleEntries.length > 0
             ? [{ value: '', label: '请选择条目' }]
-                .concat(ui.entries.map((entry, index) => ({ value: entryKey(entry, index), label: entryLabel(entry) })))
-            : [{ value: '', label: ui.entryError || '这个世界书里没有条目' }];
+                .concat(visibleEntries.map(entry => ({ value: entryKey(entry, ui.entries.indexOf(entry)), label: entryLabel(entry) })))
+            : [{ value: '', label: needle ? '没有匹配的条目' : (ui.entryError || '这个世界书里没有条目') }];
         const entryAt = key => {
             const index = ui.entries.findIndex((entry, position) => entryKey(entry, position) === key);
             return index >= 0 ? ui.entries[index] : null;
         };
-        const addKey = ui.addEntryKey || '';
-        const entry = addKey ? entryAt(addKey) : null;
+        const storedKey = ui.addEntryKey || '';
+        const storedEntry = storedKey ? entryAt(storedKey) : null;
+        const addKey = storedEntry && (!needle || entryName(storedEntry).toLowerCase().includes(needle)) ? storedKey : '';
+        const entry = addKey ? storedEntry : null;
         const legacy = Boolean(entry && hasLegacyLayout(entry));
         const savedLayout = entry && !legacy ? savedLayoutForUiEntry(entry) : null;
         const parsed = entry && !legacy
             ? outlineFromEntry(entry, { layout: savedLayout || { version: 3, stages: [] } })
             : null;
         const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
-        children.push(muted('条目'));
+        const filter = el('input', {
+            class: 'dga-input dga-entry-filter',
+            type: 'search',
+            placeholder: '搜索条目',
+            value: ui.entryQuery || '',
+        });
+        filter.addEventListener('input', event => {
+            ui.entryQuery = event.target.value;
+            ui.entryQueryFocus = true;
+            render();
+        });
+        children.push(muted('条目'), filter);
         const divide = btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
             ghost: true,
             disabled: !entry || legacy || Boolean(binding),
@@ -7066,6 +7256,11 @@ ${P} .dga-add-row-sub { display: flex; gap: 8px; align-items: center; flex-wrap:
 ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
+${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
+${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; }
+${P} .dga-panel-nav { display: flex; gap: 8px; overflow-x: auto; position: sticky; top: 0; z-index: 2; padding: 2px 0 6px; background: var(--dga-bg-0); }
+${P} .dga-panel-nav-item { flex: 0 0 auto; min-height: 32px; padding: 6px 12px; border: 1px solid var(--dga-border-2); border-radius: 999px; background: var(--dga-bg-1); color: var(--dga-text-2); font: inherit; font-size: 12px; cursor: pointer; }
+${P} .dga-panel-nav-item:hover { color: var(--dga-text-1); background: var(--dga-hover); }
 ${P} .dga-bind-item.is-new { border-color: var(--dga-accent); animation: dga-bind-in 1.4s ease-out; }
 @keyframes dga-bind-in { 0% { opacity: 0; transform: translateY(-6px); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dga-accent) 45%, transparent); } 60% { opacity: 1; transform: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--dga-accent) 30%, transparent); } 100% { opacity: 1; transform: none; box-shadow: none; } }
 ${P} .dga-bind-item-head { display: flex; align-items: center; gap: 8px; }
