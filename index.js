@@ -5485,27 +5485,14 @@
         return true;
     }
 
-    function judgeWaitText(context, config) {
+    function judgeWaitText(context) {
         if (!context || context.autoAdvance !== 'judge') return '';
-        const settings = config && config.settings ? config.settings : {};
-        const interval = bindingJudgeInterval(context.binding, settings);
-        const checked = context.state.lastJudgeCheckedId;
-        const now = currentMessageId();
-        let wait = '';
-        if (interval > 1) {
-            if (checked == null) wait = '还没检查过，下一条回复会查';
-            else if (now == null) wait = `每 ${interval} 层`;
-            else {
-                const since = Number(now) - Number(checked);
-                const left = since <= 0 ? interval : interval - since;
-                wait = left <= 0 ? '下一条回复会查' : `还差 ${left} 层`;
-            }
-        }
         const verdict = context.state.lastJudgeYes === true
             ? '上次 YES'
             : (context.state.lastJudgeYes === false ? '上次 NO' : '');
+        if (!verdict) return '';
         const basis = context.state.lastJudgeBasis ? `：${context.state.lastJudgeBasis}` : '';
-        return [verdict ? `${verdict}${basis}` : '', wait].filter(Boolean).join(' · ');
+        return `${verdict}${basis}`;
     }
 
     // 仪表盘「开关」卡（v2.24 起只放流式输出：判断模式三档挪到「动态指导」页的
@@ -5802,8 +5789,8 @@
                 'aria-label': '这条的判断设置',
                 onclick: () => { ui.paceKey = context.key; render(); },
             }, '设置 ›'),
-            judgeWaitText(context, ui.snapshot && ui.snapshot.config)
-                ? el('p', { class: 'dga-judge-status', text: judgeWaitText(context, ui.snapshot && ui.snapshot.config) })
+            judgeWaitText(context)
+                ? el('p', { class: 'dga-judge-status', text: judgeWaitText(context) })
                 : null,
         );
     }
@@ -5861,7 +5848,7 @@
                 if (Number.isFinite(n) && n >= 1) item.judgeInterval = n;
                 else delete item.judgeInterval;
             }), { success: '已记下这条的检查间隔' }))));
-            const wait = judgeWaitText(context, config);
+            const wait = judgeWaitText(context);
             if (wait) children.push(el('p', { class: 'dga-judge-status', text: wait }));
             if (context.stage && !context.stage.terminal) {
                 const extra = el('input', {
