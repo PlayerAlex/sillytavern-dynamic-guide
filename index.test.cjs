@@ -2006,6 +2006,36 @@ async function bootGuidePage() {
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
 
+test('动态指导自己的条目不出现在待选列表', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一', enabled: true });
+    state.entries.push(
+        { uid: 9, name: '大纲（动态指导）', content: '正文一', enabled: true },
+        { uid: 10, name: '大纲（动态指导·标记）', content: '标记说明', enabled: true },
+        { uid: 11, name: '（动态指导·配置）', content: '{}', enabled: false },
+        { uid: 12, name: '（动态指导·状态）', content: '{}', enabled: false },
+        { uid: 13, name: 'TavernDB-ACU-OutlineTable', content: '表格', enabled: true },
+        { uid: 14, name: 'ACU-[chat1]-TavernDB-ACU-MemoryStart', content: '隐藏数据', enabled: false },
+        { uid: 15, name: '总结条目', content: '总结', enabled: true },
+        { uid: 16, name: '小总结条目', content: '小总结', enabled: true },
+        { uid: 17, name: '重要人物条目', content: '人物', enabled: true },
+        { uid: 18, comment: '关系档案\n<!-- ACU_CUSTOM_TABLE_EXPORT_V1 {"version":1} -->', content: '导出', enabled: true },
+    );
+    helper.getWorldbookNames = () => ['测试世界书'];
+    helper.getCharWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const booted = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const select = findTag(panel().querySelector('.dga-add-row'), 'SELECT');
+    const labels = optionsOf(select).map(item => item.textContent).join('\n');
+    assert.match(labels, /大纲/);
+    assert.doesNotMatch(labels, /动态指导|TavernDB|总结条目|重要人物|关系档案/);
+    assert.deepEqual(booted.errors, []);
+});
+
 test('条目搜索只留下名字对得上的', async () => {
     const run = await bootGuidePage();
     const filter = run.panel().querySelector('.dga-entry-filter');

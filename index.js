@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.54
+     * 动态指导助手 v2.55
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.54';
+    const VERSION = '2.55';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2446,6 +2446,34 @@
         return String(entry && (entry.comment || entry.name || entry.title || `条目 ${entry.uid}`) || '未命名条目');
     }
 
+    // 插件自己写进世界书的条目：镜像、标记说明、配置、旧状态。不给用户拿来绑定。
+    function isAssistantEntry(entry) {
+        const name = entryName(entry);
+        return name === CONFIG_ENTRY_NAME
+            || name === STATE_ENTRY_NAME
+            || name.endsWith(MIRROR_SUFFIX)
+            || name.endsWith(CUE_SUFFIX);
+    }
+
+    // 数据库（AlbusKen/shujuku）写进世界书的条目：TavernDB-ACU-、总结/人物索引，
+    // 以及带 ACU_CUSTOM_TABLE_EXPORT 标记的导出。只从待选列表拿掉，不改这些条目。
+    function isDatabaseEntry(entry) {
+        const raw = entryName(entry);
+        if (raw.includes('ACU_CUSTOM_TABLE_EXPORT_V1')) return true;
+        const name = raw
+            .replace(/<!--\s*ACU_CUSTOM_TABLE_EXPORT_V1\s+\{[\s\S]*?\}\s*-->/g, '')
+            .replace(/^ACU-\[[^\]]+\]-/, '')
+            .trim();
+        return name.startsWith('TavernDB-ACU-')
+            || name.startsWith('重要人物条目')
+            || name.startsWith('总结条目')
+            || name.startsWith('小总结条目');
+    }
+
+    function isPickerExcludedEntry(entry) {
+        return isAssistantEntry(entry) || isDatabaseEntry(entry);
+    }
+
     function sameUid(left, right) {
         return left != null && right != null && String(left) === String(right);
     }
@@ -4506,7 +4534,7 @@
         ui.entryError = '';
         if (ui.selectedWorldbook) {
             try {
-                ui.entries = worldbookEntries(await getWorldbook(ui.selectedWorldbook));
+                ui.entries = worldbookEntries(await getWorldbook(ui.selectedWorldbook)).filter(entry => !isPickerExcludedEntry(entry));
             } catch (error) {
                 ui.entryError = `读取世界书失败：${error.message || String(error)}`;
             }
