@@ -42,7 +42,7 @@ test('v2 只发送当前阶段、范围内附加和常驻内容', () => {
     assert.deepEqual(plain(core.activeAddons(parsed, 0).map(item => item.name)), ['道具', '风格']);
     const injected = core.formatInjection(parsed.stages[0], core.activeAddons(parsed, 0));
     assert.match(injected, /当前正文/);
-    assert.match(injected, /DGA_COMPLETE:/);
+    assert.doesNotMatch(injected, /DGA_COMPLETE|完成判定|当前阶段：/);
     assert.doesNotMatch(injected, /未来正文|不应发送/);
     assert.doesNotMatch(injected, /动态指导助手：当前有效内容|以下是作者为当前进度/, '正文不能带插件头部');
     assert.equal(core.activeAddons(parsed, 2).length, 0);
@@ -1781,12 +1781,12 @@ test('常驻挪到所有阶段之前，注入里就排在当前阶段内容之�
     assert.equal(always.aboveStages, true, '常驻在所有阶段之前要标记为“在上面”');
     const injected = core.formatInjection(parsed.stages[0], core.activeAddons(parsed, 0));
     assert.ok(injected.indexOf('风格正文') < injected.indexOf('正文一'), '注入里常驻排在阶段内容之前');
-    assert.match(injected, /## 常驻提示[\s\S]*## 当前阶段/);
+    assert.doesNotMatch(injected, /## 常驻提示|## 当前阶段|完成判定/);
     // 写在后面的常驻保持在附加内容区
     const bottom = core.parseOutline(content);
     const injectedBottom = core.formatInjection(bottom.stages[0], core.activeAddons(bottom, 0));
     assert.ok(injectedBottom.indexOf('风格正文') > injectedBottom.indexOf('正文一'));
-    assert.match(injectedBottom, /## 同时有效的附加内容[\s\S]*风格正文/);
+    assert.doesNotMatch(injectedBottom, /同时有效的附加内容|完成判定/);
 });
 
 test('选区模式重建保留常驻的前后位置，开关可以切换', () => {
@@ -1860,6 +1860,37 @@ test('编辑原文里改过的字会保存，阶段区间跟着挪', async () =>
     assert.deepEqual(errors, []);
 });
 
+test('分段里保存完成条件不改原文，条件记在条目旁边', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const original = '## 第一幕\n暑假正文\n\n## 第二幕\n寒假正文';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const bar = panel().querySelector('.dga-segbar');
+    bar.listeners.click[0]();
+    const sheet = panel().querySelector('.dga-sheet');
+    const area = (function find(node) {
+        if (node.tagName === 'TEXTAREA' && String(node.getAttribute('placeholder') || '').includes('例：')) return node;
+        for (const child of node.children || []) {
+            const found = find(child);
+            if (found) return found;
+        }
+        return null;
+    })(sheet);
+    area.value = '正文已经写到寒假开始';
+    area.listeners.input[0]({ target: area });
+    findButton(sheet, '保存修改').listeners.click[0]();
+    await findButton(panel(), '保存').listeners.click[0]();
+    const saved = state.entries.find(item => item.uid === 1);
+    assert.equal(saved.content, original, '完成条件不能写进原文');
+    const stage = saved.extra.dynamicGuideAssistantLayout.stages.find(item => item.name === '第一幕');
+    assert.equal(stage.completion, '正文已经写到寒假开始');
+    assert.deepEqual(errors, []);
+});
+
 // ---------------------------------------------------------------
 // v2.6 自动推进三档
 // ---------------------------------------------------------------
@@ -1872,17 +1903,13 @@ test('“完成：自动”解析为 autoComplete，“自动门”这类文本�
     assert.equal(parsed.stages[1].completion, '自动门被推开');
 });
 
-test('formatInjection 只在 auto 档追加通用判断指令，有完成条件时不变成通用块', () => {
+test('镜像只复制原文切片，不附完成条件', () => {
     const parsed = core.parseOutline('## 第一幕\n正文一');
     const stage = parsed.stages[0];
-    assert.doesNotMatch(core.formatInjection(stage, []), /进入下一段的时机/);
-    const marker = core.formatInjection(stage, [], { auto: true });
-    assert.match(marker, /进入下一段的时机/);
-    assert.match(marker, new RegExp(`DGA_COMPLETE:${stage.id}`));
-    const withCondition = core.parseOutline('## 第一幕\n完成：交谈结束。\n正文一');
-    const conditional = core.formatInjection(withCondition.stages[0], [], { auto: true });
-    assert.match(conditional, /当前阶段的完成判定/);
-    assert.doesNotMatch(conditional, /进入下一段的时机/);
+    stage.completion = '正文已经写到寒假开始';
+    const injected = core.formatInjection(stage, [], { auto: true });
+    assert.equal(injected, '正文一');
+    assert.doesNotMatch(injected, /完成判定|DGA_COMPLETE|寒假开始|进入下一段的时机|当前阶段：/);
 });
 
 test('选区模式往返保留“完成：自动”', () => {
@@ -1894,9 +1921,8 @@ test('选区模式往返保留“完成：自动”', () => {
     assert.equal(again.stages[1].autoComplete, false);
 });
 
-test('标记判断档给没有完成条件的阶段镜像附通用判断指令', async () => {
+test('标记判断档的镜像仍是原文切片，不附完成条件', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
-    const stageId = core.parseOutline(content).stages[0].id;
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
@@ -1907,8 +1933,10 @@ test('标记判断档给没有完成条件的阶段镜像附通用判断指令',
     const run = load(helper);
     await new Promise(setImmediate);
     const mirror = state.books.书A.find(isMirror);
-    assert.match(mirror.content, /进入下一段的时机/);
-    assert.match(mirror.content, new RegExp(`DGA_COMPLETE:${stageId}`));
+    const source = state.books.书A.find(item => item.uid === 1);
+    assert.equal(source.content, content, '绑定的原文不能被改');
+    assert.match(mirror.content, /甲一正文/);
+    assert.doesNotMatch(mirror.content, /甲二正文|进入下一段的时机|DGA_COMPLETE|完成判定/);
     assert.deepEqual(run.errors, []);
 });
 

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.43
+     * 动态指导助手 v2.44
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.43';
+    const VERSION = '2.44';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -556,27 +556,21 @@
         return [];
     }
 
-    function formatInjection(stage, addons, options) {
+    function formatInjection(stage, addons) {
         if (!stage) return '';
-        const auto = Boolean(options && options.auto);
-        // 写在所有阶段之前的常驻排在最前面，其余附加/常驻按正文顺序放在阶段之后。
-        // 不要加任何插件头部或解释文字：这份内容会原样出现在镜像条目里，
-        // 用户在提示词查看器里看到的就是大纲正文本身。
-        const above = addons.filter(item => item.kind === 'always' && item.aboveStages);
-        const below = addons.filter(item => !above.includes(item));
-        const lines = [];
-        if (above.length > 0) {
-            lines.push('## 常驻提示');
-            above.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
-            lines.push('');
-        }
-        lines.push(`## 当前阶段：${stage.name}`, stage.prompt);
-        if (below.length > 0) {
-            lines.push('', '## 同时有效的附加内容');
-            below.forEach(item => lines.push('', `### ${item.name}`, item.prompt));
-        }
-        if (!stage.terminal) lines.push(...completionInstruction(stage, auto || stage.autoComplete));
-        return lines.join('\n');
+        // 镜像只拼原文切片。不加标题，不写完成条件，不写完成标记。
+        // 完成条件在条目的划分数据里，正文 AI 读不到，判断 AI 另读那一份。
+        const parts = [];
+        (addons || []).forEach(item => {
+            if (item && item.kind === 'always' && item.aboveStages && item.prompt) parts.push(item.prompt);
+        });
+        if (stage.prompt) parts.push(stage.prompt);
+        (addons || []).forEach(item => {
+            if (!item || !item.prompt) return;
+            if (item.kind === 'always' && item.aboveStages) return;
+            parts.push(item.prompt);
+        });
+        return parts.join('\n\n');
     }
 
     function reconcileState(rawState, parsed) {
@@ -2402,23 +2396,48 @@
         return parseOutline(entry && entry.content || '').stages.length;
     }
 
-    async function writeEntryContent(worldbookName, uid, name, content, layout) {
+    function applyEntryLayout(entry, layout) {
+        const extra = entry.extra && typeof entry.extra === 'object' ? { ...entry.extra } : {};
+        delete extra[LEGACY_META_KEY];
+        if (layout) extra[LAYOUT_EXTRA_KEY] = layout;
+        entry.extra = extra;
+    }
+
+    async function writeEntryFields(worldbookName, uid, name, mutate) {
         let found = false;
         await updateWorldbook(worldbookName, worldbook => {
             const entry = findEntry(worldbook, uid, name);
             if (!entry) return worldbook;
             found = true;
-            entry.content = content;
-            const extra = entry.extra && typeof entry.extra === 'object' ? { ...entry.extra } : {};
-            delete extra[LEGACY_META_KEY];
-            if (layout) extra[LAYOUT_EXTRA_KEY] = layout;
-            entry.extra = extra;
+            mutate(entry);
             return worldbook;
         });
         if (!found) throw new Error(`在世界书“${worldbookName}”里找不到要保存的条目`);
         const saved = findEntry(await getWorldbook(worldbookName), uid, name);
-        if (!saved || normalizeText(saved.content) !== normalizeText(content)) {
+        if (!saved) throw new Error('保存后读不到条目，请稍后重试。');
+        return saved;
+    }
+
+    async function writeEntryContent(worldbookName, uid, name, content, layout) {
+        const saved = await writeEntryFields(worldbookName, uid, name, entry => {
+            entry.content = content;
+            applyEntryLayout(entry, layout);
+        });
+        if (normalizeText(saved.content) !== normalizeText(content)) {
             throw new Error('保存后读回的正文和要保存的内容不一致，请稍后重试。');
+        }
+        return saved;
+    }
+
+    // 划分、完成条件、循环只写进条目旁的隐藏数据。不改绑定条目的正文。
+    async function writeEntryLayout(worldbookName, uid, name, layout) {
+        const before = findEntry(await getWorldbook(worldbookName), uid, name);
+        const original = before ? before.content : undefined;
+        const saved = await writeEntryFields(worldbookName, uid, name, entry => {
+            applyEntryLayout(entry, layout);
+        });
+        if (original != null && saved.content !== original) {
+            throw new Error('保存划分时原文被改动了，已中止。');
         }
         return saved;
     }
@@ -5766,7 +5785,7 @@
             changeOwnerKind(editor.pick, owner, sheet.kind);
         }
         editor.sheet = null;
-        // 名称、进入条件都会写进正文（## 名称 / 完成：条件），所以必须重建。
+        // 名称和完成条件只留在划分数据里，不写进原文。
         commitPick(editor);
     }
 
@@ -6198,10 +6217,15 @@
 
     async function saveEditor() {
         const editor = ui.editor;
-        if (editor.mode === 'raw' && editor.pick) rebasePickText(editor.pick, editor.lines.join('\n'));
-        const content = editor.pick ? String(editor.pick.text || '') : editor.lines.join('\n');
         const layout = editor.pick ? layoutFromPick(editor.pick) : null;
-        const saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content, layout);
+        let saved;
+        if (editor.mode === 'raw') {
+            if (editor.pick) rebasePickText(editor.pick, editor.lines.join('\n'));
+            const content = editor.pick ? String(editor.pick.text || '') : editor.lines.join('\n');
+            saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content, layout);
+        } else {
+            saved = await writeEntryLayout(editor.worldbookName, editor.entry.uid, entryName(editor.entry), layout);
+        }
         editor.entry = saved;
         editor.lines = normalizeText(saved.content).split('\n');
         editor.parsed = outlineFromEntry(saved);
@@ -6215,9 +6239,9 @@
             editor.pick.pendingRanges = [];
             pickAttach(editor);
         }
-        setMessage(editor.bound
-            ? '已保存，进度按阶段名自动对上。'
-            : '已保存。回「动态指导」页点「绑定」开始使用。', 'success');
+        setMessage(editor.mode === 'raw'
+            ? '已保存你改过的原文。'
+            : (editor.bound ? '已保存划分，原文没有改动。' : '已保存划分，原文没有改动。回「动态指导」页点「绑定」开始使用。'), 'success');
     }
 
     // ---------------------------------------------------------------
