@@ -25,6 +25,26 @@ const { core } = load();
 const plain = value => JSON.parse(JSON.stringify(value));
 const range = (text, quote) => ({ start: text.indexOf(quote), end: text.indexOf(quote) + quote.length, quote });
 
+function savedStages(content, stages) {
+    return {
+        version: 3,
+        loop: false,
+        stages: stages.map((stage, index) => {
+            const start = content.indexOf(stage.quote);
+            return {
+                id: `s${index + 1}`,
+                name: stage.name,
+                completion: stage.completion || '',
+                terminal: false,
+                ranges: [{ start, end: start + stage.quote.length }],
+            };
+        }),
+        addons: [],
+        always: { ranges: [] },
+        note: { ranges: [] },
+    };
+}
+
 function memoryStorage(initial) {
     const data = new Map(Object.entries(initial || {}));
     return {
@@ -1122,8 +1142,15 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
             this.isCollapsed = false;
         },
     };
-    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '前言介绍\n\n## 第一幕\n第一幕正文', enabled: false });
-    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const preface = '前言介绍\n\n## 第一幕\n第一幕正文';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: preface, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            layouts: { '测试世界书#大纲': savedStages(preface, [{ name: '第一幕', quote: '第一幕正文' }]) },
+        },
+    };
     const logs = [];
     const errors = [];
     const sandbox = {
@@ -1473,15 +1500,39 @@ test('隐藏字段被清掉后，状态条目里的划分和完成条件会写�
 });
 
 test('绑定用状态条目里的起始步，不写死第一段', async () => {
+    const source = '## 暑假\n暑假正文\n\n## 寒假\n寒假正文';
+    const span = quote => {
+        const start = source.indexOf(quote);
+        return { start, end: start + quote.length };
+    };
     const books = {
         书A: [
-            { uid: 1, name: '大纲', content: '## 暑假\n暑假正文\n\n## 寒假\n寒假正文', enabled: true },
+            { uid: 1, name: '大纲', content: source, enabled: true },
             {
                 uid: 8,
                 name: '（动态指导·状态）',
                 enabled: false,
                 disable: true,
-                content: JSON.stringify({ version: 1, entries: { 大纲: { loop: false, startIndex: 1 } } }),
+                content: JSON.stringify({
+                    version: 1,
+                    entries: {
+                        大纲: {
+                            loop: false,
+                            startIndex: 1,
+                            layout: {
+                                version: 3,
+                                loop: false,
+                                stages: [
+                                    { id: 's1', name: '暑假', completion: '', terminal: false, ranges: [span('暑假正文')] },
+                                    { id: 's2', name: '寒假', completion: '', terminal: false, ranges: [span('寒假正文')] },
+                                ],
+                                addons: [],
+                                always: { ranges: [] },
+                                note: { ranges: [] },
+                            },
+                        },
+                    },
+                }),
             },
         ],
     };
@@ -1632,8 +1683,20 @@ test('未分配的文字仍收在最前面当前言（夹在中间会被解析�
 
 test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写回草稿', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
-    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n他们在雨夜互相介绍。\n\n## 第二幕\n第二幕正文', enabled: false });
-    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const outline = '## 第一幕\n他们在雨夜互相介绍。\n\n## 第二幕\n第二幕正文';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: outline, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            layouts: {
+                '测试世界书#大纲': savedStages(outline, [
+                    { name: '第一幕', quote: '他们在雨夜互相介绍。' },
+                    { name: '第二幕', quote: '第二幕正文' },
+                ]),
+            },
+        },
+    };
     const calls = [];
     helper.generateRaw = async options => { calls.push(options); return '完成：两人完成第一次正式交谈。'; };
     const logs = [];
@@ -1686,8 +1749,16 @@ test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写�
 
 test('齿轮里可以改生成提示词，并单独选 API 预设', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
-    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n他们在雨夜互相介绍。', enabled: false });
-    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [], settings: {} } };
+    const gearOutline = '## 第一幕\n他们在雨夜互相介绍。';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: gearOutline, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            settings: {},
+            layouts: { '测试世界书#大纲': savedStages(gearOutline, [{ name: '第一幕', quote: '他们在雨夜互相介绍。' }]) },
+        },
+    };
     const storage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([
             { name: '生成专用', connection: 'main', maxTokens: 60000, temperature: 1 },
@@ -1955,6 +2026,10 @@ test('没有 ## 标题的条目也能绑定，划分不改原文', async () => {
     const panel = () => documentRef.getElementById(PANEL_ID);
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
+    const select = findTag(panel().querySelector('.dga-add-row'), 'SELECT');
+    const option = optionsOf(select).find(item => /大纲/.test(item.textContent));
+    select.value = optionValue(option);
+    select.listeners.change[0]({ target: select });
     const bind = findButton(panel().querySelector('.dga-add-row'), '绑定');
     assert.ok(bind, '选中没有 ## 标题的条目也要有绑定按钮');
     await bind.listeners.click[0]();
@@ -1977,12 +2052,14 @@ test('认领模型：绑定后待绑行当场让位，条目变成常驻小卡�
     const select = findTag(row, 'SELECT');
     const options = optionsOf(select);
     assert.equal(optionValue(options[0]), '', '待选行第一个选项是占位');
-    assert.match(options[1].textContent, /大纲/, '默认要自动挑一个可绑条目');
-    assert.equal(select.value, optionValue(options[1]), '进页面时待选行已经有默认选中项');
+    assert.match(options[1].textContent, /大纲/);
+    assert.equal(select.value, '', '进页面时不自动选中条目，要自己选');
+    select.value = optionValue(options[1]);
+    select.listeners.change[0]({ target: select });
 
-    const bind = findButton(row, '绑定');
+    const bind = findButton(run.panel().querySelector('.dga-add-row'), '绑定');
     assert.equal(bind.textContent, '绑定');
-    assert.ok(!Object.prototype.hasOwnProperty.call(bind.attributes, 'disabled'), '已分阶段的条目可以直接绑');
+    assert.ok(!Object.prototype.hasOwnProperty.call(bind.attributes, 'disabled'), '选中条目后就可以绑定，不必先按标题拆阶段');
     await bind.listeners.click[0]();
 
     const panel = run.panel();
@@ -2005,6 +2082,10 @@ test('认领模型：绑定后待绑行当场让位，条目变成常驻小卡�
 
 test('认领模型：连绑第二个条目，高亮跟着新小卡走', async () => {
     const run = await bootGuidePage();
+    const firstSelect = findTag(run.panel().querySelector('.dga-add-row'), 'SELECT');
+    const first = optionsOf(firstSelect).find(item => /大纲/.test(item.textContent));
+    firstSelect.value = optionValue(first);
+    firstSelect.listeners.change[0]({ target: firstSelect });
     await findButton(run.panel().querySelector('.dga-add-row'), '绑定').listeners.click[0]();
 
     const select = findTag(run.panel().querySelector('.dga-add-row'), 'SELECT');
@@ -2084,8 +2165,20 @@ test('选区模式重建保留常驻的前后位置，开关可以切换', () =>
 
 test('分段界面：标题条的下移按钮交换阶段顺序且不打开弹层', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
-    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
-    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const moveOutline = '## 第一幕\n正文一\n\n## 第二幕\n正文二';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: moveOutline, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            layouts: {
+                '测试世界书#大纲': savedStages(moveOutline, [
+                    { name: '第一幕', quote: '## 第一幕\n正文一' },
+                    { name: '第二幕', quote: '## 第二幕\n正文二' },
+                ]),
+            },
+        },
+    };
     const { errors, sandbox } = loadWithDocument(documentRef, helper);
     const uiCore = sandbox.DynamicGuideAssistantCore;
     await new Promise(setImmediate);
@@ -2118,7 +2211,18 @@ test('编辑原文里改过的字会保存，阶段区间跟着挪', async () =>
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const original = '## 第一幕\n暑假正文\n\n## 第二幕\n寒假正文';
     const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
-    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            layouts: {
+                '测试世界书#大纲': savedStages(original, [
+                    { name: '第一幕', quote: '暑假正文' },
+                    { name: '第二幕', quote: '寒假正文' },
+                ]),
+            },
+        },
+    };
     const { errors, sandbox } = loadWithDocument(documentRef, helper);
     await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await sandbox.DynamicGuideAssistantCore.refresh();
@@ -2143,7 +2247,18 @@ test('分段里保存完成条件不改原文，条件记在条目旁边', async
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const original = '## 第一幕\n暑假正文\n\n## 第二幕\n寒假正文';
     const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
-    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            layouts: {
+                '测试世界书#大纲': savedStages(original, [
+                    { name: '第一幕', quote: '暑假正文' },
+                    { name: '第二幕', quote: '寒假正文' },
+                ]),
+            },
+        },
+    };
     const { errors, sandbox } = loadWithDocument(documentRef, helper);
     await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await sandbox.DynamicGuideAssistantCore.refresh();

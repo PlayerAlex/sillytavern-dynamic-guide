@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.51
+     * 动态指导助手 v2.52
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.51';
+    const VERSION = '2.52';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2047,6 +2047,19 @@
         return raw;
     }
 
+    function blankLayout() {
+        return { version: 3, loop: false, stages: [], addons: [], always: { ranges: [] }, note: { ranges: [] } };
+    }
+
+    function configWithBindings(config, bindings) {
+        return {
+            version: 2,
+            bindings,
+            settings: (config && config.settings) || {},
+            layouts: (config && config.layouts) || {},
+        };
+    }
+
     function normalizeConfig(raw) {
         const empty = { version: 2, bindings: [], settings: {} };
         if (!raw || typeof raw !== 'object') return empty;
@@ -2685,7 +2698,7 @@
     function outlineFromEntry(entry, flag) {
         const content = String(entry && entry.content || '');
         const layout = layoutFor(entry, flag);
-        if (layout) return outlineFromLayout(content, layout);
+        if (layout && layout.stages) return outlineFromLayout(content, layout);
         const parsed = parseOutline(content);
         parsed.loop = Boolean(flag && flag.loop);
         if (Array.isArray(parsed.stages)) parsed.stages.forEach(stage => { stage.terminal = Boolean(stage.terminal); });
@@ -3295,7 +3308,8 @@
                 }
                 if (known.has(byUid) || known.has(byName)) continue;
                 if (hasLegacyLayout(source)) continue;
-                const parsed = outlineFromEntry(source);
+                let parsed = outlineFromEntry(source);
+                if (parsed.stages.length === 0) parsed = parseOutline(String(source.content || ''));
                 if (parsed.stages.length === 0) continue;
                 const candidate = {
                     worldbookName,
@@ -3309,7 +3323,7 @@
             }
         }
         if (recovered.length === 0 && uidMoves.length === 0) return 0;
-        await writeConfig({ version: 2, bindings: config.bindings, settings: config.settings || {} });
+        await writeConfig(configWithBindings(config, config.bindings));
         for (const move of uidMoves) {
             const nextKey = bindingKey(move.binding);
             if (move.oldKey !== nextKey) await renameStateKey(move.oldKey, nextKey);
@@ -3518,16 +3532,24 @@
         const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
         if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
         if (hasLegacyLayout(fresh)) throw new Error('这个条目还是旧版划分，请先点“转换成新版格式”。');
-        const parsed = outlineFromEntry(fresh);
         const config = await readConfig();
         const flags = await readFlagMap(worldbookName);
         const named = findBindingForEntry(config, worldbookName, fresh);
         const flag = flags[entryName(fresh)];
+        const saved = (named && cleanLayout(named.layout))
+            || cleanLayout((config.layouts || {})[layoutRecordKey(worldbookName, entryName(fresh))])
+            || savedLayoutFromFlag(flag)
+            || readLayout(fresh);
+        // 选中再绑定不会按 ## 标题拆阶段。没有已保存的划分就记一份空划分，
+        // 这样后面同步不会再把正文标题当成阶段。
+        const layout = saved || blankLayout();
+        const parsed = outlineFromEntry(fresh, { layout });
         const candidate = {
             worldbookName,
             entryUid: fresh.uid,
             entryName: entryName(fresh),
             boundAt: new Date().toISOString(),
+            layout,
         };
         if ((flag && flag.loop) || parsed.loop || (named && named.loop)) candidate.loop = true;
         const startRaw = named && named.startIndex > 0
@@ -3539,7 +3561,7 @@
         const bindings = named
             ? config.bindings.map(item => (item === named ? { ...item, ...candidate } : item))
             : [...config.bindings, candidate];
-        await writeConfig({ version: 2, bindings, settings: config.settings || {} });
+        await writeConfig(configWithBindings(config, bindings));
         const start = clampStart(startRaw, parsed.stages.length);
         await writeStateFor(key, {
             stageIndex: start,
@@ -3591,7 +3613,7 @@
         } else {
             await removeOrphanMirror(binding);
         }
-        await writeConfig({ version: 2, bindings: config.bindings.filter(item => bindingKey(item) !== key), settings: config.settings || {} });
+        await writeConfig(configWithBindings(config, config.bindings.filter(item => bindingKey(item) !== key)));
         await writeStateFor(key, null);
         LogModule.info('绑定', `已移出「${binding.entryName || '条目'}」，条目已重新打开`);
         notify(`已移出“${binding.entryName || '条目'}”，条目已重新打开。`, 'success');
@@ -4434,16 +4456,13 @@
         const rowKeys = ui.entries.map((entry, index) => entryKey(entry, index));
         const kept = ui.addEntryKey && rowKeys.includes(ui.addEntryKey) ? ui.addEntryKey : null;
         if (kept) ui.addEntryKey = kept;
-        else if (ui.addEntryKey == null) ui.addEntryKey = pickEntryKey(settings.entryKey || '');
-        else ui.addEntryKey = '';
+        else ui.addEntryKey = settings.entryKey && rowKeys.includes(settings.entryKey) ? settings.entryKey : '';
     }
 
     function pickEntryKey(requested) {
         const keys = ui.entries.map((entry, index) => entryKey(entry, index));
         if (requested && keys.includes(requested)) return requested;
-        const ready = ui.entries.findIndex(entry => hasLegacyLayout(entry) || entryStageCount(entry) > 0);
-        if (ready >= 0) return keys[ready];
-        return keys[0] || '';
+        return '';
     }
 
     // 认领（v2.27）：绑定成功后待绑行当场让位——清空选择、把刚绑的那条点亮一次。
@@ -4460,13 +4479,22 @@
             && (sameUid(item.entryUid, entry.uid) || item.entryName === name)) || null;
     }
 
+    function savedLayoutForUiEntry(entry) {
+        const name = entryName(entry);
+        const binding = bindingForEntry(ui.selectedWorldbook, entry);
+        const config = ui.snapshot && ui.snapshot.config;
+        return (binding && cleanLayout(binding.layout))
+            || cleanLayout((config && config.layouts || {})[layoutRecordKey(ui.selectedWorldbook, name)])
+            || readLayout(entry);
+    }
+
     function entryLabel(entry) {
         const name = entryName(entry);
         if (hasLegacyLayout(entry)) return `${name}（旧版划分，需转换）`;
-        const parsed = outlineFromEntry(entry);
+        const layout = savedLayoutForUiEntry(entry);
         const marks = [];
-        marks.push(parsed.stages.length > 0
-            ? `${parsed.stages.length} 段${parsed.addons.length ? `、${parsed.addons.length} 附加` : ''}`
+        marks.push(layout && layout.stages.length > 0
+            ? `${layout.stages.length} 段${(layout.addons || []).length ? `、${layout.addons.length} 附加` : ''}`
             : '未分阶段');
         if (bindingForEntry(ui.selectedWorldbook, entry)) marks.push('已绑定');
         else if (entryIsDisabled(entry)) marks.push('已关闭');
@@ -5657,7 +5685,10 @@
         const addKey = ui.addEntryKey || '';
         const entry = addKey ? entryAt(addKey) : null;
         const legacy = Boolean(entry && hasLegacyLayout(entry));
-        const parsed = entry && !legacy ? outlineFromEntry(entry) : null;
+        const savedLayout = entry && !legacy ? savedLayoutForUiEntry(entry) : null;
+        const parsed = entry && !legacy
+            ? outlineFromEntry(entry, { layout: savedLayout || { version: 3, stages: [] } })
+            : null;
         const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
         children.push(muted('条目'));
         const divide = btn('划分阶段', () => runAction('打开编辑器', () => openEditorAt(ui.selectedWorldbook, entry), { refresh: false }), {
@@ -5683,8 +5714,8 @@
             );
         } else if (binding) {
             children.push(muted('↳ 已绑定，就在上面的小卡里；解绑点 ×。'));
-        } else if (entry && parsed && parsed.stages.length === 0) {
-            children.push(muted('↳ 可以先绑定，再点小卡中间划分；原文不会被改写。'));
+        } else if (entry && (!parsed || parsed.stages.length === 0)) {
+            children.push(muted('↳ 选中后点「划分阶段」，自己拖选分配。正文里的标题不会自动拆成阶段。'));
         } else {
             children.push(muted('绑定后条目会被关闭，AI 只看到当前阶段；之后点小卡中间那块随时改划分。'));
         }
@@ -5763,7 +5794,7 @@
             worldbookName,
             entry: fresh,
             lines,
-            parsed: stored ? outlineFromLayout(source, stored) : parseOutline(source),
+            parsed: stored ? outlineFromLayout(source, stored) : emptyOutline(source),
             dirty: false,
             sheet: null,
             // 两档视图：'seg' 分段 / 'raw' 编辑原文
@@ -5971,8 +6002,8 @@
         const text = editor.lines.join('\n');
         const stored = editor.baseLayout || readLayout(editor.entry);
         const keptLoop = editor.pick ? Boolean(editor.pick.loop) : null;
-        editor.pick = stored ? pickFromLayout(text, stored) : pickFromSource(text);
-        editor.parsed = stored ? outlineFromLayout(text, stored) : parseOutline(text);
+        editor.pick = stored ? pickFromLayout(text, stored) : blankPick(text);
+        editor.parsed = stored ? outlineFromLayout(text, stored) : emptyOutline(text);
         if (keptLoop != null) editor.pick.loop = keptLoop;
         else if (editor.bindingLoop) editor.pick.loop = true;
         editor.parsed.loop = Boolean(editor.pick.loop);
