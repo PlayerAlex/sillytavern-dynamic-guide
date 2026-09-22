@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.41
+     * 动态指导助手 v2.42
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.41';
+    const VERSION = '2.42';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3809,12 +3809,11 @@
         if (ui.editor) ui.editor.focusStage = null;
         const focusTarget = pendingFocusScroll;
         pendingFocusScroll = null;
-        if (focusTarget && typeof focusTarget.scrollIntoView === 'function') {
-            try { focusTarget.scrollIntoView({ block: 'center' }); } catch (error) { /* 老环境不支持就算了 */ }
-        }
         shell.classList.toggle('dga-busy', ui.busy);
         const body = shell.querySelector('.dga-body');
         if (body) body.scrollTop = scrollTop;
+        // 只滚面板内部。用 scrollIntoView 会把酒馆页面一起卷走，顶栏会跑出屏幕。
+        if (focusTarget) scrollStageIntoView(body, focusTarget);
         ui.renderedView = ui.view;
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
     }
@@ -5170,8 +5169,17 @@
         render();
     }
 
-    // 从小卡点进来的那一段：渲染完把它的标题条滚进视野并高亮一次（v2.28）。
+    // 从小卡点进来的那一段：渲染完把它的标题条滚进面板正文并高亮一次（v2.28）。
     let pendingFocusScroll = null;
+
+    function scrollStageIntoView(container, target) {
+        if (!container || !target || typeof target.getBoundingClientRect !== 'function') return;
+        if (typeof container.getBoundingClientRect !== 'function') return;
+        const box = container.getBoundingClientRect();
+        const item = target.getBoundingClientRect();
+        const top = container.scrollTop + (item.top - box.top) - Math.max(0, (container.clientHeight - item.height) / 2);
+        container.scrollTop = Math.max(0, top);
+    }
 
     function renderEditor() {
         const editor = ui.editor;
@@ -6211,13 +6219,13 @@
 ${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(6, 8, 14, 0.62); backdrop-filter: blur(4px); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 15px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: var(--SmartThemeBlurTintColor, #0E1523); --dga-bg-1: var(--SmartThemeBlurTintColor, #141D2E); --dga-bg-2: color-mix(in srgb, var(--dga-bg-0) 82%, var(--dga-accent) 18%); --dga-text-1: var(--SmartThemeBodyColor, #E8EDF5); --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, transparent); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 58%, transparent); --dga-accent: var(--SmartThemeQuoteColor, #5C86DB); --dga-on-accent: #F2F6FF; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 26%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 12%, transparent); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 20%, transparent); --dga-hover: color-mix(in srgb, var(--dga-text-1) 8%, transparent); --dga-success: #67B08C; --dga-warning: #D9A75C; --dga-danger: #DB6E6E; --dga-radius-sm: 6px; --dga-radius-md: 6px; --dga-radius-lg: 6px; --dga-shadow: 0 18px 48px rgba(1, 4, 9, 0.36); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --dga-font-mono: Consolas, Menlo, Monaco, "Courier New", monospace; }
 ${P}[hidden] { display: none; }
 ${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
-${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: 720px; max-height: 100%; background: var(--dga-bg-0); border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); box-shadow: var(--dga-shadow); overflow: hidden; outline: none; }
-${P} .dga-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--dga-border); }
+${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: 720px; min-width: 0; min-height: 0; max-height: 100%; background: var(--dga-bg-0); border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); box-shadow: var(--dga-shadow); overflow: hidden; outline: none; }
+${P} .dga-head { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 12px 16px; border-bottom: 1px solid var(--dga-border); }
 ${P} .dga-head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-${P} .dga-head h2 { margin: 0; font-size: 15px; }
+${P} .dga-head h2 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
 ${P} .dga-head small { color: var(--dga-text-3); font-size: 13px; overflow-wrap: anywhere; }
 ${P} .dga-close { flex: 0 0 auto; min-width: 44px; padding: 8px 12px; }
-${P} .dga-body { flex: 1 1 auto; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; padding: 12px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+${P} .dga-body { flex: 1 1 auto; min-height: 0; min-width: 0; overflow: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; padding: 12px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-foot { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px solid var(--dga-border); background: var(--dga-bg-2); }
 ${P} .dga-foot .dga-btn { flex: 1 1 0; }
 ${P} .dga-card { display: flex; flex-direction: column; gap: 12px; padding: 16px; border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); border: 1px solid var(--dga-border); }
@@ -6295,7 +6303,8 @@ ${P} .dga-move:disabled { opacity: 0.25; cursor: default; }
 ${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 13px; color: var(--dga-text-3); }
 /* 标题条（v2.28）：内联在正文流里的分段头，user-select 关掉避免被选中，
    textOffsetTo 按 data-dga-skip 整块跳过它的文字，所以不会污染选区偏移。 */
-${P} .dga-segbar { display: flex; align-items: center; gap: 8px; margin: 6px 0; padding: 8px 12px; border-radius: var(--dga-radius-md); border-left: 5px solid var(--dga-c, #8b5cf6); background: color-mix(in srgb, var(--dga-c, #8b5cf6) 18%, transparent); cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-pick, ${P} .dga-pick-surface { min-width: 0; max-width: 100%; }
+${P} .dga-segbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: 100%; margin: 6px 0; padding: 8px 12px; border-radius: var(--dga-radius-md); border-left: 5px solid var(--dga-c, #8b5cf6); background: color-mix(in srgb, var(--dga-c, #8b5cf6) 18%, transparent); cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-segbar:hover, ${P} .dga-segbar:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-segbar-count { flex: 0 0 auto; color: var(--dga-text-3); font-size: 12px; }
 ${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
