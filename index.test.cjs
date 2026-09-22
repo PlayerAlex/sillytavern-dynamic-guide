@@ -1428,6 +1428,74 @@ test('条目 uid 变了也不另开一条没有循环的绑定', async () => {
     assert.deepEqual(run.errors, []);
 });
 
+test('隐藏字段被清掉后，状态条目里的划分和完成条件会写回去，原文不动', async () => {
+    const content = '暑假正文\n\n寒假正文';
+    const layout = {
+        version: 3,
+        loop: true,
+        stages: [
+            { id: 's1', name: '暑假', completion: '正文已经写到寒假开始', ranges: [{ start: 0, end: 4 }] },
+            { id: 's2', name: '寒假', completion: '', ranges: [{ start: 6, end: 10 }] },
+        ],
+        addons: [],
+        always: { ranges: [] },
+        note: { ranges: [] },
+    };
+    const books = {
+        书A: [
+            { uid: 1, name: '大纲', content, enabled: false },
+            {
+                uid: 8,
+                name: '（动态指导·状态）',
+                enabled: false,
+                disable: true,
+                content: JSON.stringify({ version: 1, entries: { 大纲: { loop: true, startIndex: 0, layout } } }),
+            },
+        ],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: { version: 2, bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲' }] },
+    });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const source = state.books.书A.find(item => item.uid === 1);
+    assert.equal(source.content, content, '恢复划分不能改原文');
+    const restored = source.extra.dynamicGuideAssistantLayout;
+    assert.equal(restored.stages[0].completion, '正文已经写到寒假开始');
+    assert.equal(restored.stages[0].name, '暑假');
+    const mirror = state.books.书A.find(isMirror);
+    assert.match(mirror.content, /暑假正文/);
+    assert.doesNotMatch(mirror.content, /寒假开始/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('绑定用状态条目里的起始步，不写死第一段', async () => {
+    const books = {
+        书A: [
+            { uid: 1, name: '大纲', content: '## 暑假\n暑假正文\n\n## 寒假\n寒假正文', enabled: true },
+            {
+                uid: 8,
+                name: '（动态指导·状态）',
+                enabled: false,
+                disable: true,
+                content: JSON.stringify({ version: 1, entries: { 大纲: { loop: false, startIndex: 1 } } }),
+            },
+        ],
+    };
+    const { state, helper } = multiWorld(books, { config: { version: 2, bindings: [] } });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await run.core.add('书A', state.books.书A[0]);
+    const chat = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+    assert.equal(chat.stageIndex, 1, '绑定后的当前聊天从第 2 步开始');
+    const mirror = state.books.书A.find(isMirror);
+    assert.match(mirror.content, /寒假正文/);
+    assert.doesNotMatch(mirror.content, /暑假正文/);
+    assert.deepEqual(run.errors, []);
+});
+
 test('浏览器里的跟卡走丢了，世界书里的配置条目还在就恢复', async () => {
     const books = {
         甲书: [

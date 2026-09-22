@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.49
+     * 动态指导助手 v2.50
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.49';
+    const VERSION = '2.50';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1763,6 +1763,13 @@
             return next;
         });
         await writeConfig(config);
+        const located = await locateEntry(binding).catch(() => null);
+        const layout = located && readLayout(located.entry);
+        await writeFlag(located ? located.worldbookName : binding.worldbookName, binding.entryName, {
+            loop: Boolean(binding.loop),
+            startIndex: index,
+            layout: layout || undefined,
+        });
     }
 
     // 开发者模式（v2.32）：本机偏好。打开后左侧导航会多出一页「开发者模式」，
@@ -1917,6 +1924,9 @@
         entry.key = [];
         entry.secondary_keys = [];
         entry.keysecondary = [];
+        if (entry.strategy && typeof entry.strategy === 'object') {
+            entry.strategy = { ...entry.strategy, type: 'selective', keys: [], keys_secondary: [] };
+        }
         return entry;
     }
 
@@ -2609,11 +2619,14 @@
             if (!data.entries || typeof data.entries !== 'object') data.entries = {};
             const prev = data.entries[name] && typeof data.entries[name] === 'object' ? data.entries[name] : {};
             const start = patch.startIndex != null ? Math.floor(Number(patch.startIndex)) : Math.floor(Number(prev.startIndex));
-            data.version = 1;
-            data.entries[name] = {
+            const next = {
                 loop: patch.loop === true,
                 startIndex: Number.isFinite(start) && start > 0 ? start : 0,
             };
+            if (patch.layout && patch.layout.version === 3 && Array.isArray(patch.layout.stages)) next.layout = patch.layout;
+            else if (prev.layout) next.layout = prev.layout;
+            data.version = 1;
+            data.entries[name] = next;
             const payload = JSON.stringify(data);
             if (entry) {
                 entry.content = payload;
@@ -2633,6 +2646,24 @@
             });
             addEntryToWorldbook(worldbook, created);
             return worldbook;
+        });
+    }
+
+    function savedLayoutFromFlag(flag) {
+        const layout = flag && flag.layout;
+        if (!layout || layout.version !== 3 || !Array.isArray(layout.stages)) return null;
+        return layout;
+    }
+
+    // 划分、完成条件和循环都写进关着的状态条目。条目隐藏字段被清掉后，从这里写回去。原文不动。
+    async function rememberEntryLayout(worldbookName, entry, layout) {
+        if (!worldbookName || !entry || !layout) return;
+        const config = await readConfig();
+        const binding = findBindingForEntry(config, worldbookName, entry);
+        await writeFlag(worldbookName, entryName(entry), {
+            loop: Boolean(layout.loop || (binding && binding.loop)),
+            startIndex: binding && binding.startIndex > 0 ? binding.startIndex : 0,
+            layout,
         });
     }
 
@@ -2675,7 +2706,16 @@
             const hasFlag = flag && typeof flag === 'object' && Object.prototype.hasOwnProperty.call(flag, 'loop');
             let located = null;
             try { located = await locateEntry(binding); } catch (error) { located = null; }
-            const layout = located && readLayout(located.entry);
+            let layout = located && readLayout(located.entry);
+            const savedLayout = savedLayoutFromFlag(flag);
+            if (!layout && savedLayout && located) {
+                try {
+                    await writeEntryLayout(located.worldbookName, located.entry.uid, entryName(located.entry), savedLayout);
+                    layout = savedLayout;
+                } catch (error) {
+                    console.warn(`[${SCRIPT_NAME}] 从状态条目恢复划分失败`, error);
+                }
+            }
             const effective = hasFlag ? flag.loop === true : Boolean(binding.loop || (layout && layout.loop));
             if (effective && binding.loop !== true) {
                 binding.loop = true;
@@ -2689,7 +2729,14 @@
                 binding.startIndex = start;
                 changed = true;
             }
-            if (!hasFlag && effective) {
+            if (layout && (!savedLayout || JSON.stringify(layout) !== JSON.stringify(savedLayout))) {
+                await writeFlag(book, binding.entryName, {
+                    loop: effective,
+                    startIndex: binding.startIndex || 0,
+                    layout,
+                });
+                maps.get(book)[binding.entryName] = { loop: effective, startIndex: binding.startIndex || 0, layout };
+            } else if (!hasFlag && effective) {
                 await writeFlag(book, binding.entryName, { loop: true, startIndex: binding.startIndex || 0 });
                 maps.get(book)[binding.entryName] = { loop: true, startIndex: binding.startIndex || 0 };
             }
@@ -3300,16 +3347,19 @@
                         continue;
                     }
                     const parsed = outlineFromEntry(located.entry);
+                    if (binding.loop) parsed.loop = true;
                     push(label, parsed.stages.length > 0,
                         `${parsed.stages.length} 个阶段；条目${entryIsDisabled(located.entry) ? '已关闭' : '现在是打开的（同步时会自动关闭）'}；位置：${positionText(located.entry.position)}`);
-                    // 镜像行：内容必须与当前进度应有的正文逐字一致
+                    // 镜像行：和真正发给 AI 的正文用同一条路径比较，带上循环和起始步。
                     const mirrorName = mirrorNameFor(entryName(located.entry));
-                    const state = reconcileState(stateMap[bindingKey(binding)] || null, parsed);
-                    const stage = parsed.stages[state.stageIndex] || null;
-                    const want = stage && !hasLegacyLayout(located.entry)
-                        ? formatInjection(stage, activeAddons(parsed, state.stageIndex),
-                            { auto: autoAdvanceMode(config) === 'marker' })
-                        : null;
+                    const state = reconcileState(stateMap[bindingKey(binding)] || null, parsed, binding.startIndex);
+                    const want = guideTextFor({
+                        configured: true,
+                        legacy: hasLegacyLayout(located.entry),
+                        parsed,
+                        state,
+                        entry: located.entry,
+                    }, 'normal');
                     const mirror = findMirrorEntries(await getWorldbook(located.worldbookName),
                         { binding, entry: located.entry }, mirrorName)[0] || null;
                     if (want == null) {
@@ -3384,16 +3434,20 @@
             boundAt: new Date().toISOString(),
         };
         if ((flag && flag.loop) || parsed.loop || (named && named.loop)) candidate.loop = true;
-        if (named && named.startIndex > 0) candidate.startIndex = named.startIndex;
+        const startRaw = named && named.startIndex > 0
+            ? named.startIndex
+            : (flag && Math.floor(Number(flag.startIndex)) > 0 ? Math.floor(Number(flag.startIndex)) : 0);
+        if (startRaw > 0) candidate.startIndex = startRaw;
         const key = bindingKey(candidate);
         await disableEntry(worldbookName, fresh.uid, entryName(fresh));
         const bindings = named
             ? config.bindings.map(item => (item === named ? { ...item, ...candidate } : item))
             : [...config.bindings, candidate];
         await writeConfig({ version: 2, bindings, settings: config.settings || {} });
+        const start = clampStart(startRaw, parsed.stages.length);
         await writeStateFor(key, {
-            stageIndex: 0,
-            stageName: parsed.stages[0] ? parsed.stages[0].name : '',
+            stageIndex: start,
+            stageName: parsed.stages[start] ? parsed.stages[start].name : '',
             lastCompletionMessageId: null,
             lastCompletionFingerprint: '',
             lastJudgeCheckedId: null,
@@ -3403,7 +3457,7 @@
         await syncMirrors('normal');
         LogModule.info('绑定', `已添加「${entryName(fresh)}」（${worldbookName}），共 ${parsed.stages.length} 个阶段`);
         notify(parsed.stages.length
-            ? `已添加“${entryName(fresh)}”，当前阶段：${parsed.stages[0].name}`
+            ? `已添加“${entryName(fresh)}”，当前阶段：${parsed.stages[start].name}`
             : `已添加“${entryName(fresh)}”。还没有阶段，点小卡中间「划分」即可。`, 'success');
         return true;
     }
@@ -6693,7 +6747,8 @@
         editor.lines = normalizeText(saved.content).split('\n');
         editor.parsed = outlineFromEntry(saved);
         editor.dirty = false;
-        // 循环记在绑定上。只写在世界书隐藏字段里的话，导出或酒馆重写条目后会丢。
+        // 划分和完成条件写进状态条目。隐藏字段被清掉后还能写回来。原文不动。
+        if (layout) await rememberEntryLayout(editor.worldbookName, editor.entry, layout);
         if (editor.bound) await persistBindingLoop(editor);
         if (editor.bound) await syncMirrors('normal');
         // 留在分段视图：按保存后的正文重新铺开，待分配的预览不保留。
