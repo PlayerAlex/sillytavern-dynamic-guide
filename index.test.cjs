@@ -2442,16 +2442,16 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
         ['system', 'user', 'assistant', 'user_input'], '默认四段：系统 / 规则 / 预确认 / 案例（案例即 user_input）');
-    assert.match(ordered[0].content, /<verdict>YES<\/verdict>/, '系统段要给出英文填表标签');
-    assert.match(ordered[0].content, /格式示例/, '系统段要带一条填好的格式示例');
+    assert.match(ordered[0].content, /一段时间或持续状态还在，就不是完成/, '系统段只交代判定口径');
+    assert.doesNotMatch(ordered[0].content, /格式示例|<basis>|<verdict>/, '系统段不解释标签');
     assert.match(ordered[1].content, /【判断规则】/, '第二段是判断规则（与案例数据分开）');
     assert.match(ordered[1].content, /判例对照/, '规则段要带一对正反判例');
     assert.match(ordered[2].content, /收到/, '第三段是 assistant 预确认（抄数据库 ACK 段）');
     assert.match(String(verdicts[0].user_input), /【当前阶段】\n甲一/, '案例段要带阶段名');
     assert.match(String(verdicts[0].user_input), /甲一正文/, '案例段要带阶段正文');
     assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案例段要带最近剧情');
-    assert.match(String(verdicts[0].user_input), /现在填表/, '案例段以「现在填表」收尾（无独立最终注入）');
-    assert.match(String(verdicts[0].user_input), /<basis>\n<\/basis>\n<verdict>\n<\/verdict>/, '案例段末尾是英文空表');
+    assert.match(String(verdicts[0].user_input), /<basis>\n<\/basis>\n<verdict>\n<\/verdict>/, '案例段以英文空表收尾');
+    assert.doesNotMatch(String(verdicts[0].user_input), /不要翻译|照抄下面/, '空表前不解释标签');
     assert.doesNotMatch(ordered[1].content, /\{\{/, '默认段里的占位符都要被替换');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
@@ -2541,7 +2541,7 @@ test('判断AI档：自定义提示词段按序组装并替换占位符', async 
     assert.deepEqual(run.errors, []);
 });
 
-test('默认判断提示词：还在暑假不能因为符合暑假就换成平时', async () => {
+test('默认判断提示词：还停在当前时段不能因为符合这段就进入下一段', async () => {
     const content = '## 暑假\n当前还在暑假期间，不需要上课\n\n## 平时\n正常学期，周一到周五要上课';
     const books = { 书A: [{ uid: 1, name: '大纲', content, enabled: false }] };
     const { state, helper } = multiWorld(books, {
@@ -2554,18 +2554,17 @@ test('默认判断提示词：还在暑假不能因为符合暑假就换成平�
         lastMessageId: 3,
     });
     const sent = [];
-    helper.generateRaw = async options => { sent.push(options); return '<依据>还在放假</依据>\n<结论>NO</结论>'; };
+    helper.generateRaw = async options => { sent.push(options); return '<basis>还在放假</basis>\n<verdict>NO</verdict>'; };
     const run = load(helper);
     await new Promise(setImmediate);
     await state.events.get('message_received')(3);
     const blob = JSON.stringify(sent[0]);
     assert.match(blob, /下一阶段/);
-    assert.match(blob, /平时/);
-    assert.match(blob, /符合暑假/);
-    assert.match(blob, /结论必须是 NO/);
-    assert.match(blob, /不能换成平时/);
-    assert.match(blob, /先定时间/);
-    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '还在暑假时不能推进');
+    assert.match(blob, /平时/, '下一段名字来自用户的阶段，不是写死在提示词里');
+    assert.match(blob, /正文还符合当前这段/);
+    assert.match(blob, /不能因为符合这段就写 YES/);
+    assert.doesNotMatch(blob, /符合暑假|不能换成平时|在家、做饭|不要翻译标签名/);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '还停在当前时段时不能推进');
     assert.deepEqual(run.errors, []);
 });
 
@@ -2827,7 +2826,7 @@ test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
     assert.equal(cmCalls[0].messages[2].role, 'assistant', '第三段是 assistant 预确认');
     assert.equal(cmCalls[0].messages[3].role, 'user');
     assert.match(cmCalls[0].messages[3].content, /这一轮的回复/);
-    assert.match(cmCalls[0].messages[3].content, /现在填表/, '案例段以「现在填表」收尾');
+    assert.match(cmCalls[0].messages[3].content, /<verdict>\n<\/verdict>/, '案例段以空表收尾');
     assert.equal(cmCalls[0].messages.length, 4, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
