@@ -111,6 +111,17 @@ test('循环时下一段回到第一段，没开循环时停在全部完成', ()
     assert.equal(core.stepTarget(0, -1, 3, false), 0);
 });
 
+test('循环开着且进度停在全部完成时，拉回第一段继续发送', () => {
+    const parsed = core.parseOutline('## 暑假\n暑假正文\n\n## 寒假\n寒假正文');
+    parsed.loop = true;
+    const looped = core.reconcileState({ stageIndex: 2, stageName: '' }, parsed);
+    assert.equal(looped.stageIndex, 0);
+    assert.equal(looped.stageName, '暑假');
+    const stopped = core.reconcileState({ stageIndex: 2, stageName: '' }, core.parseOutline('## 暑假\n暑假正文\n\n## 寒假\n寒假正文'));
+    assert.equal(stopped.stageIndex, 2);
+    assert.equal(stopped.stageName, '');
+});
+
 test('同名阶段停在当前下标，不跳回第一个', () => {
     const parsed = core.parseOutline('## 暑假\nA\n\n## 寒假\nB\n\n## 暑假\nC');
     const state = core.reconcileState({ stageIndex: 2, stageName: '暑假' }, parsed);
@@ -307,6 +318,35 @@ test('循环回到第一段后，重新生成仍显示刚完成的最后一段',
     const mirror = state.entries.find(isMirror);
     assert.match(mirror.content, /平时正文/, '循环绕回第一段时，重新生成要回到推进前的最后一段');
     assert.doesNotMatch(mirror.content, /暑假正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('循环开着且进度停在全部完成时，镜像回到第一段', async () => {
+    const text = '暑假正文\n寒假正文';
+    const span = quote => ({ start: text.indexOf(quote), end: text.indexOf(quote) + quote.length });
+    const entry = {
+        uid: 1, name: '大纲', content: text, enabled: false,
+        extra: {
+            dynamicGuideAssistantLayout: {
+                version: 3,
+                loop: true,
+                stages: [
+                    { id: 's', name: '暑假', ranges: [span('暑假正文')] },
+                    { id: 'w', name: '寒假', ranges: [span('寒假正文')] },
+                ],
+            },
+        },
+    };
+    const { state, helper } = helperFor(entry);
+    state.variables.chat.$dynamicGuideAssistant = {
+        state: { stageIndex: 2, stageName: '', lastCompletionMessageId: null, lastCompletionFingerprint: '' },
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const mirror = state.entries.find(isMirror);
+    assert.ok(mirror, '循环开着就不能因为停在全部完成而拆掉镜像');
+    assert.match(mirror.content, /暑假正文/);
+    assert.doesNotMatch(mirror.content, /寒假正文/);
     assert.deepEqual(run.errors, []);
 });
 

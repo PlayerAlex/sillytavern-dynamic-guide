@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.42
+     * 动态指导助手 v2.43
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.42';
+    const VERSION = '2.43';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -593,6 +593,9 @@
             if (byName >= 0) index = byName;
         }
         index = Math.max(0, Math.min(index, parsed.stages.length));
+        // 开了循环却停在「全部完成」时，进度还记在段数之外，小卡会写成不再发送。
+        // 拉回第一段，镜像才能继续发。
+        if (parsed.loop && parsed.stages.length > 0 && index >= parsed.stages.length) index = 0;
         return {
             stageIndex: index,
             stageName: parsed.stages[index] ? parsed.stages[index].name : '',
@@ -2680,6 +2683,7 @@
         if (!context || !context.configured) return null;
         if (context.legacy || context.parsed.stages.length === 0) return null;
         let index = context.state.stageIndex;
+        if (context.parsed.loop && context.parsed.stages.length > 0 && index >= context.parsed.stages.length) index = 0;
         // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段显示。
         // 循环从最后一段回到第一段时，进度号是 0，要靠记下的推进前下标退回去。
         if ((generationType === 'swipe' || generationType === 'regenerate')
@@ -2963,7 +2967,9 @@
             const label = entryName(context.entry);
             notify(next.stageName
                 ? `「${label}」当前阶段：${next.stageName}`
-                : `「${label}」全部阶段已完成，之后不再显示指导。`, 'success');
+                : (loop
+                    ? `「${label}」循环已回到第一段。`
+                    : `「${label}」全部阶段已完成，之后不再显示指导。`), 'success');
         }
         return next;
     }
@@ -5161,11 +5167,16 @@
         ui.editor = null;
     }
 
-    function closeEditor(force) {
+    async function closeEditor(force) {
         if (!force && editorUnsaved(ui.editor) && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
         discardEditor();
         ui.view = 'guide';
         enterGuidePage();
+        try {
+            await refresh();
+        } catch (error) {
+            ui.contextError = error.message || String(error);
+        }
         render();
     }
 
@@ -6251,11 +6262,13 @@ ${P} .dga-toggle-row { display: flex; flex-direction: column; gap: 4px; }
 ${P} .dga-toggle-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 ${P} .dga-toggle-label { font-size: 13px; font-weight: 500; }
 ${P} .dga-toggle-desc { margin: 0; font-size: 12px; line-height: 1.5; color: var(--dga-text-3); }
-${P} .dga-switch { appearance: none; -webkit-appearance: none; width: 38px; height: 22px; border-radius: 999px; background: var(--dga-border-2); position: relative; cursor: pointer; flex: 0 0 auto; transition: background 0.15s ease; margin: 0; }
-${P} .dga-switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--dga-text-1); transition: left 0.15s ease; }
-${P} .dga-switch:checked { background: var(--dga-accent); }
-${P} .dga-switch:checked::after { left: 19px; }
-${P} .dga-switch:disabled { opacity: 0.5; cursor: not-allowed; }
+${P} input.dga-switch { appearance: none !important; -webkit-appearance: none !important; -moz-appearance: none !important; width: 38px; height: 22px; border-radius: 999px; background-color: var(--dga-border-2); background-image: none !important; position: relative; cursor: pointer; flex: 0 0 auto; transition: background-color 0.15s ease; margin: 0; color: transparent; }
+${P} input.dga-switch::before { content: none !important; display: none !important; }
+${P} input.dga-switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--dga-text-1); transition: left 0.15s ease; }
+${P} input.dga-switch:checked,
+${P} input.dga-switch:checked:hover { background-color: var(--dga-accent); background-image: none !important; }
+${P} input.dga-switch:checked::after { left: 19px; }
+${P} input.dga-switch:disabled { opacity: 0.5; cursor: not-allowed; }
 ${P} .dga-tab-bar { display: flex; border: 1px solid var(--dga-border-2); border-radius: 4px; overflow: hidden; }
 ${P} .dga-tab { flex: 1; padding: 8px 0; background: transparent; border: none; color: var(--dga-text-3); font: inherit; font-size: 13px; cursor: pointer; min-height: 36px; }
 ${P} .dga-tab.is-on { background: var(--dga-hover); color: var(--dga-text-1); font-weight: 600; }
