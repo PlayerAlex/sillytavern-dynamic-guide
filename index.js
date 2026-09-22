@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.56
+     * 动态指导助手 v2.57
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.56';
+    const VERSION = '2.57';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -5776,19 +5776,29 @@
                 }), { refresh: false })),
                     el('span', { class: 'dga-stepper-stage', text: stageText }),
                     nameText ? el('span', { class: 'dga-stepper-name', text: nameText }) : null,
-                    el('div', { class: 'dga-stepper-bar' }, el('i', { style: { width: `${percent}%` } })),
-                    el('span', { class: 'dga-stepper-edit', text: '划分 ›' })),
+                    el('div', { class: 'dga-stepper-bar' }, el('i', { style: { width: `${percent}%` } }))),
                 btn('下一段 ›', () => move('切换到下一段', stepTarget(stageIndex, 1, total, context.parsed.loop)), {
                     ghost: !usable || (finished && !context.parsed.loop),
                     primary: usable && !(finished && !context.parsed.loop),
                     disabled: !usable || (!context.parsed.loop && (finished || stageIndex >= total - 1)),
                 })),
-            el('button', {
-                type: 'button',
-                class: 'dga-pace-open',
-                'aria-label': '这条的判断设置',
-                onclick: () => { ui.paceKey = context.key; render(); },
-            }, '设置 ›'),
+            el('div', { class: 'dga-bind-actions' },
+                el('button', {
+                    type: 'button',
+                    class: 'dga-pace-open',
+                    'aria-label': '划分阶段',
+                    text: '划分 ›',
+                    onclick: () => runAction('打开编辑器', () => openEditorAt(context.worldbookName, context.entry, {
+                        focusStageIndex: total > 0 ? Math.min(stageIndex, total - 1) : null,
+                    }), { refresh: false }),
+                }),
+                el('button', {
+                    type: 'button',
+                    class: 'dga-pace-open dga-set-open',
+                    'aria-label': '这条的判断设置',
+                    text: '设置 ›',
+                    onclick: () => { ui.paceKey = context.key; render(); },
+                })),
             judgeWaitText(context)
                 ? el('p', { class: 'dga-judge-status', text: judgeWaitText(context) })
                 : null,
@@ -7320,7 +7330,9 @@ ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-pace-open { align-self: center; margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
+${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; gap: 4px; }
+${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
+${P} .dga-set-open { margin-left: 14px; }
 ${P} .dga-pace-open:hover, ${P} .dga-pace-open:focus-visible { color: var(--dga-accent); outline: none; }
 ${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; text-align: center; }
 ${P} .dga-panel-nav { flex: 0 0 auto; display: flex; gap: 0; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid var(--dga-border); background: var(--dga-bg-0); padding: 0 8px; }

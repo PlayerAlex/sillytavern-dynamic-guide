@@ -1941,7 +1941,10 @@ test('小卡步进器中间那块是划分阶段的入口，点进去落在当�
     const mid = panel().querySelector('.dga-stepper-mid');
     assert.ok(mid, '小卡步进器中间那块就是划分阶段的入口');
     assert.match(mid.textContent, /第 2 \/ 3 段/);
-    assert.match(mid.textContent, /划分 ›/, '要有「划分」的可见提示');
+    const actions = panel().querySelector('.dga-bind-actions');
+    assert.ok(actions, '划分和设置排在上一段、下一段下面');
+    assert.equal(actions.children[0].textContent, '划分 ›');
+    assert.equal(actions.children[1].textContent, '设置 ›');
     await mid.listeners.click[0]();
 
     const focused = collectByClass(panel(), 'is-focus', []);
