@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.45
+     * 动态指导助手 v2.46
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.45';
+    const VERSION = '2.46';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6305,10 +6305,10 @@
     function styles() {
         const P = `#${PANEL_ID}`;
         return `
-${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(6, 8, 14, 0.62); backdrop-filter: blur(4px); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 15px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: var(--SmartThemeBlurTintColor, #0E1523); --dga-bg-1: var(--SmartThemeBlurTintColor, #141D2E); --dga-bg-2: color-mix(in srgb, var(--dga-bg-0) 82%, var(--dga-accent) 18%); --dga-text-1: var(--SmartThemeBodyColor, #E8EDF5); --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, transparent); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 58%, transparent); --dga-accent: var(--SmartThemeQuoteColor, #5C86DB); --dga-on-accent: #F2F6FF; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 26%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 12%, transparent); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 20%, transparent); --dga-hover: color-mix(in srgb, var(--dga-text-1) 8%, transparent); --dga-success: #67B08C; --dga-warning: #D9A75C; --dga-danger: #DB6E6E; --dga-radius-sm: 6px; --dga-radius-md: 6px; --dga-radius-lg: 6px; --dga-shadow: 0 18px 48px rgba(1, 4, 9, 0.36); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --dga-font-mono: Consolas, Menlo, Monaco, "Courier New", monospace; }
+${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: stretch; justify-content: stretch; padding: 0; background: var(--dga-bg-0); backdrop-filter: blur(4px); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 15px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: var(--SmartThemeBlurTintColor, #0E1523); --dga-bg-1: var(--SmartThemeBlurTintColor, #141D2E); --dga-bg-2: color-mix(in srgb, var(--dga-bg-0) 82%, var(--dga-accent) 18%); --dga-text-1: var(--SmartThemeBodyColor, #E8EDF5); --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, transparent); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 58%, transparent); --dga-accent: var(--SmartThemeQuoteColor, #5C86DB); --dga-on-accent: #F2F6FF; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 26%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 12%, transparent); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 20%, transparent); --dga-hover: color-mix(in srgb, var(--dga-text-1) 8%, transparent); --dga-success: #67B08C; --dga-warning: #D9A75C; --dga-danger: #DB6E6E; --dga-radius-sm: 6px; --dga-radius-md: 6px; --dga-radius-lg: 6px; --dga-shadow: 0 18px 48px rgba(1, 4, 9, 0.36); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --dga-font-mono: Consolas, Menlo, Monaco, "Courier New", monospace; }
 ${P}[hidden] { display: none; }
 ${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
-${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: 720px; min-width: 0; min-height: 0; max-height: 100%; background: var(--dga-bg-0); border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); box-shadow: var(--dga-shadow); overflow: hidden; outline: none; }
+${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: none; min-width: 0; height: 100%; min-height: 0; max-height: none; background: var(--dga-bg-0); border: 0; border-radius: 0; box-shadow: none; overflow: hidden; outline: none; }
 ${P} .dga-head { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 12px 16px; border-bottom: 1px solid var(--dga-border); }
 ${P} .dga-head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 ${P} .dga-head h2 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
@@ -6540,8 +6540,6 @@ ${P} .dga-log-text { overflow-wrap: anywhere; white-space: pre-wrap; }
 ${P} .dga-danger-text { color: var(--dga-danger); font-size: 13px; overflow-wrap: anywhere; }
 ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 4px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
 @media (max-width: 680px) {
-    ${P} { padding: 0; }
-    ${P} .dga-shell { max-width: none; height: 100%; max-height: none; border-radius: 0; border: 0; }
     /* 窄屏：步进器换行——段数/阶段名/进度条占满一整行，上一段与下一段并排在下面。
        否则中间那块被两个按钮挤到只剩一百多像素，阶段名会折成好几行不好读。 */
     ${P} .dga-stepper { flex-wrap: wrap; }
