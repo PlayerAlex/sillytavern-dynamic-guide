@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.44
+     * 动态指导助手 v2.45
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.44';
+    const VERSION = '2.45';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -530,8 +530,8 @@
         return parsed.addons.filter(item => stageIndex >= item.fromIndex && stageIndex <= item.toIndex && item.prompt);
     }
 
-    // 完成判定块：有 completion 就用用户写的条件；否则 auto 档给一段通用判断指令。
-    // 两种都在回复末尾要同一行隐藏标记，handleMessageReceived 识别后推进。
+    // 只在「随正文 AI 判断」时，单独写进「（动态指导·标记）」条目。
+    // 不放进原文，也不放进镜像。正文 AI 和这条说明一起看到，完成了就在回复末尾带标记。
     function completionInstruction(stage, auto) {
         if (!stage) return [];
         const marker = `<!-- DGA_COMPLETE:${stage.id} -->`;
@@ -1913,7 +1913,8 @@
         });
         // settings 原样保留，逐个字段校验（目前只有 autoAdvance 三档）。
         const settings = raw.settings && typeof raw.settings === 'object' ? { ...raw.settings } : {};
-        if (!['off', 'marker', 'judge'].includes(settings.autoAdvance)) settings.autoAdvance = 'off';
+        if (settings.autoAdvance === 'marker') settings.autoAdvance = 'story';
+        if (!['off', 'story', 'judge'].includes(settings.autoAdvance)) settings.autoAdvance = 'off';
         // 判断AI的提问模板：空值回落到默认文案；引擎非法值归 auto。
         if (settings.judgePrompt != null && typeof settings.judgePrompt !== 'string') {
             settings.judgePrompt = String(settings.judgePrompt);
@@ -1971,14 +1972,15 @@
     }
 
     function autoAdvanceMode(config) {
-        const mode = config && config.settings ? config.settings.autoAdvance : 'off';
-        return ['off', 'marker', 'judge'].includes(mode) ? mode : 'off';
+        let mode = config && config.settings ? config.settings.autoAdvance : 'off';
+        if (mode === 'marker') mode = 'story';
+        return ['off', 'story', 'judge'].includes(mode) ? mode : 'off';
     }
 
     const AUTO_ADVANCE_LABELS = {
-        off: '手动推进（只有写了完成条件的阶段会自动进入下一段）',
-        marker: '标记判断（AI 自己判断时机，不额外花请求）',
-        judge: '判断AI（每条回复多花一次小请求，判断更准确）',
+        off: '手动推进（不调用 AI）',
+        story: '随正文 AI 判断',
+        judge: '判断 AI（单独再问一次）',
     };
 
     async function readConfig() {
@@ -2698,13 +2700,11 @@
     }
 
     // 当前进度应该显示给 AI 的正文；没有可显示的内容（旧布局、没阶段）时返回 null。
-    function guideTextFor(context, generationType) {
+    function stageForGuide(context, generationType) {
         if (!context || !context.configured) return null;
-        if (context.legacy || context.parsed.stages.length === 0) return null;
+        if (context.legacy || !context.parsed || context.parsed.stages.length === 0) return null;
         let index = context.state.stageIndex;
-        if (context.parsed.loop && context.parsed.stages.length > 0 && index >= context.parsed.stages.length) index = 0;
-        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段显示。
-        // 循环从最后一段回到第一段时，进度号是 0，要靠记下的推进前下标退回去。
+        if (context.parsed.loop && index >= context.parsed.stages.length) index = 0;
         if ((generationType === 'swipe' || generationType === 'regenerate')
             && context.state.lastCompletionMessageId != null) {
             const lastId = currentMessageId();
@@ -2715,21 +2715,70 @@
                 else if (index > 0) index -= 1;
             }
         }
-        const stage = context.parsed.stages[index];
+        return context.parsed.stages[index] || null;
+    }
+
+    function guideTextFor(context, generationType) {
+        const stage = stageForGuide(context, generationType);
         if (!stage) return null;
-        return formatInjection(stage, activeAddons(context.parsed, index),
-            { auto: context.autoAdvance === 'marker' });
+        return formatInjection(stage, activeAddons(context.parsed, context.parsed.stages.indexOf(stage)));
+    }
+
+    const CUE_SUFFIX = '（动态指导·标记）';
+
+    function cueNameFor(name) {
+        return `${name}${CUE_SUFFIX}`;
+    }
+
+    // 随正文 AI 判断：标记说明单独一条，镜像仍然只是原文切片。
+    function storyCueText(context, generationType) {
+        if (!context || context.autoAdvance !== 'story') return null;
+        const stage = stageForGuide(context, generationType);
+        if (!stage || stage.terminal) return null;
+        return completionInstruction(stage, true).join('\n').trim();
     }
 
     // 同步一条绑定的镜像。先在读到的副本上试跑，没变化就不写世界书；
     // 有变化才写，写后读回验证内容，防止世界书接口把字段吞掉。
+    function syncCueInPlace(worldbook, context, text) {
+        const cueName = cueNameFor(entryName(context.entry));
+        const original = findEntry(worldbook, context.entry.uid, entryName(context.entry));
+        const cues = worldbookEntries(worldbook).filter(item => entryName(item) === cueName && !sameUid(item.uid, context.entry.uid));
+        let changed = false;
+        const cue = cues[0] || null;
+        cues.slice(1).forEach(extra => {
+            removeEntryFromWorldbook(worldbook, extra);
+            changed = true;
+        });
+        if (text == null) {
+            if (cue) {
+                removeEntryFromWorldbook(worldbook, cue);
+                changed = true;
+            }
+            return changed;
+        }
+        if (!cue) {
+            addEntryToWorldbook(worldbook, buildMirrorEntry(original || context.entry, freshUid(worldbook), cueName, text));
+            return true;
+        }
+        const want = buildMirrorEntry(original || context.entry, cue.uid, cueName, text);
+        if (mirrorDiffers(cue, want)) {
+            Object.assign(cue, want);
+            changed = true;
+        }
+        return changed;
+    }
+
     async function syncMirrorFor(context, generationType) {
         const text = guideTextFor(context, generationType);
+        const cue = storyCueText(context, generationType);
         const preview = await getWorldbook(context.worldbookName);
         const plan = syncMirrorInPlace(preview, context, text);
-        if (!plan.changed) return plan;
+        const cueChanged = syncCueInPlace(preview, context, cue);
+        if (!plan.changed && !cueChanged) return plan;
         await updateWorldbook(context.worldbookName, worldbook => {
             syncMirrorInPlace(worldbook, context, text);
+            syncCueInPlace(worldbook, context, cue);
             return worldbook;
         });
         const saved = findMirrorEntries(await getWorldbook(context.worldbookName), context, plan.mirrorName)[0] || null;
@@ -2913,7 +2962,7 @@
             push('自动推进', true, AUTO_ADVANCE_LABELS[mode]);
             if (mode === 'judge') {
                 push('接口 generateRaw', Boolean(api('generateRaw', false)),
-                    api('generateRaw', false) ? '可用' : '缺失——判断AI用不了，请改用「标记判断」或升级酒馆助手');
+                    api('generateRaw', false) ? '可用' : '缺失——判断AI用不了，请改用「随正文 AI 判断」或升级酒馆助手');
                 const localPresets = readJudgeApiPresets();
                 const selectedPreset = config.settings && config.settings.judgePreset || '';
                 push('本机API 预设', !selectedPreset || localPresets.some(item => item.name === selectedPreset),
@@ -3057,7 +3106,7 @@
                 }
                 worldbookEntries(worldbook).slice().forEach(item => {
                     if (sameUid(item.uid, located.entry.uid)) return;
-                    if (sameUid(item.uid, binding.mirrorUid) || entryName(item) === mirrorName) {
+                    if (sameUid(item.uid, binding.mirrorUid) || entryName(item) === mirrorName || entryName(item) === cueNameFor(entryName(located.entry))) {
                         removeEntryFromWorldbook(worldbook, item);
                     }
                 });
@@ -3504,7 +3553,7 @@
             }
         } else if ((!preset || preset.connection === 'main') && !api('generateRaw', false)) {
             // 自定义连接直连酒馆后端，不需要 generateRaw。
-            reportOnce('judge-no-engine', '「判断AI」需要酒馆助手的 generateRaw 接口，当前不可用；请改用「标记判断」档或升级酒馆助手。');
+            reportOnce('judge-no-engine', '「判断AI」需要酒馆助手的 generateRaw 接口，当前不可用；请改用「随正文 AI 判断」或升级酒馆助手。');
             return;
         }
         judgeState.running.add(context.key);
@@ -3556,7 +3605,7 @@
         } catch (error) {
             const reason = error && error.message ? error.message : String(error);
             LogModule.error('判断AI', `「${bindingLabel}」调用失败：${reason}`);
-            reportOnce('judge-failed', `判断AI调用失败：${reason}。请检查当前 API 连接，或把「自动推进」改用「标记判断」档。`);
+            reportOnce('judge-failed', `判断AI调用失败：${reason}。请检查当前 API 连接，或改成「手动推进」。`);
         } finally {
             judgeState.running.delete(context.key);
             const queued = judgeState.pending.get(context.key);
@@ -3582,8 +3631,9 @@
         LogModule.debug('事件', `收到正文（第 ${messageId} 层）`);
 
         const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
-        // judge 档即使没有完成标记也要走判断AI，所以不能在这里提前 return。
-        if (markers.length === 0 && autoAdvanceMode(await readConfig()) !== 'judge') return;
+        const mode = autoAdvanceMode(await readConfig());
+        // 手动推进、随正文 AI 都不另开请求。随正文 AI 的标记写在回复里，这里检测到再推进。
+        if (markers.length === 0 && mode !== 'judge') return;
         const all = await loadContexts();
         if (!all.configured) return;
 
@@ -3603,7 +3653,7 @@
             }
         }
 
-        // 判断AI档：标记流程之后按最新进度逐条绑定问判断AI（标记已推进的会被守卫跳过）。
+        // 判断 AI 才另开一次请求。随正文 AI 只看回复里的标记。
         if (all.configured && autoAdvanceMode(all.config) === 'judge') {
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
@@ -4769,14 +4819,18 @@
         const mode = autoAdvanceMode(config);
         const settings = config && config.settings ? config.settings : {};
         const presetList = readJudgeApiPresets();
-        const modeOptions = ['off', 'marker', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
+        const modeOptions = ['off', 'story', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const children = [
             field('判断模式', selectControl(modeOptions, mode, value => {
                 saveGuideSettings({ autoAdvance: value }, `判断模式已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
             })),
         ];
-        if (mode !== 'judge') {
-            children.push(muted('切成「判断AI」后，这里会出现 API 预设与检查频率。'));
+        if (mode === 'off') {
+            children.push(muted('不调用 AI。要进入下一段，自己点小卡上的「下一段」。'));
+            return card('如何判断？', ...children);
+        }
+        if (mode === 'story') {
+            children.push(muted('写正文的 AI 如果已经完成这一段，会在同一条回复末尾带一个标记。脚本看到标记就进入下一段。标记说明单独放着，不改原文，镜像仍是原文切片。'));
             return card('如何判断？', ...children);
         }
         const presetOptions = [{ value: '', label: '酒馆主 API（不用预设）' }]

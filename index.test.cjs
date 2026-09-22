@@ -1940,6 +1940,37 @@ test('标记判断档的镜像仍是原文切片，不附完成条件', async ()
     assert.deepEqual(run.errors, []);
 });
 
+test('随正文AI判断：标记说明单独一条，回复里的标记切到下一段', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const stageId = core.parseOutline(content).stages[0].id;
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'story' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: `这一段写完了 <!-- DGA_COMPLETE:${stageId} -->` };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let called = 0;
+    helper.generateRaw = async () => { called += 1; return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const source = state.books.书A.find(item => item.uid === 1);
+    const mirror = state.books.书A.find(item => item.name === '大纲A（动态指导）');
+    const cue = state.books.书A.find(item => item.name === '大纲A（动态指导·标记）');
+    assert.equal(source.content, content, '原文不能被改');
+    assert.match(mirror.content, /甲一正文/);
+    assert.doesNotMatch(mirror.content, /DGA_COMPLETE|完成判定/);
+    assert.ok(cue, '标记说明要单独一条，给写正文的 AI 看');
+    assert.match(cue.content, new RegExp(`DGA_COMPLETE:${stageId}`));
+    await state.events.get('message_received')(5);
+    assert.equal(called, 0, '随正文 AI 判断不能再开一次请求');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
+    assert.match(state.books.书A.find(item => item.name === '大纲A（动态指导）').content, /甲二正文/);
+    assert.equal(state.books.书A.find(item => item.uid === 1).content, content);
+    assert.deepEqual(run.errors, []);
+});
+
 
 test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
