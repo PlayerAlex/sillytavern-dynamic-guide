@@ -2442,7 +2442,7 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
         ['system', 'user', 'assistant', 'user_input'], '默认四段：系统 / 规则 / 预确认 / 案例（案例即 user_input）');
-    assert.match(ordered[0].content, /<结论>YES 或 NO<\/结论>/, '系统段要给出填表标签输出契约');
+    assert.match(ordered[0].content, /<verdict>YES<\/verdict>/, '系统段要给出英文填表标签');
     assert.match(ordered[0].content, /格式示例/, '系统段要带一条填好的格式示例');
     assert.match(ordered[1].content, /【判断规则】/, '第二段是判断规则（与案例数据分开）');
     assert.match(ordered[1].content, /判例对照/, '规则段要带一对正反判例');
@@ -2451,6 +2451,7 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.match(String(verdicts[0].user_input), /甲一正文/, '案例段要带阶段正文');
     assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案例段要带最近剧情');
     assert.match(String(verdicts[0].user_input), /现在填表/, '案例段以「现在填表」收尾（无独立最终注入）');
+    assert.match(String(verdicts[0].user_input), /<basis>\n<\/basis>\n<verdict>\n<\/verdict>/, '案例段末尾是英文空表');
     assert.doesNotMatch(ordered[1].content, /\{\{/, '默认段里的占位符都要被替换');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
@@ -2458,6 +2459,14 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.equal(verdicts.length, 1, '同一消息第二次触发不能重复推进');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
     assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：英文 <verdict> 优先，basis 里的 YES 不算；旧中文标签仍认', () => {
+    assert.equal(core.judgeSaysYes('<basis>条件里写了 YES 才算。</basis>\n<verdict>NO</verdict>'), false);
+    assert.equal(core.judgeSaysYes('<basis>还在暑假</basis>\n<verdict>YES</verdict>'), true);
+    assert.equal(core.judgeSaysYes('<依据>谈过了</依据>\n<结论>YES</结论>'), true, '旧中文标签仍能推进');
+    assert.equal(core.judgeBasisText('<basis>在家吃饭，没有上课</basis>\n<verdict>NO</verdict>'), '在家吃饭，没有上课');
+    assert.equal(core.previewJudgeOutput('<verdict>NO</verdict>', {}).hasTag, true);
 });
 
 test('判断AI档：填表标签结论优先——<结论>YES</结论> 推进、NO 不推进', async () => {
