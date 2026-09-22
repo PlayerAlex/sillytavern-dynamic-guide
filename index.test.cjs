@@ -1461,7 +1461,9 @@ test('隐藏字段被清掉后，状态条目里的划分和完成条件会写�
     await new Promise(setImmediate);
     const source = state.books.书A.find(item => item.uid === 1);
     assert.equal(source.content, content, '恢复划分不能改原文');
-    const restored = source.extra.dynamicGuideAssistantLayout;
+    assert.equal(source.extra, undefined, '不把划分写回条目隐藏字段');
+    assert.equal(state.books.书A.some(item => item.name === '（动态指导·状态）'), false, '看得到的状态条目要删掉');
+    const restored = state.variables.character.$dynamicGuideAssistant.config.bindings[0].layout;
     assert.equal(restored.stages[0].completion, '正文已经写到寒假开始');
     assert.equal(restored.stages[0].name, '暑假');
     const mirror = state.books.书A.find(isMirror);
@@ -1493,6 +1495,46 @@ test('绑定用状态条目里的起始步，不写死第一段', async () => {
     const mirror = state.books.书A.find(isMirror);
     assert.match(mirror.content, /寒假正文/);
     assert.doesNotMatch(mirror.content, /暑假正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('划分记在酒馆扩展设置和角色变量里，世界书配置条目看不到', async () => {
+    const layout = {
+        version: 3,
+        loop: true,
+        stages: [{ id: 's1', name: '暑假', completion: '到寒假', ranges: [{ start: 0, end: 4 }] }],
+        addons: [],
+        always: { ranges: [] },
+        note: { ranges: [] },
+    };
+    const books = { 书A: [{ uid: 1, name: '大纲', content: '暑假正文', enabled: false }] };
+    const saves = [];
+    const extensionSettings = {};
+    const SillyTavern = {
+        getContext: () => ({ extensionSettings, saveSettingsDebounced: () => { saves.push(1); } }),
+    };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲', layout }],
+            settings: { storageMode: 'card' },
+        },
+    });
+    helper.getCharData = () => ({ name: '甲', avatar: 'a.png' });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const storage = memoryStorage({ 'dynamic-guide-assistant:config-storage:v1': 'card' });
+    const run = load(helper, { localStorage: storage, SillyTavern });
+    await new Promise(setImmediate);
+    assert.ok(saves.length > 0, '要走数据库同款的 saveSettingsDebounced');
+    const saved = extensionSettings['dynamic-guide-assistant'].layouts['avatar:a.png']['书A#大纲'].layout;
+    assert.equal(saved.stages[0].completion, '到寒假');
+    const card = state.variables.character.$dynamicGuideAssistant.config;
+    assert.equal(card.bindings[0].layout.stages[0].name, '暑假');
+    const configEntry = state.books.书A.find(item => item.name === '（动态指导·配置）');
+    const parsed = JSON.parse(configEntry.content);
+    assert.equal(parsed.layouts, undefined, '世界书里那条配置不带划分');
+    assert.equal(parsed.bindings[0].layout, undefined);
+    assert.equal(state.books.书A.some(item => item.name === '（动态指导·状态）'), false);
     assert.deepEqual(run.errors, []);
 });
 
@@ -2088,9 +2130,11 @@ test('编辑原文里改过的字会保存，阶段区间跟着挪', async () =>
     await findButton(panel(), '保存').listeners.click[0]();
     const saved = state.entries.find(item => item.uid === 1);
     assert.match(saved.content, /暑假正文已改/);
-    const stage = saved.extra.dynamicGuideAssistantLayout.stages.find(item => item.name === '第一幕');
+    assert.equal(saved.extra, undefined, '划分不写进条目隐藏字段');
+    const layout = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
+    const stage = layout.stages.find(item => item.name === '第一幕');
     assert.match(saved.content.slice(stage.ranges[0].start, stage.ranges[0].end), /暑假正文已改/);
-    const winter = saved.extra.dynamicGuideAssistantLayout.stages.find(item => item.name === '第二幕');
+    const winter = layout.stages.find(item => item.name === '第二幕');
     assert.match(saved.content.slice(winter.ranges[0].start, winter.ranges[0].end), /寒假正文/);
     assert.deepEqual(errors, []);
 });
@@ -2121,7 +2165,8 @@ test('分段里保存完成条件不改原文，条件记在条目旁边', async
     await findButton(panel(), '保存').listeners.click[0]();
     const saved = state.entries.find(item => item.uid === 1);
     assert.equal(saved.content, original, '完成条件不能写进原文');
-    const stage = saved.extra.dynamicGuideAssistantLayout.stages.find(item => item.name === '第一幕');
+    assert.equal(saved.extra, undefined, '完成条件不写进条目隐藏字段');
+    const stage = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'].stages.find(item => item.name === '第一幕');
     assert.equal(stage.completion, '正文已经写到寒假开始');
     assert.deepEqual(errors, []);
 });
