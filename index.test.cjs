@@ -1471,6 +1471,7 @@ test('小卡步进器中间那块是划分阶段的入口，点进去落在当�
     assert.equal(focused.length, 1, '落在小卡当前的段上，只高亮那一段');
     assert.match(focused[0].textContent, /第二幕/);
     assert.ok(panel().querySelector('.dga-mode-seg'), '点进去打开的是「分段」视图');
+    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '划分阶段是二级页，左上角不放导航');
     assert.deepEqual(errors, []);
 });
 
@@ -1511,10 +1512,26 @@ async function bootGuidePage() {
     const panel = () => documentRef.getElementById(PANEL_ID);
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
-    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '二级页左上角不放导航');
-    assert.equal(panel().querySelector('.dga-close').textContent, '×', '二级页右上角是简化的 ×');
+    assert.ok(panel().querySelector('.dga-nav-toggle'), '动态指导在目录里，左上角要有导航');
+    assert.equal(panel().querySelector('.dga-close').textContent, '×', '右上角仍是简化的 ×');
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
+
+test('API、动态指导、运行日志左上角有导航', async () => {
+    const run = await bootGuidePage();
+    const panel = run.panel;
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), 'API').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-nav-toggle'), 'API 页左上角要有导航');
+    assert.equal(panel().querySelector('.dga-close').textContent, '×');
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '运行日志').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-nav-toggle'), '运行日志页左上角要有导航');
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-nav-toggle'), '从目录回到动态指导后，导航还在');
+    assert.deepEqual(run.errors, []);
+});
 
 test('没有 ## 标题的条目也能绑定，划分不改原文', async () => {
     const original = '#暑假\n当前还在暑假期间，<user>不需要上课\n#寒假\n当前在寒假期间，<user>不需要上课\n#平时\n当前是正常的学期，在周一到周五期间要上课，周末不需要';

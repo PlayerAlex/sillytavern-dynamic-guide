@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.38
+     * 动态指导助手 v2.39
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.38';
+    const VERSION = '2.39';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3621,17 +3621,19 @@
         ui.message = text ? { text, type: type || 'info' } : null;
     }
 
-    // 标题栏。仪表盘：☰ 目录 / 标题 / 外观齿轮 / ×。
-    // 二级页（subpage）：左上角不放导航，右上角只留一个 ×，点它回到上一页。
+    // 标题栏。仪表盘和目录里的页面：☰ 目录 / 标题 / ×。
+    // 二级页（subpage，且没有 nav）：左上角不放导航，右上角只留一个 ×，点它回到上一页。
+    // 目录页可以同时带 subpage 的 × 和 nav，这样 API、动态指导、运行日志也能打开目录。
     function header(title, subtitle, onclose, closeLabel, extra, options) {
         const subpage = Boolean(options && options.subpage);
+        const showNav = Boolean(options && options.nav) || !subpage;
         return el('header', { class: 'dga-head' },
-            subpage ? null : el('button', {
+            showNav ? el('button', {
                 type: 'button',
                 class: 'dga-btn dga-ghost dga-nav-toggle',
                 'aria-label': '打开目录',
                 onclick: () => { ui.navOpen = true; render(); },
-            }, '☰'),
+            }, '☰') : null,
             el('div', { class: 'dga-head-text' },
                 el('h2', { text: title }),
                 subtitle ? el('small', { text: subtitle }) : null),
@@ -3639,7 +3641,7 @@
             el('button', {
                 type: 'button',
                 class: 'dga-btn dga-ghost dga-close',
-                'aria-label': subpage ? '返回' : (closeLabel || '关闭'),
+                'aria-label': subpage && !showNav ? '返回' : (closeLabel || '关闭'),
                 onclick: onclose,
             }, subpage ? '×' : (closeLabel || '×')),
         );
@@ -3836,7 +3838,7 @@
     function renderDevPage() {
         const mode = configStorageMode();
         const bindings = (ui.snapshot && ui.snapshot.config && ui.snapshot.config.bindings) || [];
-        return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true }),
+        return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 card('配置存哪',
@@ -3923,7 +3925,7 @@
             judgeSettingsCard(),
             guideRulesCard(),
         );
-        return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true }), body];
+        return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }), body];
     }
 
     // 目录抽屉：复刻 shujuku 新版 Sidebar——品牌区（方块标 + 标题 + 版本副标）、
@@ -4242,7 +4244,7 @@
                 ui.apiReturnView = '';
                 ui.view = back;
                 render();
-            }, '返回', null, { subpage: true }),
+            }, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 muted('预设只存本机 localStorage（明文），不随角色卡导出；共享设备别存密钥。'),
@@ -4424,7 +4426,7 @@
     }
 
     // ---------------------------------------------------------------
-    // 三、界面：运行日志页（二级页，从目录抽屉进入）
+    // 三、界面：运行日志页（目录页，左上角可以打开导航）
     //
     // 展示 LogModule 的内存日志：等级筛选 + 调试日志采集开关 + 复制/清空。
     // 页面打开期间订阅日志模块，新日志实时刷新；日志只存内存（上限 500 条），
@@ -4463,7 +4465,7 @@
             el('span', { class: 'dga-log-text', text: entry.message })));
         const back = () => { ui.view = 'manager'; render(); };
         return [
-            header('运行日志', `${statsText} · 上限 500 · 只存内存`, back, '返回', null, { subpage: true }),
+            header('运行日志', `${statsText} · 上限 500 · 只存内存`, back, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 el('div', { class: 'dga-log-toolbar' },
