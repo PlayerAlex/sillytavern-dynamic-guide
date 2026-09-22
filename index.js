@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.47
+     * 动态指导助手 v2.48
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.47';
+    const VERSION = '2.48';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -573,11 +573,20 @@
         return parts.join('\n\n');
     }
 
-    function reconcileState(rawState, parsed) {
+    function clampStart(startIndex, total) {
+        const n = Math.floor(Number(startIndex));
+        if (!Number.isFinite(n) || n < 0) return 0;
+        if (!total) return 0;
+        return Math.min(n, total - 1);
+    }
+
+    function reconcileState(rawState, parsed, startIndex) {
         const old = rawState && typeof rawState === 'object' ? rawState : {};
         // 兼容 1.x 的字段名 mainIndex / mainName
-        const oldIndex = Number.isInteger(old.stageIndex) ? old.stageIndex
-            : (Number.isInteger(old.mainIndex) ? old.mainIndex : 0);
+        const hasExplicit = Number.isInteger(old.stageIndex) || Number.isInteger(old.mainIndex);
+        const oldIndex = hasExplicit
+            ? (Number.isInteger(old.stageIndex) ? old.stageIndex : old.mainIndex)
+            : clampStart(startIndex, parsed.stages.length);
         const oldName = old.stageName || old.mainName || '';
         let index = oldIndex;
         // 当前位置的名字还对得上就留在这里。两个阶段同名时，按名字找会跳回第一个。
@@ -1690,12 +1699,14 @@
     // 配置存哪（开发者模式里切）：
     //   绑定的正本永远是当前角色的角色变量。酒馆换卡时这份变量跟着换，所以天然按卡分开，
     //   不再用头像文件名在 localStorage 里另存一份（那份会和角色变量打架，改头像还会丢）。
-    //   'user' = 只本机：只写角色变量，不写世界书。分享卡时不带绑定。
+    //   'user' = 只本机：只写角色变量，不写世界书。
     //   'card' = 跟角色卡：角色变量之外，再把一份脱敏配置写进世界书的「（动态指导·配置）」条目。
     //            导入的人如果没有角色变量，就从这条读回来。
+    //   存放方式本身也写进角色变量。只放在浏览器里的话，过一段时间或换一台电脑就会掉回「只本机」。
     //   v2.32 按头像存过的本机档只在角色变量还没有配置时读一次，用来迁移。
     const CONFIG_STORAGE_KEY = 'dynamic-guide-assistant:config-storage:v1';
     const LOCAL_CONFIG_PREFIX = 'dynamic-guide-assistant:config:v2:';
+    const LOCAL_PRESET_PREFIX = 'dynamic-guide-assistant:preset-names:v1:';
     // 世界书里的配置条目：关着的，只给插件读，永远不进 AI 上下文，也不参与关键词触发。
     const CONFIG_ENTRY_NAME = '（动态指导·配置）';
 
@@ -1715,6 +1726,73 @@
             try { storage.setItem(CONFIG_STORAGE_KEY, mode === 'card' ? 'card' : 'user'); } catch (error) { /* 存不了就只用内存 */ }
         }
         return configStorageMode();
+    }
+
+    async function persistStorageMode(mode) {
+        const next = mode === 'card' ? 'card' : 'user';
+        setConfigStorageMode(next);
+        const config = await readConfig();
+        config.settings = { ...(config.settings || {}), storageMode: next };
+        await writeConfig(config);
+        return next;
+    }
+
+    async function persistBindingLoop(editor) {
+        if (!editor || !editor.bound || !editor.pick) return;
+        const want = Boolean(editor.pick.loop);
+        const config = await readConfig();
+        const key = bindingKey({
+            worldbookName: editor.worldbookName,
+            entryUid: editor.entry.uid,
+            entryName: entryName(editor.entry),
+        });
+        let changed = false;
+        const bindings = config.bindings.map(item => {
+            if (bindingKey(item) !== key) return item;
+            if (Boolean(item.loop) === want) return item;
+            changed = true;
+            const next = { ...item };
+            if (want) next.loop = true;
+            else delete next.loop;
+            return next;
+        });
+        if (!changed) return;
+        editor.bindingLoop = want;
+        await writeConfig({ version: 2, bindings, settings: config.settings || {} });
+    }
+
+    async function saveBindingLoop(binding, on) {
+        const located = await locateEntry(binding);
+        if (located) {
+            const layout = readLayout(located.entry);
+            if (layout && Boolean(layout.loop) !== Boolean(on)) {
+                layout.loop = Boolean(on);
+                await writeEntryLayout(located.worldbookName, located.entry.uid, entryName(located.entry), layout);
+            }
+        }
+        const config = await readConfig();
+        const key = bindingKey(binding);
+        config.bindings = config.bindings.map(item => {
+            if (bindingKey(item) !== key) return item;
+            const next = { ...item };
+            if (on) next.loop = true;
+            else delete next.loop;
+            return next;
+        });
+        await writeConfig(config);
+    }
+
+    async function saveBindingStart(binding, index) {
+        const config = await readConfig();
+        const key = bindingKey(binding);
+        config.bindings = config.bindings.map(item => {
+            if (bindingKey(item) !== key) return item;
+            const next = { ...item };
+            if (index > 0) next.startIndex = index;
+            else delete next.startIndex;
+            return next;
+        });
+        await writeConfig(config);
     }
 
     // 开发者模式（v2.32）：本机偏好。打开后左侧导航会多出一页「开发者模式」，
@@ -1786,13 +1864,56 @@
         try { storage.setItem(key, JSON.stringify(config)); } catch (error) { /* 同上 */ }
     }
 
-    // 跟卡走的那一份必须脱敏：judgePreset 只是本机 localStorage 里某个预设的名字，
-    // 而 API 预设本体（端点 / API Key / 模型）从来就不在配置里。分享卡绝不能把密钥带出去。
+    // 角色变量和世界书配置都会随卡导出。API 预设名只是本机 localStorage 里的名字，
+    // 预设本体（端点 / API Key / 模型）也在本机。这两处都不能带预设名。
     function configForCard(config) {
         const settings = { ...((config && config.settings) || {}) };
         delete settings.judgePreset;
         delete settings.conditionPreset;
         return { version: 2, bindings: (config && config.bindings) || [], settings };
+    }
+
+    async function presetNameStorageKey() {
+        const scope = await currentScopeId();
+        return `${LOCAL_PRESET_PREFIX}${scope || 'global'}`;
+    }
+
+    async function readLocalPresetNames() {
+        const storage = presetStorage();
+        const empty = { judgePreset: '', conditionPreset: '' };
+        if (!storage) return empty;
+        try {
+            const raw = storage.getItem(await presetNameStorageKey());
+            const parsed = raw ? JSON.parse(raw) : {};
+            return {
+                judgePreset: typeof parsed.judgePreset === 'string' ? parsed.judgePreset : '',
+                conditionPreset: typeof parsed.conditionPreset === 'string' ? parsed.conditionPreset : '',
+            };
+        } catch (error) {
+            return empty;
+        }
+    }
+
+    async function writeLocalPresetNames(names) {
+        const storage = presetStorage();
+        if (!storage) return;
+        const next = {
+            judgePreset: names && typeof names.judgePreset === 'string' ? names.judgePreset : '',
+            conditionPreset: names && typeof names.conditionPreset === 'string' ? names.conditionPreset : '',
+        };
+        try { storage.setItem(await presetNameStorageKey(), JSON.stringify(next)); } catch (error) { /* 存不了就只用这次内存里的名字 */ }
+    }
+
+    async function rememberPresetNames(config) {
+        const settings = (config && config.settings) || {};
+        const hasJudge = Object.prototype.hasOwnProperty.call(settings, 'judgePreset');
+        const hasCondition = Object.prototype.hasOwnProperty.call(settings, 'conditionPreset');
+        if (!hasJudge && !hasCondition) return;
+        const local = await readLocalPresetNames();
+        await writeLocalPresetNames({
+            judgePreset: hasJudge ? String(settings.judgePreset || '') : local.judgePreset,
+            conditionPreset: hasCondition ? String(settings.conditionPreset || '') : local.conditionPreset,
+        });
     }
 
     async function currentBoundWorldbooks() {
@@ -1871,9 +1992,50 @@
     }
 
     async function writeConfig(config) {
-        await writeRootField('character', 'config', config);
-        if (configStorageMode() === 'card') await writeCardConfig(config);
+        await rememberPresetNames(config);
+        const safe = configForCard(config);
+        await writeRootField('character', 'config', safe);
+        const mode = safe.settings && (safe.settings.storageMode === 'card' || safe.settings.storageMode === 'user')
+            ? safe.settings.storageMode
+            : configStorageMode();
+        if (mode === 'card') await writeCardConfig(safe);
         return config;
+    }
+
+    // 启动时把已经写进角色变量的预设名搬回本机，并记下存放方式。
+    // 世界书里还有「（动态指导·配置）」但浏览器里的开关丢了，就恢复成跟卡走。
+    async function parkExportedSecrets() {
+        const raw = await readRootField('character', 'config');
+        const normalized = normalizeConfig(raw);
+        const leakedJudge = raw && raw.settings && typeof raw.settings.judgePreset === 'string' ? raw.settings.judgePreset : '';
+        const leakedCondition = raw && raw.settings && typeof raw.settings.conditionPreset === 'string' ? raw.settings.conditionPreset : '';
+        if (leakedJudge || leakedCondition) {
+            const local = await readLocalPresetNames();
+            await writeLocalPresetNames({
+                judgePreset: local.judgePreset || leakedJudge,
+                conditionPreset: local.conditionPreset || leakedCondition,
+            });
+            delete normalized.settings.judgePreset;
+            delete normalized.settings.conditionPreset;
+        }
+        const storage = presetStorage();
+        const stored = storage ? storage.getItem(CONFIG_STORAGE_KEY) : null;
+        let mode = normalized.settings.storageMode;
+        if (mode !== 'card' && mode !== 'user') {
+            if (stored === 'card' || stored === 'user') mode = stored;
+            else if (await readCardConfig()) mode = 'card';
+        }
+        if (mode === 'card' || mode === 'user') {
+            if (storage) {
+                try { storage.setItem(CONFIG_STORAGE_KEY, mode); } catch (error) { /* 浏览器拒写时仍写进角色变量 */ }
+            }
+            normalized.settings.storageMode = mode;
+        }
+        const savedMode = raw && raw.settings ? raw.settings.storageMode : undefined;
+        const leaked = Boolean(leakedJudge || leakedCondition);
+        if (leaked || ((mode === 'card' || mode === 'user') && savedMode !== mode)) {
+            await writeConfig(normalized);
+        }
     }
     const readRawState = () => readRootField('chat', 'state');
 
@@ -1906,6 +2068,9 @@
                 entryName: String(item.entryName || ''),
                 boundAt: item.boundAt || null,
             };
+            const start = Math.floor(Number(item.startIndex));
+            if (Number.isFinite(start) && start > 0) binding.startIndex = start;
+            if (item.loop === true) binding.loop = true;
             const key = bindingKey(binding);
             if (seen.has(key)) return;
             seen.add(key);
@@ -1957,6 +2122,9 @@
         }
         // 流式输出（v2.18，数据库 streamingEnabled 同款）：只认布尔，缺省 false。
         if (settings.streamingEnabled != null) settings.streamingEnabled = settings.streamingEnabled === true;
+        if (settings.storageMode != null && settings.storageMode !== 'card' && settings.storageMode !== 'user') {
+            delete settings.storageMode;
+        }
         // 判断AI输出的提取/排除规则（v2.13）：数据库填表同款 {start,end} 边界对；
         // 非法项丢弃，整列为空时删字段（= 不过滤，原文直通）。
         ['extractRules', 'excludeRules'].forEach(field => {
@@ -1984,7 +2152,15 @@
     };
 
     async function readConfig() {
-        return normalizeConfig(await readRawConfig());
+        const config = normalizeConfig(await readRawConfig());
+        const local = await readLocalPresetNames();
+        const judge = local.judgePreset || (typeof config.settings.judgePreset === 'string' ? config.settings.judgePreset : '');
+        const condition = local.conditionPreset || (typeof config.settings.conditionPreset === 'string' ? config.settings.conditionPreset : '');
+        if (judge) config.settings.judgePreset = judge;
+        else delete config.settings.judgePreset;
+        if (condition) config.settings.conditionPreset = condition;
+        else delete config.settings.conditionPreset;
+        return config;
     }
 
     // 2.0 的 state 是扁平的单个进度；2.1 变成 { version: 2, bindings: { key: 进度 } }。
@@ -2477,8 +2653,9 @@
                     throw new Error(`找不到绑定的条目“${binding.entryName || ''}”。请在下面把它移出后重新添加。`);
                 }
                 const parsed = outlineFromEntry(located.entry);
+                if (binding.loop) parsed.loop = true;
                 const rawState = stateMap[key] || null;
-                const state = reconcileState(rawState, parsed);
+                const state = reconcileState(rawState, parsed, binding.startIndex);
                 contexts.push({
                     key,
                     binding,
@@ -2918,6 +3095,10 @@
                 reportOnce(`no-stages-${context.key}`, `“${entryName(context.entry)}”还没有分阶段，这次不会显示指导。`);
             } else if (statesDiffer(context.rawState, context.state)) {
                 await writeStateFor(context.key, { ...context.state, updatedAt: new Date().toISOString() });
+            }
+            if (context.parsed && context.parsed.loop && context.binding && context.binding.loop !== true) {
+                context.binding.loop = true;
+                configChanged = true;
             }
             const plan = await syncMirrorFor(context, generationType);
             const before = context.binding.mirrorUid == null ? null : String(context.binding.mirrorUid);
@@ -4023,26 +4204,69 @@
 
     // 开发者模式页（v2.32）：作者向设置。导航里只在这个模式下才出现。
     function renderDevPage() {
-        const mode = configStorageMode();
+        const savedMode = ui.snapshot && ui.snapshot.config && ui.snapshot.config.settings
+            ? ui.snapshot.config.settings.storageMode
+            : '';
+        const mode = savedMode === 'card' || savedMode === 'user' ? savedMode : configStorageMode();
         const bindings = (ui.snapshot && ui.snapshot.config && ui.snapshot.config.bindings) || [];
+        const contexts = (ui.snapshot && ui.snapshot.contexts) || [];
+        const startRows = bindings.map(binding => {
+            const context = contexts.find(item => item.binding && bindingKey(item.binding) === bindingKey(binding));
+            const stages = context && context.parsed ? context.parsed.stages : [];
+            const total = stages.length;
+            const start = Number.isInteger(binding.startIndex) ? binding.startIndex : 0;
+            const shown = total > 0 ? Math.min(start, Math.max(0, total - 1)) + 1 : start + 1;
+            const stageName = stages[shown - 1] ? stages[shown - 1].name : '';
+            const input = el('input', {
+                type: 'number',
+                min: '1',
+                max: total > 0 ? String(total) : null,
+                value: String(shown),
+                'aria-label': `${binding.entryName || '条目'}导出后从第几步开始`,
+                onchange: event => {
+                    const n = Math.floor(Number(event.target.value));
+                    let index = Number.isFinite(n) && n >= 1 ? n - 1 : 0;
+                    if (total > 0) index = Math.min(index, total - 1);
+                    runAction('保存起始步', () => saveBindingStart(binding, index), {
+                        success: `「${binding.entryName || '条目'}」导出后从第 ${index + 1} 步开始`,
+                    });
+                },
+            });
+            const loopOn = Boolean(binding.loop || (context && context.parsed && context.parsed.loop));
+            return el('div', { class: 'dga-bind-item' },
+                el('div', { class: 'dga-heading-text' },
+                    el('b', { text: binding.entryName || '未命名条目' }),
+                    el('small', { text: stageName ? `第 ${shown} 步：${stageName}` : `第 ${shown} 步` })),
+                field('导出后从第几步开始', input),
+                toggleRow('循环', '记在这条绑定上，随角色卡导出。不靠世界书里那份容易丢的隐藏数据。', loopOn, checked => {
+                    runAction('保存循环', () => saveBindingLoop(binding, checked), {
+                        success: checked ? `「${binding.entryName || '条目'}」的循环已记在绑定上` : `「${binding.entryName || '条目'}」已关掉循环`,
+                    });
+                }));
+        });
         return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body dga-split' },
                 messageBar(),
                 card('配置存哪',
-                    muted('决定绑定列表与判断AI设置存在哪里。普通使用不需要动这里。'),
+                    muted('绑定、循环和起始步可以随卡走。API 预设名只留在这台电脑，导出时不会带上。'),
                     field('存放位置', selectControl([
-                        { value: 'user', label: '只本机（记在这张卡上，不写入世界书）' },
-                        { value: 'card', label: '跟角色卡走（随卡分发）' },
+                        { value: 'user', label: '只本机（记在这张卡的角色变量里，不写入世界书）' },
+                        { value: 'card', label: '跟角色卡走（再写一份到世界书）' },
                     ], mode, value => {
-                        setConfigStorageMode(value);
-                        setMessage(value === 'card'
-                            ? '已改为跟角色卡走：下次保存会写一份脱敏配置到世界书的「（动态指导·配置）」条目。'
-                            : '已改为只本机：绑定只记在这张角色卡的角色变量里，不写入世界书。', 'success');
-                        render();
+                        runAction('保存存放位置', () => persistStorageMode(value), {
+                            success: value === 'card'
+                                ? '已改为跟角色卡走，并记在这张卡上。世界书里会写一份不含 API 预设名的配置。'
+                                : '已改为只本机。API 预设名仍然只留在这台电脑。',
+                        });
                     })),
                     muted(mode === 'card'
-                        ? '跟卡走的那份会剔除 API 预设名（它指向本机的密钥），API 预设本体从来不进配置。世界书里那个配置条目是关着的，永远不发给 AI。'
-                        : '记在这张角色卡的角色变量里。换一张卡就换一份变量，不会串到别的卡，也不会写进世界书跟卡分享。'),
+                        ? '跟卡走的那份写在关着的「（动态指导·配置）」里，不发给 AI。角色变量和这份配置都不含 API 预设名。'
+                        : '绑定记在这张卡的角色变量里。API 预设名另存在本机，导出角色卡时不会带上。'),
+                ),
+                card('导出后从第几步开始',
+                    muted('新开的聊天，以及导入这张卡的人，从这里开始。当前这次聊天的进度不会被改掉。循环不一定从第一段开始。'),
+                    bindings.length ? null : muted('还没有绑定条目。'),
+                    ...startRows,
                 ),
                 card('当前状态',
                     muted(`存放位置：${mode === 'card' ? '跟角色卡走' : '只本机'}`),
@@ -5234,6 +5458,7 @@
         const bound = config.bindings.some(item => bindingKey(item) === bindingKey(candidate));
         const source = lines.join('\n');
         const stored = readLayout(fresh);
+        const binding = config.bindings.find(item => bindingKey(item) === bindingKey(candidate));
         ui.editor = {
             worldbookName,
             entry: fresh,
@@ -5244,6 +5469,7 @@
             // 两档视图：'seg' 分段 / 'raw' 编辑原文
             mode: 'seg',
             bound,
+            bindingLoop: Boolean(binding && binding.loop),
             pick: null,
             pickListeners: null,
             // 从小卡点进来时带的当前段：渲染完滚到它并高亮一次
@@ -5432,8 +5658,12 @@
         const settings = options || {};
         const text = editor.lines.join('\n');
         const stored = readLayout(editor.entry);
+        const keptLoop = editor.pick ? Boolean(editor.pick.loop) : null;
         editor.pick = stored ? pickFromLayout(text, stored) : pickFromSource(text);
         editor.parsed = stored ? outlineFromLayout(text, stored) : parseOutline(text);
+        if (keptLoop != null) editor.pick.loop = keptLoop;
+        else if (editor.bindingLoop) editor.pick.loop = true;
+        editor.parsed.loop = Boolean(editor.pick.loop);
         if (settings.dirty !== false) editor.dirty = true;
         return editor.pick;
     }
@@ -6306,7 +6536,8 @@
         editor.lines = normalizeText(saved.content).split('\n');
         editor.parsed = outlineFromEntry(saved);
         editor.dirty = false;
-        // 已绑定的条目：保存后立刻按新正文同步镜像，进度按阶段名自动对上。
+        // 循环记在绑定上。只写在世界书隐藏字段里的话，导出或酒馆重写条目后会丢。
+        if (editor.bound) await persistBindingLoop(editor);
         if (editor.bound) await syncMirrors('normal');
         // 留在分段视图：按保存后的正文重新铺开，待分配的预览不保留。
         if (editor.mode === 'seg') {
@@ -6821,6 +7052,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
     // 镜像条目存在世界书里、跨重载有效，第一次生成前同步完即可。
     runEventTask('准备指导', async () => {
         await clearLegacyInjections();
+        await parkExportedSecrets();
         // 先自愈再同步：导入别人的卡时绑定可能没跟过来，只有镜像跟过来了。
         await recoverBindings();
         await syncMirrors('startup');
@@ -6850,6 +7082,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
             // 换聊天后进度不同：镜像内容按新聊天的进度重新对齐（镜像在世界书里，不按聊天隔离）。
             LogModule.info('事件', '切换聊天，按当前角色卡重新对齐绑定和镜像');
+            await parkExportedSecrets();
             await recoverBindings();
             await syncMirrors('normal');
             const doc = hostDocument();

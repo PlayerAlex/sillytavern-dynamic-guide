@@ -116,6 +116,9 @@ test('循环开着且进度停在全部完成时，拉回第一段继续发送',
     parsed.loop = true;
     const looped = core.reconcileState({ stageIndex: 2, stageName: '' }, parsed);
     assert.equal(looped.stageIndex, 0);
+    const started = core.reconcileState(null, parsed, 1);
+    assert.equal(started.stageIndex, 1, '没有聊天进度时从绑定上的起始步开始');
+    assert.equal(started.stageName, '寒假');
     assert.equal(looped.stageName, '暑假');
     const stopped = core.reconcileState({ stageIndex: 2, stageName: '' }, core.parseOutline('## 暑假\n暑假正文\n\n## 寒假\n寒假正文'));
     assert.equal(stopped.stageIndex, 2);
@@ -1299,8 +1302,103 @@ test('跟角色卡走时，配置条目关掉且不带关键词，短正文靠�
     const parsed = JSON.parse(configEntry.content);
     assert.equal(parsed.settings.judgePreset, undefined, '写进世界书的配置要去掉 API 预设名');
     assert.equal(parsed.settings.conditionPreset, undefined, '生成用的 API 预设名也不跟卡走');
+    const cardConfig = state.variables.character.$dynamicGuideAssistant.config;
+    assert.equal(cardConfig.settings.judgePreset, undefined, '角色变量会随卡导出，也不能带 API 预设名');
+    assert.equal(cardConfig.settings.conditionPreset, undefined, '生成用的 API 预设名也不进角色变量');
+    assert.equal(cardConfig.settings.storageMode, 'card', '跟卡走要记在角色变量里，不能只放浏览器');
+    const parked = JSON.parse(storage.getItem('dynamic-guide-assistant:preset-names:v1:avatar:a.png'));
+    assert.equal(parked.judgePreset, '密钥名');
+    assert.equal(parked.conditionPreset, '生成预设');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('甲书', 1)].stageIndex, 1,
         '正文太短时要按「当前阶段：阶段名」对齐，而不是退回第一段');
+    assert.deepEqual(run.errors, []);
+});
+
+test('没有聊天进度时从绑定的起始步开始，循环不靠世界书隐藏数据', async () => {
+    const books = {
+        书A: [{ uid: 1, name: '大纲', content: '## 暑假\n暑假正文\n\n## 寒假\n寒假正文', enabled: false }],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲', loop: true, startIndex: 1 }],
+            settings: { judgePreset: '不该导出', autoAdvance: 'off' },
+        },
+    });
+    helper.getCharData = () => ({ name: '甲', avatar: 'a.png' });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const storage = memoryStorage();
+    const run = load(helper, { localStorage: storage });
+    await new Promise(setImmediate);
+    const mirror = state.books.书A.find(isMirror);
+    assert.ok(mirror, '要有镜像');
+    assert.match(mirror.content, /寒假正文/, '新聊天从绑定上的第 2 步开始');
+    assert.doesNotMatch(mirror.content, /暑假正文/);
+    const saved = state.variables.character.$dynamicGuideAssistant.config;
+    assert.equal(saved.bindings[0].startIndex, 1);
+    assert.equal(saved.bindings[0].loop, true, '循环要写在绑定上');
+    assert.equal(saved.settings.judgePreset, undefined, '起始步这条配置里也不能带 API 预设名');
+    const parked = JSON.parse(storage.getItem('dynamic-guide-assistant:preset-names:v1:avatar:a.png'));
+    assert.equal(parked.judgePreset, '不该导出');
+    assert.deepEqual(run.errors, []);
+});
+
+test('进度停在全部完成时，绑定上的循环仍能绕回第一段', async () => {
+    const books = {
+        书A: [{ uid: 1, name: '大纲', content: '## 暑假\n暑假正文\n\n## 寒假\n寒假正文', enabled: false }],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲', loop: true }],
+        },
+        chatState: {
+            version: 2,
+            bindings: {
+                '书A#uid:1': { stageIndex: 2, stageName: '', lastCompletionMessageId: null, lastCompletionFingerprint: '' },
+            },
+        },
+    });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const mirror = state.books.书A.find(isMirror);
+    assert.ok(mirror, '循环还在，不能因为进度越界就把镜像删掉');
+    assert.match(mirror.content, /暑假正文/);
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings[0].loop, true);
+    assert.deepEqual(run.errors, []);
+});
+
+test('浏览器里的跟卡走丢了，世界书里的配置条目还在就恢复', async () => {
+    const books = {
+        甲书: [
+            { uid: 1, name: '大纲', content: '## 甲\n甲正文', enabled: false },
+            {
+                uid: 8,
+                name: '（动态指导·配置）',
+                enabled: false,
+                content: JSON.stringify({
+                    version: 2,
+                    bindings: [{ worldbookName: '甲书', entryUid: 1, entryName: '大纲' }],
+                    settings: {},
+                }),
+            },
+        ],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '甲书', entryUid: 1, entryName: '大纲' }],
+            settings: {},
+        },
+    });
+    helper.getCharData = () => ({ name: '甲', avatar: 'a.png' });
+    helper.getCharWorldbookNames = () => ['甲书'];
+    const storage = memoryStorage();
+    const run = load(helper, { localStorage: storage });
+    await new Promise(setImmediate);
+    assert.equal(storage.getItem('dynamic-guide-assistant:config-storage:v1'), 'card');
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.settings.storageMode, 'card');
     assert.deepEqual(run.errors, []);
 });
 
@@ -1482,8 +1580,10 @@ test('齿轮里可以改生成提示词，并单独选 API 预设', async () => 
     select.listeners.change[0]({ target: select });
     await findButton(dialog, '保存').listeners.click[0]();
     const saved = state.variables.character.$dynamicGuideAssistant.config.settings;
-    assert.equal(saved.conditionPreset, '生成专用');
+    assert.equal(saved.conditionPreset, undefined, '生成用的 API 预设名不写进会导出的角色变量');
     assert.match(saved.conditionSystemPrompt, /自定义闸门/);
+    const parked = JSON.parse(storage.getItem('dynamic-guide-assistant:preset-names:v1:global'));
+    assert.equal(parked.conditionPreset, '生成专用', '预设名只留在本机');
 
     const bar = collectByClass(panel(), 'dga-segbar', [])[0];
     bar.listeners.click[0]();
