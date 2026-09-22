@@ -104,6 +104,13 @@ test('改原文时阶段区间跟着挪，后面的阶段不被带跑', () => {
     assert.equal(pick.text.slice(pick.stages[1].ranges[0].start, pick.stages[1].ranges[0].end), '寒假正文');
 });
 
+test('循环时下一段回到第一段，没开循环时停在全部完成', () => {
+    assert.equal(core.stepTarget(1, 1, 2, true), 0);
+    assert.equal(core.stepTarget(0, -1, 3, true), 2);
+    assert.equal(core.stepTarget(2, 1, 3, false), 3);
+    assert.equal(core.stepTarget(0, -1, 3, false), 0);
+});
+
 test('同名阶段停在当前下标，不跳回第一个', () => {
     const parsed = core.parseOutline('## 暑假\nA\n\n## 寒假\nB\n\n## 暑假\nC');
     const state = core.reconcileState({ stageIndex: 2, stageName: '暑假' }, parsed);
@@ -300,6 +307,35 @@ test('循环回到第一段后，重新生成仍显示刚完成的最后一段',
     const mirror = state.entries.find(isMirror);
     assert.match(mirror.content, /平时正文/, '循环绕回第一段时，重新生成要回到推进前的最后一段');
     assert.doesNotMatch(mirror.content, /暑假正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('循环开着时，快捷指令下一段从最后一段回到第一段', async () => {
+    const text = '暑假正文\n寒假正文';
+    const span = quote => ({ start: text.indexOf(quote), end: text.indexOf(quote) + quote.length });
+    const entry = {
+        uid: 1, name: '大纲', content: text, enabled: false,
+        extra: {
+            dynamicGuideAssistantLayout: {
+                version: 3,
+                loop: true,
+                stages: [
+                    { id: 's', name: '暑假', ranges: [span('暑假正文')] },
+                    { id: 'w', name: '寒假', ranges: [span('寒假正文')] },
+                ],
+            },
+        },
+    };
+    const { state, helper } = helperFor(entry);
+    state.variables.chat.$dynamicGuideAssistant = {
+        state: { stageIndex: 1, stageName: '寒假', lastCompletionMessageId: null, lastCompletionFingerprint: '' },
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.match(state.entries.find(isMirror).content, /寒假正文/);
+    await run.core.next();
+    assert.match(state.entries.find(isMirror).content, /暑假正文/);
+    assert.doesNotMatch(state.entries.find(isMirror).content, /寒假正文/);
     assert.deepEqual(run.errors, []);
 });
 
@@ -1980,6 +2016,43 @@ test('判断AI档：每 2 层检查一次——首次立即查，之后到层才
     assert.equal(bindingState().lastJudgeCheckedId, 7, '问过之后重新计数');
     await state.events.get('message_received')(7);
     assert.equal(calls, 3, '同一层重新生成要再判断一次');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断还在进行时来了新回复，结束后补判新的一层', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const messages = [
+        { message_id: 5, role: 'assistant', message: '第五层。' },
+        { message_id: 6, role: 'assistant', message: '第六层。' },
+    ];
+    const { state, helper } = multiWorld(books, { config, messages, lastMessageId: 6 });
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    let markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const calls = [];
+    helper.generateRaw = async options => {
+        calls.push(options);
+        markStarted();
+        if (calls.length === 1) await gate;
+        return 'NO';
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const first = state.events.get('message_received')(5);
+    await started;
+    await state.events.get('message_received')(6);
+    assert.equal(calls.length, 1, '同一条绑定的判断要排队，不并发');
+    assert.equal(calls[0].max_tokens, 1024, '判断回复要压短');
+    release();
+    await first;
+    assert.equal(calls.length, 2, '前一层结束后补判新回复');
     assert.deepEqual(run.errors, []);
 });
 

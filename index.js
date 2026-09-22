@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.40
+     * 动态指导助手 v2.41
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.40';
+    const VERSION = '2.41';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -993,6 +993,19 @@
     // 推进顺序是用户定的（新建的先后，或 ↑↓），不跟文字在原文里的位置走。
     function stageSequence(pick) {
         return pick && Array.isArray(pick.stages) ? pick.stages.slice() : [];
+    }
+
+    // 上一段 / 下一段。循环开着时从最后一段回到第一段，从第一段退回最后一段。
+    // 没开循环时，再往前停在第一段，再往后停在「全部完成」（下标等于段数）。
+    function stepTarget(index, delta, total, loop) {
+        const count = Math.max(0, Math.floor(Number(total) || 0));
+        const from = Math.floor(Number(index) || 0);
+        const step = Math.floor(Number(delta) || 0);
+        if (count <= 0) return 0;
+        if (!loop) return Math.max(0, Math.min(from + step, count));
+        const base = from >= count ? (step > 0 ? -1 : count) : from;
+        const target = base + step;
+        return ((target % count) + count) % count;
     }
 
     // 原文改了几个字时，把阶段区间平移到新字符串上。只认一处连续改动：
@@ -3044,13 +3057,15 @@
     }
 
     // 判断AI（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
+    // 回复只要结论，压到 1024，避免预设里的 60000 让模型空转。
+    const JUDGE_REPLY_CAP = 1024;
     // 提示词在二级页面按「段」自定义（每段可选 system/user/assistant 角色，
     // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符，可导入导出/恢复默认）；
     // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
     //   酒馆主 API → 酒馆助手 generateRaw；酒馆预设 → ConnectionManagerRequestService；
     //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
     // running 集合防止同一绑定并发判断AI；判断AI结果一律只信一次，失败不重试。
-    const judgeState = { running: new Set() };
+    const judgeState = { running: new Set(), pending: new Map() };
 
     // 最近一次判断AI调用的留痕（v2.14）：只存内存，给规则测试器「填入最近一次输出」用。
     const judgeRuntime = { lastRaw: '', lastFiltered: '', lastAt: 0, lastYes: null };
@@ -3433,7 +3448,13 @@
         if (!context || context.broken || !context.stage || context.stage.terminal) return;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到判断AI跳过。
         if (context.state.lastCompletionMessageId === messageId) return;
-        if (judgeState.running.has(context.key)) return;
+        if (judgeState.running.has(context.key)) {
+            const queued = judgeState.pending.get(context.key);
+            if (!queued || Number(messageId) >= Number(queued.messageId)) {
+                judgeState.pending.set(context.key, { messageId });
+            }
+            return;
+        }
         const settings = config && config.settings ? config.settings : {};
         // 检查频率：每 N 层（条 AI 回复）查一次，数据库填表同款频率制；首次检查立即执行。
         const interval = judgeCheckInterval(settings);
@@ -3470,9 +3491,13 @@
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
             const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）');
+            const cap = JUDGE_REPLY_CAP;
+            const judgePreset = preset
+                ? { ...preset, maxTokens: Math.min(Math.floor(Number(preset.maxTokens)) || cap, cap) }
+                : null;
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：开始检查阶段「${stage.name}」（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
-            const text = await askJudge(messages, preset, settings);
+            const text = await askJudge(messages, judgePreset, { ...settings, judgeMaxTokens: cap });
             // 只补检查楼层。判断要等接口，这几秒里用户可能已经点了上一段/下一段，
             // 不能把开始时的整份进度写回去。
             await patchStateFor(context.key, { lastJudgeCheckedId: messageId });
@@ -3509,6 +3534,13 @@
             reportOnce('judge-failed', `判断AI调用失败：${reason}。请检查当前 API 连接，或把「自动推进」改用「标记判断」档。`);
         } finally {
             judgeState.running.delete(context.key);
+            const queued = judgeState.pending.get(context.key);
+            judgeState.pending.delete(context.key);
+            if (queued && String(queued.messageId) !== String(messageId)) {
+                const fresh = await loadContexts();
+                const latest = fresh.contexts.find(item => item.key === context.key);
+                if (latest) await maybeJudgeAdvance(latest, queued.messageId, fresh.config);
+            }
         }
     }
 
@@ -3549,10 +3581,10 @@
         // 判断AI档：标记流程之后按最新进度逐条绑定问判断AI（标记已推进的会被守卫跳过）。
         if (all.configured && autoAdvanceMode(all.config) === 'judge') {
             const fresh = await loadContexts();
-            for (const context of fresh.contexts) {
-                if (context.broken || !context.stage) continue;
-                await maybeJudgeAdvance(context, messageId, fresh.config);
-            }
+            await Promise.all(fresh.contexts.map(context => {
+                if (context.broken || !context.stage) return null;
+                return maybeJudgeAdvance(context, messageId, fresh.config);
+            }));
         }
     }
 
@@ -4915,9 +4947,13 @@
             return moveToIndex(fresh, target);
         });
         const percent = total > 0 ? Math.round(Math.min(stageIndex, total) / total * 100) : 0;
-        const stageText = total === 0 ? '未分段' : (finished ? `全部 ${total} 段完成` : `第 ${stageIndex + 1} / ${total} 段`);
+        const hints = [];
+        if (context.parsed.loop) hints.push('循环');
+        if (context.stage && context.stage.terminal) hints.push('到此结束');
+        const hintText = hints.length ? ` · ${hints.join(' · ')}` : '';
+        const stageText = total === 0 ? '未分段' : (finished && !context.parsed.loop ? `全部 ${total} 段完成` : `第 ${Math.min(stageIndex, total - 1) + 1} / ${total} 段${hintText}`);
         const nameText = total === 0 ? '分好阶段后才会发送'
-            : (finished ? '不再发送指导' : (context.stage ? context.stage.name : ''));
+            : (finished && !context.parsed.loop ? '不再发送指导' : (context.stage ? context.stage.name : (context.parsed.stages[Math.min(stageIndex, total - 1)] || {}).name || ''));
         return el('div', { class: `dga-bind-item${ui.justBoundKey === context.key ? ' is-new' : ''}` },
             el('div', { class: 'dga-bind-item-head' },
                 el('div', { class: 'dga-heading-text' },
@@ -4931,7 +4967,10 @@
                 ? messageBar({ type: 'warning', text: '旧版（1.x）划分，转换前不发送。' })
                 : null,
             el('div', { class: 'dga-stepper' },
-                btn('‹ 上一段', () => move('切换到上一段', stageIndex - 1), { ghost: true, disabled: !usable || stageIndex <= 0 }),
+                btn('‹ 上一段', () => move('切换到上一段', stepTarget(stageIndex, -1, total, context.parsed.loop)), {
+                    ghost: true,
+                    disabled: !usable || (!context.parsed.loop && stageIndex <= 0),
+                }),
                 // 步进器中间这块就是「划分阶段」的入口（v2.28）：点进去直接落在这一条
                 // 绑定当前的段上，于是不同小卡进去分的就是各自条目的段，不再依赖
                 // 添加行里那个「下拉选中是谁」的猜测。
@@ -4940,15 +4979,16 @@
                     title: usable ? '划分阶段：直接落在这一段' : '划分阶段',
                     'aria-label': '划分阶段',
                 }, () => runAction('打开编辑器', () => openEditorAt(context.worldbookName, context.entry, {
-                    focusStageIndex: total > 0 ? stageIndex : null,
+                    focusStageIndex: total > 0 ? Math.min(stageIndex, total - 1) : null,
                 }), { refresh: false })),
                     el('span', { class: 'dga-stepper-stage', text: stageText }),
                     nameText ? el('span', { class: 'dga-stepper-name', text: nameText }) : null,
                     el('div', { class: 'dga-stepper-bar' }, el('i', { style: { width: `${percent}%` } })),
                     el('span', { class: 'dga-stepper-edit', text: '划分 ›' })),
-                btn('下一段 ›', () => move('切换到下一段', context.parsed.loop && stageIndex === total - 1 ? 0 : stageIndex + 1), {
-                    ghost: !usable || finished, primary: usable && !finished,
-                    disabled: !usable || finished || (stageIndex >= total - 1 && !context.parsed.loop),
+                btn('下一段 ›', () => move('切换到下一段', stepTarget(stageIndex, 1, total, context.parsed.loop)), {
+                    ghost: !usable || (finished && !context.parsed.loop),
+                    primary: usable && !(finished && !context.parsed.loop),
+                    disabled: !usable || (!context.parsed.loop && (finished || stageIndex >= total - 1)),
                 })),
         );
     }
@@ -5193,8 +5233,8 @@
             mode === 'seg' && mergedCount > 0
                 ? messageBar({ type: 'info', text: `这个条目有 ${mergedCount} 处「合并到」。分段保存不会改原文，归属记在条目旁边。` })
                 : null,
-            mode === 'seg' && parsed.blocks.length > 0
-                ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` })
+            mode === 'seg' && ((editor.pick && stageSequence(editor.pick).length) || parsed.stages.length)
+                ? messageBar({ type: 'info', text: `现在有 ${(editor.pick ? stageSequence(editor.pick) : parsed.stages).length} 个剧情阶段${(editor.pick ? editor.pick.addons.length : parsed.addons.length) ? `、${editor.pick ? editor.pick.addons.length : parsed.addons.length} 个附加内容` : ''}${editor.pick && editor.pick.loop ? '，循环开着' : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` })
                 : null,
         );
         const foot = el('footer', { class: 'dga-foot' },
@@ -6561,7 +6601,8 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
     async function shiftStage(delta) {
         try {
             const context = await requireContext();
-            await moveToIndex(context, context.state.stageIndex + delta);
+            const target = stepTarget(context.state.stageIndex, delta, context.parsed.stages.length, context.parsed.loop);
+            await moveToIndex(context, target);
         } catch (error) {
             notify(error.message || String(error), 'error');
         }
@@ -6616,6 +6657,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         pickLoad,
         pickBuild,
         rebasePickText,
+        stepTarget,
         pickAssign,
         pickRemove,
         openEditorAt,
