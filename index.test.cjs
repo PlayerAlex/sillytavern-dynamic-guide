@@ -1369,6 +1369,65 @@ test('进度停在全部完成时，绑定上的循环仍能绕回第一段', as
     assert.deepEqual(run.errors, []);
 });
 
+test('世界书状态条目里的循环，角色变量丢了也能找回来', async () => {
+    const books = {
+        书A: [
+            { uid: 5, name: '大纲', content: '## 暑假\n暑假正文\n\n## 寒假\n寒假正文', enabled: false },
+            {
+                uid: 8,
+                name: '（动态指导·状态）',
+                enabled: false,
+                disable: true,
+                content: JSON.stringify({ version: 1, entries: { 大纲: { loop: true, startIndex: 0 } } }),
+            },
+        ],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 5, entryName: '大纲' }],
+        },
+        chatState: {
+            version: 2,
+            bindings: {
+                '书A#uid:5': { stageIndex: 2, stageName: '', lastCompletionMessageId: null, lastCompletionFingerprint: '' },
+            },
+        },
+    });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const mirror = state.books.书A.find(isMirror);
+    assert.ok(mirror, '循环从状态条目恢复后，进度越界也要继续发第一段');
+    assert.match(mirror.content, /暑假正文/);
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings[0].loop, true);
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings.length, 1);
+    assert.deepEqual(run.errors, []);
+});
+
+test('条目 uid 变了也不另开一条没有循环的绑定', async () => {
+    const books = {
+        书A: [
+            { uid: 5, name: '大纲', content: '## 暑假\n暑假正文\n\n## 寒假\n寒假正文', enabled: false },
+            { uid: 9, name: '大纲（动态指导）', content: '暑假正文', enabled: true },
+        ],
+    };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲', loop: true }],
+        },
+    });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const bindings = state.variables.character.$dynamicGuideAssistant.config.bindings;
+    assert.equal(bindings.length, 1, '不能因为 uid 变了就再绑一条');
+    assert.equal(bindings[0].entryUid, 5);
+    assert.equal(bindings[0].loop, true);
+    assert.deepEqual(run.errors, []);
+});
+
 test('浏览器里的跟卡走丢了，世界书里的配置条目还在就恢复', async () => {
     const books = {
         甲书: [

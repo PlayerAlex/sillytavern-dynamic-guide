@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.48
+     * 动态指导助手 v2.49
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.48';
+    const VERSION = '2.49';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1709,6 +1709,9 @@
     const LOCAL_PRESET_PREFIX = 'dynamic-guide-assistant:preset-names:v1:';
     // 世界书里的配置条目：关着的，只给插件读，永远不进 AI 上下文，也不参与关键词触发。
     const CONFIG_ENTRY_NAME = '（动态指导·配置）';
+    // 循环如果只放在条目 extra 里，手机会在酒馆自己保存世界书时把这份隐藏数据清掉。
+    // 状态条目是关着的正文，世界书一定会把它留下。
+    const STATE_ENTRY_NAME = '（动态指导·状态）';
 
     function configStorageMode() {
         const storage = presetStorage();
@@ -1738,48 +1741,15 @@
     }
 
     async function persistBindingLoop(editor) {
-        if (!editor || !editor.bound || !editor.pick) return;
-        const want = Boolean(editor.pick.loop);
-        const config = await readConfig();
-        const key = bindingKey({
-            worldbookName: editor.worldbookName,
-            entryUid: editor.entry.uid,
-            entryName: entryName(editor.entry),
-        });
-        let changed = false;
-        const bindings = config.bindings.map(item => {
-            if (bindingKey(item) !== key) return item;
-            if (Boolean(item.loop) === want) return item;
-            changed = true;
-            const next = { ...item };
-            if (want) next.loop = true;
-            else delete next.loop;
-            return next;
-        });
-        if (!changed) return;
-        editor.bindingLoop = want;
-        await writeConfig({ version: 2, bindings, settings: config.settings || {} });
+        if (!editor || !editor.pick) return;
+        editor.bindingLoop = Boolean(editor.pick.loop);
+        await storeLoop(editor.worldbookName, editor.entry, editor.pick.loop);
     }
 
     async function saveBindingLoop(binding, on) {
         const located = await locateEntry(binding);
-        if (located) {
-            const layout = readLayout(located.entry);
-            if (layout && Boolean(layout.loop) !== Boolean(on)) {
-                layout.loop = Boolean(on);
-                await writeEntryLayout(located.worldbookName, located.entry.uid, entryName(located.entry), layout);
-            }
-        }
-        const config = await readConfig();
-        const key = bindingKey(binding);
-        config.bindings = config.bindings.map(item => {
-            if (bindingKey(item) !== key) return item;
-            const next = { ...item };
-            if (on) next.loop = true;
-            else delete next.loop;
-            return next;
-        });
-        await writeConfig(config);
+        const entry = located ? located.entry : { uid: binding.entryUid, name: binding.entryName, comment: binding.entryName };
+        await storeLoop(located ? located.worldbookName : binding.worldbookName, entry, on);
     }
 
     async function saveBindingStart(binding, index) {
@@ -2183,6 +2153,24 @@
     }
 
     // state 传 null 表示删掉这条绑定的进度（移出绑定时用）。
+    async function renameStateKey(oldKey, newKey) {
+        if (!oldKey || !newKey || oldKey === newKey) return;
+        await updateVariables('chat', variables => {
+            const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
+                ? variables[VARIABLE_ROOT]
+                : {};
+            const old = root.state && typeof root.state === 'object'
+                && root.state.version === 2 && root.state.bindings && typeof root.state.bindings === 'object'
+                ? root.state.bindings
+                : null;
+            if (!old || !old[oldKey] || old[newKey]) return variables;
+            const bindings = { ...old, [newKey]: old[oldKey] };
+            delete bindings[oldKey];
+            variables[VARIABLE_ROOT] = { ...root, state: { version: 2, bindings } };
+            return variables;
+        });
+    }
+
     async function writeStateFor(key, state) {
         await updateVariables('chat', variables => {
             const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
@@ -2364,10 +2352,12 @@
     const LAYOUT_EXTRA_KEY = 'dynamicGuideAssistantLayout';
 
     function readLayout(entry) {
-        const extra = entry && entry.extra;
-        const layout = extra && extra[LAYOUT_EXTRA_KEY];
-        if (!layout || layout.version !== 3 || !Array.isArray(layout.stages)) return null;
-        return layout;
+        const pools = [entry && entry.extra, entry && entry.extensions];
+        for (const pool of pools) {
+            const layout = pool && pool[LAYOUT_EXTRA_KEY];
+            if (layout && layout.version === 3 && Array.isArray(layout.stages)) return layout;
+        }
+        return null;
     }
 
     function lineSpans(text) {
@@ -2579,6 +2569,140 @@
         delete extra[LEGACY_META_KEY];
         if (layout) extra[LAYOUT_EXTRA_KEY] = layout;
         entry.extra = extra;
+        // 酒馆保存世界书时留的是 extensions。只写 extra，手机上重开后循环会丢。
+        const extensions = entry.extensions && typeof entry.extensions === 'object' ? { ...entry.extensions } : {};
+        if (layout) extensions[LAYOUT_EXTRA_KEY] = layout;
+        entry.extensions = extensions;
+    }
+
+    function findBindingForEntry(config, worldbookName, entry) {
+        const list = config && config.bindings || [];
+        const name = entryName(entry);
+        return list.find(item => item.worldbookName === worldbookName && sameUid(item.entryUid, entry && entry.uid))
+            || list.find(item => item.worldbookName === worldbookName && item.entryName === name)
+            || null;
+    }
+
+    async function readFlagMap(worldbookName) {
+        try {
+            const entry = worldbookEntries(await getWorldbook(worldbookName))
+                .find(item => entryName(item) === STATE_ENTRY_NAME);
+            if (!entry) return {};
+            const parsed = JSON.parse(String(entry.content || '{}'));
+            return parsed && parsed.entries && typeof parsed.entries === 'object' ? parsed.entries : {};
+        } catch (error) {
+            return {};
+        }
+    }
+
+    async function writeFlag(worldbookName, name, patch) {
+        await updateWorldbook(worldbookName, worldbook => {
+            const list = worldbookEntries(worldbook);
+            let entry = list.find(item => entryName(item) === STATE_ENTRY_NAME);
+            let data = { version: 1, entries: {} };
+            if (entry) {
+                try {
+                    const parsed = JSON.parse(String(entry.content || '{}'));
+                    if (parsed && parsed.entries && typeof parsed.entries === 'object') data = parsed;
+                } catch (error) { /* 坏掉的状态条目按空的重写 */ }
+            }
+            if (!data.entries || typeof data.entries !== 'object') data.entries = {};
+            const prev = data.entries[name] && typeof data.entries[name] === 'object' ? data.entries[name] : {};
+            const start = patch.startIndex != null ? Math.floor(Number(patch.startIndex)) : Math.floor(Number(prev.startIndex));
+            data.version = 1;
+            data.entries[name] = {
+                loop: patch.loop === true,
+                startIndex: Number.isFinite(start) && start > 0 ? start : 0,
+            };
+            const payload = JSON.stringify(data);
+            if (entry) {
+                entry.content = payload;
+                sealConfigEntry(entry);
+                return worldbook;
+            }
+            const template = list.find(item => !entryName(item).endsWith('（动态指导）')
+                && entryName(item) !== CONFIG_ENTRY_NAME
+                && entryName(item) !== STATE_ENTRY_NAME) || {};
+            const created = sealConfigEntry({
+                ...template,
+                uid: freshUid(worldbook),
+                comment: STATE_ENTRY_NAME,
+                name: STATE_ENTRY_NAME,
+                title: STATE_ENTRY_NAME,
+                content: payload,
+            });
+            addEntryToWorldbook(worldbook, created);
+            return worldbook;
+        });
+    }
+
+    // 循环的正本是世界书里的状态条目。角色变量和 extra 只是副本，丢了也能从这里找回来。
+    async function storeLoop(worldbookName, entry, on) {
+        if (!worldbookName || !entry) return;
+        const name = entryName(entry);
+        const config = await readConfig();
+        const binding = findBindingForEntry(config, worldbookName, entry);
+        if (binding && !sameUid(binding.entryUid, entry.uid)) binding.entryUid = entry.uid;
+        if (binding) {
+            if (on) binding.loop = true;
+            else delete binding.loop;
+            await writeConfig(config);
+        }
+        await writeFlag(worldbookName, name, {
+            loop: Boolean(on),
+            startIndex: binding && binding.startIndex > 0 ? binding.startIndex : 0,
+        });
+        const layout = readLayout(entry);
+        if (layout && Boolean(layout.loop) !== Boolean(on)) {
+            layout.loop = Boolean(on);
+            try {
+                await writeEntryLayout(worldbookName, entry.uid, name, layout);
+            } catch (error) {
+                console.warn(`[${SCRIPT_NAME}] 把循环写回划分数据失败`, error);
+            }
+        }
+    }
+
+    async function restoreEntryFlags() {
+        const config = await readConfig();
+        const maps = new Map();
+        let changed = false;
+        for (const binding of config.bindings) {
+            const book = binding.worldbookName;
+            if (!book || !binding.entryName) continue;
+            if (!maps.has(book)) maps.set(book, await readFlagMap(book));
+            const flag = maps.get(book)[binding.entryName];
+            const hasFlag = flag && typeof flag === 'object' && Object.prototype.hasOwnProperty.call(flag, 'loop');
+            let located = null;
+            try { located = await locateEntry(binding); } catch (error) { located = null; }
+            const layout = located && readLayout(located.entry);
+            const effective = hasFlag ? flag.loop === true : Boolean(binding.loop || (layout && layout.loop));
+            if (effective && binding.loop !== true) {
+                binding.loop = true;
+                changed = true;
+            } else if (!effective && binding.loop === true && hasFlag) {
+                delete binding.loop;
+                changed = true;
+            }
+            const start = flag && Math.floor(Number(flag.startIndex));
+            if ((!Number.isFinite(Number(binding.startIndex)) || binding.startIndex <= 0) && Number.isFinite(start) && start > 0) {
+                binding.startIndex = start;
+                changed = true;
+            }
+            if (!hasFlag && effective) {
+                await writeFlag(book, binding.entryName, { loop: true, startIndex: binding.startIndex || 0 });
+                maps.get(book)[binding.entryName] = { loop: true, startIndex: binding.startIndex || 0 };
+            }
+            if (layout && Boolean(layout.loop) !== effective && located) {
+                layout.loop = effective;
+                try {
+                    await writeEntryLayout(located.worldbookName, located.entry.uid, entryName(located.entry), layout);
+                } catch (error) {
+                    console.warn(`[${SCRIPT_NAME}] 恢复循环到划分数据失败`, error);
+                }
+            }
+        }
+        if (changed) await writeConfig(config);
     }
 
     async function writeEntryFields(worldbookName, uid, name, mutate) {
@@ -3001,6 +3125,7 @@
         // 只扫当前这张卡绑定的世界书。扫全库会把别的卡的镜像收进这张卡的配置。
         const names = await currentBoundWorldbooks();
         const recovered = [];
+        const uidMoves = [];
         for (const worldbookName of names) {
             let entries = [];
             try {
@@ -3016,6 +3141,16 @@
                 if (!source) continue;
                 const byUid = `${worldbookName}#uid:${String(source.uid)}`;
                 const byName = `${worldbookName}#name:${sourceName}`;
+                // 同一条目换了 uid 时不能另开一条没有循环的绑定，否则手机上循环看起来像丢了。
+                const sameName = config.bindings.find(item => item.worldbookName === worldbookName && item.entryName === sourceName);
+                if (sameName) {
+                    if (!sameUid(sameName.entryUid, source.uid)) {
+                        uidMoves.push({ oldKey: bindingKey(sameName), binding: sameName, nextUid: source.uid });
+                        sameName.entryUid = source.uid;
+                    }
+                    known.add(bindingKey(sameName));
+                    continue;
+                }
                 if (known.has(byUid) || known.has(byName)) continue;
                 if (hasLegacyLayout(source)) continue;
                 const parsed = outlineFromEntry(source);
@@ -3031,8 +3166,12 @@
                 recovered.push({ candidate, mirror, parsed });
             }
         }
-        if (recovered.length === 0) return 0;
+        if (recovered.length === 0 && uidMoves.length === 0) return 0;
         await writeConfig({ version: 2, bindings: config.bindings, settings: config.settings || {} });
+        for (const move of uidMoves) {
+            const nextKey = bindingKey(move.binding);
+            if (move.oldKey !== nextKey) await renameStateKey(move.oldKey, nextKey);
+        }
         // 进度：这份聊天还没有这条绑定的进度时才写，且按镜像内容对齐到当前段（对不上就从第一段开始）。
         const existing = await readState(config).catch(() => ({}));
         for (const item of recovered) {
@@ -3048,9 +3187,11 @@
                 updatedAt: new Date().toISOString(),
             });
         }
-        const labels = recovered.map(item => `「${item.candidate.entryName}」`).join('、');
-        LogModule.info('自愈', `发现 ${recovered.length} 个「${MIRROR_SUFFIX}」镜像条目没有绑定，已自动接管：${labels}`);
-        notify(`已自动接管 ${labels} 的「${MIRROR_SUFFIX}」镜像并重建绑定。`, 'success');
+        if (recovered.length > 0) {
+            const labels = recovered.map(item => `「${item.candidate.entryName}」`).join('、');
+            LogModule.info('自愈', `发现 ${recovered.length} 个「${MIRROR_SUFFIX}」镜像条目没有绑定，已自动接管：${labels}`);
+            notify(`已自动接管 ${labels} 的「${MIRROR_SUFFIX}」镜像并重建绑定。`, 'success');
+        }
         return recovered.length;
     }
 
@@ -3233,17 +3374,21 @@
         if (hasLegacyLayout(fresh)) throw new Error('这个条目还是旧版划分，请先点“转换成新版格式”。');
         const parsed = outlineFromEntry(fresh);
         const config = await readConfig();
+        const flags = await readFlagMap(worldbookName);
+        const named = findBindingForEntry(config, worldbookName, fresh);
+        const flag = flags[entryName(fresh)];
         const candidate = {
             worldbookName,
             entryUid: fresh.uid,
             entryName: entryName(fresh),
             boundAt: new Date().toISOString(),
         };
+        if ((flag && flag.loop) || parsed.loop || (named && named.loop)) candidate.loop = true;
+        if (named && named.startIndex > 0) candidate.startIndex = named.startIndex;
         const key = bindingKey(candidate);
-        const existing = config.bindings.some(item => bindingKey(item) === key);
         await disableEntry(worldbookName, fresh.uid, entryName(fresh));
-        const bindings = existing
-            ? config.bindings.map(item => (bindingKey(item) === key ? { ...item, ...candidate } : item))
+        const bindings = named
+            ? config.bindings.map(item => (item === named ? { ...item, ...candidate } : item))
             : [...config.bindings, candidate];
         await writeConfig({ version: 2, bindings, settings: config.settings || {} });
         await writeStateFor(key, {
@@ -5454,11 +5599,12 @@
         if (!fresh) throw new Error('这个条目已经不存在了，请刷新后重试。');
         const lines = normalizeText(fresh.content).split('\n');
         const config = ui.snapshot && ui.snapshot.config ? ui.snapshot.config : await readConfig();
-        const candidate = { worldbookName, entryUid: fresh.uid, entryName: entryName(fresh) };
-        const bound = config.bindings.some(item => bindingKey(item) === bindingKey(candidate));
+        const binding = findBindingForEntry(config, worldbookName, fresh);
+        const bound = Boolean(binding);
         const source = lines.join('\n');
         const stored = readLayout(fresh);
-        const binding = config.bindings.find(item => bindingKey(item) === bindingKey(candidate));
+        const flags = await readFlagMap(worldbookName);
+        const flagLoop = Boolean(flags[entryName(fresh)] && flags[entryName(fresh)].loop);
         ui.editor = {
             worldbookName,
             entry: fresh,
@@ -5469,7 +5615,7 @@
             // 两档视图：'seg' 分段 / 'raw' 编辑原文
             mode: 'seg',
             bound,
-            bindingLoop: Boolean(binding && binding.loop),
+            bindingLoop: Boolean((binding && binding.loop) || flagLoop || (stored && stored.loop)),
             pick: null,
             pickListeners: null,
             // 从小卡点进来时带的当前段：渲染完滚到它并高亮一次
@@ -5545,12 +5691,23 @@
             editor.pick ? el('button', {
                 type: 'button',
                 class: `dga-seg-btn${editor.pick.loop ? ' is-on' : ''}`,
-                onclick: () => { editor.pick.loop = !editor.pick.loop; editor.dirty = true; render(); },
+                onclick: () => {
+                    const on = !editor.pick.loop;
+                    editor.pick.loop = on;
+                    editor.bindingLoop = on;
+                    if (editor.parsed) editor.parsed.loop = on;
+                    render();
+                    // 不等「保存」。手机上只改内存的话，过一会儿酒馆重写世界书，循环就没了。
+                    storeLoop(editor.worldbookName, editor.entry, on).catch(error => {
+                        setMessage(error.message || String(error), 'error');
+                        render();
+                    });
+                },
             }, editor.pick.loop ? '循环：开' : '循环：关') : null,
         );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
-            : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。';
+            : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。循环一点就记住，不用再点保存。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
@@ -7055,6 +7212,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         await parkExportedSecrets();
         // 先自愈再同步：导入别人的卡时绑定可能没跟过来，只有镜像跟过来了。
         await recoverBindings();
+        await restoreEntryFlags();
         await syncMirrors('startup');
     });
 
@@ -7084,6 +7242,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
             LogModule.info('事件', '切换聊天，按当前角色卡重新对齐绑定和镜像');
             await parkExportedSecrets();
             await recoverBindings();
+            await restoreEntryFlags();
             await syncMirrors('normal');
             const doc = hostDocument();
             const panel = doc && doc.getElementById(PANEL_ID);
