@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.53
+     * 动态指导助手 v2.54
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.53';
+    const VERSION = '2.54';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -4254,6 +4254,8 @@
         entryQuery: '',
         entryQueryFocus: false,
         judgeExtras: {},
+        guideSection: 'dga-card-bind',
+        paceKey: '',
         // 运行日志页：等级 + 标签筛选
         logLevelFilter: 'all',
         logTagFilter: 'all',
@@ -4444,6 +4446,10 @@
             ui.entryQueryFocus = false;
         }
         ui.renderedView = ui.view;
+        if (ui.view === 'guide' && ui.paceKey) {
+            const sheet = renderPaceSheet();
+            if (sheet) shell.appendChild(sheet);
+        }
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
     }
 
@@ -4707,18 +4713,24 @@
     // 顶部只留错误条（v2.24 起成功/提示类绿条不在本页显示）；
     // v2.25 起独立绑定卡片区删除，功能并入绑定世界书卡的行内。
     function scrollPanelTo(id) {
+        ui.guideSection = id;
+        render();
         const doc = hostDocument();
         const panel = doc && doc.getElementById(PANEL_ID);
         const body = panel && panel.querySelector('.dga-body');
         const target = doc && doc.getElementById(id);
-        scrollStageIntoView(body, target);
+        if (!body || !target || typeof target.getBoundingClientRect !== 'function' || typeof body.getBoundingClientRect !== 'function') return;
+        const box = body.getBoundingClientRect();
+        const item = target.getBoundingClientRect();
+        body.scrollTop = Math.max(0, body.scrollTop + (item.top - box.top) - 8);
     }
 
     function panelNav(items) {
-        return el('nav', { class: 'dga-panel-nav dga-span', 'aria-label': '页面板块' },
+        return el('nav', { class: 'dga-panel-nav', 'aria-label': '页面板块' },
             ...items.map(item => el('button', {
                 type: 'button',
-                class: 'dga-panel-nav-item',
+                class: `dga-panel-nav-item${ui.guideSection === item.id ? ' is-on' : ''}`,
+                'aria-current': ui.guideSection === item.id ? 'location' : null,
                 onclick: () => scrollPanelTo(item.id),
             }, item.label)));
     }
@@ -4732,18 +4744,21 @@
         rules.id = 'dga-card-rules';
         rules.classList.add('dga-span');
         const body = el('div', { class: 'dga-body dga-split' },
-            panelNav([
-                { id: 'dga-card-bind', label: '绑定' },
-                { id: 'dga-card-judge', label: '如何判断' },
-                { id: 'dga-card-rules', label: '提取规则' },
-            ]),
             ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             bindCard,
             judgeCard,
             rules,
         );
-        return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }), body];
+        return [
+            header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
+            panelNav([
+                { id: 'dga-card-bind', label: '绑定' },
+                { id: 'dga-card-judge', label: '如何判断' },
+                { id: 'dga-card-rules', label: '提取规则' },
+            ]),
+            body,
+        ];
     }
 
     // 离开划分阶段时若还有未保存的修改，先问一声。从侧栏跳走也要丢掉编辑器，并刷新小卡。
@@ -5750,8 +5765,37 @@
                     primary: usable && !(finished && !context.parsed.loop),
                     disabled: !usable || (!context.parsed.loop && (finished || stageIndex >= total - 1)),
                 })),
-            bindingPace(context),
+            el('button', {
+                type: 'button',
+                class: 'dga-pace-open',
+                'aria-label': '这条的判断设置',
+                onclick: () => { ui.paceKey = context.key; render(); },
+            }, '设置 ›'),
+            judgeWaitText(context, ui.snapshot && ui.snapshot.config)
+                ? el('p', { class: 'dga-judge-status', text: judgeWaitText(context, ui.snapshot && ui.snapshot.config) })
+                : null,
         );
+    }
+
+    function renderPaceSheet() {
+        const contexts = ui.snapshot ? ui.snapshot.contexts : [];
+        const context = contexts.find(item => item.key === ui.paceKey && !item.broken);
+        if (!context) return null;
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg',
+            onclick: event => {
+                if (event.target === backdrop) { ui.paceKey = ''; render(); }
+            },
+        });
+        const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '这条的判断设置' });
+        box.append(
+            el('h3', { text: `「${entryName(context.entry)}」怎么判断` }),
+            bindingPace(context),
+            el('div', { class: 'dga-sheet-actions' },
+                btn('完成', () => { ui.paceKey = ''; render(); }, { primary: true })),
+        );
+        backdrop.append(box);
+        return backdrop;
     }
 
     function bindingPace(context) {
@@ -5871,7 +5915,7 @@
         const binding = entry ? bindingForEntry(ui.selectedWorldbook, entry) : null;
         const filter = el('input', {
             class: 'dga-input dga-entry-filter',
-            type: 'search',
+            type: 'text',
             placeholder: '搜索条目',
             value: ui.entryQuery || '',
         });
@@ -7158,7 +7202,8 @@ ${P} .dga-btn.dga-danger { color: var(--dga-danger); border-color: color-mix(in 
 ${P} .dga-btn.dga-ghost { background: transparent; }
 ${P} .dga-field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
 ${P} .dga-field > span { color: var(--dga-text-2); }
-${P} select, ${P} input[type="text"], ${P} textarea { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 4px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
+${P} select, ${P} input[type="text"], ${P} input[type="search"], ${P} textarea { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 4px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); appearance: none; -webkit-appearance: none; }
+${P} input[type="search"]::-webkit-search-decoration, ${P} input[type="search"]::-webkit-search-cancel-button, ${P} input[type="search"]::-webkit-search-results-button { -webkit-appearance: none; appearance: none; display: none; }
 ${P} select:focus-visible, ${P} input:focus-visible, ${P} textarea:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--dga-accent-glow); }
 ${P} textarea { min-height: 72px; resize: vertical; }
 ${P} .dga-check { display: flex; align-items: center; gap: 10px; font-size: 13px; }
@@ -7257,10 +7302,15 @@ ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; }
-${P} .dga-panel-nav { display: flex; gap: 8px; overflow-x: auto; position: sticky; top: 0; z-index: 2; padding: 2px 0 6px; background: var(--dga-bg-0); }
-${P} .dga-panel-nav-item { flex: 0 0 auto; min-height: 32px; padding: 6px 12px; border: 1px solid var(--dga-border-2); border-radius: 999px; background: var(--dga-bg-1); color: var(--dga-text-2); font: inherit; font-size: 12px; cursor: pointer; }
-${P} .dga-panel-nav-item:hover { color: var(--dga-text-1); background: var(--dga-hover); }
+${P} .dga-pace-open { align-self: center; margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
+${P} .dga-pace-open:hover, ${P} .dga-pace-open:focus-visible { color: var(--dga-accent); outline: none; }
+${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; text-align: center; }
+${P} .dga-panel-nav { flex: 0 0 auto; display: flex; gap: 0; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid var(--dga-border); background: var(--dga-bg-0); padding: 0 8px; }
+${P} .dga-panel-nav::-webkit-scrollbar { display: none; }
+${P} .dga-panel-nav-item { position: relative; flex: 0 0 auto; min-height: 32px; padding: 6px 10px; border: 0; border-radius: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 12px; font-weight: 650; line-height: 1.2; cursor: pointer; }
+${P} .dga-panel-nav-item:hover { color: var(--dga-text-1); background: transparent; }
+${P} .dga-panel-nav-item.is-on { color: var(--dga-text-1); }
+${P} .dga-panel-nav-item.is-on::after { content: ''; position: absolute; left: 10px; right: 10px; bottom: 0; height: 2px; border-radius: 2px 2px 0 0; background: var(--dga-accent); }
 ${P} .dga-bind-item.is-new { border-color: var(--dga-accent); animation: dga-bind-in 1.4s ease-out; }
 @keyframes dga-bind-in { 0% { opacity: 0; transform: translateY(-6px); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dga-accent) 45%, transparent); } 60% { opacity: 1; transform: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--dga-accent) 30%, transparent); } 100% { opacity: 1; transform: none; box-shadow: none; } }
 ${P} .dga-bind-item-head { display: flex; align-items: center; gap: 8px; }

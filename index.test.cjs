@@ -1996,7 +1996,10 @@ async function bootGuidePage() {
     assert.match(panel().querySelector('.dga-split').className, /dga-body/, '宽屏时卡片分成两列');
     assert.equal(panel().querySelector('.dga-close').textContent, '×', '右上角仍是简化的 ×');
     const nav = panel().querySelector('.dga-panel-nav');
-    assert.ok(nav, '动态指导页顶部有板块跳转');
+    const body = panel().querySelector('.dga-body');
+    assert.ok(nav, '动态指导页标题下有一排板块标签');
+    assert.equal(body.querySelector('.dga-panel-nav'), null, '标签在滚动卡片外面，不跟在绑定世界书下面');
+    assert.ok(nav.parentNode.children.indexOf(nav) < nav.parentNode.children.indexOf(body), '标签排在卡片滚动区前面');
     assert.match(nav.textContent, /绑定/);
     assert.match(nav.textContent, /如何判断/);
     assert.match(nav.textContent, /提取规则/);
