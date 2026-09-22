@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.39
+     * 动态指导助手 v2.40
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.39';
+    const VERSION = '2.40';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -586,7 +586,9 @@
             : (Number.isInteger(old.mainIndex) ? old.mainIndex : 0);
         const oldName = old.stageName || old.mainName || '';
         let index = oldIndex;
-        if (oldName) {
+        // 当前位置的名字还对得上就留在这里。两个阶段同名时，按名字找会跳回第一个。
+        const at = parsed.stages[oldIndex];
+        if (oldName && (!at || at.name !== oldName)) {
             const byName = parsed.stages.findIndex(stage => stage.name === oldName);
             if (byName >= 0) index = byName;
         }
@@ -597,6 +599,7 @@
             lastCompletionMessageId: old.lastCompletionMessageId == null ? null : old.lastCompletionMessageId,
             lastCompletionFingerprint: old.lastCompletionFingerprint || '',
             lastJudgeCheckedId: old.lastJudgeCheckedId == null ? null : old.lastJudgeCheckedId,
+            preAdvanceIndex: Number.isInteger(old.preAdvanceIndex) ? old.preAdvanceIndex : null,
             updatedAt: old.updatedAt || new Date().toISOString(),
         };
     }
@@ -990,6 +993,46 @@
     // 推进顺序是用户定的（新建的先后，或 ↑↓），不跟文字在原文里的位置走。
     function stageSequence(pick) {
         return pick && Array.isArray(pick.stages) ? pick.stages.slice() : [];
+    }
+
+    // 原文改了几个字时，把阶段区间平移到新字符串上。只认一处连续改动：
+    // 改动前面的位置不动，后面的位置整体挪，改动内部按比例缩。
+    function rebasePickText(pick, newText) {
+        const oldText = String(pick && pick.text || '');
+        const next = String(newText == null ? '' : newText);
+        if (!pick || oldText === next) return pick;
+        const oldLen = oldText.length;
+        const newLen = next.length;
+        let start = 0;
+        const limit = Math.min(oldLen, newLen);
+        while (start < limit && oldText.charCodeAt(start) === next.charCodeAt(start)) start += 1;
+        let oldEnd = oldLen;
+        let newEnd = newLen;
+        while (oldEnd > start && newEnd > start && oldText.charCodeAt(oldEnd - 1) === next.charCodeAt(newEnd - 1)) {
+            oldEnd -= 1;
+            newEnd -= 1;
+        }
+        const delta = (newEnd - start) - (oldEnd - start);
+        const oldSpan = oldEnd - start;
+        const newSpan = newEnd - start;
+        const mapPoint = point => {
+            const value = Math.max(0, Math.floor(Number(point) || 0));
+            // 插在区间右边界上的字算进这一段（右边界是开区间）。
+            if (value < start) return value;
+            if (value >= oldEnd) return Math.max(0, value + delta);
+            if (oldSpan === 0) return start;
+            return start + Math.round((value - start) * newSpan / oldSpan);
+        };
+        const mapRanges = ranges => normalizeRanges((ranges || []).map(range => {
+            const mappedStart = mapPoint(range.start);
+            const mappedEnd = mapPoint(range.end);
+            return mappedEnd > mappedStart ? { start: mappedStart, end: mappedEnd } : null;
+        }));
+        pickOwners(pick).forEach(owner => { owner.ranges = mapRanges(owner.ranges); });
+        pick.pendingRanges = mapRanges(pick.pendingRanges);
+        if (pick.tapHead != null) pick.tapHead = mapPoint(pick.tapHead);
+        pick.text = next;
+        return pick;
     }
 
     function pickSafeName(name, fallback) {
@@ -1969,6 +2012,24 @@
         });
     }
 
+    // 只改进度里的几个字段，保留这段时间里别人已经写上的阶段号。
+    async function patchStateFor(key, patch) {
+        await updateVariables('chat', variables => {
+            const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object'
+                ? variables[VARIABLE_ROOT]
+                : {};
+            const old = root.state && typeof root.state === 'object'
+                && root.state.version === 2 && root.state.bindings && typeof root.state.bindings === 'object'
+                ? root.state.bindings
+                : {};
+            const bindings = { ...old };
+            const prev = bindings[key] && typeof bindings[key] === 'object' ? bindings[key] : {};
+            bindings[key] = { ...prev, ...patch };
+            variables[VARIABLE_ROOT] = { ...root, state: { version: 2, bindings } };
+            return variables;
+        });
+    }
+
     // ---------------------------------------------------------------
     // 二、适配层：角色与世界书
     // ---------------------------------------------------------------
@@ -2282,8 +2343,13 @@
             });
         }
         (layout.addons || []).forEach(addon => {
-            const from = stages.findIndex(stage => stage.name === addon.from);
-            const to = stages.findIndex(stage => stage.name === addon.to);
+            let from = stages.findIndex(stage => stage.name === addon.from);
+            let to = stages.findIndex(stage => stage.name === addon.to);
+            if (from >= 0 && to >= 0 && from > to) {
+                const swap = from;
+                from = to;
+                to = swap;
+            }
             addons.push({
                 kind: 'addon',
                 name: addon.name || '附加',
@@ -2601,12 +2667,17 @@
         if (!context || !context.configured) return null;
         if (context.legacy || context.parsed.stages.length === 0) return null;
         let index = context.state.stageIndex;
-        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段显示
+        // 刚靠完成标记推进过的那条消息如果被重新生成（swipe），仍按推进前的阶段显示。
+        // 循环从最后一段回到第一段时，进度号是 0，要靠记下的推进前下标退回去。
         if ((generationType === 'swipe' || generationType === 'regenerate')
-            && index > 0
             && context.state.lastCompletionMessageId != null) {
             const lastId = currentMessageId();
-            if (lastId != null && String(lastId) === String(context.state.lastCompletionMessageId)) index -= 1;
+            if (lastId != null && String(lastId) === String(context.state.lastCompletionMessageId)) {
+                const back = context.state.preAdvanceIndex;
+                const total = context.parsed.stages.length;
+                if (Number.isInteger(back) && back >= 0 && back < total && back !== index) index = back;
+                else if (index > 0) index -= 1;
+            }
         }
         const stage = context.parsed.stages[index];
         if (!stage) return null;
@@ -2867,6 +2938,8 @@
                 : settings.messageId,
             lastCompletionFingerprint: settings.fingerprint || context.state.lastCompletionFingerprint,
             lastJudgeCheckedId: context.state.lastJudgeCheckedId == null ? null : context.state.lastJudgeCheckedId,
+            // 这条消息引起的推进才记下「从哪一段过来」。手动拨进度清掉，避免重新生成退错段。
+            preAdvanceIndex: settings.messageId != null ? context.state.stageIndex : null,
             updatedAt: new Date().toISOString(),
         };
         await writeStateFor(context.key, next);
@@ -3364,8 +3437,11 @@
         const settings = config && config.settings ? config.settings : {};
         // 检查频率：每 N 层（条 AI 回复）查一次，数据库填表同款频率制；首次检查立即执行。
         const interval = judgeCheckInterval(settings);
-        if (interval > 1 && context.state.lastJudgeCheckedId != null
-            && Number(messageId) - Number(context.state.lastJudgeCheckedId) < interval) {
+        const sinceCheck = context.state.lastJudgeCheckedId == null
+            ? null
+            : Number(messageId) - Number(context.state.lastJudgeCheckedId);
+        // 间隔只跳过「中间那些层」。同一层再来（重新生成）或楼层号倒退，都要重新判断。
+        if (interval > 1 && sinceCheck != null && sinceCheck > 0 && sinceCheck < interval) {
             LogModule.debug('判断AI', `「${entryName(context.entry)}」第 ${messageId} 层未到检查间隔（每 ${interval} 层），跳过`);
             return;
         }
@@ -3397,8 +3473,9 @@
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：开始检查阶段「${stage.name}」（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
             const text = await askJudge(messages, preset, settings);
-            // 本次检查已发生：记录检查楼层，「每 N 层」从这里重新计数（无论结论是 YES 还是 NO）。
-            await writeStateFor(context.key, { ...context.state, lastJudgeCheckedId: messageId });
+            // 只补检查楼层。判断要等接口，这几秒里用户可能已经点了上一段/下一段，
+            // 不能把开始时的整份进度写回去。
+            await patchStateFor(context.key, { lastJudgeCheckedId: messageId });
             // 先过提取/排除规则（数据库填表同款），削掉思维链等噪声后再解析结论。
             const filtered = applyBoundaryRules(text, settings);
             const yes = judgeSaysYes(filtered);
@@ -5071,7 +5148,9 @@
         rawArea.value = editor.lines.join('\n');
         // 原文编辑时不要整页重绘，否则每敲一个字就会丢焦点。
         rawArea.addEventListener('input', event => {
-            editor.lines = normalizeText(event.target.value).split('\n');
+            const next = normalizeText(event.target.value);
+            if (editor.pick) rebasePickText(editor.pick, next);
+            editor.lines = next.split('\n');
             editor.dirty = true;
         });
         const modeButton = (label, target) => el('button', {
@@ -5090,7 +5169,7 @@
             }, editor.pick.loop ? '循环：开' : '循环：关') : null,
         );
         const helpText = mode === 'raw'
-            ? '直接改条目原文：增删、调序、自己写「## 阶段名」都行。回「分段」会重新按标题分段。'
+            ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
             : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
@@ -5112,7 +5191,7 @@
                 }, { ghost: true })
                 : null,
             mode === 'seg' && mergedCount > 0
-                ? messageBar({ type: 'warning', text: `这个条目有 ${mergedCount} 处「合并到」；在「分段」里保存会把它们并进目标阶段的正文（文字不丢，「合并到：」头会没了）。要保留结构请用「编辑原文」。` })
+                ? messageBar({ type: 'info', text: `这个条目有 ${mergedCount} 处「合并到」。分段保存不会改原文，归属记在条目旁边。` })
                 : null,
             mode === 'seg' && parsed.blocks.length > 0
                 ? messageBar({ type: 'info', text: `现在有 ${parsed.stages.length} 个剧情阶段${parsed.addons.length ? `、${parsed.addons.length} 个附加内容` : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` })
@@ -5179,8 +5258,9 @@
         const editor = ui.editor;
         if (!editor || editor.mode === mode) return;
         if (editor.mode === 'raw' && rawArea) {
-            editor.lines = normalizeText(rawArea.value).split('\n');
-            if (editor.pick) editor.pick.text = editor.lines.join('\n');
+            const next = normalizeText(rawArea.value);
+            editor.lines = next.split('\n');
+            if (editor.pick) rebasePickText(editor.pick, next);
         }
         if (editor.mode === 'seg' && editor.pick) editor.lines = String(editor.pick.text || '').split('\n');
         if (editor.mode === 'seg') pickDetach(editor);
@@ -5217,7 +5297,7 @@
             return owner.completion ? `进入下一段：${owner.completion}` : '手动点「下一段」推进';
         }
         if (owner.kind === 'addon') {
-            if (!sortedStages(editor.pick).length) return '还没有剧情阶段';
+            if (!stageSequence(editor.pick).length) return '还没有剧情阶段';
             if (!owner.from && !owner.to) return '还没选生效范围';
             return owner.from === owner.to ? `只在「${owner.from}」有效` : `「${owner.from}」到「${owner.to}」有效`;
         }
@@ -5238,6 +5318,7 @@
             onclick: event => { event.stopPropagation(); moveSegment(editor, owner, delta); },
         }, label);
         const canMove = owner.kind === 'stage' && stageIndex != null && stageIndex >= 0;
+        const stageTotal = stageSequence(editor.pick).length;
         return el('div', pressable({
             class: 'dga-segbar',
             'data-dga-skip': '1',
@@ -5250,13 +5331,12 @@
             el('span', { class: 'dga-segbar-count', text: chars > 0 ? `${chars} 字` : '空' }),
             canMove ? el('span', { class: 'dga-move-wrap' },
                 moveBtn('↑', -1, stageIndex <= 0, '和上一段交换'),
-                moveBtn('↓', 1, false, '和下一段交换')) : null,
+                moveBtn('↓', 1, stageIndex >= stageTotal - 1, '和下一段交换')) : null,
             el('span', { class: 'dga-chev', text: '›' }),
         );
     }
 
-    // ↑↓ 只给阶段：阶段顺序本来就由文字位置推导（sortedStages），所以这里落回正文
-    // 交换相邻两块再重新派生。附加/常驻的位置是类型规则决定的，不给 ↑↓。
+    // ↑↓ 只改推进顺序（pick.stages 的先后），不改原文位置。
     function moveSegment(editor, owner, delta) {
         if (owner.kind !== 'stage') return;
         const stages = editor.pick.stages;
@@ -5401,10 +5481,14 @@
         const settings = config && config.settings ? config.settings : {};
         const preset = findJudgeApiPreset(typeof settings.conditionPreset === 'string' ? settings.conditionPreset : '');
         const owner = sheet.owner;
-        const body = ownerBodyText(owner);
+        const clip = text => {
+            const value = String(text || '').trim();
+            return value.length > 180 ? `${value.slice(0, 180)}…` : value;
+        };
+        const body = clip(ownerBodyText(owner));
         const next = nextStageOwner(owner);
         const pair = conditionPromptPair(settings);
-        const fill = template => fillConditionPrompt(template, owner.name, body, next && next.name, next && ownerBodyText(next));
+        const fill = template => fillConditionPrompt(template, owner.name, body, next && next.name, next && clip(ownerBodyText(next)));
         const messages = [
             { role: 'system', content: fill(pair.system) },
             { role: 'user', content: fill(pair.user) },
@@ -5425,8 +5509,8 @@
         const name = typeof settings.conditionPreset === 'string' ? settings.conditionPreset.trim() : '';
         const via = name ? `API 预设「${name}」` : '酒馆主 API';
         return ownerBodyText(owner)
-            ? `用${via}生成，依据这一段的正文。提示词在右上角齿轮里改。`
-            : `用${via}生成；这一段还没有正文，只能按阶段名推断。`;
+            ? `用${via}写成进入下一段的条件。提示词在右上角齿轮里改。`
+            : `用${via}生成；这一段还没有正文，只能按阶段名和下一段的名字推断。`;
     }
 
     // 一个属主名下的正文（生成完成条件时拿它当依据）。
@@ -5518,7 +5602,7 @@
             }
         }
         if (sheet.kind === 'addon') {
-            const stages = sortedStages(editor.pick);
+            const stages = stageSequence(editor.pick);
             if (stages.length === 0) {
                 box.append(muted('还没有剧情阶段。先分段，再给附加内容选生效范围。'));
             } else {
@@ -5571,7 +5655,7 @@
         }
         pick.stages = pick.stages.filter(item => item !== owner);
         owner.kind = 'addon';
-        const stages = sortedStages(pick);
+        const stages = stageSequence(pick);
         owner.from = stages.length ? stages[0].name : '';
         owner.to = stages.length ? stages[stages.length - 1].name : '';
         owner.color = KIND_COLORS.addon;
@@ -5589,6 +5673,12 @@
             render();
             return;
         }
+        const staysStage = sheet.kind === 'stage' && !sheet.mergeInto;
+        if (staysStage && editor.pick.stages.some(stage => stage !== owner && stage.name === name)) {
+            sheet.error = '已经有同名阶段。进度按名字记住当前段，同名会跳到第一个。';
+            render();
+            return;
+        }
         if (/[#【】\[\]]/.test(name)) {
             sheet.error = '名称里不要用 #、【】、[] 这些符号。';
             render();
@@ -5599,11 +5689,13 @@
             owner.completion = String(sheet.completion || '').trim();
             owner.terminal = Boolean(sheet.terminal);
         }
+        let mergedAway = false;
         if (owner.kind === 'stage' && sheet.mergeInto) {
             const target = pickOwner(editor.pick, sheet.mergeInto);
             if (target && target !== owner) {
                 pickAssign(editor.pick, target.id, owner.ranges);
                 editor.pick.stages = editor.pick.stages.filter(item => item !== owner);
+                mergedAway = true;
             }
         }
         if (owner.kind === 'addon') {
@@ -5611,7 +5703,7 @@
             owner.to = sheet.to;
         }
         if (owner.kind === 'always') editor.pick.alwaysTop = Boolean(sheet.alwaysTop);
-        if ((owner.kind === 'stage' || owner.kind === 'addon') && sheet.kind !== owner.kind) {
+        if (!mergedAway && (owner.kind === 'stage' || owner.kind === 'addon') && sheet.kind !== owner.kind) {
             changeOwnerKind(editor.pick, owner, sheet.kind);
         }
         editor.sheet = null;
@@ -5624,7 +5716,7 @@
         if (!pick || !owner) return;
         if (!hostWindow.confirm(`删除「${owner.name}」？它的文字会回到未分配。`)) return;
         if (owner.kind === 'stage') {
-            const order = sortedStages(pick);
+            const order = stageSequence(pick);
             const index = order.indexOf(owner);
             const fallback = order[index + 1] || order[index - 1] || null;
             pick.stages = pick.stages.filter(item => item !== owner);
@@ -5799,7 +5891,7 @@
             pick.stages.push(stage);
             return stage;
         }
-        const stages = sortedStages(pick);
+        const stages = stageSequence(pick);
         const addon = {
             id: `pick-addon-${stamp}-${pick.addons.length}`,
             kind: 'addon',
@@ -6047,6 +6139,7 @@
 
     async function saveEditor() {
         const editor = ui.editor;
+        if (editor.mode === 'raw' && editor.pick) rebasePickText(editor.pick, editor.lines.join('\n'));
         const content = editor.pick ? String(editor.pick.text || '') : editor.lines.join('\n');
         const layout = editor.pick ? layoutFromPick(editor.pick) : null;
         const saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content, layout);
@@ -6522,6 +6615,7 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         log: LogModule,
         pickLoad,
         pickBuild,
+        rebasePickText,
         pickAssign,
         pickRemove,
         openEditorAt,

@@ -86,6 +86,31 @@ test('旧布局未分配的秘密不能通过原文标题逃出备注', () => {
     assert.doesNotMatch(injected, /未分配秘密|最终秘密|绝不能提前暴露|额外秘密/);
 });
 
+test('改原文时阶段区间跟着挪，后面的阶段不被带跑', () => {
+    const oldText = '暑假正文\n寒假正文';
+    const pick = {
+        text: oldText,
+        stages: [
+            { id: 'a', kind: 'stage', name: '暑假', ranges: [{ start: 0, end: 4 }] },
+            { id: 'b', kind: 'stage', name: '寒假', ranges: [{ start: 5, end: 9 }] },
+        ],
+        addons: [],
+        always: { id: 'always', kind: 'always', ranges: [] },
+        note: { id: 'note', kind: 'note', ranges: [] },
+        pendingRanges: [],
+    };
+    core.rebasePickText(pick, '暑假正文已改\n寒假正文');
+    assert.equal(pick.text.slice(pick.stages[0].ranges[0].start, pick.stages[0].ranges[0].end), '暑假正文已改');
+    assert.equal(pick.text.slice(pick.stages[1].ranges[0].start, pick.stages[1].ranges[0].end), '寒假正文');
+});
+
+test('同名阶段停在当前下标，不跳回第一个', () => {
+    const parsed = core.parseOutline('## 暑假\nA\n\n## 寒假\nB\n\n## 暑假\nC');
+    const state = core.reconcileState({ stageIndex: 2, stageName: '暑假' }, parsed);
+    assert.equal(state.stageIndex, 2);
+    assert.equal(state.stageName, '暑假');
+});
+
 test('阶段改名保留直接、带引号、多行和数字引用的端点', () => {
     const input = '## 第一幕\n正文一\n\n## 第二幕\n正文二\n\n## 道具 [附加]\n从：第一幕\n到：《第二幕》结束时\n道具正文\n\\到：第二幕\n\n## 多行道具 [附加]\n从：\n“第一幕”正在进行时\n\n到：\n《第二幕》结束时\n\n多行正文\n\n## 数字道具 [附加]\n从：1\n到：2\n数字正文';
     let parsed = core.parseOutline(input);
@@ -243,6 +268,38 @@ test('swipe 重新生成时镜像显示的是推进前的阶段', async () => {
     const mirror = state.entries.find(isMirror);
     assert.match(mirror.content, /第一段正文/, 'swipe 要回到推进前的阶段');
     assert.doesNotMatch(mirror.content, /第二段正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('循环回到第一段后，重新生成仍显示刚完成的最后一段', async () => {
+    const text = '暑假正文\n寒假正文\n平时正文';
+    const span = quote => ({ start: text.indexOf(quote), end: text.indexOf(quote) + quote.length });
+    const entry = {
+        uid: 1, name: '大纲', content: text, enabled: false,
+        extra: {
+            dynamicGuideAssistantLayout: {
+                version: 3,
+                loop: true,
+                stages: [
+                    { id: 's', name: '暑假', ranges: [span('暑假正文')] },
+                    { id: 'w', name: '寒假', ranges: [span('寒假正文')] },
+                    { id: 't', name: '平时', ranges: [span('平时正文')] },
+                ],
+            },
+        },
+    };
+    const { state, helper } = helperFor(entry);
+    state.variables.chat.$dynamicGuideAssistant = {
+        state: { stageIndex: 0, stageName: '暑假', lastCompletionMessageId: 7, preAdvanceIndex: 2 },
+    };
+    helper.getLastMessageId = () => 7;
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.match(state.entries.find(isMirror).content, /暑假正文/);
+    await state.events.get('generate')('swipe', {}, false);
+    const mirror = state.entries.find(isMirror);
+    assert.match(mirror.content, /平时正文/, '循环绕回第一段时，重新生成要回到推进前的最后一段');
+    assert.doesNotMatch(mirror.content, /暑假正文/);
     assert.deepEqual(run.errors, []);
 });
 
@@ -1698,8 +1755,32 @@ test('分段界面：标题条的下移按钮交换阶段顺序且不打开弹�
     assert.match(cards[0].textContent, /第 2 段/, '下移只改推进顺序，不搬原文');
     assert.match(cards[1].textContent, /第二幕/);
     assert.match(cards[1].textContent, /第 1 段/);
+    assert.equal(findButton(cards[0], '↓').getAttribute('disabled'), '', '已经是最后一段时，下移按钮要停用');
     assert.equal(panel.querySelector('.dga-sheet'), null, '点搬移按钮不能打开标题弹层');
     assert.match(panel.querySelector('.dga-head-text').children[1].textContent, /未保存/);
+    assert.deepEqual(errors, []);
+});
+
+test('编辑原文里改过的字会保存，阶段区间跟着挪', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const original = '## 第一幕\n暑假正文\n\n## 第二幕\n寒假正文';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = { config: { version: 2, bindings: [] } };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel(), '编辑原文').listeners.click[0]();
+    const area = panel().querySelector('.dga-raw');
+    area.value = original.replace('暑假正文', '暑假正文已改');
+    area.listeners.input[0]({ target: area });
+    await findButton(panel(), '保存').listeners.click[0]();
+    const saved = state.entries.find(item => item.uid === 1);
+    assert.match(saved.content, /暑假正文已改/);
+    const stage = saved.extra.dynamicGuideAssistantLayout.stages.find(item => item.name === '第一幕');
+    assert.match(saved.content.slice(stage.ranges[0].start, stage.ranges[0].end), /暑假正文已改/);
+    const winter = saved.extra.dynamicGuideAssistantLayout.stages.find(item => item.name === '第二幕');
+    assert.match(saved.content.slice(winter.ranges[0].start, winter.ranges[0].end), /寒假正文/);
     assert.deepEqual(errors, []);
 });
 
@@ -1897,6 +1978,8 @@ test('判断AI档：每 2 层检查一次——首次立即查，之后到层才
     await state.events.get('message_received')(7);
     assert.equal(calls, 2, '第 7 层到间隔（7-5>=2），再问一次');
     assert.equal(bindingState().lastJudgeCheckedId, 7, '问过之后重新计数');
+    await state.events.get('message_received')(7);
+    assert.equal(calls, 3, '同一层重新生成要再判断一次');
     assert.deepEqual(run.errors, []);
 });
 
