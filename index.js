@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.55
+     * 动态指导助手 v2.56
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.55';
+    const VERSION = '2.56';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -5491,12 +5491,15 @@
         const interval = bindingJudgeInterval(context.binding, settings);
         const checked = context.state.lastJudgeCheckedId;
         const now = currentMessageId();
-        let wait = interval <= 1 ? '每层都查' : `每 ${interval} 层`;
-        if (checked == null) wait = interval <= 1 ? '每层都查，下一条回复会查' : '还没检查过，下一条回复会查';
-        else if (now != null && interval > 1) {
-            const since = Number(now) - Number(checked);
-            const left = since <= 0 ? interval : interval - since;
-            wait = left <= 0 ? '下一条回复会查' : `还差 ${left} 层`;
+        let wait = '';
+        if (interval > 1) {
+            if (checked == null) wait = '还没检查过，下一条回复会查';
+            else if (now == null) wait = `每 ${interval} 层`;
+            else {
+                const since = Number(now) - Number(checked);
+                const left = since <= 0 ? interval : interval - since;
+                wait = left <= 0 ? '下一条回复会查' : `还差 ${left} 层`;
+            }
         }
         const verdict = context.state.lastJudgeYes === true
             ? '上次 YES'
