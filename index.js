@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.61
+     * 动态指导助手 v2.62
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.61';
+    const VERSION = '2.62';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3796,7 +3796,7 @@
         '3. 完成条件里的每一件都有正文依据，才写 YES；',
         '4. 部分达成和偏离都写 NO，并写明还差什么，或实际演的是什么；',
         '5. 拿不准就写 NO，不用听起来合理的细节把空白填上；',
-        '6. 只填最后的空表，空表以外不要写字。',
+        '6. 最后三个标签都按里面的条目填，标签外不要写字。',
         '7. 一段时间还停在当前这段时写 NO；只有正文已经换成下一阶段的状态才写 YES。',
     ].join('\n');
 
@@ -3826,8 +3826,10 @@
         '</checklist>',
         '',
         '<basis>',
+        '- 已发生：正文里对得上的事',
         '</basis>',
         '<verdict>',
+        '- 结论：只写 YES 或 NO',
         '</verdict>',
     ].join('\n');
 
@@ -3877,8 +3879,10 @@
             '</checklist>',
             '',
             '<basis>',
+            '- 已发生：正文里对得上的事',
             '</basis>',
             '<stage>',
+            '- 序号：第几段',
             '</stage>',
         ].join('\n');
     }
@@ -3977,6 +3981,18 @@
         return null;
     }
 
+    function judgeFieldBody(inner) {
+        return String(inner || '')
+            .split('\n')
+            .map(line => line
+                .replace(/^\s*[-–—•]+\s*/, '')
+                .replace(/^(已发生|依据|结论|序号|basis|verdict|stage)\s*[:：]\s*/i, '')
+                .trim())
+            .filter(Boolean)
+            .join(' ')
+            .trim();
+    }
+
     // 判定结论：优先读英文 <verdict>，再认旧的 <结论>。都没有时回退「开头就是 YES」。
     function judgeVerdictInner(text) {
         const raw = String(text || '');
@@ -3988,7 +4004,11 @@
 
     function judgeSaysYes(text) {
         const inner = judgeVerdictInner(text);
-        if (inner != null) return /^\s*YES\b/i.test(inner);
+        if (inner != null) {
+            const body = judgeFieldBody(inner);
+            if (!body || (/\bYES\b/i.test(body) && /\bNO\b/i.test(body))) return false;
+            return /^\s*YES\b/i.test(body);
+        }
         return /^\s*YES\b/i.test(String(text || ''));
     }
 
@@ -3997,7 +4017,7 @@
         const english = raw.match(/<basis>\s*([\s\S]*?)<\/basis>/i);
         const chinese = raw.match(/<依据>\s*([\s\S]*?)<\/依据>/i);
         const tag = english || chinese;
-        const basis = (tag ? tag[1] : raw).replace(/\s+/g, ' ').trim();
+        const basis = tag ? judgeFieldBody(tag[1]) : raw.replace(/\s+/g, ' ').trim();
         return basis.slice(0, 60);
     }
 
@@ -4011,8 +4031,8 @@
         const list = Array.isArray(stages) ? stages : [];
         const tag = String(text || '').match(/<stage>\s*([\s\S]*?)<\/stage>/i);
         if (!tag) return null;
-        const inner = tag[1].trim();
-        if (!inner) return null;
+        const inner = judgeFieldBody(tag[1]);
+        if (!inner || inner === '第几段') return null;
         if (/^\d+$/.test(inner)) {
             const index = Number(inner) - 1;
             return index >= 0 && index < list.length ? index : null;

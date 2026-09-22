@@ -2450,8 +2450,7 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.match(String(verdicts[0].user_input), /【当前阶段】\n甲一/, '案例段要带阶段名');
     assert.match(String(verdicts[0].user_input), /甲一正文/, '案例段要带阶段正文');
     assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案例段要带最近剧情');
-    assert.match(String(verdicts[0].user_input), /<basis>\n<\/basis>\n<verdict>\n<\/verdict>/, '案例段以英文空表收尾');
-    assert.doesNotMatch(String(verdicts[0].user_input), /不要翻译|照抄下面/, '空表前不解释标签');
+    assert.match(String(verdicts[0].user_input), /<basis>\n- 已发生：正文里对得上的事\n<\/basis>\n<verdict>\n- 结论：只写 YES 或 NO\n<\/verdict>/, 'basis 和 verdict 与 checklist 一样是标签里的条目');
     assert.doesNotMatch(ordered[1].content, /\{\{/, '默认段里的占位符都要被替换');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
@@ -2508,6 +2507,8 @@ test('阶段怎么走：pick 盖过旧的循环，空的 stage 不换段', () =>
     assert.equal(core.bindingOrderMode(looped.bindings[0]), 'loop');
     const stages = [{ name: '甲' }, { name: '乙' }, { name: '丙' }];
     assert.equal(core.judgePickedIndex('<stage>1</stage>', stages), 0);
+    assert.equal(core.judgePickedIndex('<stage>\n- 序号：1\n</stage>', stages), 0);
+    assert.equal(core.judgePickedIndex('<stage>\n- 序号：第几段\n</stage>', stages), null);
     assert.equal(core.judgePickedIndex('<stage>丙</stage>', stages), 2);
     assert.equal(core.judgePickedIndex('<basis>还在</basis>\n<stage></stage>', stages), null);
     assert.equal(core.judgePickedIndex('<stage>9</stage>', stages), null);
@@ -2517,7 +2518,9 @@ test('判断AI档：英文 <verdict> 优先，basis 里的 YES 不算；旧中�
     assert.equal(core.judgeSaysYes('<basis>条件里写了 YES 才算。</basis>\n<verdict>NO</verdict>'), false);
     assert.equal(core.judgeSaysYes('<basis>还在暑假</basis>\n<verdict>YES</verdict>'), true);
     assert.equal(core.judgeSaysYes('<依据>谈过了</依据>\n<结论>YES</结论>'), true, '旧中文标签仍能推进');
-    assert.equal(core.judgeBasisText('<basis>在家吃饭，没有上课</basis>\n<verdict>NO</verdict>'), '在家吃饭，没有上课');
+    assert.equal(core.judgeSaysYes('<verdict>\n- 结论：YES\n</verdict>'), true);
+    assert.equal(core.judgeSaysYes('<verdict>\n- 结论：只写 YES 或 NO\n</verdict>'), false, '没填完的条目不能当成 YES');
+    assert.equal(core.judgeBasisText('<basis>\n- 已发生：在家吃饭，没有上课\n</basis>\n<verdict>NO</verdict>'), '在家吃饭，没有上课');
     assert.equal(core.previewJudgeOutput('<verdict>NO</verdict>', {}).hasTag, true);
 });
 
@@ -2878,7 +2881,7 @@ test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
     assert.equal(cmCalls[0].messages[2].role, 'assistant', '第三段是 assistant 预确认');
     assert.equal(cmCalls[0].messages[3].role, 'user');
     assert.match(cmCalls[0].messages[3].content, /这一轮的回复/);
-    assert.match(cmCalls[0].messages[3].content, /<verdict>\n<\/verdict>/, '案例段以空表收尾');
+    assert.match(cmCalls[0].messages[3].content, /<verdict>\n- 结论：只写 YES 或 NO\n<\/verdict>/, '案例段的 verdict 与 checklist 一样是条目');
     assert.equal(cmCalls[0].messages.length, 4, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
