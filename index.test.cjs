@@ -1269,6 +1269,8 @@ test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写�
     assert.match(sent, /完成条件的作者|完成条件作者/, 'system 段要是完成条件作者的契约');
     assert.match(sent, /第一幕/, '要把阶段名带进提示词');
     assert.match(sent, /他们在雨夜互相介绍/, '要把这一段正文当依据带进去');
+    assert.match(sent, /第二幕/, '要带上下一阶段，写成进入下一段的条件');
+    assert.match(sent, /进入下一阶段/);
     assert.match(sent, /拒绝空泛|抽象判词/, '提示词要禁掉空泛判词');
     assert.doesNotMatch(sent, /\{\{/, '生成提示词里的占位符要全部替换');
 

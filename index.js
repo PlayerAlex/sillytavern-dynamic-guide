@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.37
+     * 动态指导助手 v2.38
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.37';
+    const VERSION = '2.38';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3016,7 +3016,7 @@
         '二、拿什么当标准',
         '5. 把完成条件拆开。每一件都要在正文里有依据，少一件就不是达成。阶段说明用来读懂条件，不能额外加码，也不能拿来顶替条件。',
         '6. 如果完成条件不是可观察的事，而是一句通用说明（例如没有写完成条件），就改为核对「本阶段要演的内容」里写出的具体情节是否都已发生。',
-        '7. 「充分展开」「自然该进入下一段」「气氛到位」不能单独当成 YES 的理由。',
+        '7. 「充分展开」「自然该进入下一段」「气氛到位」不能单独当成 YES 的理由。时间闸门（寒假开始、暑假结束、开学）只看正文是否已经写到那个时间。',
         '',
         '三、完成度三档，怎么落到 YES / NO',
         '8. 只分三种情况：',
@@ -3075,31 +3075,27 @@
     // 没写完成条件时交给判断AI的标准。不能写成「充分展开就算完成」，否则几乎每层都会被放行。
     const JUDGE_EMPTY_CONDITION = '没有写完成条件。只核对「本阶段要演的内容」里写出的具体情节是否都已在正文里发生；感觉该往下走不算完成。';
 
-    // 一键生成「什么时候进入下一段」。这行以后会被判断AI逐件核对，所以必须是一道窄闸门，
-    // 不是剧情摘要，也不是文笔要求。
+    // 一键生成「什么时候进入下一段」。写的是离开当前阶段、进入下一阶段的那一个结果。
+    // 暑假的下一阶段是寒假时，要写「正文已经写到寒假开始」，不能写「还在暑假」。
     const DEFAULT_CONDITION_SYSTEM_PROMPT = [
-        '你是剧情阶段的完成条件作者。你只写一行闸门，而且必须短。判断AI以后逐件核对这行，全部成立才进入下一段。',
-        '你不写剧情、不续写、不解释、不加标题、不加引号、不加「完成：」。',
-        '',
-        '只输出这一行，12 到 28 个字。不要解释，不要分点，不要复述原文。',
+        '你是剧情阶段的完成条件作者。只写一行：出现什么，才离开当前阶段、进入下一阶段。',
+        '不写剧情，不解释，不加引号，不加「完成：」，不要思考过程。',
+        '12到28个字，一句陈述。',
     ].join('\n');
 
     const DEFAULT_CONDITION_USER_PROMPT = [
-        '【当前阶段】',
-        '{{stage}}',
-        '',
-        '【本阶段要演的内容】',
+        '【当前阶段】{{stage}}',
         '{{prompt}}',
         '',
-        '【写法要求】',
-        '写成这一段收束时，读者能在正文里看见的那一个结果。不要把这一段现在已经写了什么再讲一遍。',
-        '1. 只留一件标志收尾的事，包括时间状态。寒暑假、学期、周末、季节这种阶段，就写「正文已经进入暑假」这类能核对的时间结果，不要写成上课细则清单。',
-        '2. 写看得见的动作或结果，例如「两人互相报了名字，并约好下一次见面」。',
-        '3. 拒绝空泛与套话：不要出现「推动剧情发展」「加深羁绊」「深化关系」「气氛到位」「关系更进一步」这类抽象判词。',
-        '4. 不写心理、评价、比喻、原句对白、精确次数。那些一核对就会把阶段卡住。',
-        '5. 用陈述句。不用「当……时」「如果……」。不要复述阶段名。',
+        '【下一阶段】{{next}}',
+        '{{nextPrompt}}',
         '',
-        '只输出这一行完成条件：',
+        '写进入下一阶段的闸门，不要描写当前阶段本身。',
+        '时间阶段（暑假、寒假、学期、周末、季节）：写下一段的时间已经到来。当前是暑假、下一段是寒假 → 正文已经写到寒假开始。',
+        '剧情阶段：写下一段里那件标志事情已经发生。',
+        '拒绝空泛与套话，不要「加深羁绊」「推动剧情」这类抽象判词。只一件事。',
+        '',
+        '只输出这一行：',
     ].join('\n');
 
     function conditionPromptPair(settings) {
@@ -3113,10 +3109,23 @@
         return { system, user };
     }
 
-    function fillConditionPrompt(template, stageName, body) {
+    function fillConditionPrompt(template, stageName, body, nextName, nextBody) {
         return String(template || '')
             .replace(/\{\{\s*stage\s*\}\}/g, stageName)
-            .replace(/\{\{\s*prompt\s*\}\}/g, body || '（这一段还没有正文，只能按阶段名推断）');
+            .replace(/\{\{\s*prompt\s*\}\}/g, body || '（这一段还没有正文）')
+            .replace(/\{\{\s*next\s*\}\}/g, nextName || '（没有下一阶段）')
+            .replace(/\{\{\s*nextPrompt\s*\}\}/g, nextBody || '（没有）');
+    }
+
+    function nextStageOwner(owner) {
+        const pick = ui.editor && ui.editor.pick;
+        if (!pick || !owner || owner.kind !== 'stage') return null;
+        const stages = stageSequence(pick);
+        const index = stages.indexOf(owner);
+        if (index < 0) return null;
+        if (index + 1 < stages.length) return stages[index + 1];
+        if (pick.loop && stages.length > 1) return stages[0];
+        return null;
     }
 
     function fillJudgePlaceholders(template, stage, condition, history) {
@@ -3336,7 +3345,11 @@
             max_chat_history: 0,
             ordered_prompts: ordered,
         };
-        if (settings && settings.judgeMaxTokens) request.max_tokens = settings.judgeMaxTokens;
+        if (settings && settings.judgeMaxTokens) {
+            request.max_tokens = settings.judgeMaxTokens;
+            request.max_length = settings.judgeMaxTokens;
+            request.temperature = 0.2;
+        }
         const result = await generateRaw(request);
         return typeof result === 'string'
             ? result
@@ -5340,7 +5353,7 @@
         user.value = draft.user;
         const box = el('div', { class: 'dga-tip dga-tip-wide', role: 'dialog', 'aria-label': '生成提示词' },
             el('h4', { text: '生成提示词' }),
-            muted('「AI 生成」只用这里的提示词和 API 预设。可用 {{stage}} {{prompt}}。预设本体仍在 API 页，密钥不跟卡走。'),
+            muted('「AI 生成」只用这里的提示词和 API 预设。可用 {{stage}} {{prompt}} {{next}} {{nextPrompt}}。预设本体仍在 API 页，密钥不跟卡走。'),
             field('生成用的 API', selectControl(options, draft.preset, value => {
                 draft.preset = value;
             })),
@@ -5387,13 +5400,15 @@
         const preset = findJudgeApiPreset(typeof settings.conditionPreset === 'string' ? settings.conditionPreset : '');
         const owner = sheet.owner;
         const body = ownerBodyText(owner);
+        const next = nextStageOwner(owner);
         const pair = conditionPromptPair(settings);
+        const fill = template => fillConditionPrompt(template, owner.name, body, next && next.name, next && ownerBodyText(next));
         const messages = [
-            { role: 'system', content: fillConditionPrompt(pair.system, owner.name, body) },
-            { role: 'user', content: fillConditionPrompt(pair.user, owner.name, body) },
+            { role: 'system', content: fill(pair.system) },
+            { role: 'user', content: fill(pair.user) },
         ];
-        const fastPreset = preset ? { ...preset, maxTokens: 64 } : null;
-        const line = cleanConditionText(await askJudge(messages, fastPreset, { ...settings, streamingEnabled: false, judgeMaxTokens: 64 }));
+        const fastPreset = preset ? { ...preset, maxTokens: 48 } : null;
+        const line = cleanConditionText(await askJudge(messages, fastPreset, { ...settings, streamingEnabled: false, judgeMaxTokens: 48 }));
         if (!line) throw new Error('AI 没有返回可用的完成条件，请重试，或直接手写。');
         sheet.completion = line;
         if (area) area.value = line;
@@ -5424,7 +5439,10 @@
 
     // 洗掉模型爱加的包装：代码块、前缀、引号；多行只留第一段有内容的行。
     function cleanConditionText(text) {
-        let line = String(text || '').replace(/```[a-z]*/gi, '').trim();
+        let line = String(text || '')
+            .replace(/<think>[\s\S]*?<\/think>/gi, '')
+            .replace(/```[a-z]*/gi, '')
+            .trim();
         line = line.split('\n').map(item => item.trim()).find(Boolean) || '';
         line = line.replace(/^(完成条件|什么时候进入下一段|完成)\s*[:：]\s*/, '').trim();
         line = line.replace(/^["'“”『「]+/, '').replace(/["'“”』」]+$/, '').trim();
