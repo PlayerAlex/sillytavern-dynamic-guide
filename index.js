@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.60
+     * 动态指导助手 v2.61
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.60';
+    const VERSION = '2.61';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1749,10 +1749,14 @@
         await storeLoop(editor.worldbookName, editor.entry, editor.pick.loop);
     }
 
-    async function saveBindingLoop(binding, on) {
+    async function saveBindingOrder(binding, mode) {
         const located = await locateEntry(binding);
         const entry = located ? located.entry : { uid: binding.entryUid, name: binding.entryName, comment: binding.entryName };
-        await storeLoop(located ? located.worldbookName : binding.worldbookName, entry, on);
+        await storeOrderMode(located ? located.worldbookName : binding.worldbookName, entry, mode);
+    }
+
+    async function saveBindingLoop(binding, on) {
+        await saveBindingOrder(binding, on ? 'loop' : 'order');
     }
 
     async function saveBindingStart(binding, index) {
@@ -2081,7 +2085,11 @@
             };
             const start = Math.floor(Number(item.startIndex));
             if (Number.isFinite(start) && start > 0) binding.startIndex = start;
-            if (item.loop === true) binding.loop = true;
+            if (item.orderMode === 'pick') binding.orderMode = 'pick';
+            else if (item.orderMode === 'loop' || item.loop === true) {
+                binding.orderMode = 'loop';
+                binding.loop = true;
+            }
             const ownMode = item.advanceMode === 'marker' ? 'story' : item.advanceMode;
             if (['off', 'story', 'judge'].includes(ownMode)) binding.advanceMode = ownMode;
             const ownInterval = Math.floor(Number(item.judgeInterval));
@@ -2174,6 +2182,13 @@
         const own = binding && binding.advanceMode === 'marker' ? 'story' : (binding && binding.advanceMode);
         if (['off', 'story', 'judge'].includes(own)) return own;
         return autoAdvanceMode(config);
+    }
+
+    // 阶段怎么走：按顺序停在末尾、循环绕回、或由判断 AI 指定现在该停在哪一段（可以跳回更早的段）。
+    function bindingOrderMode(binding) {
+        if (binding && binding.orderMode === 'pick') return 'pick';
+        if (binding && (binding.orderMode === 'loop' || binding.loop === true)) return 'loop';
+        return 'order';
     }
 
     function bindingJudgeInterval(binding, settings) {
@@ -2846,23 +2861,36 @@
         await writeConfig(config);
     }
 
-    async function storeLoop(worldbookName, entry, on) {
+    async function storeOrderMode(worldbookName, entry, mode) {
         if (!worldbookName || !entry) return;
+        const nextMode = mode === 'pick' || mode === 'loop' ? mode : 'order';
         const name = entryName(entry);
         const config = await readConfig();
         const binding = findBindingForEntry(config, worldbookName, entry);
         const flags = await readFlagMap(worldbookName);
         let layout = (binding && cleanLayout(binding.layout)) || layoutFor(entry, flags[name]);
-        if (layout) layout = { ...layout, loop: Boolean(on) };
+        if (layout) layout = { ...layout, loop: nextMode === 'loop' };
         if (binding && !sameUid(binding.entryUid, entry.uid)) binding.entryUid = entry.uid;
         if (binding) {
-            if (on) binding.loop = true;
-            else delete binding.loop;
+            if (nextMode === 'pick') {
+                binding.orderMode = 'pick';
+                delete binding.loop;
+            } else if (nextMode === 'loop') {
+                binding.orderMode = 'loop';
+                binding.loop = true;
+            } else {
+                delete binding.orderMode;
+                delete binding.loop;
+            }
             if (layout) binding.layout = layout;
             await writeConfig(config);
         } else if (layout) {
             await writeExtensionLayout(worldbookName, name, layout);
         }
+    }
+
+    async function storeLoop(worldbookName, entry, on) {
+        await storeOrderMode(worldbookName, entry, on ? 'loop' : 'order');
     }
 
     async function restoreEntryFlags() {
@@ -2885,7 +2913,20 @@
                     layout = migrated;
                 }
             }
-            const effective = hasFlag ? flag.loop === true : Boolean(binding.loop || (layout && layout.loop));
+            let effective = hasFlag ? flag.loop === true : Boolean(binding.loop || (layout && layout.loop));
+            if (binding.orderMode === 'pick') {
+                effective = false;
+                if (binding.loop === true) {
+                    delete binding.loop;
+                    changed = true;
+                }
+            } else if (effective && binding.orderMode !== 'loop') {
+                binding.orderMode = 'loop';
+                changed = true;
+            } else if (!effective && binding.orderMode === 'loop' && hasFlag) {
+                delete binding.orderMode;
+                changed = true;
+            }
             if (effective && binding.loop !== true) {
                 binding.loop = true;
                 changed = true;
@@ -2980,7 +3021,8 @@
                 }
                 const savedLayout = layoutOnBinding(binding, config);
                 const parsed = outlineFromEntry(located.entry, savedLayout ? { layout: savedLayout, loop: binding.loop } : null);
-                if (binding.loop) parsed.loop = true;
+                if (bindingOrderMode(binding) === 'pick') parsed.loop = false;
+                else if (bindingOrderMode(binding) === 'loop') parsed.loop = true;
                 const rawState = stateMap[key] || null;
                 const state = reconcileState(rawState, parsed, binding.startIndex);
                 contexts.push({
@@ -3505,7 +3547,8 @@
                     }
                     const savedLayout = layoutOnBinding(binding, config);
                     const parsed = outlineFromEntry(located.entry, savedLayout ? { layout: savedLayout, loop: binding.loop } : null);
-                    if (binding.loop) parsed.loop = true;
+                    if (bindingOrderMode(binding) === 'pick') parsed.loop = false;
+                    else if (bindingOrderMode(binding) === 'loop') parsed.loop = true;
                     push(label, parsed.stages.length > 0,
                         `${parsed.stages.length} 个阶段；条目${entryIsDisabled(located.entry) ? '已关闭' : '现在是打开的（同步时会自动关闭）'}；位置：${positionText(located.entry.position)}`);
                     // 镜像行：和真正发给 AI 的正文用同一条路径比较，带上循环和起始步。
@@ -3601,7 +3644,11 @@
             boundAt: new Date().toISOString(),
             layout,
         };
-        if ((flag && flag.loop) || parsed.loop || (named && named.loop)) candidate.loop = true;
+        if (named && named.orderMode === 'pick') candidate.orderMode = 'pick';
+        else if ((flag && flag.loop) || parsed.loop || (named && (named.loop || named.orderMode === 'loop'))) {
+            candidate.orderMode = 'loop';
+            candidate.loop = true;
+        }
         const startRaw = named && named.startIndex > 0
             ? named.startIndex
             : (flag && Math.floor(Number(flag.startIndex)) > 0 ? Math.floor(Number(flag.startIndex)) : 0);
@@ -3796,6 +3843,46 @@
     // 没写完成条件时交给判断AI的标准。不能写成「充分展开就算完成」，否则几乎每层都会被放行。
     const JUDGE_EMPTY_CONDITION = '没有写完成条件。若本阶段写的是一段时间或持续状态，正文仍停在这个状态就是 NO，不能因为符合这段就写 YES。YES 只在正文已经离开这段、写到下一阶段时成立。若写的是要发生的具体事情，则这些事情都已发生才算 YES。';
 
+    const PICK_STAGE_SYSTEM_PROMPT = [
+        '你是剧情阶段定位器。你只决定现在该停在哪一段。',
+        '你不写剧情、不续写、不评价文笔、不改大纲。',
+        '阶段可以前进，也可以跳回更早的一段。看正文现在像哪一段，不是顺着序号加一。',
+    ].join('\n');
+
+    const PICK_STAGE_RULES_PROMPT = [
+        '【定位规则】',
+        '1. 已发生的事只认后文「最近演到哪了」。阶段说明是对照标准，不是已经发生的事。',
+        '2. 正文还像某一段的持续状态，就停在那段。过了一拍日常，不是换段。',
+        '3. 正文已经换成另一段的状态，就填那一段，哪怕序号比现在更小。',
+        '4. 拿不准就停在现在这段。',
+    ].join('\n');
+
+    const PICK_STAGE_ACK_PROMPT = '收到。我按正文现在像哪一段来填，可以跳回更早的段。';
+
+    function pickStageCase(catalog, current, history) {
+        return [
+            '【可选阶段】',
+            catalog,
+            '',
+            '【现在停在】',
+            current,
+            '',
+            '【最近演到哪了】',
+            history,
+            '',
+            '<checklist>',
+            '- 正文现在像哪一段',
+            '- 还停在现在这段里，序号不变',
+            '- 已经换成另一段，就填那一段的序号，可以比现在更小',
+            '</checklist>',
+            '',
+            '<basis>',
+            '</basis>',
+            '<stage>',
+            '</stage>',
+        ].join('\n');
+    }
+
     // 一键生成「什么时候进入下一段」。写的是离开当前阶段、进入下一阶段的那一个结果。
     // 一段时间的下一阶段是另一段时间时，要写下一段已经开始，不能写当前这段还在继续。
     const DEFAULT_CONDITION_SYSTEM_PROMPT = [
@@ -3917,6 +4004,25 @@
     function judgeHasVerdictTag(text) {
         return /<verdict>[\s\S]*?<\/verdict>/i.test(String(text || ''))
             || /<结论>[\s\S]*?<\/结论>/i.test(String(text || ''));
+    }
+
+    // AI 选段：<stage> 里是从 1 开始的序号，或阶段名。空表、对不上的序号都不换段。
+    function judgePickedIndex(text, stages) {
+        const list = Array.isArray(stages) ? stages : [];
+        const tag = String(text || '').match(/<stage>\s*([\s\S]*?)<\/stage>/i);
+        if (!tag) return null;
+        const inner = tag[1].trim();
+        if (!inner) return null;
+        if (/^\d+$/.test(inner)) {
+            const index = Number(inner) - 1;
+            return index >= 0 && index < list.length ? index : null;
+        }
+        const named = list.findIndex(stage => stage && stage.name === inner);
+        if (named >= 0) return named;
+        const leading = inner.match(/(\d+)/);
+        if (!leading) return null;
+        const index = Number(leading[1]) - 1;
+        return index >= 0 && index < list.length ? index : null;
     }
 
     // 边界规则应用（v2.13 输出侧 / v2.14 起对齐数据库：同时作用于发送前的最近剧情）。
@@ -4218,6 +4324,108 @@
         }
     }
 
+    async function maybePickStage(context, messageId, config, options) {
+        const flags = options || {};
+        if (!context || context.broken || bindingOrderMode(context.binding) !== 'pick') return;
+        const stages = context.parsed && context.parsed.stages || [];
+        if (!stages.length) return;
+        if (context.state.lastCompletionMessageId === messageId && !flags.force) return;
+        if (judgeState.running.has(context.key)) {
+            const queued = judgeState.pending.get(context.key);
+            if (!queued || Number(messageId) >= Number(queued.messageId)) {
+                judgeState.pending.set(context.key, { messageId });
+            }
+            return;
+        }
+        const settings = config && config.settings ? config.settings : {};
+        const interval = bindingJudgeInterval(context.binding, settings);
+        const sinceCheck = context.state.lastJudgeCheckedId == null
+            ? null
+            : Number(messageId) - Number(context.state.lastJudgeCheckedId);
+        if (!flags.force && interval > 1 && sinceCheck != null && sinceCheck > 0 && sinceCheck < interval) return;
+        const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
+        const preset = presetName ? findJudgeApiPreset(presetName) : null;
+        if (presetName && !preset) {
+            reportOnce(`judge-preset-missing:${presetName}`, `找不到本机 API 预设「${presetName}」，本次不选段；请重新选择或保存同名预设。`);
+            return;
+        }
+        if (preset && preset.connection === 'tavern') {
+            if (!connectionManagerService()) {
+                reportOnce('judge-no-cm', '「酒馆预设」连接需要酒馆的连接管理器（ConnectionManagerRequestService），当前不可用；请升级酒馆版本或改用其他连接方式。');
+                return;
+            }
+        } else if ((!preset || preset.connection === 'main') && !api('generateRaw', false)) {
+            reportOnce('judge-no-engine', 'AI 选段需要酒馆助手的 generateRaw 接口，当前不可用。');
+            return;
+        }
+        judgeState.running.add(context.key);
+        const startStageIndex = context.state.stageIndex;
+        const bindingLabel = entryName(context.entry);
+        try {
+            const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
+            const catalog = stages.map((stage, index) => {
+                const body = String(stage.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+                return `${index + 1}. ${stage.name}${body ? `：${body}` : ''}`;
+            }).join('\n');
+            const currentStage = stages[startStageIndex];
+            const current = currentStage ? `${startStageIndex + 1}. ${currentStage.name}` : '（还没有停在某一段）';
+            const extra = String(flags.extra || '').trim();
+            let caseText = pickStageCase(catalog, current, history || '（没有取到聊天记录）');
+            if (extra) caseText += `\n本次只看这一次的附加要求：${extra}`;
+            const messages = [
+                { role: 'system', content: PICK_STAGE_SYSTEM_PROMPT },
+                { role: 'user', content: PICK_STAGE_RULES_PROMPT },
+                { role: 'assistant', content: PICK_STAGE_ACK_PROMPT },
+                { role: 'user', content: caseText },
+            ];
+            const cap = JUDGE_REPLY_CAP;
+            const judgePreset = preset
+                ? { ...preset, maxTokens: Math.min(Math.floor(Number(preset.maxTokens)) || cap, cap) }
+                : null;
+            LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：按正文选段（现在第 ${Math.min(startStageIndex, stages.length - 1) + 1} 段）`);
+            const text = await askJudge(messages, judgePreset, { ...settings, judgeMaxTokens: cap });
+            const picked = judgePickedIndex(text, stages);
+            const basis = judgeBasisText(text);
+            await patchStateFor(context.key, {
+                lastJudgeCheckedId: messageId,
+                lastJudgeYes: picked != null && picked !== startStageIndex,
+                lastJudgeBasis: basis,
+            });
+            judgeRuntime.lastRaw = String(text || '');
+            judgeRuntime.lastFiltered = text;
+            judgeRuntime.lastAt = Date.now();
+            judgeRuntime.lastYes = picked != null && picked !== startStageIndex;
+            if (picked == null || picked === startStageIndex) {
+                LogModule.info('判断AI', `「${bindingLabel}」停在当前段`);
+                return;
+            }
+            const fresh = await loadContexts();
+            const latest = fresh.contexts.find(item => item.key === context.key);
+            if (!latest || latest.broken) return;
+            const nowMessageId = currentMessageId();
+            if (latest.state.stageIndex !== startStageIndex
+                || (nowMessageId != null && nowMessageId !== messageId)) {
+                LogModule.warn('判断AI', `「${bindingLabel}」选了第 ${picked + 1} 段，但检查期间进度已变化，放弃`);
+                return;
+            }
+            LogModule.info('判断AI', `「${bindingLabel}」改到第 ${picked + 1} 段「${stages[picked].name}」`);
+            await moveToIndex(latest, picked, { messageId });
+        } catch (error) {
+            const reason = error && error.message ? error.message : String(error);
+            LogModule.error('判断AI', `「${bindingLabel}」选段失败：${reason}`);
+            reportOnce('judge-failed', `AI 选段失败：${reason}。请检查当前 API 连接。`);
+        } finally {
+            judgeState.running.delete(context.key);
+            const queued = judgeState.pending.get(context.key);
+            judgeState.pending.delete(context.key);
+            if (queued && String(queued.messageId) !== String(messageId)) {
+                const fresh = await loadContexts();
+                const latest = fresh.contexts.find(item => item.key === context.key);
+                if (latest) await maybePickStage(latest, queued.messageId, fresh.config);
+            }
+        }
+    }
+
     async function handleMessageReceived() {
         if (!isCurrentInstance()) return;
         const args = Array.from(arguments);
@@ -4232,10 +4440,11 @@
 
         const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
         const config = await readConfig();
-        const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge');
+        const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge' && bindingOrderMode(binding) !== 'pick');
+        const pickNeeded = (config.bindings || []).some(binding => bindingOrderMode(binding) === 'pick');
         // 手动推进、随正文 AI 都不另开请求。随正文 AI 的标记写在回复里，这里检测到再推进。
         // 只要有一条绑定自己开了判断 AI，就要进来，不必整页都是判断 AI。
-        if (markers.length === 0 && !judgeNeeded) return;
+        if (markers.length === 0 && !judgeNeeded && !pickNeeded) return;
         const all = await loadContexts();
         if (!all.configured) return;
 
@@ -4248,6 +4457,7 @@
             // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
             for (const context of all.contexts) {
                 if (context.broken || !context.stage || context.stage.terminal) continue;
+                if (bindingOrderMode(context.binding) === 'pick') continue;
                 const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
                 if (context.state.lastCompletionFingerprint === fingerprint) continue;
                 if (!markers.some(match => match[1] === context.stage.id)) continue;
@@ -4260,7 +4470,15 @@
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
                 if (context.broken || !context.stage || context.autoAdvance !== 'judge') return null;
+                if (bindingOrderMode(context.binding) === 'pick') return null;
                 return maybeJudgeAdvance(context, messageId, fresh.config);
+            }));
+        }
+        if (all.configured && pickNeeded) {
+            const fresh = await loadContexts();
+            await Promise.all(fresh.contexts.map(context => {
+                if (context.broken || bindingOrderMode(context.binding) !== 'pick') return null;
+                return maybePickStage(context, messageId, fresh.config);
             }));
         }
     }
@@ -4681,17 +4899,23 @@
                     });
                 },
             });
-            const loopOn = Boolean(binding.loop || (context && context.parsed && context.parsed.loop));
+            const orderOptions = [
+                { value: 'order', label: '按顺序' },
+                { value: 'loop', label: '循环' },
+                { value: 'pick', label: 'AI 选下一段' },
+            ];
             return el('div', { class: 'dga-bind-item' },
                 el('div', { class: 'dga-heading-text' },
                     el('b', { text: binding.entryName || '未命名条目' }),
                     el('small', { text: stageName ? `第 ${shown} 步：${stageName}` : `第 ${shown} 步` })),
                 field('导出后从第几步开始', input),
-                toggleRow('循环', '记在这条绑定上，随角色卡导出。不靠世界书里那份容易丢的隐藏数据。', loopOn, checked => {
-                    runAction('保存循环', () => saveBindingLoop(binding, checked), {
-                        success: checked ? `「${binding.entryName || '条目'}」的循环已记在绑定上` : `「${binding.entryName || '条目'}」已关掉循环`,
+                field('阶段怎么走', selectControl(orderOptions, bindingOrderMode(binding), value => {
+                    const label = { order: '按顺序', loop: '循环', pick: 'AI 选下一段' }[value] || '按顺序';
+                    runAction('保存阶段怎么走', () => saveBindingOrder(binding, value), {
+                        success: `「${binding.entryName || '条目'}」改为${label}`,
                     });
-                }));
+                })),
+            );
         });
         return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body dga-split' },
@@ -5523,7 +5747,13 @@
     }
 
     function judgeWaitText(context) {
-        if (!context || context.autoAdvance !== 'judge') return '';
+        if (!context) return '';
+        if (bindingOrderMode(context.binding) === 'pick') {
+            if (context.state.lastJudgeCheckedId == null && !context.state.lastJudgeBasis) return '';
+            const basis = context.state.lastJudgeBasis ? `：${context.state.lastJudgeBasis}` : '';
+            return `上次选段${basis}`;
+        }
+        if (context.autoAdvance !== 'judge') return '';
         const verdict = context.state.lastJudgeYes === true
             ? '上次 YES'
             : (context.state.lastJudgeYes === false ? '上次 NO' : '');
@@ -5778,7 +6008,9 @@
         });
         const percent = total > 0 ? Math.round(Math.min(stageIndex, total) / total * 100) : 0;
         const hints = [];
-        if (context.parsed.loop) hints.push('循环');
+        const orderMode = bindingOrderMode(context.binding);
+        if (orderMode === 'pick') hints.push('AI选段');
+        else if (orderMode === 'loop' || context.parsed.loop) hints.push('循环');
         if (context.stage && context.stage.terminal) hints.push('到此结束');
         const hintText = hints.length ? ` · ${hints.join(' · ')}` : '';
         const stageText = total === 0 ? '未分段' : (finished && !context.parsed.loop ? `全部 ${total} 段完成` : `第 ${Math.min(stageIndex, total - 1) + 1} / ${total} 段${hintText}`);
@@ -5875,13 +6107,22 @@
             { value: 'story', label: '这条随正文' },
             { value: 'judge', label: '这条判断AI' },
         ];
+        const orderMode = bindingOrderMode(binding);
+        const orderOptions = [
+            { value: 'order', label: '按顺序' },
+            { value: 'loop', label: '循环' },
+            { value: 'pick', label: 'AI 选下一段' },
+        ];
         const children = [
+            field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
+                success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
+            }))),
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
                 if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
                 else delete item.advanceMode;
             }), { success: '已记下这条的判断方式' }))),
         ];
-        if (context.autoAdvance === 'judge') {
+        if (orderMode === 'pick' || context.autoAdvance === 'judge') {
             const settings = config && config.settings ? config.settings : {};
             const globalInterval = judgeCheckInterval(settings);
             const presets = [1, 2, 3, 5];
@@ -5897,7 +6138,10 @@
             }), { success: '已记下这条的检查间隔' }))));
             const wait = judgeWaitText(context);
             if (wait) children.push(el('p', { class: 'dga-judge-status', text: wait }));
-            if (context.stage && !context.stage.terminal) {
+            const canCheck = orderMode === 'pick'
+                ? context.parsed.stages.length > 0
+                : Boolean(context.stage && !context.stage.terminal);
+            if (canCheck) {
                 const extra = el('input', {
                     class: 'dga-input',
                     type: 'text',
@@ -5910,11 +6154,13 @@
                 children.push(extra, btn('现在检查', () => runAction('现在检查', async () => {
                     const loaded = await loadContexts();
                     const fresh = loaded.contexts.find(item => item.key === context.key);
-                    if (!fresh || fresh.broken || !fresh.stage) throw new Error('这条绑定现在不能检查。');
+                    if (!fresh || fresh.broken) throw new Error('这条绑定现在不能检查。');
+                    if (orderMode !== 'pick' && !fresh.stage) throw new Error('这条绑定现在不能检查。');
                     const messageId = currentMessageId();
                     if (messageId == null) throw new Error('当前没有可检查的回复。');
                     const hint = String((ui.judgeExtras && ui.judgeExtras[context.key]) || '').trim();
-                    await maybeJudgeAdvance(fresh, messageId, loaded.config, { force: true, extra: hint });
+                    if (orderMode === 'pick') await maybePickStage(fresh, messageId, loaded.config, { force: true, extra: hint });
+                    else await maybeJudgeAdvance(fresh, messageId, loaded.config, { force: true, extra: hint });
                     ui.judgeExtras[context.key] = '';
                     return true;
                 }, { success: '已检查这一段' }), { ghost: true }));
@@ -6101,6 +6347,9 @@
             bound,
             baseLayout: stored || null,
             bindingLoop: Boolean((binding && binding.loop) || flagLoop || (stored && stored.loop)),
+            orderMode: binding && binding.orderMode === 'pick'
+                ? 'pick'
+                : (Boolean((binding && (binding.loop || binding.orderMode === 'loop')) || flagLoop || (stored && stored.loop)) ? 'loop' : 'order'),
             pick: null,
             pickListeners: null,
             // 从小卡点进来时带的当前段：渲染完滚到它并高亮一次
@@ -6175,24 +6424,26 @@
                 modeButton('编辑原文', 'raw')),
             editor.pick ? el('button', {
                 type: 'button',
-                class: `dga-seg-btn${editor.pick.loop ? ' is-on' : ''}`,
+                class: `dga-seg-btn${(editor.orderMode || (editor.pick.loop ? 'loop' : 'order')) === 'order' ? '' : ' is-on'}`,
                 onclick: () => {
-                    const on = !editor.pick.loop;
-                    editor.pick.loop = on;
-                    editor.bindingLoop = on;
-                    if (editor.parsed) editor.parsed.loop = on;
+                    const order = ['order', 'loop', 'pick'];
+                    const current = editor.orderMode || (editor.pick.loop ? 'loop' : 'order');
+                    const next = order[(Math.max(0, order.indexOf(current)) + 1) % order.length];
+                    editor.orderMode = next;
+                    editor.pick.loop = next === 'loop';
+                    editor.bindingLoop = next === 'loop';
+                    if (editor.parsed) editor.parsed.loop = next === 'loop';
                     render();
-                    // 不等「保存」。手机上只改内存的话，过一会儿酒馆重写世界书，循环就没了。
-                    storeLoop(editor.worldbookName, editor.entry, on).catch(error => {
+                    storeOrderMode(editor.worldbookName, editor.entry, next).catch(error => {
                         setMessage(error.message || String(error), 'error');
                         render();
                     });
                 },
-            }, editor.pick.loop ? '循环：开' : '循环：关') : null,
+            }, { order: '按顺序', loop: '循环', pick: 'AI选段' }[editor.orderMode || (editor.pick.loop ? 'loop' : 'order')]) : null,
         );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
-            : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。循环一点就记住，不用再点保存。';
+            : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走一点就记住，不用再点保存。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
@@ -7669,6 +7920,8 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         judgeMessagesFor,
         judgeSaysYes,
         judgeBasisText,
+        judgePickedIndex,
+        bindingOrderMode,
         applyJudgeOutputRules,
         applyBoundaryRules,
         previewJudgeOutput,

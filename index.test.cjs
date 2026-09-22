@@ -2461,6 +2461,58 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.deepEqual(run.errors, []);
 });
 
+test('AI 选段：可以从第 3 段跳回第 1 段', async () => {
+    const content = '## 甲\n甲正文\n\n## 乙\n乙正文\n\n## 丙\n丙正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const key = keyOf('书A', 1);
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', orderMode: 'pick' }],
+            settings: { autoAdvance: 'off' },
+        },
+        chatState: {
+            version: 2,
+            bindings: {
+                [key]: { stageIndex: 2, stageName: '丙', lastCompletionMessageId: null, lastJudgeCheckedId: null },
+            },
+        },
+        messages: [{ message_id: 8, role: 'assistant', message: '事情又回到最开始。' }],
+        lastMessageId: 8,
+    });
+    const sent = [];
+    helper.generateRaw = async options => { sent.push(options); return '<basis>已经回到第一段</basis>\n<stage>1</stage>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(8);
+    assert.equal(sent.length, 1, '选段模式即使全局是手动也要问');
+    assert.match(String(sent[0].user_input), /1\. 甲/);
+    assert.match(String(sent[0].user_input), /3\. 丙/);
+    assert.match(String(sent[0].user_input), /可以比现在更小/);
+    assert.doesNotMatch(String(sent[0].user_input), /暑假|不要翻译/);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[key].stageIndex, 0, '第 3 段可以跳回第 1 段');
+    assert.deepEqual(run.errors, []);
+});
+
+test('阶段怎么走：pick 盖过旧的循环，空的 stage 不换段', () => {
+    const picked = core.normalizeConfig({
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryName: '大纲', orderMode: 'pick', loop: true }],
+    });
+    assert.equal(picked.bindings[0].orderMode, 'pick');
+    assert.equal(picked.bindings[0].loop, undefined);
+    const looped = core.normalizeConfig({
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryName: '大纲', loop: true }],
+    });
+    assert.equal(core.bindingOrderMode(looped.bindings[0]), 'loop');
+    const stages = [{ name: '甲' }, { name: '乙' }, { name: '丙' }];
+    assert.equal(core.judgePickedIndex('<stage>1</stage>', stages), 0);
+    assert.equal(core.judgePickedIndex('<stage>丙</stage>', stages), 2);
+    assert.equal(core.judgePickedIndex('<basis>还在</basis>\n<stage></stage>', stages), null);
+    assert.equal(core.judgePickedIndex('<stage>9</stage>', stages), null);
+});
+
 test('判断AI档：英文 <verdict> 优先，basis 里的 YES 不算；旧中文标签仍认', () => {
     assert.equal(core.judgeSaysYes('<basis>条件里写了 YES 才算。</basis>\n<verdict>NO</verdict>'), false);
     assert.equal(core.judgeSaysYes('<basis>还在暑假</basis>\n<verdict>YES</verdict>'), true);
