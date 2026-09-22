@@ -2527,10 +2527,38 @@ test('判断AI档：自定义提示词段按序组装并替换占位符', async 
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))), ['system', 'assistant', 'user_input']);
     assert.match(ordered[0].content, /^规则：只判断 甲一$/, 'system 段里占位符要替换');
     assert.match(ordered[1].content, /这一轮的回复/, 'assistant 段里的 {{history}} 也要替换');
-    assert.equal(verdicts[0].user_input, '阶段=甲一 条件=没有写完成条件。只核对「本阶段要演的内容」里写出的具体情节是否都已在正文里发生；感觉该往下走不算完成。', '最后一条 user 段作为 user_input');
+    assert.match(verdicts[0].user_input, /条件=没有写完成条件/);
+    assert.match(verdicts[0].user_input, /不能因为符合这段就写 YES/);
     assert.deepEqual(run.errors, []);
 });
 
+test('默认判断提示词：还在暑假不能因为符合暑假就换成平时', async () => {
+    const content = '## 暑假\n当前还在暑假期间，不需要上课\n\n## 平时\n正常学期，周一到周五要上课';
+    const books = { 书A: [{ uid: 1, name: '大纲', content, enabled: false }] };
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲' }],
+            settings: { autoAdvance: 'judge' },
+        },
+        messages: [{ message_id: 3, role: 'assistant', message: '白辞在家看电视，希雅做了饭，两人吃了排骨，没有上课。' }],
+        lastMessageId: 3,
+    });
+    const sent = [];
+    helper.generateRaw = async options => { sent.push(options); return '<依据>还在放假</依据>\n<结论>NO</结论>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(3);
+    const blob = JSON.stringify(sent[0]);
+    assert.match(blob, /下一阶段/);
+    assert.match(blob, /平时/);
+    assert.match(blob, /符合暑假/);
+    assert.match(blob, /结论必须是 NO/);
+    assert.match(blob, /不能换成平时/);
+    assert.match(blob, /先定时间/);
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '还在暑假时不能推进');
+    assert.deepEqual(run.errors, []);
+});
 
 test('判断AI档：每 2 层检查一次——首次立即查，之后到层才问、问过重新计数', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';

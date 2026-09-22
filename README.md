@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.57**（发布标签：`v2.57`）
+当前版本：**v2.58**（发布标签：`v2.58`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点「解绑」就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.57 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.57)下载导入文件：
+在 [v2.58 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.58)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.57/dynamic-guide-offline-v2.57.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.57/dynamic-guide-online-v2.57.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.57/dynamic-guide-regex-marker-hide-v2.57.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.58/dynamic-guide-offline-v2.58.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.58/dynamic-guide-online-v2.58.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.58/dynamic-guide-regex-marker-hide-v2.58.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.57/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.58/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.57`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.58`。
 
 ## v2.0 文本格式
 
@@ -173,6 +173,10 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.58（2026-09-23）
+
+- **默认判断先看正文现在过的是哪一段时间。** 暑假、寒假、平时这种阶段，正文还停在这段就写 NO。在家、不用上课，是暑假还在继续，不会因为「符合暑假」换成平时。要看到已经开学、去上课，才离开暑假。吃一顿饭、看一会儿电视，不换时间。状态栏、总结、思维链里的字不算。判断时会带上一段的名字和内容。改过判断提示词的，要点「恢复默认提示词」才会用上这套。
 
 ### v2.57（2026-09-22）
 
