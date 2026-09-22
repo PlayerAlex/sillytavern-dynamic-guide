@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.46
+     * 动态指导助手 v2.47
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.46';
+    const VERSION = '2.47';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3805,9 +3805,9 @@
         ui.message = text ? { text, type: type || 'info' } : null;
     }
 
-    // 标题栏。仪表盘和目录里的页面：☰ 目录 / 标题 / ×。
+    // 标题栏。电脑上目录页左侧是常驻导航，☰ 先藏起来；窄屏才用 ☰ 拉开抽屉。
     // 二级页（subpage，且没有 nav）：左上角不放导航，右上角只留一个 ×，点它回到上一页。
-    // 目录页可以同时带 subpage 的 × 和 nav，这样 API、动态指导、运行日志也能打开目录。
+    // 目录页可以同时带 subpage 的 × 和 nav，这样 API、动态指导、运行日志在窄屏也能打开目录。
     function header(title, subtitle, onclose, closeLabel, extra, options) {
         const subpage = Boolean(options && options.subpage);
         const showNav = Boolean(options && options.nav) || !subpage;
@@ -3876,7 +3876,11 @@
         const shell = panel.querySelector('.dga-shell');
         const oldBody = shell.querySelector('.dga-body');
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
-        shell.replaceChildren(...(ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : (ui.view === 'dev' ? renderDevPage() : (ui.view === 'guide' ? renderGuidePage() : renderManager())))))));
+        const page = ui.view === 'editor' ? renderEditor() : (ui.view === 'api' ? renderApiPage() : (ui.view === 'judgePrompt' ? renderJudgePromptPage() : (ui.view === 'logs' ? renderLogPage() : (ui.view === 'dev' ? renderDevPage() : (ui.view === 'guide' ? renderGuidePage() : renderManager())))));
+        // 电脑端和数据库一样：目录页左侧常驻导航，右侧是当前页。划分阶段、判断AI提示词仍是二级页，不放这列。
+        const showRail = ui.view !== 'editor' && ui.view !== 'judgePrompt';
+        const main = el('div', { class: 'dga-main' }, ...page);
+        shell.replaceChildren(...(showRail ? [renderNavRail(), main] : [main]));
         // 新绑定小卡的入场高亮只播一次（v2.27）：节点已经带上 is-new，这里立刻清掉
         // 标记，下次因为别的操作重渲染时不会重播动画。
         ui.justBoundKey = '';
@@ -3998,7 +4002,7 @@
     // ---------------------------------------------------------------
 
     function renderManager() {
-        const body = el('div', { class: 'dga-body' },
+        const body = el('div', { class: 'dga-body dga-split' },
             messageBar(),
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             statusCard(),
@@ -4022,7 +4026,7 @@
         const mode = configStorageMode();
         const bindings = (ui.snapshot && ui.snapshot.config && ui.snapshot.config.bindings) || [];
         return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
-            el('div', { class: 'dga-body' },
+            el('div', { class: 'dga-body dga-split' },
                 messageBar(),
                 card('配置存哪',
                     muted('决定绑定列表与判断AI设置存在哪里。普通使用不需要动这里。'),
@@ -4101,41 +4105,46 @@
     // 顶部只留错误条（v2.24 起成功/提示类绿条不在本页显示）；
     // v2.25 起独立绑定卡片区删除，功能并入绑定世界书卡的行内。
     function renderGuidePage() {
-        const body = el('div', { class: 'dga-body' },
+        const rules = guideRulesCard();
+        rules.classList.add('dga-span');
+        const body = el('div', { class: 'dga-body dga-split' },
             ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             addCard(),
             judgeSettingsCard(),
-            guideRulesCard(),
+            rules,
         );
         return [header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }), body];
     }
 
-    // 目录抽屉：复刻 shujuku 新版 Sidebar——品牌区（方块标 + 标题 + 版本副标）、
-    // 组标题、整宽导航项（当前页用主题强调色高亮）。点击进入对应页面后自动收起。
-    function renderNavDrawer() {
-        const go = view => {
-            if (view === 'editor' && !ui.editor) return;
-            if (view === 'api') enterApiPage();
-            if (view === 'guide') enterGuidePage();
-            ui.view = view;
-            ui.navOpen = false;
+    // 离开划分阶段时若还有未保存的修改，先问一声。从侧栏跳走也要丢掉编辑器，并刷新小卡。
+    function openView(view) {
+        if (view === 'editor' && !ui.editor) return;
+        const leavingEditor = ui.view === 'editor' && view !== 'editor';
+        if (leavingEditor && editorUnsaved(ui.editor) && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
+        if (leavingEditor) discardEditor();
+        if (view === 'api') enterApiPage();
+        if (view === 'guide') enterGuidePage();
+        ui.view = view;
+        ui.navOpen = false;
+        if (!leavingEditor) {
             render();
-        };
-        const item = (label, view, disabled) => el('button', {
+            return;
+        }
+        refresh().catch(error => {
+            ui.contextError = error.message || String(error);
+        }).finally(() => render());
+    }
+
+    // 目录：复刻 shujuku 新版 Sidebar。电脑上常驻在左侧；窄屏收成抽屉，点进去后收起。
+    function renderNavMenu() {
+        const item = (label, view) => el('button', {
             type: 'button',
             class: `dga-nav-item${ui.view === view ? ' is-on' : ''}`,
             'aria-current': ui.view === view ? 'page' : null,
-            disabled: Boolean(disabled),
-            onclick: () => go(view),
+            onclick: () => openView(view),
         }, label);
-        const backdrop = el('div', {
-            class: 'dga-nav-backdrop',
-            onclick: event => {
-                if (event.target === backdrop) { ui.navOpen = false; render(); }
-            },
-        });
-        backdrop.append(el('aside', { class: 'dga-nav-drawer', role: 'dialog', 'aria-label': '页面导航' },
+        return [
             el('div', { class: 'dga-nav-brand' },
                 el('span', { class: 'dga-nav-brand-mark', 'aria-hidden': 'true' }, '指'),
                 el('span', { class: 'dga-nav-brand-copy' },
@@ -4149,10 +4158,23 @@
                 item('API', 'api'),
                 item('动态指导', 'guide'),
                 item('运行日志', 'logs'),
-                // 开发者模式（v2.32）：只有打开了才出现在导航里。
                 devModeOn() ? item('开发者模式', 'dev') : null,
             ),
-        ));
+        ];
+    }
+
+    function renderNavRail() {
+        return el('aside', { class: 'dga-rail', 'aria-label': '页面导航' }, ...renderNavMenu());
+    }
+
+    function renderNavDrawer() {
+        const backdrop = el('div', {
+            class: 'dga-nav-backdrop',
+            onclick: event => {
+                if (event.target === backdrop) { ui.navOpen = false; render(); }
+            },
+        });
+        backdrop.append(el('aside', { class: 'dga-nav-drawer', role: 'dialog', 'aria-label': '页面导航' }, ...renderNavMenu()));
         return backdrop;
     }
 
@@ -6308,7 +6330,10 @@
 ${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: stretch; justify-content: stretch; padding: 0; background: var(--dga-bg-0); backdrop-filter: blur(4px); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 15px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: var(--SmartThemeBlurTintColor, #0E1523); --dga-bg-1: var(--SmartThemeBlurTintColor, #141D2E); --dga-bg-2: color-mix(in srgb, var(--dga-bg-0) 82%, var(--dga-accent) 18%); --dga-text-1: var(--SmartThemeBodyColor, #E8EDF5); --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, transparent); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 58%, transparent); --dga-accent: var(--SmartThemeQuoteColor, #5C86DB); --dga-on-accent: #F2F6FF; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 26%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 12%, transparent); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 20%, transparent); --dga-hover: color-mix(in srgb, var(--dga-text-1) 8%, transparent); --dga-success: #67B08C; --dga-warning: #D9A75C; --dga-danger: #DB6E6E; --dga-radius-sm: 6px; --dga-radius-md: 6px; --dga-radius-lg: 6px; --dga-shadow: 0 18px 48px rgba(1, 4, 9, 0.36); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --dga-font-mono: Consolas, Menlo, Monaco, "Courier New", monospace; }
 ${P}[hidden] { display: none; }
 ${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
-${P} .dga-shell { position: relative; display: flex; flex-direction: column; width: 100%; max-width: none; min-width: 0; height: 100%; min-height: 0; max-height: none; background: var(--dga-bg-0); border: 0; border-radius: 0; box-shadow: none; overflow: hidden; outline: none; }
+${P} .dga-shell { position: relative; display: flex; flex-direction: row; width: 100%; max-width: none; min-width: 0; height: 100%; min-height: 0; max-height: none; background: var(--dga-bg-0); border: 0; border-radius: 0; box-shadow: none; overflow: hidden; outline: none; }
+${P} .dga-rail { flex: 0 0 220px; width: 220px; height: 100%; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 24px 12px 16px; background: var(--dga-bg-1); border-right: 1px solid var(--dga-border); }
+${P} .dga-main { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+${P} .dga-nav-toggle { display: none; }
 ${P} .dga-head { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 12px 16px; border-bottom: 1px solid var(--dga-border); }
 ${P} .dga-head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 ${P} .dga-head h2 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
@@ -6550,6 +6575,16 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
     ${P} .dga-sheet-bg { align-items: center; padding: 20px; }
     ${P} .dga-sheet { max-width: 520px; border-radius: var(--dga-radius-md); border: 1px solid var(--dga-border-2); }
     ${P} .dga-seg { grid-template-columns: repeat(4, 1fr); }
+}
+@media (min-width: 861px) {
+    ${P} .dga-head h2 { font-size: 20px; }
+    ${P} .dga-body.dga-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; align-items: start; }
+    ${P} .dga-body.dga-split > :not(.dga-card) { grid-column: 1 / -1; }
+    ${P} .dga-body.dga-split > .dga-span { grid-column: 1 / -1; }
+}
+@media (max-width: 720px) {
+    ${P} .dga-rail { display: none; }
+    ${P} .dga-nav-toggle { display: inline-flex; }
 }`;
     }
 

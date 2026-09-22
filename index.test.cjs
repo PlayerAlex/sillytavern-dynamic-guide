@@ -815,6 +815,10 @@ test('面板高度写死成视口高度，不再靠 inset 定位', () => {
     assert.match(css, /height:\s*100dvh/, '手机要用 100dvh 撑满');
     assert.match(css, /max-height:\s*100dvh/);
     assert.doesNotMatch(css, /position:\s*fixed;\s*inset:\s*0/, '单独用 inset 定位会在手机上算出 0 高度');
+    assert.match(css, /\.dga-rail \{[^}]*width:\s*220px/, '电脑左侧目录宽 220');
+    assert.match(css, /\.dga-nav-toggle \{ display: none; \}/, '电脑上藏起左上角 ☰');
+    assert.match(css, /max-width:\s*720px\) \{\s*#dynamic-guide-assistant-panel \.dga-rail \{ display: none; \}/, '窄屏才收起左侧目录');
+    assert.match(css, /min-width:\s*861px\) \{[\s\S]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/, '宽屏卡片两列');
 });
 
 // ---------------------------------------------------------------
@@ -1605,6 +1609,7 @@ test('小卡步进器中间那块是划分阶段的入口，点进去落在当�
     assert.match(focused[0].textContent, /第二幕/);
     assert.ok(panel().querySelector('.dga-mode-seg'), '点进去打开的是「分段」视图');
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '划分阶段是二级页，左上角不放导航');
+    assert.equal(panel().querySelector('.dga-rail'), null, '划分阶段是二级页，电脑上也不放左侧目录');
     assert.deepEqual(errors, []);
 });
 
@@ -1646,6 +1651,9 @@ async function bootGuidePage() {
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-nav-toggle'), '动态指导在目录里，左上角要有导航');
+    assert.ok(panel().querySelector('.dga-rail'), '电脑上目录页左侧常驻导航');
+    assert.ok(panel().querySelector('.dga-main'), '右侧是当前页');
+    assert.match(panel().querySelector('.dga-split').className, /dga-body/, '宽屏时卡片分成两列');
     assert.equal(panel().querySelector('.dga-close').textContent, '×', '右上角仍是简化的 ×');
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
