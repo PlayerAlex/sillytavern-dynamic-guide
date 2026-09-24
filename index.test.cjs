@@ -3820,7 +3820,7 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     assert.ok(findButton(panel(), '设置'), '时间线页顶上能去设置');
     await findButton(panel(), '设置').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
-    assert.match(panel().textContent, /岔路是点进某一段后勾选和哪些段互斥/);
+    assert.match(panel().textContent, /只列出和它一起选的段/);
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置也是二级页');
     await findButton(panel(), '编辑').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '从设置能进到分段编辑');
@@ -3946,9 +3946,18 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     assert.match(sheet().textContent, /暑假正文/);
     assert.ok(findButton(sheet(), '加一条附加'));
     assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
-    assert.match(findButton(sheet(), '第二幕').className, /dga-seg-btn/);
-    findButton(sheet(), '第二幕').listeners.click[0]();
-    assert.match(findButton(sheet(), '第二幕').className, /is-on/, '点一下就把这一段和它标成互斥');
+    assert.equal(findButton(sheet(), '第二幕'), null, '没加入岔路的段不出现在列表里');
+    const forkSelect = (function findSelects(node, out) {
+        if (node.tagName === 'SELECT' && optionsOf(node).some(option => option.textContent === '加上一段…')) out.push(node);
+        (node.children || []).forEach(child => findSelects(child, out));
+        return out;
+    })(sheet(), []);
+    assert.equal(forkSelect.length, 1);
+    const option = optionsOf(forkSelect[0]).find(item => item.textContent === '第二幕');
+    forkSelect[0].value = optionValue(option);
+    forkSelect[0].listeners.change[0]({ target: forkSelect[0] });
+    assert.match(sheet().textContent, /第二幕/, '加上之后才出现在岔路里');
+    assert.equal(findButton(sheet(), '第二幕'), null, '岔路里的段不是一排开关');
     findButton(sheet(), '加一条附加').listeners.click[0]();
     const areas = [];
     const walk = node => {

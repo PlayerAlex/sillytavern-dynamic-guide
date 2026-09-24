@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.73
+     * 动态指导助手 v2.74
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.73';
+    const VERSION = '2.74';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6714,7 +6714,7 @@
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
                 success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
             }))),
-            muted('按顺序、循环、AI 选段管的是这一轮怎么往下走。岔路是点进某一段后勾选和哪些段互斥：走进一个，其余这次不再走。开了循环后，绕回时走同一条还是重新选择，在这里先定好。'),
+            muted('按顺序、循环、AI 选段管的是这一轮怎么往下走。岔路是点进某一段后，只列出和它一起选的段：走进一个，其余这次不再走。开了循环后，绕回时走同一条还是重新选择，在这里先定好。'),
             orderMode === 'loop' ? field('循环绕回时', el('div', { class: 'dga-seg' },
                 ...[['fresh', '重新选择'], ['keep', '走同一条']].map(([value, label]) => el('button', {
                     type: 'button',
@@ -7869,17 +7869,23 @@
                     }, { ghost: true }));
             });
             const others = stageSequence(editor.pick).filter(stage => stage !== owner);
-            const forkButtons = others.map(stage => el('button', {
-                type: 'button',
-                class: `dga-seg-btn${(sheet.exclusiveIds || []).includes(stage.id) ? ' is-on' : ''}`,
-                onclick: () => {
-                    const ids = new Set(sheet.exclusiveIds || []);
-                    if (ids.has(stage.id)) ids.delete(stage.id);
-                    else ids.add(stage.id);
-                    sheet.exclusiveIds = [...ids];
+            const chosen = others.filter(stage => (sheet.exclusiveIds || []).includes(stage.id));
+            const available = others.filter(stage => !(sheet.exclusiveIds || []).includes(stage.id));
+            const forkRows = chosen.map(stage => el('div', { class: 'dga-fork-row' },
+                el('b', { text: stage.name }),
+                btn('移出', () => {
+                    sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
+                    render();
+                }, { ghost: true })));
+            const forkAdd = available.length ? selectControl(
+                [{ value: '', label: '加上一段…' }].concat(available.map(stage => ({ value: stage.id, label: stage.name }))),
+                '',
+                value => {
+                    if (!value) return;
+                    sheet.exclusiveIds = [...(sheet.exclusiveIds || []), value];
                     render();
                 },
-            }, stage.name));
+            ) : null;
             box.append(sheetSection('离开这一段',
                 field('什么时候进入下一段', completion),
                 el('div', { class: 'dga-inline-action' },
@@ -7893,10 +7899,9 @@
                         onclick: () => { sheet.terminal = value; render(); },
                     }, label))))));
             box.append(sheetSection('岔路',
-                others.length
-                    ? el('div', { class: 'dga-fork-list' }, ...forkButtons)
-                    : muted('还没有别的段。'),
-                muted('点亮的段和这一段只能走一个。都不点就是普通往下走。')));
+                chosen.length ? el('div', { class: 'dga-fork-list' }, ...forkRows) : muted(others.length ? '这一段还没有岔路。' : '还没有别的段。'),
+                forkAdd,
+                muted('这里只列出和这一段一起选的段。走进其中一个，其余这次不再走。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
@@ -8652,7 +8657,8 @@ ${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color
 ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
 ${P} .dga-fork-list { display: flex; flex-direction: column; gap: 6px; }
-${P} .dga-fork-list .dga-seg-btn { width: 100%; text-align: left; padding: 8px 12px; }
+${P} .dga-fork-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; padding: 4px 4px 4px 12px; border: 1px solid var(--dga-border); border-radius: 6px; }
+${P} .dga-fork-row .dga-btn { flex: 0 0 auto; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
 /* 设置齿轮与小贴士（v2.29）：齿轮挨着右上角关闭按钮，贴士是居中的小卡片 */
