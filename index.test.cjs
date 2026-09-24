@@ -3896,6 +3896,12 @@ test('原文划分优先于卡片旧正文，空卡片不能把原文发空', ()
         beforeIds: ['stay'],
         extras: [{ id: 'extra', name: '戒指', body: '戒指能看见灵体' }],
     }, source, [{ id: 'stay', name: '文风', body: '保持克制' }]), '保持克制\n\n只有卡片\n\n戒指能看见灵体', '原文还没划进来时仍发卡片里的字');
+    assert.equal(core.stageGuidePrompt({
+        body: '卡片旧文',
+        ranges,
+        beforeIds: ['stay'],
+        extras: [{ id: 'extra', name: '戒指', body: '戒指能看见灵体' }],
+    }, source, [{ id: 'stay', name: '文风', body: '保持克制' }]), '保持克制\n\n原文这一段\n\n戒指能看见灵体', '原文有字时仍带上这一段的常驻和附加');
 });
 
 test('发给 AI 的内容按常驻在前、这一张、附加、常驻在后排好', () => {
@@ -3909,4 +3915,51 @@ test('发给 AI 的内容按常驻在前、这一张、附加、常驻在后排�
         { id: 'tail', name: '提醒', body: '不要替用户决定' },
     ]);
     assert.equal(text, '保持克制\n\n苏醒后的正文\n\n戒指能看见灵体\n\n不要替用户决定');
+});
+
+test('点进一段分成离开、岔路、发给 AI、附加和常驻', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const original = '## 第一幕\n暑假正文\n\n## 第二幕\n寒假正文';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [],
+            layouts: {
+                '测试世界书#大纲': savedStages(original, [
+                    { name: '第一幕', quote: '暑假正文' },
+                    { name: '第二幕', quote: '寒假正文' },
+                ]),
+            },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    showBody(panel());
+    panel().querySelector('.dga-segbar').listeners.click[0]();
+    const sheet = () => panel().querySelector('.dga-sheet');
+    assert.match(sheet().textContent, /离开这一段/);
+    assert.match(sheet().textContent, /岔路/);
+    assert.match(sheet().textContent, /发给 AI/);
+    assert.match(sheet().textContent, /暑假正文/);
+    assert.ok(findButton(sheet(), '加一条附加'));
+    assert.ok(findButton(sheet(), '加一条常驻'));
+    findButton(sheet(), '加一条附加').listeners.click[0]();
+    const areas = [];
+    const walk = node => {
+        if (node.tagName === 'TEXTAREA' && String(node.getAttribute('placeholder') || '').includes('一起发给 AI')) areas.push(node);
+        (node.children || []).forEach(walk);
+    };
+    walk(sheet());
+    assert.equal(areas.length, 1);
+    areas[0].value = '戒指能看见灵体';
+    areas[0].listeners.input[0]({ target: areas[0] });
+    findButton(sheet(), '保存修改').listeners.click[0]();
+    await findButton(panel(), '保存').listeners.click[0]();
+    const saved = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
+    const stage = saved.stages.find(item => item.name === '第一幕');
+    assert.equal(stage.extras[0].body, '戒指能看见灵体');
+    assert.deepEqual(errors, []);
 });

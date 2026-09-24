@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.71
+     * 动态指导助手 v2.72
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.71';
+    const VERSION = '2.72';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2872,9 +2872,9 @@
     // 空字符串不能把原文发成空白。
     function stageGuidePrompt(stage, source, residents) {
         const sliced = sliceRanges(String(source || ''), stage && stage.ranges).trim();
-        if (sliced) return sliced;
-        if (!stage || typeof stage.body !== 'string' || !stage.body.trim()) return '';
-        return stageSendText(stage, residents);
+        const card = stage && typeof stage.body === 'string' ? stage.body.trim() : '';
+        if (!stage) return sliced || card;
+        return stageSendText({ ...stage, body: sliced || card }, residents);
     }
 
     function pickFromSource(text) {
@@ -7390,6 +7390,10 @@
             terminal: owner.kind === 'stage' ? Boolean(owner.terminal) : false,
             branch: owner.kind === 'stage' ? String(owner.branch || '') : '',
             mergeInto: '',
+            extras: cleanExtras(owner.extras).map(item => ({ ...item })),
+            beforeIds: Array.isArray(owner.beforeIds) ? owner.beforeIds.map(id => String(id)) : [],
+            afterIds: Array.isArray(owner.afterIds) ? owner.afterIds.map(id => String(id)) : [],
+            residents: cleanResidents(ui.editor && ui.editor.pick && ui.editor.pick.residents).map(item => ({ ...item })),
             from: owner.kind === 'addon' ? owner.from : '',
             to: owner.kind === 'addon' ? owner.to : '',
             alwaysTop: Boolean(ui.editor && ui.editor.pick && ui.editor.pick.alwaysTop),
@@ -7745,6 +7749,46 @@
         return line.slice(0, 120);
     }
 
+    function sheetSection(title, ...nodes) {
+        return el('section', { class: 'dga-sheet-section' },
+            el('h4', { text: title }),
+            ...nodes);
+    }
+
+    function stageSheetPreview(editor, owner, sheet) {
+        const pick = editor && editor.pick;
+        const stageText = stageGuidePrompt({
+            ranges: owner.ranges,
+            body: owner.body,
+            extras: sheet.extras,
+            beforeIds: sheet.beforeIds,
+            afterIds: sheet.afterIds,
+        }, pick ? pick.text : '', sheet.residents);
+        const alwaysText = pick && pick.always
+            ? normalizeRanges(pick.always.ranges).map(range => pick.text.slice(range.start, range.end).trim()).filter(Boolean).join('\n\n')
+            : '';
+        const parts = [];
+        if (alwaysText && pick.alwaysTop) parts.push(alwaysText);
+        if (stageText) parts.push(stageText);
+        if (alwaysText && !pick.alwaysTop) parts.push(alwaysText);
+        return parts.join('\n\n');
+    }
+
+    function setResidentPlace(sheet, id, place) {
+        const before = new Set(sheet.beforeIds || []);
+        const after = new Set(sheet.afterIds || []);
+        const already = place === 'before' ? before.has(id) : after.has(id);
+        before.delete(id);
+        after.delete(id);
+        if (!already) {
+            if (place === 'before') before.add(id);
+            else after.add(id);
+        }
+        sheet.beforeIds = [...before];
+        sheet.afterIds = [...after];
+        render();
+    }
+
     function renderSheet(sheet) {
         const editor = ui.editor;
         const owner = sheet.owner;
@@ -7767,16 +7811,6 @@
         nameInput.value = sheet.name;
         box.append(field('名称', nameInput));
 
-        // 常驻 / 备注是单例，不给类型切换：想换类型就重新拖选文字、选另一个归属。
-        if (owner.kind === 'stage' || owner.kind === 'addon') {
-            box.append(field('这是什么', el('div', { class: 'dga-seg' },
-                ...[['stage', '剧情阶段'], ['addon', '附加内容']].map(([kind, label]) => el('button', {
-                    type: 'button',
-                    class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
-                    onclick: () => { sheet.kind = kind; render(); },
-                }, label)))));
-        }
-
         if (sheet.kind === 'stage') {
             const completion = el('textarea', {
                 rows: 2,
@@ -7784,22 +7818,6 @@
                 oninput: event => { sheet.completion = event.target.value; },
             });
             completion.value = sheet.completion;
-            box.append(field('什么时候进入下一段（AI 自己判断）', completion));
-            // 一键生成（v2.30）：走判断AI那套 API 设置，结果只填进草稿，点「保存修改」才落盘。
-            box.append(el('div', { class: 'dga-inline-action' },
-                btn('AI 生成', () => runAction('生成完成条件', () => generateCondition(sheet, completion), {
-                    success: '已生成，确认后点「保存修改」。',
-                }), { ghost: true }),
-                el('span', {
-                    class: 'dga-muted',
-                    text: conditionGenerateHint(sheet.owner),
-                })));
-            box.append(field('到了这里', el('div', { class: 'dga-seg' },
-                ...[[false, '继续判断下一阶段'], [true, '到此结束']].map(([value, label]) => el('button', {
-                    type: 'button',
-                    class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
-                    onclick: () => { sheet.terminal = value; render(); },
-                }, label)))));
             const branchInput = el('input', {
                 type: 'text',
                 maxlength: 20,
@@ -7807,17 +7825,119 @@
                 oninput: event => { sheet.branch = event.target.value; },
             });
             branchInput.value = sheet.branch;
-            box.append(field('分支组', branchInput));
-            box.append(muted('同一组名的阶段互斥：进入其中一个，其余分支这次聊天就不再走。'));
+            const preview = stageSheetPreview(editor, owner, sheet);
+            const extraNodes = (sheet.extras || []).map(extra => {
+                const nameBox = el('input', {
+                    type: 'text',
+                    maxlength: 40,
+                    placeholder: '附加的名字',
+                    oninput: event => { extra.name = event.target.value; },
+                });
+                nameBox.value = extra.name || '';
+                const bodyBox = el('textarea', {
+                    rows: 2,
+                    placeholder: '走到这一段时，一起发给 AI',
+                    oninput: event => { extra.body = event.target.value; },
+                });
+                bodyBox.value = extra.body || '';
+                return el('div', { class: 'dga-extra-row' },
+                    nameBox,
+                    bodyBox,
+                    btn('去掉', () => {
+                        sheet.extras = sheet.extras.filter(item => item !== extra);
+                        render();
+                    }, { ghost: true }));
+            });
+            const residentNodes = (sheet.residents || []).map(resident => {
+                const nameBox = el('input', {
+                    type: 'text',
+                    maxlength: 40,
+                    placeholder: '常驻的名字',
+                    oninput: event => { resident.name = event.target.value; },
+                });
+                nameBox.value = resident.name || '';
+                const bodyBox = el('textarea', {
+                    rows: 2,
+                    placeholder: '这段常驻的正文',
+                    oninput: event => { resident.body = event.target.value; },
+                });
+                bodyBox.value = resident.body || '';
+                const place = (sheet.beforeIds || []).includes(resident.id)
+                    ? 'before'
+                    : ((sheet.afterIds || []).includes(resident.id) ? 'after' : '');
+                return el('div', { class: 'dga-extra-row' },
+                    nameBox,
+                    bodyBox,
+                    el('div', { class: 'dga-seg' },
+                        ...[['before', '这一段之前'], ['after', '这一段之后']].map(([value, label]) => el('button', {
+                            type: 'button',
+                            class: `dga-seg-btn${place === value ? ' is-on' : ''}`,
+                            onclick: () => setResidentPlace(sheet, resident.id, value),
+                        }, label))),
+                    btn('去掉', () => {
+                        sheet.residents = sheet.residents.filter(item => item !== resident);
+                        sheet.beforeIds = (sheet.beforeIds || []).filter(id => id !== resident.id);
+                        sheet.afterIds = (sheet.afterIds || []).filter(id => id !== resident.id);
+                        render();
+                    }, { ghost: true }));
+            });
             const others = stageSequence(editor.pick).filter(stage => stage !== owner);
-            if (others.length) {
-                box.append(field('再分配', selectControl(
-                    [{ value: '', label: '不并入' }].concat(others.map(stage => ({ value: stage.id, label: `并入「${stage.name}」` }))),
-                    sheet.mergeInto || '',
-                    value => { sheet.mergeInto = value; },
-                )));
-                box.append(muted('并入会把这一段的文字归到选中的阶段，这一段本身删掉。原文不动。'));
+            box.append(sheetSection('离开这一段',
+                field('什么时候进入下一段', completion),
+                el('div', { class: 'dga-inline-action' },
+                    btn('AI 生成', () => runAction('生成完成条件', () => generateCondition(sheet, completion), {
+                        success: '已生成，确认后点「保存修改」。',
+                    }), { ghost: true })),
+                field('到了这里', el('div', { class: 'dga-seg' },
+                    ...[[false, '继续往后'], [true, '到此结束']].map(([value, label]) => el('button', {
+                        type: 'button',
+                        class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
+                        onclick: () => { sheet.terminal = value; render(); },
+                    }, label))))));
+            box.append(sheetSection('岔路',
+                field('分支组', branchInput, '同一组名的阶段互斥：走进一个，其余这次不再走。'),
+            ));
+            box.append(sheetSection('发给 AI',
+                el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
+                muted('上面是走到这一段时镜像里的字：这一段之前的常驻、这一段正文、附加、这一段之后的常驻。全局常驻如果开了，也会算进去。')));
+            box.append(sheetSection('附在这一段',
+                ...extraNodes,
+                btn('加一条附加', () => {
+                    sheet.extras = sheet.extras || [];
+                    sheet.extras.push({ id: `extra-${Date.now().toString(36)}-${sheet.extras.length}`, name: '附加', body: '' });
+                    render();
+                }, { ghost: true })));
+            box.append(sheetSection('这一段前后的常驻',
+                ...residentNodes,
+                btn('加一条常驻', () => {
+                    sheet.residents = sheet.residents || [];
+                    const id = `stay-${Date.now().toString(36)}-${sheet.residents.length}`;
+                    sheet.residents.push({ id, name: '常驻', body: '' });
+                    sheet.beforeIds = [...(sheet.beforeIds || []), id];
+                    render();
+                }, { ghost: true }),
+                muted('点「这一段之前」或「这一段之后」决定放在正文的哪一侧。再点一次就先不用。')));
+            if (others.length || owner.kind === 'stage') {
+                box.append(sheetSection('整理',
+                    field('这是什么', el('div', { class: 'dga-seg' },
+                        ...[['stage', '剧情阶段'], ['addon', '附加内容']].map(([kind, label]) => el('button', {
+                            type: 'button',
+                            class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
+                            onclick: () => { sheet.kind = kind; render(); },
+                        }, label)))),
+                    others.length ? field('再分配', selectControl(
+                        [{ value: '', label: '不并入' }].concat(others.map(stage => ({ value: stage.id, label: `并入「${stage.name}」` }))),
+                        sheet.mergeInto || '',
+                        value => { sheet.mergeInto = value; },
+                    ), '并入会把文字归到选中的阶段，这一段删掉。原文不动。') : null));
             }
+        } else if (owner.kind === 'stage' || owner.kind === 'addon') {
+            box.append(field('这是什么', el('div', { class: 'dga-seg' },
+                ...[['stage', '剧情阶段'], ['addon', '附加内容']].map(([kind, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
+                    onclick: () => { sheet.kind = kind; render(); },
+                }, label)))));
         }
         if (sheet.kind === 'addon') {
             const stages = stageSequence(editor.pick);
@@ -7909,6 +8029,11 @@
             owner.completion = String(sheet.completion || '').trim();
             owner.terminal = Boolean(sheet.terminal);
             owner.branch = String(sheet.branch || '').trim();
+            owner.extras = cleanExtras(sheet.extras);
+            const residentIds = (sheet.residents || []).map(item => item.id);
+            owner.beforeIds = cleanIdList(sheet.beforeIds, residentIds);
+            owner.afterIds = cleanIdList(sheet.afterIds, residentIds);
+            editor.pick.residents = cleanResidents(sheet.residents);
         }
         let mergedAway = false;
         if (owner.kind === 'stage' && sheet.mergeInto) {
@@ -8534,6 +8659,10 @@ ${P} .dga-work-switch { display: grid; grid-template-columns: repeat(3, minmax(0
 ${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: var(--dga-radius-md) var(--dga-radius-md) 0 0; background: var(--dga-bg-1); border-top: 1px solid var(--dga-border-2); display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-sheet h3 { margin: 0; font-size: 15px; }
+${P} .dga-sheet-section { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--dga-border); }
+${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--dga-text-2); }
+${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
+${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
 /* 设置齿轮与小贴士（v2.29）：齿轮挨着右上角关闭按钮，贴士是居中的小卡片 */
