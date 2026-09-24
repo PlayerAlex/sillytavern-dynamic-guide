@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.72
+     * 动态指导助手 v2.73
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.72';
+    const VERSION = '2.73';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6714,7 +6714,7 @@
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
                 success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
             }))),
-            muted('按顺序、循环、AI 选段管的是这一轮怎么往下走。分支组是岔路：走进一条，同组其余这次不再走。开了循环后，绕回时走同一条还是重新选择，在这里先定好。'),
+            muted('按顺序、循环、AI 选段管的是这一轮怎么往下走。岔路是点进某一段后勾选和哪些段互斥：走进一个，其余这次不再走。开了循环后，绕回时走同一条还是重新选择，在这里先定好。'),
             orderMode === 'loop' ? field('循环绕回时', el('div', { class: 'dga-seg' },
                 ...[['fresh', '重新选择'], ['keep', '走同一条']].map(([value, label]) => el('button', {
                     type: 'button',
@@ -7305,7 +7305,8 @@
 
     function segmentSubtitle(editor, owner) {
         if (owner.kind === 'stage') {
-            const branchTag = owner.branch ? ` · 分支「${owner.branch}」` : '';
+            const partners = stageSequence(editor.pick).filter(stage => exclusivePartnerIds(editor.pick, owner).includes(stage.id)).map(stage => stage.name);
+            const branchTag = partners.length ? ` · 和${partners.join('、')}互斥` : '';
             if (owner.completion === '自动') return `进入下一段：AI 自己判断${branchTag}`;
             return (owner.completion ? `进入下一段：${owner.completion}` : '手动点「下一段」推进') + branchTag;
         }
@@ -7390,10 +7391,8 @@
             terminal: owner.kind === 'stage' ? Boolean(owner.terminal) : false,
             branch: owner.kind === 'stage' ? String(owner.branch || '') : '',
             mergeInto: '',
+            exclusiveIds: exclusivePartnerIds(ui.editor && ui.editor.pick, owner),
             extras: cleanExtras(owner.extras).map(item => ({ ...item })),
-            beforeIds: Array.isArray(owner.beforeIds) ? owner.beforeIds.map(id => String(id)) : [],
-            afterIds: Array.isArray(owner.afterIds) ? owner.afterIds.map(id => String(id)) : [],
-            residents: cleanResidents(ui.editor && ui.editor.pick && ui.editor.pick.residents).map(item => ({ ...item })),
             from: owner.kind === 'addon' ? owner.from : '',
             to: owner.kind === 'addon' ? owner.to : '',
             alwaysTop: Boolean(ui.editor && ui.editor.pick && ui.editor.pick.alwaysTop),
@@ -7761,9 +7760,9 @@
             ranges: owner.ranges,
             body: owner.body,
             extras: sheet.extras,
-            beforeIds: sheet.beforeIds,
-            afterIds: sheet.afterIds,
-        }, pick ? pick.text : '', sheet.residents);
+            beforeIds: owner.beforeIds,
+            afterIds: owner.afterIds,
+        }, pick ? pick.text : '', pick ? pick.residents : []);
         const alwaysText = pick && pick.always
             ? normalizeRanges(pick.always.ranges).map(range => pick.text.slice(range.start, range.end).trim()).filter(Boolean).join('\n\n')
             : '';
@@ -7774,19 +7773,47 @@
         return parts.join('\n\n');
     }
 
-    function setResidentPlace(sheet, id, place) {
-        const before = new Set(sheet.beforeIds || []);
-        const after = new Set(sheet.afterIds || []);
-        const already = place === 'before' ? before.has(id) : after.has(id);
-        before.delete(id);
-        after.delete(id);
-        if (!already) {
-            if (place === 'before') before.add(id);
-            else after.add(id);
+    function exclusivePartnerIds(pick, owner) {
+        const group = String(owner && owner.branch || '').trim();
+        if (!group || !pick) return [];
+        return stageSequence(pick)
+            .filter(stage => stage !== owner && String(stage.branch || '').trim() === group)
+            .map(stage => stage.id);
+    }
+
+    function clearLonelyBranches(pick) {
+        const stages = stageSequence(pick);
+        const counts = new Map();
+        stages.forEach(stage => {
+            const group = String(stage.branch || '').trim();
+            if (!group) return;
+            counts.set(group, (counts.get(group) || 0) + 1);
+        });
+        stages.forEach(stage => {
+            const group = String(stage.branch || '').trim();
+            if (group && counts.get(group) < 2) stage.branch = '';
+        });
+    }
+
+    // 勾选的段和当前段合成一组互斥。没勾的退出这一组。只剩一段的组清掉。
+    function applyExclusiveGroup(pick, owner, selectedIds) {
+        const stages = stageSequence(pick);
+        const selected = new Set(selectedIds || []);
+        const oldGroup = String(owner.branch || '').trim();
+        const peers = stages.filter(stage => stage !== owner && selected.has(stage.id));
+        if (!peers.length) owner.branch = '';
+        else {
+            const keep = oldGroup && peers.every(stage => String(stage.branch || '').trim() === oldGroup);
+            const group = keep ? oldGroup : `岔路-${owner.id}`;
+            owner.branch = group;
+            peers.forEach(stage => { stage.branch = group; });
         }
-        sheet.beforeIds = [...before];
-        sheet.afterIds = [...after];
-        render();
+        if (oldGroup) {
+            stages.forEach(stage => {
+                if (stage !== owner && !selected.has(stage.id) && String(stage.branch || '').trim() === oldGroup) stage.branch = '';
+            });
+        }
+        clearLonelyBranches(pick);
     }
 
     function renderSheet(sheet) {
@@ -7818,13 +7845,6 @@
                 oninput: event => { sheet.completion = event.target.value; },
             });
             completion.value = sheet.completion;
-            const branchInput = el('input', {
-                type: 'text',
-                maxlength: 20,
-                placeholder: '留空 = 不分支；互斥的几段写同一个组名',
-                oninput: event => { sheet.branch = event.target.value; },
-            });
-            branchInput.value = sheet.branch;
             const preview = stageSheetPreview(editor, owner, sheet);
             const extraNodes = (sheet.extras || []).map(extra => {
                 const nameBox = el('input', {
@@ -7848,40 +7868,18 @@
                         render();
                     }, { ghost: true }));
             });
-            const residentNodes = (sheet.residents || []).map(resident => {
-                const nameBox = el('input', {
-                    type: 'text',
-                    maxlength: 40,
-                    placeholder: '常驻的名字',
-                    oninput: event => { resident.name = event.target.value; },
-                });
-                nameBox.value = resident.name || '';
-                const bodyBox = el('textarea', {
-                    rows: 2,
-                    placeholder: '这段常驻的正文',
-                    oninput: event => { resident.body = event.target.value; },
-                });
-                bodyBox.value = resident.body || '';
-                const place = (sheet.beforeIds || []).includes(resident.id)
-                    ? 'before'
-                    : ((sheet.afterIds || []).includes(resident.id) ? 'after' : '');
-                return el('div', { class: 'dga-extra-row' },
-                    nameBox,
-                    bodyBox,
-                    el('div', { class: 'dga-seg' },
-                        ...[['before', '这一段之前'], ['after', '这一段之后']].map(([value, label]) => el('button', {
-                            type: 'button',
-                            class: `dga-seg-btn${place === value ? ' is-on' : ''}`,
-                            onclick: () => setResidentPlace(sheet, resident.id, value),
-                        }, label))),
-                    btn('去掉', () => {
-                        sheet.residents = sheet.residents.filter(item => item !== resident);
-                        sheet.beforeIds = (sheet.beforeIds || []).filter(id => id !== resident.id);
-                        sheet.afterIds = (sheet.afterIds || []).filter(id => id !== resident.id);
-                        render();
-                    }, { ghost: true }));
-            });
             const others = stageSequence(editor.pick).filter(stage => stage !== owner);
+            const forkButtons = others.map(stage => el('button', {
+                type: 'button',
+                class: `dga-seg-btn${(sheet.exclusiveIds || []).includes(stage.id) ? ' is-on' : ''}`,
+                onclick: () => {
+                    const ids = new Set(sheet.exclusiveIds || []);
+                    if (ids.has(stage.id)) ids.delete(stage.id);
+                    else ids.add(stage.id);
+                    sheet.exclusiveIds = [...ids];
+                    render();
+                },
+            }, stage.name));
             box.append(sheetSection('离开这一段',
                 field('什么时候进入下一段', completion),
                 el('div', { class: 'dga-inline-action' },
@@ -7895,11 +7893,13 @@
                         onclick: () => { sheet.terminal = value; render(); },
                     }, label))))));
             box.append(sheetSection('岔路',
-                field('分支组', branchInput, '同一组名的阶段互斥：走进一个，其余这次不再走。'),
-            ));
+                others.length
+                    ? el('div', { class: 'dga-fork-list' }, ...forkButtons)
+                    : muted('还没有别的段。'),
+                muted('点亮的段和这一段只能走一个。都不点就是普通往下走。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
-                muted('上面是走到这一段时镜像里的字：这一段之前的常驻、这一段正文、附加、这一段之后的常驻。全局常驻如果开了，也会算进去。')));
+                muted('上面是走到这一段时会发给 AI 的字。')));
             box.append(sheetSection('附在这一段',
                 ...extraNodes,
                 btn('加一条附加', () => {
@@ -7907,16 +7907,6 @@
                     sheet.extras.push({ id: `extra-${Date.now().toString(36)}-${sheet.extras.length}`, name: '附加', body: '' });
                     render();
                 }, { ghost: true })));
-            box.append(sheetSection('这一段前后的常驻',
-                ...residentNodes,
-                btn('加一条常驻', () => {
-                    sheet.residents = sheet.residents || [];
-                    const id = `stay-${Date.now().toString(36)}-${sheet.residents.length}`;
-                    sheet.residents.push({ id, name: '常驻', body: '' });
-                    sheet.beforeIds = [...(sheet.beforeIds || []), id];
-                    render();
-                }, { ghost: true }),
-                muted('点「这一段之前」或「这一段之后」决定放在正文的哪一侧。再点一次就先不用。')));
             if (others.length || owner.kind === 'stage') {
                 box.append(sheetSection('整理',
                     field('这是什么', el('div', { class: 'dga-seg' },
@@ -8028,12 +8018,8 @@
         if (owner.kind === 'stage') {
             owner.completion = String(sheet.completion || '').trim();
             owner.terminal = Boolean(sheet.terminal);
-            owner.branch = String(sheet.branch || '').trim();
             owner.extras = cleanExtras(sheet.extras);
-            const residentIds = (sheet.residents || []).map(item => item.id);
-            owner.beforeIds = cleanIdList(sheet.beforeIds, residentIds);
-            owner.afterIds = cleanIdList(sheet.afterIds, residentIds);
-            editor.pick.residents = cleanResidents(sheet.residents);
+            if (!sheet.mergeInto) applyExclusiveGroup(editor.pick, owner, sheet.exclusiveIds);
         }
         let mergedAway = false;
         if (owner.kind === 'stage' && sheet.mergeInto) {
@@ -8041,6 +8027,7 @@
             if (target && target !== owner) {
                 pickAssign(editor.pick, target.id, owner.ranges);
                 editor.pick.stages = editor.pick.stages.filter(item => item !== owner);
+                clearLonelyBranches(editor.pick);
                 mergedAway = true;
             }
         }
@@ -8066,6 +8053,7 @@
             const index = order.indexOf(owner);
             const fallback = order[index + 1] || order[index - 1] || null;
             pick.stages = pick.stages.filter(item => item !== owner);
+            clearLonelyBranches(pick);
             pick.links = (pick.links || []).filter(link => link.from !== owner.id && link.to !== owner.id);
             pick.addons.forEach(addon => {
                 if (addon.from === owner.name) addon.from = fallback ? fallback.name : '';
@@ -8663,6 +8651,8 @@ ${P} .dga-sheet-section { display: flex; flex-direction: column; gap: 8px; paddi
 ${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--dga-text-2); }
 ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
+${P} .dga-fork-list { display: flex; flex-direction: column; gap: 6px; }
+${P} .dga-fork-list .dga-seg-btn { width: 100%; text-align: left; padding: 8px 12px; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
 /* 设置齿轮与小贴士（v2.29）：齿轮挨着右上角关闭按钮，贴士是居中的小卡片 */

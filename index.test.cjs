@@ -3820,7 +3820,7 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     assert.ok(findButton(panel(), '设置'), '时间线页顶上能去设置');
     await findButton(panel(), '设置').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
-    assert.match(panel().textContent, /绕回时走同一条还是重新选择，在这里先定好/);
+    assert.match(panel().textContent, /岔路是点进某一段后勾选和哪些段互斥/);
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置也是二级页');
     await findButton(panel(), '编辑').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '从设置能进到分段编辑');
@@ -3945,7 +3945,10 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     assert.match(sheet().textContent, /发给 AI/);
     assert.match(sheet().textContent, /暑假正文/);
     assert.ok(findButton(sheet(), '加一条附加'));
-    assert.ok(findButton(sheet(), '加一条常驻'));
+    assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
+    assert.match(findButton(sheet(), '第二幕').className, /dga-seg-btn/);
+    findButton(sheet(), '第二幕').listeners.click[0]();
+    assert.match(findButton(sheet(), '第二幕').className, /is-on/, '点一下就把这一段和它标成互斥');
     findButton(sheet(), '加一条附加').listeners.click[0]();
     const areas = [];
     const walk = node => {
@@ -3961,5 +3964,7 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     const saved = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
     const stage = saved.stages.find(item => item.name === '第一幕');
     assert.equal(stage.extras[0].body, '戒指能看见灵体');
+    assert.ok(stage.branch, '勾过的段要记下互斥');
+    assert.equal(saved.stages.find(item => item.name === '第二幕').branch, stage.branch);
     assert.deepEqual(errors, []);
 });
