@@ -3817,6 +3817,13 @@ test('线：可选会清掉互斥名单，点名的互斥才留下', () => {
     assert.equal(links[1].exclusiveWith.join(','), 'a');
 });
 
+test('箭头从卡片边缘指向下一张，不从中心穿出去', () => {
+    const ends = core.mapArrowEnds({ x: 0, y: 0 }, { x: 220, y: 0 });
+    assert.equal(ends.x1, 156);
+    assert.equal(ends.y1, 36);
+    assert.ok(ends.x2 < 220 && ends.x2 > 156, '箭头停在目标卡片左边一点');
+});
+
 test('点卡片可以编辑这一张的剧情，保存不改原文', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const original = '原文保持不动';

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.65
+     * 动态指导助手 v2.66
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.65';
+    const VERSION = '2.66';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1174,6 +1174,31 @@
             });
         });
         return { rows, edges: storyEdges(rows), placed };
+    }
+
+    // 箭头从卡片边缘指向另一张卡片边缘，按谁在谁的哪一侧决定左右还是上下。
+    function mapArrowEnds(from, to) {
+        const fx = from.x + MAP_NODE_W / 2;
+        const fy = from.y + MAP_NODE_H / 2;
+        const tx = to.x + MAP_NODE_W / 2;
+        const ty = to.y + MAP_NODE_H / 2;
+        const dx = tx - fx;
+        const dy = ty - fy;
+        const horizontal = Math.abs(dx) >= Math.abs(dy);
+        const start = horizontal
+            ? { x: dx >= 0 ? from.x + MAP_NODE_W : from.x, y: from.y + MAP_NODE_H / 2 }
+            : { x: from.x + MAP_NODE_W / 2, y: dy >= 0 ? from.y + MAP_NODE_H : from.y };
+        const end = horizontal
+            ? { x: dx >= 0 ? to.x : to.x + MAP_NODE_W, y: to.y + MAP_NODE_H / 2 }
+            : { x: to.x + MAP_NODE_W / 2, y: dy >= 0 ? to.y : to.y + MAP_NODE_H };
+        const length = Math.hypot(end.x - start.x, end.y - start.y) || 1;
+        const pad = Math.min(14, length / 2);
+        return {
+            x1: start.x,
+            y1: start.y,
+            x2: end.x - (end.x - start.x) / length * pad,
+            y2: end.y - (end.y - start.y) / length * pad,
+        };
     }
 
     // 时间线只读标记：被否决的分支不再亮；当前下标之前是走过的，正好是现在。
@@ -7023,6 +7048,21 @@
         ];
     }
 
+    function svgNode(tag, attrs, ...children) {
+        const doc = hostDocument();
+        const node = typeof doc.createElementNS === 'function'
+            ? doc.createElementNS('http://www.w3.org/2000/svg', tag)
+            : doc.createElement(tag);
+        Object.entries(attrs || {}).forEach(([key, value]) => {
+            if (value == null || value === false) return;
+            node.setAttribute(key === 'className' ? 'class' : key, String(value));
+        });
+        children.flat(Infinity).forEach(child => {
+            if (child) node.appendChild(child);
+        });
+        return node;
+    }
+
     function renderStoryMap(stages, options) {
         const settings = options || {};
         const list = Array.isArray(stages) ? stages : [];
@@ -7034,16 +7074,19 @@
             maxX = Math.max(maxX, pos.x + MAP_NODE_W + 32);
             maxY = Math.max(maxY, pos.y + MAP_NODE_H + 48);
         });
+        const arrowId = `${PANEL_ID}-arrow`;
         const lines = drawn.map(edge => {
             const from = graph.placed.get(edge.from);
             const to = graph.placed.get(edge.to);
             if (!from || !to) return null;
-            return el('line', {
-                class: 'dga-map-edge',
-                x1: from.x + MAP_NODE_W / 2,
-                y1: from.y + MAP_NODE_H,
-                x2: to.x + MAP_NODE_W / 2,
-                y2: to.y,
+            const ends = mapArrowEnds(from, to);
+            return svgNode('line', {
+                class: `dga-map-edge${edge.optional ? ' is-optional' : ''}`,
+                x1: ends.x1,
+                y1: ends.y1,
+                x2: ends.x2,
+                y2: ends.y2,
+                'marker-end': `url(#${arrowId})`,
             });
         });
         const board = el('div', {
@@ -7076,9 +7119,21 @@
                 render();
             },
         });
-        board.append(el('svg', { class: 'dga-map-lines', width: String(maxX), height: String(maxY) }, ...lines));
+        board.append(svgNode('svg', { class: 'dga-map-lines', width: String(maxX), height: String(maxY) },
+            svgNode('defs', null,
+                svgNode('marker', {
+                    id: arrowId,
+                    markerWidth: '8',
+                    markerHeight: '8',
+                    refX: '7',
+                    refY: '4',
+                    orient: 'auto',
+                }, svgNode('path', { d: 'M0,0 L8,4 L0,8 Z', class: 'dga-map-arrow' }))),
+            ...lines));
         if (!list.length) {
             board.append(el('p', { class: 'dga-hint', text: '还没有卡片。点「新建」加第一张。' }));
+        } else if (!settings.readonly && !drawn.length) {
+            board.append(el('p', { class: 'dga-hint', text: '还没有线。点一张卡片，编辑，再点「加一条线」。' }));
         }
         list.forEach((stage, index) => {
             const pos = graph.placed.get(stage.id) || { x: 24, y: 24 };
@@ -8490,7 +8545,9 @@ ${P} .dga-danger-text { color: var(--dga-danger); font-size: 13px; overflow-wrap
 ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 4px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
 ${P} .dga-map { position: relative; min-height: 420px; overflow: auto; border: 1px solid var(--dga-border); border-radius: 6px; background: color-mix(in srgb, var(--dga-text-1) 3%, transparent); touch-action: pan-x pan-y; }
 ${P} .dga-map-lines { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
-${P} .dga-map-edge { stroke: var(--dga-border-2); stroke-width: 2; }
+${P} .dga-map-edge { stroke: var(--dga-accent); stroke-width: 2; fill: none; }
+${P} .dga-map-edge.is-optional { stroke-dasharray: 5 4; }
+${P} .dga-map-arrow { fill: var(--dga-accent); }
 ${P} .dga-map-node { position: absolute; width: 156px; min-height: 72px; padding: 10px 28px 10px 12px; border: 1px solid var(--dga-border-2); border-radius: 6px; background: var(--dga-bg-1); color: var(--dga-text-1); cursor: grab; user-select: none; }
 ${P} .dga-map.is-readonly .dga-map-node { cursor: default; }
 ${P} .dga-map-node.is-now, ${P} .dga-map-node.is-focus { border-color: var(--dga-accent); box-shadow: 0 0 0 1px var(--dga-accent); }
@@ -8735,6 +8792,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         storyPositions,
         stageMapStatus,
         cleanStoryLinks,
+        mapArrowEnds,
         bindingOrderMode,
         applyJudgeOutputRules,
         applyBoundaryRules,
