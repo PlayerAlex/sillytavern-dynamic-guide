@@ -3854,8 +3854,11 @@ test('点卡片可以编辑这一张的剧情，保存不改原文', async () =>
     const option = optionsOf(select).find(item => item.textContent === '新阶段 2');
     select.value = optionValue(option);
     select.listeners.change[0]({ target: select });
-    findButton(sheet(), '互斥').listeners.click[0]();
+    assert.equal(findButton(sheet(), '互斥'), null, '编辑剧情时不选可选或互斥');
     findButton(sheet(), '保存修改').listeners.click[0]();
+    findButton(panel(), '可选').listeners.click[0]();
+    findButton(sheet(), '互斥').listeners.click[0]();
+    findButton(sheet(), '完成').listeners.click[0]();
     await findButton(panel(), '保存').listeners.click[0]();
 
     const entry = state.entries.find(item => item.uid === 1);

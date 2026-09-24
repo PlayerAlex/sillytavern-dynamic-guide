@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.66
+     * 动态指导助手 v2.67
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.66';
+    const VERSION = '2.67';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6912,7 +6912,7 @@
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
             : (mode === 'map'
-                ? '点卡片后选择编辑或删除。编辑里写这一张自己的剧情，并设置拉出去的线。拖远一点才挪位置。这里不改原文。'
+                ? '点卡片后选择编辑或删除。线连上之后，点线上的字选择可选或互斥。拖远一点才挪位置。这里不改原文。'
                 : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走一点就记住，不用再点保存。');
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
@@ -6960,7 +6960,8 @@
         else if (ui.editorTip) parts.push(renderEditorTip());
         if (editor.sheet) {
             parts.push(editor.sheet.mode === 'menu' ? renderCardMenu(editor.sheet)
-                : (editor.sheet.mode === 'write' ? renderCardWrite(editor.sheet) : renderSheet(editor.sheet)));
+                : (editor.sheet.mode === 'write' ? renderCardWrite(editor.sheet)
+                    : (editor.sheet.mode === 'line' ? renderLineSheet(editor.sheet) : renderSheet(editor.sheet))));
         }
         return parts;
     }
@@ -7089,6 +7090,19 @@
                 'marker-end': `url(#${arrowId})`,
             });
         });
+        const linePicks = settings.readonly ? [] : drawn.map(edge => {
+            const from = graph.placed.get(edge.from);
+            const to = graph.placed.get(edge.to);
+            if (!from || !to) return null;
+            const ends = mapArrowEnds(from, to);
+            return el('button', {
+                type: 'button',
+                class: `dga-line-pick${edge.optional ? ' is-optional' : ''}`,
+                style: { left: `${(ends.x1 + ends.x2) / 2}px`, top: `${(ends.y1 + ends.y2) / 2}px` },
+                text: edge.optional ? '可选' : '互斥',
+                onclick: () => openLineSheet(edge.id),
+            });
+        });
         const board = el('div', {
             class: `dga-map${settings.readonly ? ' is-readonly' : ''}`,
             onpointermove: event => {
@@ -7130,6 +7144,7 @@
                     orient: 'auto',
                 }, svgNode('path', { d: 'M0,0 L8,4 L0,8 Z', class: 'dga-map-arrow' }))),
             ...lines));
+        linePicks.forEach(pick => { if (pick) board.append(pick); });
         if (!list.length) {
             board.append(el('p', { class: 'dga-hint', text: '还没有卡片。点「新建」加第一张。' }));
         } else if (!settings.readonly && !drawn.length) {
@@ -7406,7 +7421,7 @@
         body.value = sheet.body || '';
         box.append(field('名称', nameInput), field('这一张的剧情', body));
         box.append(el('h3', { text: '从这里拉出去的线' }));
-        if (!sheet.links.length) box.append(muted('还没有线。加上之后可以选择可选，或者和某几根线互斥。'));
+        if (!sheet.links.length) box.append(muted('还没有线。连上之后，回到图上点那根线，再选可选或互斥。'));
         sheet.links.forEach(link => {
             const row = el('div', { class: 'dga-card' });
             row.append(field('连到', selectControl(
@@ -7414,38 +7429,6 @@
                 link.to || '',
                 value => { link.to = value; render(); },
             )));
-            row.append(field('这条线', el('div', { class: 'dga-seg' },
-                ...[[true, '可选'], [false, '互斥']].map(([optional, label]) => el('button', {
-                    type: 'button',
-                    class: `dga-seg-btn${(link.optional !== false) === optional ? ' is-on' : ''}`,
-                    onclick: () => {
-                        link.optional = optional;
-                        if (optional) link.exclusiveWith = [];
-                        render();
-                    },
-                }, label)))));
-            if (link.optional === false) {
-                const pool = (pick.links || []).filter(item => item.id !== link.id && item.from !== owner.id)
-                    .concat(sheet.links.filter(item => item !== link && item.to));
-                if (!pool.length) row.append(muted('图上还没有别的线可以互斥。'));
-                pool.forEach(other => {
-                    const from = stageSequence(pick).find(stage => stage.id === other.from);
-                    const to = stageSequence(pick).find(stage => stage.id === other.to);
-                    const label = `${from ? from.name : '这张'} → ${to ? to.name : '另一张'}`;
-                    const on = (link.exclusiveWith || []).includes(other.id);
-                    row.append(el('button', {
-                        type: 'button',
-                        class: `dga-seg-btn${on ? ' is-on' : ''}`,
-                        onclick: () => {
-                            const list = new Set(link.exclusiveWith || []);
-                            if (list.has(other.id)) list.delete(other.id);
-                            else list.add(other.id);
-                            link.exclusiveWith = Array.from(list);
-                            render();
-                        },
-                    }, on ? `互斥：${label}` : label));
-                });
-            }
             row.append(btn('去掉这根线', () => {
                 sheet.links = sheet.links.filter(item => item !== link);
                 render();
@@ -7465,6 +7448,73 @@
         box.append(el('div', { class: 'dga-sheet-actions' },
             btn('保存修改', () => applyCardWrite(sheet), { primary: true }),
             btn('取消', closeSheet, { ghost: true })));
+        backdrop.append(box);
+        return backdrop;
+    }
+
+    function openLineSheet(linkId) {
+        const editor = ui.editor;
+        const link = editor && editor.pick && (editor.pick.links || []).find(item => item.id === linkId);
+        if (!link) return;
+        editor.sheet = { mode: 'line', linkId };
+        render();
+    }
+
+    function renderLineSheet(sheet) {
+        const editor = ui.editor;
+        const pick = editor.pick;
+        const link = (pick.links || []).find(item => item.id === sheet.linkId);
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg',
+            onclick: event => { if (event.target === backdrop) closeSheet(); },
+        });
+        const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '这条线' });
+        if (!link) {
+            box.append(el('h3', { text: '这条线已经不在了' }), btn('关闭', closeSheet, { primary: true }));
+            backdrop.append(box);
+            return backdrop;
+        }
+        const from = stageSequence(pick).find(stage => stage.id === link.from);
+        const to = stageSequence(pick).find(stage => stage.id === link.to);
+        const setOptional = optional => {
+            link.optional = optional;
+            if (optional) link.exclusiveWith = [];
+            editor.dirty = true;
+            render();
+        };
+        box.append(
+            el('h3', { text: `${from ? from.name : '这张'} → ${to ? to.name : '另一张'}` }),
+            muted('点这根线选择。可选是支线，走了不取消别的线。互斥只和下面点到的线打架。'),
+            field('这条线', el('div', { class: 'dga-seg' },
+                ...[[true, '可选'], [false, '互斥']].map(([optional, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${(link.optional !== false) === optional ? ' is-on' : ''}`,
+                    onclick: () => setOptional(optional),
+                }, label)))),
+        );
+        if (link.optional === false) {
+            const pool = (pick.links || []).filter(item => item.id !== link.id && item.to);
+            if (!pool.length) box.append(muted('图上还没有别的线。这条先记成互斥，等有别的线再点它。'));
+            pool.forEach(other => {
+                const otherFrom = stageSequence(pick).find(stage => stage.id === other.from);
+                const otherTo = stageSequence(pick).find(stage => stage.id === other.to);
+                const label = `${otherFrom ? otherFrom.name : '这张'} → ${otherTo ? otherTo.name : '另一张'}`;
+                const on = (link.exclusiveWith || []).includes(other.id);
+                box.append(el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${on ? ' is-on' : ''}`,
+                    onclick: () => {
+                        const chosen = new Set(link.exclusiveWith || []);
+                        if (chosen.has(other.id)) chosen.delete(other.id);
+                        else chosen.add(other.id);
+                        link.exclusiveWith = Array.from(chosen);
+                        editor.dirty = true;
+                        render();
+                    },
+                }, on ? `和它互斥：${label}` : `点了就和它互斥：${label}`));
+            });
+        }
+        box.append(el('div', { class: 'dga-sheet-actions' }, btn('完成', closeSheet, { primary: true })));
         backdrop.append(box);
         return backdrop;
     }
@@ -8548,6 +8598,7 @@ ${P} .dga-map-lines { position: absolute; left: 0; top: 0; overflow: visible; po
 ${P} .dga-map-edge { stroke: var(--dga-accent); stroke-width: 2; fill: none; }
 ${P} .dga-map-edge.is-optional { stroke-dasharray: 5 4; }
 ${P} .dga-map-arrow { fill: var(--dga-accent); }
+${P} .dga-line-pick { position: absolute; z-index: 2; transform: translate(-50%, -50%); min-height: 22px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--dga-accent); background: var(--dga-bg-1); color: var(--dga-accent); font: inherit; font-size: 11px; line-height: 20px; cursor: pointer; }
 ${P} .dga-map-node { position: absolute; width: 156px; min-height: 72px; padding: 10px 28px 10px 12px; border: 1px solid var(--dga-border-2); border-radius: 6px; background: var(--dga-bg-1); color: var(--dga-text-1); cursor: grab; user-select: none; }
 ${P} .dga-map.is-readonly .dga-map-node { cursor: default; }
 ${P} .dga-map-node.is-now, ${P} .dga-map-node.is-focus { border-color: var(--dga-accent); box-shadow: 0 0 0 1px var(--dga-accent); }
