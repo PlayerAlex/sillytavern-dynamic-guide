@@ -1103,6 +1103,12 @@ function findButton(node, prefix) {
     return null;
 }
 
+function showBody(panel) {
+    const button = findButton(panel, '正文');
+    assert.ok(button, '编辑器里要有「正文」');
+    button.listeners.click[0]();
+}
+
 test('分段界面：拖选前言分配给第一段，正文立刻重建并标脏', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     // mock Range：toString() 量出从正文开头到端点的字数，也就是选区偏移
@@ -1173,8 +1179,9 @@ test('分段界面：拖选前言分配给第一段，正文立刻重建并标�
     await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await uiCore.refresh();
     const panel = documentRef.getElementById(PANEL_ID);
-    assert.ok(panel.querySelector('.dga-mode-seg'), '编辑器第一档是「分段」');
-    assert.ok(panel.querySelector('.dga-mode-raw'), '编辑器第二档是「编辑原文」');
+    assert.ok(panel.querySelector('.dga-mode-map'), '编辑器第一档是「导图」');
+    assert.ok(panel.querySelector('.dga-mode-raw'), '编辑器里仍有「编辑原文」');
+    showBody(panel);
 
     let surface = panel.querySelector('.dga-pick-surface');
     assert.ok(surface, '分段视图要把正文铺成连续文字');
@@ -1719,6 +1726,7 @@ test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写�
     await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await uiCore.refresh();
     const panel = () => documentRef.getElementById(PANEL_ID);
+    showBody(panel());
 
     // 点第一段的标题条 → 打开属性弹层
     const bar = collectByClass(panel(), 'dga-segbar', [])[0];
@@ -1787,6 +1795,7 @@ test('齿轮里可以改生成提示词，并单独选 API 预设', async () => 
     await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await uiCore.refresh();
     const panel = () => documentRef.getElementById(PANEL_ID);
+    showBody(panel());
     const findAttr = (node, name, value) => {
         if (node.getAttribute && node.getAttribute(name) === value) return node;
         for (const child of node.children || []) {
@@ -1876,6 +1885,7 @@ test('分段视图：从选中文字新建阶段，弹层确认后还能退回�
     await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await uiCore.refresh();
     const panel = () => documentRef.getElementById(PANEL_ID);
+    showBody(panel());
     const assign = value => {
         const select = findTag(panel().querySelector('.dga-pick-bar'), 'SELECT');
         select.value = value;
@@ -1942,17 +1952,19 @@ test('小卡步进器中间那块是划分阶段的入口，点进去落在当�
     assert.ok(mid, '小卡步进器中间那块就是划分阶段的入口');
     assert.match(mid.textContent, /第 2 \/ 3 段/);
     const actions = panel().querySelector('.dga-bind-actions');
-    assert.ok(actions, '划分和设置排在上一段、下一段下面');
-    assert.equal(actions.children[0].textContent, '划分 ›');
-    assert.equal(actions.children[1].textContent, '设置 ›');
+    assert.ok(actions, '时间线、编辑和设置排在上一段、下一段下面');
+    assert.equal(actions.children[0].textContent, '时间线 ›');
+    assert.equal(actions.children[1].textContent, '编辑 ›');
+    assert.equal(actions.children[2].textContent, '设置 ›');
     await mid.listeners.click[0]();
 
     const focused = collectByClass(panel(), 'is-focus', []);
     assert.equal(focused.length, 1, '落在小卡当前的段上，只高亮那一段');
     assert.match(focused[0].textContent, /第二幕/);
-    assert.ok(panel().querySelector('.dga-mode-seg'), '点进去打开的是「分段」视图');
-    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '划分阶段是二级页，左上角不放导航');
-    assert.equal(panel().querySelector('.dga-rail'), null, '划分阶段是二级页，电脑上也不放左侧目录');
+    assert.ok(panel().querySelector('.dga-map'), '点进去打开的是导图');
+    assert.equal(panel().querySelector('.dga-map-delete') ? true : false, true, '编辑里可以删除');
+    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '编辑是二级页，左上角不放导航');
+    assert.equal(panel().querySelector('.dga-rail'), null, '编辑是二级页，电脑上也不放左侧目录');
     assert.deepEqual(errors, []);
 });
 
@@ -2090,6 +2102,7 @@ test('没有 ## 标题的条目也能绑定，划分不改原文', async () => {
     assert.equal(state.entries[0].content, original, '绑定不能改原文');
     await booted.sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', state.entries[0]);
     await booted.sandbox.DynamicGuideAssistantCore.refresh();
+    showBody(panel());
     const flow = node => {
         if (node.nodeType === 3) return node.textContent;
         if (node.getAttribute && node.getAttribute('data-dga-skip') != null) return '';
@@ -2239,6 +2252,7 @@ test('分段界面：标题条的下移按钮交换阶段顺序且不打开弹�
     await uiCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await uiCore.refresh();
     const panel = documentRef.getElementById(PANEL_ID);
+    showBody(panel);
     const findAll = (node, cls, out) => {
         if (String(node.className || '').split(/\s+/).includes(cls)) out.push(node);
         (node.children || []).forEach(child => findAll(child, cls, out));
@@ -2317,6 +2331,7 @@ test('分段里保存完成条件不改原文，条件记在条目旁边', async
     await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
     await sandbox.DynamicGuideAssistantCore.refresh();
     const panel = () => documentRef.getElementById(PANEL_ID);
+    showBody(panel());
     const bar = panel().querySelector('.dga-segbar');
     bar.listeners.click[0]();
     const sheet = panel().querySelector('.dga-sheet');
@@ -3711,5 +3726,80 @@ test('小卡状态字多就缩略，点「展开」看全文、再点「收起�
     assert.equal(panel().querySelector('.dga-judge-toggle').textContent, '收起');
     panel().querySelector('.dga-judge-toggle').listeners.click[0]();
     assert.ok(!panel().querySelector('.dga-judge-status').textContent.includes('很'.repeat(80)), '收起后回到缩略');
+    assert.deepEqual(errors, []);
+});
+
+test('导图：分支并排，前后主线散开再收回', () => {
+    const stages = [
+        { id: 'a', name: '雨夜', branch: '' },
+        { id: 'b', name: '留下', branch: '去向' },
+        { id: 'c', name: '分别', branch: '去向' },
+        { id: 'd', name: '再联系', branch: '' },
+    ];
+    const graph = core.storyPositions(stages);
+    assert.equal(graph.rows.length, 3);
+    assert.equal(graph.rows[1].map(item => item.id).join(','), 'b,c');
+    assert.equal(graph.edges.map(edge => `${edge.from}->${edge.to}`).join(','), 'a->b,a->c,b->d,c->d');
+    assert.ok(graph.placed.get('b').x < graph.placed.get('c').x);
+    assert.equal(graph.placed.get('b').y, graph.placed.get('c').y);
+    const kept = core.storyPositions([{ id: 'a', name: '甲', x: 40, y: 80 }]);
+    assert.equal(kept.placed.get('a').x, 40);
+    assert.equal(kept.placed.get('a').y, 80);
+});
+
+test('时间线状态：走过、现在、被否决', () => {
+    const stages = [
+        { id: 'a', branch: '' },
+        { id: 'b', branch: '去向' },
+        { id: 'c', branch: '去向' },
+    ];
+    const state = { stageIndex: 1, branchChoices: { 去向: 'b' } };
+    assert.equal(core.stageMapStatus(stages[0], 0, state), 'done');
+    assert.equal(core.stageMapStatus(stages[1], 1, state), 'now');
+    assert.equal(core.stageMapStatus(stages[2], 2, state), 'skipped');
+});
+
+test('编辑导图可以新建、拖动、删除；时间线只看不能改', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: { version: 2, bindings: [{ worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' }] },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+
+    findButton(panel(), '时间线 ›').listeners.click[0]();
+    assert.equal(panel().querySelector('.dga-map-delete'), null, '时间线没有删除');
+    assert.equal(findButton(panel(), '新建'), null, '时间线不能新建');
+    const timelineNodes = collectByClass(panel(), 'dga-map-node', []);
+    assert.equal(timelineNodes.length, 2, '时间线能看到全部阶段');
+    assert.ok(collectByClass(panel(), 'is-now', []).length, '当前阶段要标出来');
+    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '时间线是二级页');
+    panel().querySelector('.dga-close').listeners.click[0]();
+
+    await findButton(panel(), '编辑 ›').listeners.click[0]();
+    const before = collectByClass(panel(), 'dga-map-node', []).length;
+    findButton(panel(), '新建').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-sheet'), '新建后打开这张卡片');
+    findButton(panel(), '取消').listeners.click[0]();
+    assert.equal(collectByClass(panel(), 'dga-map-node', []).length, before + 1, '取消名称也留下这张新卡片');
+
+    const node = collectByClass(panel(), 'dga-map-node', []).find(item => /新阶段/.test(item.textContent));
+    assert.ok(node, '新卡片叫新阶段');
+    node.listeners.pointerdown[0]({ clientX: 10, clientY: 20, target: node });
+    const board = panel().querySelector('.dga-map');
+    board.listeners.pointermove[0]({ clientX: 80, clientY: 90 });
+    board.listeners.pointerup[0]({ clientX: 80, clientY: 90 });
+    assert.match(panel().querySelector('.dga-head-text').textContent, /未保存/);
+
+    const created = collectByClass(panel(), 'dga-map-node', []).find(item => /新阶段/.test(item.textContent));
+    created.querySelector('.dga-map-delete').listeners.click[0]({ stopPropagation() {} });
+    assert.equal(collectByClass(panel(), 'dga-map-node', []).some(item => /新阶段/.test(item.textContent)), false, '删除后这张卡片不在了');
     assert.deepEqual(errors, []);
 });
