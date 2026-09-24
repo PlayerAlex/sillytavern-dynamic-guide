@@ -560,8 +560,14 @@ function element(tag, registry) {
     return node;
 }
 
+function nodeClassNames(node) {
+    const fromName = typeof node.className === 'string' ? node.className : '';
+    const fromAttr = node.attributes && node.attributes.class ? String(node.attributes.class) : '';
+    return `${fromName} ${fromAttr}`.split(/\s+/).filter(Boolean);
+}
+
 function findClass(node, name, skipSelf) {
-    if (!skipSelf && String(node.className || '').split(/\s+/).includes(name)) return node;
+    if (!skipSelf && nodeClassNames(node).includes(name)) return node;
     for (const child of node.children || []) {
         const found = findClass(child, name, false);
         if (found) return found;
@@ -575,6 +581,24 @@ function fakeDocument(html) {
         head: element('head', registry),
         body: element('body', registry),
         createElement: tag => element(tag, registry),
+        // 真浏览器的 SVG：className 是只读对象，赋值会抛错。setAttribute('class') 仍然生效。
+        createElementNS: (_namespace, tag) => {
+            const node = element(tag, registry);
+            const animated = { baseVal: '' };
+            Object.defineProperty(node, 'className', {
+                configurable: true,
+                get() { return animated; },
+                set() {
+                    throw new TypeError('Cannot set property className of #<SVGElement> which has only a getter');
+                },
+            });
+            const setAttribute = node.setAttribute.bind(node);
+            node.setAttribute = (name, value) => {
+                setAttribute(name, value);
+                if (name === 'class') animated.baseVal = String(value);
+            };
+            return node;
+        },
         createTextNode: text => ({ nodeType: 3, __text: true, textContent: String(text) }),
         getElementById: id => registry.get(id) || null,
         querySelector: () => null,
@@ -3556,7 +3580,11 @@ test('分支：手动步进跳过被否决分支，未决组给候选，循环�
     parsed.loop = true;
     const wrap = core.stepTargetVisible(parsed, { stageIndex: 3, branchChoices: chosen }, 1);
     assert.equal(wrap.target, 0);
-    assert.equal(wrap.resetBranches, true, '循环绕回 = 全部重来，清空分支选择');
+    assert.equal(wrap.resetBranches, true, '没预设走同一条时，循环绕回清空分支选择');
+    parsed.loopKeepBranch = true;
+    const kept = core.stepTargetVisible(parsed, { stageIndex: 3, branchChoices: chosen }, 1);
+    assert.equal(kept.target, 0);
+    assert.equal(kept.resetBranches, false, '创作者预设走同一条时，绕回不清分支选择');
     const back = core.stepTargetVisible(parsed, { stageIndex: 0, branchChoices: chosen }, -1);
     assert.equal(back.target, 3);
     assert.equal(back.resetBranches, false, '退回上一轮只是回看，不清选择');
@@ -3787,12 +3815,53 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     assert.equal(findButton(panel(), '可选'), null, '时间线上不能改可选或互斥');
     assert.equal(timelineNodes[0].listeners.pointerdown, undefined, '时间线卡片不能拖');
     assert.equal(panel().querySelector('.dga-map').listeners.pointermove, undefined, '时间线不能拖动画布');
+    assert.ok(findButton(panel(), '时间线'), '时间线页顶上能去时间线');
+    assert.ok(findButton(panel(), '编辑'), '时间线页顶上能去编辑');
+    assert.ok(findButton(panel(), '设置'), '时间线页顶上能去设置');
+    await findButton(panel(), '设置').listeners.click[0]();
+    assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
+    assert.match(panel().textContent, /绕回时走同一条还是重新选择，在这里先定好/);
+    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置也是二级页');
+    await findButton(panel(), '编辑').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-pick-surface'), '从设置能进到分段编辑');
+    await findButton(panel(), '时间线').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-map'), '从编辑能回到时间线');
     panel().querySelector('.dga-close').listeners.click[0]();
 
     await findButton(panel(), '编辑 ›').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '编辑打开的是原来的分段');
     assert.equal(panel().querySelector('.dga-map'), null, '编辑页不放导图');
     assert.equal(findButton(panel(), '新建'), null, '分段编辑没有导图的新建');
+    assert.deepEqual(errors, []);
+});
+
+test('卡片旧正文不盖过已划进原文的字，只有卡片的字在分段里能看见', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const original = '## 第一幕\n暑假正文\n\n## 第二幕\n寒假正文';
+    const layout = savedStages(original, [
+        { name: '第一幕', quote: '暑假正文' },
+        { name: '第二幕', quote: '寒假正文' },
+    ]);
+    layout.stages[0].body = '';
+    layout.stages[1].body = '卡片旧文';
+    layout.stages.push({ id: 's3', name: '只在卡片', completion: '', terminal: false, ranges: [], body: '只有卡片里的这一段' });
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
+    state.variables.character.$dynamicGuideAssistant = {
+        config: { version: 2, bindings: [], layouts: { '测试世界书#大纲': layout } },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    showBody(panel());
+    assert.match(panel().textContent, /暑假正文/);
+    assert.match(panel().textContent, /只有卡片里的这一段/);
+    assert.equal(panel().textContent.includes('空分段（名下没有文字，不会发送）'), false, '卡片里有字的阶段不能写成不会发送');
+    await findButton(panel(), '保存').listeners.click[0]();
+    const saved = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
+    assert.equal(saved.stages[0].body, undefined, '原文已有文字时不再留下空的卡片正文');
+    assert.equal(saved.stages[1].body, undefined, '原文已有文字时不再留下旧的卡片正文');
+    assert.equal(saved.stages[2].body, '只有卡片里的这一段', '原文还是空的阶段保留卡片正文');
     assert.deepEqual(errors, []);
 });
 
@@ -3814,6 +3883,19 @@ test('箭头从卡片边缘指向下一张，不从中心穿出去', () => {
     assert.equal(ends.x1, 156);
     assert.equal(ends.y1, 36);
     assert.ok(ends.x2 < 220 && ends.x2 > 156, '箭头停在目标卡片左边一点');
+});
+
+test('原文划分优先于卡片旧正文，空卡片不能把原文发空', () => {
+    const source = '原文这一段';
+    const ranges = [{ start: 0, end: source.length }];
+    assert.equal(core.stageGuidePrompt({ body: '', ranges }, source, []), source, '空的卡片正文不能盖过原文');
+    assert.equal(core.stageGuidePrompt({ body: '卡片旧文', ranges }, source, []), source, '原文里有字时不用卡片旧文');
+    assert.equal(core.stageGuidePrompt({
+        body: '只有卡片',
+        ranges: [],
+        beforeIds: ['stay'],
+        extras: [{ id: 'extra', name: '戒指', body: '戒指能看见灵体' }],
+    }, source, [{ id: 'stay', name: '文风', body: '保持克制' }]), '保持克制\n\n只有卡片\n\n戒指能看见灵体', '原文还没划进来时仍发卡片里的字');
 });
 
 test('发给 AI 的内容按常驻在前、这一张、附加、常驻在后排好', () => {

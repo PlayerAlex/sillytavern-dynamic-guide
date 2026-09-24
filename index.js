@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.68
+     * 动态指导助手 v2.71
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.68';
+    const VERSION = '2.71';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1111,8 +1111,9 @@
             if (!stageBranchSkipped(stages[target], choices)) break;
         }
         if (stageBranchSkipped(stages[target], choices)) return { target: from, resetBranches: false, pending: null };
-        // 往前走并绕过末尾 = 这一轮走完重新来，分支选择清空；往后退回第一段只是回看，不动选择。
-        const resetBranches = wrapped && delta > 0;
+        // 往前走并绕过末尾：没预设「走同一条」就清空分支，下一圈可以重选。
+        // 创作者设了走同一条，则选择留着，绕回后仍跳过被否决的分支。往后退只是回看，不动选择。
+        const resetBranches = wrapped && delta > 0 && parsed.loopKeepBranch !== true;
         const pending = delta > 0 && !resetBranches ? branchPendingChoices(parsed, state, target) : null;
         return { target, resetBranches, pending };
     }
@@ -2284,6 +2285,7 @@
             else if (item.orderMode === 'loop' || item.loop === true) {
                 binding.orderMode = 'loop';
                 binding.loop = true;
+                if (item.loopBranch === 'keep') binding.loopBranch = 'keep';
             }
             const ownMode = item.advanceMode === 'marker' ? 'story' : item.advanceMode;
             if (['off', 'story', 'judge'].includes(ownMode)) binding.advanceMode = ownMode;
@@ -2866,6 +2868,15 @@
         return parts.join('\n\n');
     }
 
+    // 发给 AI 的这一段：原文里已经划进来的字优先。导图时期留下的 body 只在原文还是空的时候才用，
+    // 空字符串不能把原文发成空白。
+    function stageGuidePrompt(stage, source, residents) {
+        const sliced = sliceRanges(String(source || ''), stage && stage.ranges).trim();
+        if (sliced) return sliced;
+        if (!stage || typeof stage.body !== 'string' || !stage.body.trim()) return '';
+        return stageSendText(stage, residents);
+    }
+
     function pickFromSource(text) {
         const source = String(text || '');
         const parsed = parseOutline(source);
@@ -2925,18 +2936,22 @@
             version: 3,
             loop: Boolean(pick && pick.loop),
             alwaysTop: Boolean(pick && pick.alwaysTop),
-            stages: stageSequence(pick).map(stage => ({
-                ...pack(stage),
-                completion: stage.completion || '',
-                terminal: Boolean(stage.terminal),
-                branch: String(stage.branch || '').trim(),
-                ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
-                beforeIds: cleanIdList(stage.beforeIds, (pick.residents || []).map(item => item.id)),
-                afterIds: cleanIdList(stage.afterIds, (pick.residents || []).map(item => item.id)),
-                extras: cleanExtras(stage.extras),
-                ...(Number.isFinite(stage.x) ? { x: stage.x } : {}),
-                ...(Number.isFinite(stage.y) ? { y: stage.y } : {}),
-            })),
+            stages: stageSequence(pick).map(stage => {
+                const saved = {
+                    ...pack(stage),
+                    completion: stage.completion || '',
+                    terminal: Boolean(stage.terminal),
+                    branch: String(stage.branch || '').trim(),
+                    beforeIds: cleanIdList(stage.beforeIds, (pick.residents || []).map(item => item.id)),
+                    afterIds: cleanIdList(stage.afterIds, (pick.residents || []).map(item => item.id)),
+                    extras: cleanExtras(stage.extras),
+                    ...(Number.isFinite(stage.x) ? { x: stage.x } : {}),
+                    ...(Number.isFinite(stage.y) ? { y: stage.y } : {}),
+                };
+                const card = typeof stage.body === 'string' ? stage.body : '';
+                if (card.trim() && saved.ranges.length === 0) saved.body = card;
+                return saved;
+            }),
             links: cleanStoryLinks(pick && pick.links, stageSequence(pick).map(stage => stage.id)),
             residents: cleanResidents(pick && pick.residents),
             startId: (() => {
@@ -2958,9 +2973,7 @@
                 id: stage.id || `stage-${index + 1}`,
                 kind: 'stage',
                 name: stage.name || `阶段 ${index + 1}`,
-                prompt: typeof stage.body === 'string'
-                    ? stageSendText(stage, cleanResidents(layout.residents))
-                    : sliceRanges(source, stage.ranges),
+                prompt: stageGuidePrompt(stage, source, cleanResidents(layout.residents)),
                 completion: autoComplete ? '' : completion,
                 autoComplete,
                 terminal: Boolean(stage.terminal),
@@ -3158,12 +3171,14 @@
             if (nextMode === 'pick') {
                 binding.orderMode = 'pick';
                 delete binding.loop;
+                delete binding.loopBranch;
             } else if (nextMode === 'loop') {
                 binding.orderMode = 'loop';
                 binding.loop = true;
             } else {
                 delete binding.orderMode;
                 delete binding.loop;
+                delete binding.loopBranch;
             }
             if (layout) binding.layout = layout;
             await writeConfig(config);
@@ -3305,7 +3320,10 @@
                 const savedLayout = layoutOnBinding(binding, config);
                 const parsed = outlineFromEntry(located.entry, savedLayout ? { layout: savedLayout, loop: binding.loop } : null);
                 if (bindingOrderMode(binding) === 'pick') parsed.loop = false;
-                else if (bindingOrderMode(binding) === 'loop') parsed.loop = true;
+                else if (bindingOrderMode(binding) === 'loop') {
+                    parsed.loop = true;
+                    parsed.loopKeepBranch = binding.loopBranch === 'keep';
+                }
                 const rawState = stateMap[key] || null;
                 const state = reconcileState(rawState, parsed, binding.startIndex);
                 contexts.push({
@@ -3891,8 +3909,11 @@
         const total = context.parsed.stages.length;
         const loop = Boolean(context.parsed.loop);
         const index = loop && total > 0 && target >= total ? 0 : Math.max(0, Math.min(target, total));
-        // 分支选择默认沿用进度里的；选分支时由调用处传入新表；循环绕回时清空（全部重来）。
-        const branchChoices = settings.resetBranches
+        const wrappedByIndex = loop && total > 0 && target >= total;
+        // 手动步进会自己带上 resetBranches。自动推进把下标推过末尾时，按创作者预设决定清不清分支。
+        const resetBranches = settings.resetBranches === true
+            || (settings.resetBranches !== false && wrappedByIndex && context.parsed.loopKeepBranch !== true);
+        const branchChoices = resetBranches
             ? {}
             : branchChoicesOf(settings.branchChoices !== undefined ? { branchChoices: settings.branchChoices } : context.state);
         const next = {
@@ -5135,13 +5156,14 @@
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
         const page = ui.view === 'editor' ? renderEditor()
             : (ui.view === 'timeline' ? renderTimeline()
-                : (ui.view === 'api' ? renderApiPage()
-                    : (ui.view === 'judgePrompt' ? renderJudgePromptPage()
-                        : (ui.view === 'logs' ? renderLogPage()
-                            : (ui.view === 'dev' ? renderDevPage()
-                                : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
-        // 电脑端和数据库一样：目录页左侧常驻导航，右侧是当前页。编辑、时间线、判断AI提示词仍是二级页，不放这列。
-        const showRail = ui.view !== 'editor' && ui.view !== 'timeline' && ui.view !== 'judgePrompt';
+                : (ui.view === 'pace' ? renderPacePage()
+                    : (ui.view === 'api' ? renderApiPage()
+                        : (ui.view === 'judgePrompt' ? renderJudgePromptPage()
+                            : (ui.view === 'logs' ? renderLogPage()
+                                : (ui.view === 'dev' ? renderDevPage()
+                                    : (ui.view === 'guide' ? renderGuidePage() : renderManager())))))));
+        // 电脑端和数据库一样：目录页左侧常驻导航，右侧是当前页。编辑、时间线、设置、判断AI提示词仍是二级页，不放这列。
+        const showRail = ui.view !== 'editor' && ui.view !== 'timeline' && ui.view !== 'pace' && ui.view !== 'judgePrompt';
         const main = el('div', { class: 'dga-main' }, ...page);
         shell.replaceChildren(...(showRail ? [renderNavRail(), main] : [main]));
         // 新绑定小卡的入场高亮只播一次（v2.27）：节点已经带上 is-new，这里立刻清掉
@@ -5166,10 +5188,6 @@
             ui.entryQueryFocus = false;
         }
         ui.renderedView = ui.view;
-        if (ui.view === 'guide' && ui.paceKey) {
-            const sheet = renderPaceSheet();
-            if (sheet) shell.appendChild(sheet);
-        }
         if (ui.view === 'guide' && ui.branchPick) {
             const branchSheet = renderBranchSheet();
             if (branchSheet) shell.appendChild(branchSheet);
@@ -6528,7 +6546,9 @@
                     'aria-label': '时间线',
                     text: '时间线 ›',
                     onclick: () => {
+                        ui.workKey = context.key;
                         ui.timelineKey = context.key;
+                        ui.paceKey = '';
                         ui.view = 'timeline';
                         render();
                     },
@@ -6547,31 +6567,85 @@
                     class: 'dga-pace-open dga-set-open',
                     'aria-label': '这条的判断设置',
                     text: '设置 ›',
-                    onclick: () => { ui.paceKey = context.key; render(); },
+                    onclick: () => {
+                        ui.workKey = context.key;
+                        ui.paceKey = context.key;
+                        ui.timelineKey = '';
+                        ui.view = 'pace';
+                        render();
+                    },
                 })),
             judgeStatusLine(context, judgeWaitText(context)),
         );
     }
 
-    function renderPaceSheet() {
+    function workContext() {
         const contexts = ui.snapshot ? ui.snapshot.contexts : [];
-        const context = contexts.find(item => item.key === ui.paceKey && !item.broken);
-        if (!context) return null;
-        const backdrop = el('div', {
-            class: 'dga-sheet-bg',
-            onclick: event => {
-                if (event.target === backdrop) { ui.paceKey = ''; render(); }
-            },
-        });
-        const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '这条的判断设置' });
-        box.append(
-            el('h3', { text: `「${entryName(context.entry)}」怎么判断` }),
-            bindingPace(context),
-            el('div', { class: 'dga-sheet-actions' },
-                btn('完成', () => { ui.paceKey = ''; render(); }, { primary: true })),
-        );
-        backdrop.append(box);
-        return backdrop;
+        const key = ui.workKey || ui.timelineKey || ui.paceKey;
+        if (!key) return null;
+        return contexts.find(item => item.key === key) || null;
+    }
+
+    function workSwitch(active) {
+        const context = workContext();
+        if (!context || context.broken) return null;
+        return el('div', { class: 'dga-work-switch', role: 'tablist', 'aria-label': '这一条的页面' },
+            ...[['timeline', '时间线'], ['editor', '编辑'], ['pace', '设置']].map(([id, label]) => el('button', {
+                type: 'button',
+                role: 'tab',
+                class: `dga-seg-btn${active === id ? ' is-on' : ''}`,
+                'aria-selected': active === id ? 'true' : 'false',
+                onclick: () => runAction('切换页面', () => openWorkPage(id), { refresh: false }),
+            }, label)));
+    }
+
+    async function openWorkPage(page) {
+        if ((page === 'timeline' && ui.view === 'timeline')
+            || (page === 'editor' && ui.view === 'editor')
+            || (page === 'pace' && ui.view === 'pace')) return false;
+        if (page !== 'editor' && ui.view === 'editor' && editorUnsaved(ui.editor)) {
+            if (!hostWindow.confirm('还有没保存的修改，确定放弃？')) return false;
+        }
+        const context = workContext();
+        if (!context || context.broken || !context.entry) throw new Error('这条绑定不可用。');
+        ui.workKey = context.key;
+        if (page === 'editor') {
+            ui.timelineKey = '';
+            ui.paceKey = '';
+            await openEditorAt(context.worldbookName, context.entry, {
+                focusStageIndex: context.parsed && context.parsed.stages.length
+                    ? Math.min(Math.max(0, Math.floor(Number(context.state && context.state.stageIndex) || 0)), context.parsed.stages.length - 1)
+                    : null,
+            });
+            return false;
+        }
+        if (ui.editor) discardEditor();
+        ui.timelineKey = page === 'timeline' ? context.key : '';
+        ui.paceKey = page === 'pace' ? context.key : '';
+        ui.view = page;
+        return false;
+    }
+
+    function renderPacePage() {
+        const context = workContext();
+        const back = () => {
+            ui.view = 'guide';
+            ui.paceKey = '';
+            ui.workKey = '';
+            render();
+        };
+        if (!context || context.broken) {
+            return [
+                header('设置', '这条绑定不可用', back, '返回', null, { subpage: true }),
+                el('div', { class: 'dga-body' }, messageBar({ type: 'warning', text: '这条绑定不可用。' })),
+            ];
+        }
+        return [
+            header('设置', entryName(context.entry), back, '返回', null, { subpage: true }),
+            el('div', { class: 'dga-body' },
+                workSwitch('pace'),
+                bindingPace(context)),
+        ];
     }
 
     // 分支走向选择（v2.63）：手动点「下一段」落到未决分支组时弹出；选中即推进并锁定这组。
@@ -6640,6 +6714,17 @@
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
                 success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
             }))),
+            muted('按顺序、循环、AI 选段管的是这一轮怎么往下走。分支组是岔路：走进一条，同组其余这次不再走。开了循环后，绕回时走同一条还是重新选择，在这里先定好。'),
+            orderMode === 'loop' ? field('循环绕回时', el('div', { class: 'dga-seg' },
+                ...[['fresh', '重新选择'], ['keep', '走同一条']].map(([value, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${(binding.loopBranch === 'keep' ? 'keep' : 'fresh') === value ? ' is-on' : ''}`,
+                    onclick: () => runAction('保存循环分支', () => updateBinding(context.key, item => {
+                        if (value === 'keep') item.loopBranch = 'keep';
+                        else delete item.loopBranch;
+                    }), { success: value === 'keep' ? '绕回后仍走这次选过的分支' : '绕回后可以重新选择分支' }),
+                }, label)))) : null,
+            orderMode === 'loop' ? muted('走同一条：下一圈还走这次选过的分支。重新选择：绕回后岔路可以再选。') : null,
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
                 if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
                 else delete item.advanceMode;
@@ -6850,6 +6935,7 @@
         const config = ui.snapshot && ui.snapshot.config ? ui.snapshot.config : await readConfig();
         const binding = findBindingForEntry(config, worldbookName, fresh);
         const bound = Boolean(binding);
+        if (binding) ui.workKey = bindingKey(binding);
         const source = lines.join('\n');
         const flags = await readFlagMap(worldbookName);
         const stored = (binding && cleanLayout(binding.layout))
@@ -6894,6 +6980,9 @@
     async function closeEditor(force) {
         if (!force && editorUnsaved(ui.editor) && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
         discardEditor();
+        ui.workKey = '';
+        ui.timelineKey = '';
+        ui.paceKey = '';
         ui.view = 'guide';
         enterGuidePage();
         try {
@@ -6951,6 +7040,7 @@
             : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走在小卡的设置里。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
+            workSwitch('editor'),
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
             toolbar,
@@ -7057,7 +7147,12 @@
     function renderTimeline() {
         const contexts = ui.snapshot ? ui.snapshot.contexts : [];
         const context = contexts.find(item => item.key === ui.timelineKey);
-        const back = () => { ui.view = 'guide'; ui.timelineKey = ''; render(); };
+        const back = () => {
+            ui.view = 'guide';
+            ui.timelineKey = '';
+            ui.workKey = '';
+            render();
+        };
         if (!context || context.broken || context.legacy) {
             return [
                 header('时间线', '这条绑定不可用', back, '返回', null, { subpage: true }),
@@ -7079,7 +7174,8 @@
         return [
             header('时间线', entryName(context.entry), back, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
-                muted('按阶段自动排好，只看，不能拖动。要改阶段，回到小卡点「编辑 ›」。'),
+                workSwitch('timeline'),
+                muted('按阶段自动排好，只看，不能拖动。要改阶段，回到这一页上面的「编辑」。'),
                 stages.length
                     ? renderStoryMap(stages.map(stage => {
                         const copy = { ...stage };
@@ -7100,7 +7196,9 @@
             if (value == null || value === false) return;
             const name = key === 'className' ? 'class' : key;
             node.setAttribute(name, String(value));
-            if (name === 'class') node.className = String(value);
+            // 真浏览器里 SVG 的 className 是只读对象，赋值会抛错并把时间线打崩。
+            // 测试用的假 DOM 才是可写字符串，需要同步一下，查询才找得到。
+            if (name === 'class' && typeof node.className === 'string') node.className = String(value);
         });
         children.flat(Infinity).forEach(child => {
             if (child) node.appendChild(child);
@@ -7200,6 +7298,11 @@
         render();
     }
 
+    function cardOnlyText(owner) {
+        if (!owner || owner.kind !== 'stage' || normalizeRanges(owner.ranges).length) return '';
+        return typeof owner.body === 'string' ? owner.body.trim() : '';
+    }
+
     function segmentSubtitle(editor, owner) {
         if (owner.kind === 'stage') {
             const branchTag = owner.branch ? ` · 分支「${owner.branch}」` : '';
@@ -7221,6 +7324,7 @@
         const settings = options || {};
         const stageIndex = settings.stageIndex;
         const chars = owner.ranges.reduce((sum, range) => sum + (range.end - range.start), 0);
+        const card = cardOnlyText(owner);
         const tag = owner.kind === 'stage' ? `第 ${stageIndex + 1} 段` : KIND_LABELS[owner.kind];
         const moveBtn = (label, delta, disabled, title) => el('button', {
             type: 'button', class: 'dga-move', title,
@@ -7238,7 +7342,7 @@
             el('div', { class: 'dga-heading-text' },
                 el('b', { text: owner.name }),
                 el('small', { text: segmentSubtitle(editor, owner) })),
-            el('span', { class: 'dga-segbar-count', text: chars > 0 ? `${chars} 字` : '空' }),
+            el('span', { class: 'dga-segbar-count', text: chars > 0 ? `${chars} 字` : (card ? `${card.length} 字` : '空') }),
             canMove ? el('span', { class: 'dga-move-wrap' },
                 moveBtn('↑', -1, stageIndex <= 0, '和上一段交换'),
                 moveBtn('↓', 1, stageIndex >= stageTotal - 1, '和下一段交换')) : null,
@@ -8232,12 +8336,19 @@
         });
 
         const empty = pickOwners(pick).filter(owner => !shown.has(owner.id) && (owner.kind === 'stage' || owner.kind === 'addon'));
+        const cardOnly = empty.filter(owner => cardOnlyText(owner));
+        const blank = empty.filter(owner => !cardOnlyText(owner));
         const root = el('div', { class: 'dga-pick' },
             renderAssignBar(editor),
             order.length === 0 ? el('p', { class: 'dga-hint', text: '还没有分段：在下面的正文上拖选一段文字，再从底部选「＋ 新阶段…」。' }) : null,
             surface,
-            empty.length > 0 ? muted('空分段（名下没有文字，不会发送）') : null,
-            ...empty.map(owner => segmentBar(editor, owner, { stageIndex: owner.kind === 'stage' ? order.indexOf(owner) : null })),
+            blank.length > 0 ? muted('空分段（名下没有文字，不会发送）') : null,
+            cardOnly.length > 0 ? muted('这些阶段的文字还在卡片里，会发给 AI。把原文拖选归到这一段后，就改用原文。') : null,
+            ...empty.flatMap(owner => {
+                const bar = segmentBar(editor, owner, { stageIndex: owner.kind === 'stage' ? order.indexOf(owner) : null });
+                const card = cardOnlyText(owner);
+                return card ? [bar, el('p', { class: 'dga-card-text', text: card })] : [bar];
+            }),
         );
         return root;
     }
@@ -8419,6 +8530,7 @@ ${P} .dga-seg-btn { min-height: 40px; border-radius: 4px; border: 1px solid var(
 ${P} .dga-seg-btn:hover { background: var(--dga-hover); }
 ${P} .dga-seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-seg-btn.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); font-weight: 700; }
+${P} .dga-work-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 ${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: var(--dga-radius-md) var(--dga-radius-md) 0 0; background: var(--dga-bg-1); border-top: 1px solid var(--dga-border-2); display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-sheet h3 { margin: 0; font-size: 15px; }
@@ -8823,6 +8935,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         stageMapStatus,
         cleanStoryLinks,
         stageSendText,
+        stageGuidePrompt,
         mapArrowEnds,
         bindingOrderMode,
         applyJudgeOutputRules,
