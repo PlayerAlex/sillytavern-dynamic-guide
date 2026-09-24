@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.67
+     * 动态指导助手 v2.68
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.67';
+    const VERSION = '2.68';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2777,6 +2777,9 @@
             ranges: clampList(stage.ranges),
             color: STAGE_COLORS[index % STAGE_COLORS.length],
             ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
+            ...(Array.isArray(stage.beforeIds) ? { beforeIds: stage.beforeIds.map(id => String(id)) } : {}),
+            ...(Array.isArray(stage.afterIds) ? { afterIds: stage.afterIds.map(id => String(id)) } : {}),
+            ...(Array.isArray(stage.extras) ? { extras: cleanExtras(stage.extras) } : {}),
             ...(Number.isFinite(stage.x) ? { x: stage.x } : {}),
             ...(Number.isFinite(stage.y) ? { y: stage.y } : {}),
         }));
@@ -2798,6 +2801,8 @@
             alwaysTop: Boolean(layout.alwaysTop),
             loop: Boolean(layout.loop),
             links: cleanStoryLinks(layout.links, stages.map(stage => stage.id)),
+            residents: cleanResidents(layout.residents),
+            startId: stages.some(stage => stage.id === layout.startId) ? layout.startId : ((stages[0] && stages[0].id) || ''),
             pendingRanges: [],
             tapHead: null,
         };
@@ -2819,6 +2824,46 @@
             kept.push({ id, from, to, optional, exclusiveWith });
         });
         return kept;
+    }
+
+    function cleanResidents(raw) {
+        if (!Array.isArray(raw)) return [];
+        return raw.filter(item => item && item.id).map(item => ({
+            id: String(item.id),
+            name: oneLine(item.name) || '常驻',
+            body: typeof item.body === 'string' ? item.body : '',
+        }));
+    }
+
+    function cleanExtras(raw) {
+        if (!Array.isArray(raw)) return [];
+        return raw.filter(item => item && item.id).map(item => ({
+            id: String(item.id),
+            name: oneLine(item.name) || '附加',
+            body: typeof item.body === 'string' ? item.body : '',
+        }));
+    }
+
+    function cleanIdList(raw, allowed) {
+        const ids = new Set(allowed || []);
+        if (!Array.isArray(raw)) return [];
+        return raw.map(id => String(id)).filter((id, index, list) => ids.has(id) && list.indexOf(id) === index);
+    }
+
+    // 走到一张卡片时发给 AI 的正文：卡片前的常驻、这一张、附加，再是卡片后的常驻。
+    function stageSendText(stage, residents) {
+        const pool = new Map((residents || []).map(item => [item.id, item]));
+        const texts = ids => cleanIdList(ids, pool.keys()).map(id => String(pool.get(id).body || '').trim()).filter(Boolean);
+        const parts = [];
+        texts(stage && stage.beforeIds).forEach(text => parts.push(text));
+        const body = stage && typeof stage.body === 'string' ? stage.body.trim() : String(stage && stage.prompt || '').trim();
+        if (body) parts.push(body);
+        cleanExtras(stage && stage.extras).forEach(extra => {
+            const text = String(extra.body || '').trim();
+            if (text) parts.push(text);
+        });
+        texts(stage && stage.afterIds).forEach(text => parts.push(text));
+        return parts.join('\n\n');
     }
 
     function pickFromSource(text) {
@@ -2886,10 +2931,18 @@
                 terminal: Boolean(stage.terminal),
                 branch: String(stage.branch || '').trim(),
                 ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
+                beforeIds: cleanIdList(stage.beforeIds, (pick.residents || []).map(item => item.id)),
+                afterIds: cleanIdList(stage.afterIds, (pick.residents || []).map(item => item.id)),
+                extras: cleanExtras(stage.extras),
                 ...(Number.isFinite(stage.x) ? { x: stage.x } : {}),
                 ...(Number.isFinite(stage.y) ? { y: stage.y } : {}),
             })),
             links: cleanStoryLinks(pick && pick.links, stageSequence(pick).map(stage => stage.id)),
+            residents: cleanResidents(pick && pick.residents),
+            startId: (() => {
+                const ids = stageSequence(pick).map(stage => stage.id);
+                return ids.includes(pick && pick.startId) ? pick.startId : (ids[0] || '');
+            })(),
             addons: (pick.addons || []).map(addon => ({ ...pack(addon), from: addon.from || '', to: addon.to || '' })),
             always: pack(pick.always || { ranges: [] }),
             note: pack(pick.note || { ranges: [] }),
@@ -2905,7 +2958,9 @@
                 id: stage.id || `stage-${index + 1}`,
                 kind: 'stage',
                 name: stage.name || `阶段 ${index + 1}`,
-                prompt: typeof stage.body === 'string' ? stage.body : sliceRanges(source, stage.ranges),
+                prompt: typeof stage.body === 'string'
+                    ? stageSendText(stage, cleanResidents(layout.residents))
+                    : sliceRanges(source, stage.ranges),
                 completion: autoComplete ? '' : completion,
                 autoComplete,
                 terminal: Boolean(stage.terminal),
@@ -2969,6 +3024,8 @@
             alwaysTop: false,
             loop: false,
             links: [],
+            residents: [],
+            startId: '',
             pendingRanges: [],
             tapHead: null,
         };
@@ -6808,8 +6865,8 @@
             parsed: stored ? outlineFromLayout(source, stored) : emptyOutline(source),
             dirty: false,
             sheet: null,
-            // 三档：'map' 导图（默认）/ 'seg' 正文 / 'raw' 编辑原文
-            mode: 'map',
+            // 编辑用分段 / 编辑原文。时间线是自动画出来的，只看。
+            mode: 'seg',
             bound,
             baseLayout: stored || null,
             bindingLoop: Boolean((binding && binding.loop) || flagLoop || (stored && stored.loop)),
@@ -6886,40 +6943,18 @@
         }, label);
         const toolbar = el('div', { class: 'dga-toolbar' },
             el('div', { class: 'dga-seg dga-mode-switch' },
-                modeButton('导图', 'map'),
-                modeButton('正文', 'seg'),
+                modeButton('分段', 'seg'),
                 modeButton('编辑原文', 'raw')),
-            mode === 'map' ? btn('新建', () => createMapStage(editor), { ghost: true }) : null,
-            editor.pick ? el('button', {
-                type: 'button',
-                class: `dga-seg-btn${(editor.orderMode || (editor.pick.loop ? 'loop' : 'order')) === 'order' ? '' : ' is-on'}`,
-                onclick: () => {
-                    const order = ['order', 'loop', 'pick'];
-                    const current = editor.orderMode || (editor.pick.loop ? 'loop' : 'order');
-                    const next = order[(Math.max(0, order.indexOf(current)) + 1) % order.length];
-                    editor.orderMode = next;
-                    editor.pick.loop = next === 'loop';
-                    editor.bindingLoop = next === 'loop';
-                    if (editor.parsed) editor.parsed.loop = next === 'loop';
-                    render();
-                    storeOrderMode(editor.worldbookName, editor.entry, next).catch(error => {
-                        setMessage(error.message || String(error), 'error');
-                        render();
-                    });
-                },
-            }, { order: '按顺序', loop: '循环', pick: 'AI选段' }[editor.orderMode || (editor.pick.loop ? 'loop' : 'order')]) : null,
         );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
-            : (mode === 'map'
-                ? '点卡片后选择编辑或删除。线连上之后，点线上的字选择可选或互斥。拖远一点才挪位置。这里不改原文。'
-                : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走一点就记住，不用再点保存。');
+            : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走在小卡的设置里。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
             toolbar,
-            mode === 'raw' ? rawArea : (mode === 'map' ? renderStoryMap(stageSequence(editor.pick), { editor, focusIndex: editor.focusStage, links: editor.pick && editor.pick.links }) : renderSegments(editor)),
+            mode === 'raw' ? rawArea : renderSegments(editor),
             // 一个标题都还没有：原始正文就是不分段的，分段完全由用户自己划。
             // 想省事可以先按空行切块，再逐块拖选归属。
             mode === 'seg' && !parsed.blocks.length && parsed.items.length > 0
@@ -6959,9 +6994,11 @@
         if (ui.conditionPromptOpen) parts.push(renderConditionPromptDialog());
         else if (ui.editorTip) parts.push(renderEditorTip());
         if (editor.sheet) {
-            parts.push(editor.sheet.mode === 'menu' ? renderCardMenu(editor.sheet)
-                : (editor.sheet.mode === 'write' ? renderCardWrite(editor.sheet)
-                    : (editor.sheet.mode === 'line' ? renderLineSheet(editor.sheet) : renderSheet(editor.sheet))));
+            const sheet = editor.sheet;
+            parts.push(sheet.mode === 'menu' ? renderCardMenu(sheet)
+                : (sheet.mode === 'write' ? renderCardWrite(sheet)
+                    : (sheet.mode === 'line' ? renderLineSheet(sheet)
+                        : (sheet.mode === 'resident' ? renderResidentSheet(sheet) : renderSheet(sheet)))));
         }
         return parts;
     }
@@ -7042,9 +7079,14 @@
         return [
             header('时间线', entryName(context.entry), back, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
-                muted('能看到全部阶段。要新建、拖动或删除，回到小卡点「编辑 ›」。'),
+                muted('按阶段自动排好，只看，不能拖动。要改阶段，回到小卡点「编辑 ›」。'),
                 stages.length
-                    ? renderStoryMap(stages, { readonly: true, links: context.binding && context.binding.layout && context.binding.layout.links })
+                    ? renderStoryMap(stages.map(stage => {
+                        const copy = { ...stage };
+                        delete copy.x;
+                        delete copy.y;
+                        return copy;
+                    }), { readonly: true, generated: true })
                     : muted('还没有阶段。')),
         ];
     }
@@ -7056,7 +7098,9 @@
             : doc.createElement(tag);
         Object.entries(attrs || {}).forEach(([key, value]) => {
             if (value == null || value === false) return;
-            node.setAttribute(key === 'className' ? 'class' : key, String(value));
+            const name = key === 'className' ? 'class' : key;
+            node.setAttribute(name, String(value));
+            if (name === 'class') node.className = String(value);
         });
         children.flat(Infinity).forEach(child => {
             if (child) node.appendChild(child);
@@ -7066,9 +7110,14 @@
 
     function renderStoryMap(stages, options) {
         const settings = options || {};
-        const list = Array.isArray(stages) ? stages : [];
+        const list = (Array.isArray(stages) ? stages : []).map(stage => {
+            const copy = { ...stage };
+            delete copy.x;
+            delete copy.y;
+            return copy;
+        });
         const graph = storyPositions(list);
-        const drawn = cleanStoryLinks(settings.links, list.map(stage => stage.id));
+        const drawn = storyEdges(graph.rows).map(edge => ({ ...edge, optional: false }));
         let maxX = 360;
         let maxY = 280;
         graph.placed.forEach(pos => {
@@ -7090,49 +7139,7 @@
                 'marker-end': `url(#${arrowId})`,
             });
         });
-        const linePicks = settings.readonly ? [] : drawn.map(edge => {
-            const from = graph.placed.get(edge.from);
-            const to = graph.placed.get(edge.to);
-            if (!from || !to) return null;
-            const ends = mapArrowEnds(from, to);
-            return el('button', {
-                type: 'button',
-                class: `dga-line-pick${edge.optional ? ' is-optional' : ''}`,
-                style: { left: `${(ends.x1 + ends.x2) / 2}px`, top: `${(ends.y1 + ends.y2) / 2}px` },
-                text: edge.optional ? '可选' : '互斥',
-                onclick: () => openLineSheet(edge.id),
-            });
-        });
-        const board = el('div', {
-            class: `dga-map${settings.readonly ? ' is-readonly' : ''}`,
-            onpointermove: event => {
-                const editor = settings.editor;
-                const drag = editor && editor.mapDrag;
-                if (!drag) return;
-                const dx = event.clientX - drag.x;
-                const dy = event.clientY - drag.y;
-                if (!drag.moved && Math.hypot(dx, dy) < 18) return;
-                drag.moved = true;
-                drag.node.style.left = `${Math.max(8, drag.ox + dx)}px`;
-                drag.node.style.top = `${Math.max(8, drag.oy + dy)}px`;
-            },
-            onpointerup: event => {
-                const editor = settings.editor;
-                const drag = editor && editor.mapDrag;
-                if (!drag || !editor.pick) return;
-                editor.mapDrag = null;
-                const stage = stageSequence(editor.pick).find(item => item.id === drag.id);
-                if (!stage) return;
-                if (!drag.moved) {
-                    openCardMenu(stage);
-                    return;
-                }
-                stage.x = Math.max(8, drag.ox + (event.clientX - drag.x));
-                stage.y = Math.max(8, drag.oy + (event.clientY - drag.y));
-                editor.dirty = true;
-                render();
-            },
-        });
+        const board = el('div', { class: 'dga-map is-readonly' });
         board.append(svgNode('svg', { class: 'dga-map-lines', width: String(maxX), height: String(maxY) },
             svgNode('defs', null,
                 svgNode('marker', {
@@ -7144,11 +7151,10 @@
                     orient: 'auto',
                 }, svgNode('path', { d: 'M0,0 L8,4 L0,8 Z', class: 'dga-map-arrow' }))),
             ...lines));
-        linePicks.forEach(pick => { if (pick) board.append(pick); });
         if (!list.length) {
             board.append(el('p', { class: 'dga-hint', text: '还没有卡片。点「新建」加第一张。' }));
-        } else if (!settings.readonly && !drawn.length) {
-            board.append(el('p', { class: 'dga-hint', text: '还没有线。点一张卡片，编辑，再点「加一条线」。' }));
+        } else if (!drawn.length) {
+            board.append(el('p', { class: 'dga-hint', text: '还没有能连起来的阶段。' }));
         }
         list.forEach((stage, index) => {
             const pos = graph.placed.get(stage.id) || { x: 24, y: 24 };
@@ -7163,36 +7169,9 @@
             const node = el('div', {
                 class: classes.join(' '),
                 style: { left: `${pos.x}px`, top: `${pos.y}px` },
-                onpointerdown: settings.readonly ? null : event => {
-                    if (event.target && event.target.classList && event.target.classList.contains('dga-map-delete')) return;
-                    const editor = settings.editor;
-                    if (!editor) return;
-                    editor.mapDrag = {
-                        id: stage.id,
-                        x: event.clientX,
-                        y: event.clientY,
-                        ox: pos.x,
-                        oy: pos.y,
-                        moved: false,
-                        node,
-                    };
-                },
             },
             el('b', { text: stage.name || '未命名' }),
             el('small', { text: note }));
-            if (!settings.readonly && settings.editor) {
-                node.append(el('button', {
-                    type: 'button',
-                    class: 'dga-map-delete',
-                    'aria-label': `删除 ${stage.name || '未命名'}`,
-                    text: '×',
-                    onpointerdown: event => event.stopPropagation(),
-                    onclick: event => {
-                        event.stopPropagation();
-                        deleteOwner(settings.editor, stage);
-                    },
-                }));
-            }
             board.append(node);
         });
         return board;
@@ -8599,7 +8578,7 @@ ${P} .dga-map-edge { stroke: var(--dga-accent); stroke-width: 2; fill: none; }
 ${P} .dga-map-edge.is-optional { stroke-dasharray: 5 4; }
 ${P} .dga-map-arrow { fill: var(--dga-accent); }
 ${P} .dga-line-pick { position: absolute; z-index: 2; transform: translate(-50%, -50%); min-height: 22px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--dga-accent); background: var(--dga-bg-1); color: var(--dga-accent); font: inherit; font-size: 11px; line-height: 20px; cursor: pointer; }
-${P} .dga-map-node { position: absolute; width: 156px; min-height: 72px; padding: 10px 28px 10px 12px; border: 1px solid var(--dga-border-2); border-radius: 6px; background: var(--dga-bg-1); color: var(--dga-text-1); cursor: grab; user-select: none; }
+${P} .dga-map-node { position: absolute; width: 156px; min-height: 72px; padding: 10px 12px; border: 1px solid var(--dga-border-2); border-radius: 6px; background: var(--dga-bg-1); color: var(--dga-text-1); cursor: default; user-select: none; }
 ${P} .dga-map.is-readonly .dga-map-node { cursor: default; }
 ${P} .dga-map-node.is-now, ${P} .dga-map-node.is-focus { border-color: var(--dga-accent); box-shadow: 0 0 0 1px var(--dga-accent); }
 ${P} .dga-map-node.is-skipped { opacity: 0.45; }
@@ -8843,6 +8822,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         storyPositions,
         stageMapStatus,
         cleanStoryLinks,
+        stageSendText,
         mapArrowEnds,
         bindingOrderMode,
         applyJudgeOutputRules,
