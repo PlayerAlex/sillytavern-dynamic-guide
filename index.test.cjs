@@ -3803,3 +3803,64 @@ test('编辑导图可以新建、拖动、删除；时间线只看不能改', as
     assert.equal(collectByClass(panel(), 'dga-map-node', []).some(item => /新阶段/.test(item.textContent)), false, '删除后这张卡片不在了');
     assert.deepEqual(errors, []);
 });
+
+test('线：可选会清掉互斥名单，点名的互斥才留下', () => {
+    const links = core.cleanStoryLinks([
+        { id: 'a', from: '1', to: '2', optional: true, exclusiveWith: ['b'] },
+        { id: 'b', from: '1', to: '3', optional: false, exclusiveWith: ['a', 'b'] },
+        { id: 'c', from: '9', to: '2' },
+    ], ['1', '2', '3']);
+    assert.equal(links.map(link => link.id).join(','), 'a,b');
+    assert.equal(links[0].optional, true);
+    assert.equal(links[0].exclusiveWith.length, 0);
+    assert.equal(links[1].optional, false);
+    assert.equal(links[1].exclusiveWith.join(','), 'a');
+});
+
+test('点卡片可以编辑这一张的剧情，保存不改原文', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const original = '原文保持不动';
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: original, enabled: false });
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await sandbox.DynamicGuideAssistantCore.openEditorAt('测试世界书', { uid: 1, name: '大纲' });
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const sheet = () => panel().querySelector('.dga-sheet');
+    findButton(panel(), '新建').listeners.click[0]();
+    const area = findTag(sheet(), 'TEXTAREA');
+    area.value = '苏醒后的这一段。';
+    area.listeners.input[0]({ target: area });
+    findButton(sheet(), '保存修改').listeners.click[0]();
+    findButton(panel(), '新建').listeners.click[0]();
+    findButton(sheet(), '保存修改').listeners.click[0]();
+
+    const first = collectByClass(panel(), 'dga-map-node', []).find(node => findTag(node, 'B').textContent === '新阶段');
+    const left = first.style.left;
+    first.listeners.pointerdown[0]({ clientX: 30, clientY: 40, target: first });
+    panel().querySelector('.dga-map').listeners.pointerup[0]({ clientX: 32, clientY: 41 });
+    assert.ok(findButton(sheet(), '编辑'), '点卡片先给编辑');
+    assert.ok(findButton(sheet(), '删除'), '点卡片先给删除');
+    findButton(sheet(), '编辑').listeners.click[0]();
+    findButton(sheet(), '加一条线').listeners.click[0]();
+    const select = findTag(sheet(), 'SELECT');
+    const option = optionsOf(select).find(item => item.textContent === '新阶段 2');
+    select.value = optionValue(option);
+    select.listeners.change[0]({ target: select });
+    findButton(sheet(), '互斥').listeners.click[0]();
+    findButton(sheet(), '保存修改').listeners.click[0]();
+    await findButton(panel(), '保存').listeners.click[0]();
+
+    const entry = state.entries.find(item => item.uid === 1);
+    assert.equal(entry.content, original, '卡片里的剧情不写回原文');
+    const layout = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
+    const saved = layout.stages.find(item => item.name === '新阶段');
+    const other = layout.stages.find(item => item.name === '新阶段 2');
+    assert.equal(saved.body, '苏醒后的这一段。');
+    assert.equal(layout.links.length, 1);
+    assert.equal(layout.links[0].optional, false);
+    assert.equal(layout.links[0].to, other.id);
+    const again = collectByClass(panel(), 'dga-map-node', []).find(node => findTag(node, 'B').textContent === '新阶段');
+    assert.equal(again.style.left, left, '保存后卡片还在原来的位置');
+    assert.deepEqual(errors, []);
+});

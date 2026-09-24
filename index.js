@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.64
+     * 动态指导助手 v2.65
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.64';
+    const VERSION = '2.65';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2751,6 +2751,7 @@
             branch: String(stage.branch || '').trim(),
             ranges: clampList(stage.ranges),
             color: STAGE_COLORS[index % STAGE_COLORS.length],
+            ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
             ...(Number.isFinite(stage.x) ? { x: stage.x } : {}),
             ...(Number.isFinite(stage.y) ? { y: stage.y } : {}),
         }));
@@ -2771,9 +2772,28 @@
             note: { id: 'note', kind: 'note', name: '备注', ranges: clampList(layout.note && layout.note.ranges), color: KIND_COLORS.note },
             alwaysTop: Boolean(layout.alwaysTop),
             loop: Boolean(layout.loop),
+            links: cleanStoryLinks(layout.links, stages.map(stage => stage.id)),
             pendingRanges: [],
             tapHead: null,
         };
+    }
+
+    // 卡片之间的线。可选 = 支线，走了也不取消别的线。互斥 = 只和点名的那几根打架。
+    function cleanStoryLinks(raw, stageIds) {
+        const ids = new Set(stageIds || []);
+        if (!Array.isArray(raw)) return [];
+        const kept = [];
+        raw.forEach(link => {
+            if (!link || typeof link !== 'object') return;
+            const from = String(link.from || '');
+            const to = String(link.to || '');
+            if (!from || !to || from === to || !ids.has(from) || !ids.has(to)) return;
+            const id = String(link.id || `link-${kept.length + 1}`);
+            const optional = link.optional === false || link.kind === 'exclusive' ? false : true;
+            const exclusiveWith = optional ? [] : (Array.isArray(link.exclusiveWith) ? link.exclusiveWith.map(item => String(item)).filter(item => item && item !== id) : []);
+            kept.push({ id, from, to, optional, exclusiveWith });
+        });
+        return kept;
     }
 
     function pickFromSource(text) {
@@ -2840,9 +2860,11 @@
                 completion: stage.completion || '',
                 terminal: Boolean(stage.terminal),
                 branch: String(stage.branch || '').trim(),
+                ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
                 ...(Number.isFinite(stage.x) ? { x: stage.x } : {}),
                 ...(Number.isFinite(stage.y) ? { y: stage.y } : {}),
             })),
+            links: cleanStoryLinks(pick && pick.links, stageSequence(pick).map(stage => stage.id)),
             addons: (pick.addons || []).map(addon => ({ ...pack(addon), from: addon.from || '', to: addon.to || '' })),
             always: pack(pick.always || { ranges: [] }),
             note: pack(pick.note || { ranges: [] }),
@@ -2858,7 +2880,7 @@
                 id: stage.id || `stage-${index + 1}`,
                 kind: 'stage',
                 name: stage.name || `阶段 ${index + 1}`,
-                prompt: sliceRanges(source, stage.ranges),
+                prompt: typeof stage.body === 'string' ? stage.body : sliceRanges(source, stage.ranges),
                 completion: autoComplete ? '' : completion,
                 autoComplete,
                 terminal: Boolean(stage.terminal),
@@ -2921,6 +2943,7 @@
             note: { id: 'note', kind: 'note', name: '备注', ranges: [], color: KIND_COLORS.note },
             alwaysTop: false,
             loop: false,
+            links: [],
             pendingRanges: [],
             tapHead: null,
         };
@@ -6864,14 +6887,14 @@
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
             : (mode === 'map'
-                ? '新建一张卡片，拖动摆位置，点卡片改名称和什么时候离开，× 删除。这里不改原文。'
+                ? '点卡片后选择编辑或删除。编辑里写这一张自己的剧情，并设置拉出去的线。拖远一点才挪位置。这里不改原文。'
                 : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走一点就记住，不用再点保存。');
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
             toolbar,
-            mode === 'raw' ? rawArea : (mode === 'map' ? renderStoryMap(stageSequence(editor.pick), { editor, focusIndex: editor.focusStage }) : renderSegments(editor)),
+            mode === 'raw' ? rawArea : (mode === 'map' ? renderStoryMap(stageSequence(editor.pick), { editor, focusIndex: editor.focusStage, links: editor.pick && editor.pick.links }) : renderSegments(editor)),
             // 一个标题都还没有：原始正文就是不分段的，分段完全由用户自己划。
             // 想省事可以先按空行切块，再逐块拖选归属。
             mode === 'seg' && !parsed.blocks.length && parsed.items.length > 0
@@ -6910,7 +6933,10 @@
         ];
         if (ui.conditionPromptOpen) parts.push(renderConditionPromptDialog());
         else if (ui.editorTip) parts.push(renderEditorTip());
-        if (editor.sheet) parts.push(renderSheet(editor.sheet));
+        if (editor.sheet) {
+            parts.push(editor.sheet.mode === 'menu' ? renderCardMenu(editor.sheet)
+                : (editor.sheet.mode === 'write' ? renderCardWrite(editor.sheet) : renderSheet(editor.sheet)));
+        }
         return parts;
     }
 
@@ -6992,7 +7018,7 @@
             el('div', { class: 'dga-body' },
                 muted('能看到全部阶段。要新建、拖动或删除，回到小卡点「编辑 ›」。'),
                 stages.length
-                    ? renderStoryMap(stages, { readonly: true })
+                    ? renderStoryMap(stages, { readonly: true, links: context.binding && context.binding.layout && context.binding.layout.links })
                     : muted('还没有阶段。')),
         ];
     }
@@ -7001,13 +7027,14 @@
         const settings = options || {};
         const list = Array.isArray(stages) ? stages : [];
         const graph = storyPositions(list);
+        const drawn = cleanStoryLinks(settings.links, list.map(stage => stage.id));
         let maxX = 360;
         let maxY = 280;
         graph.placed.forEach(pos => {
             maxX = Math.max(maxX, pos.x + MAP_NODE_W + 32);
             maxY = Math.max(maxY, pos.y + MAP_NODE_H + 48);
         });
-        const lines = graph.edges.map(edge => {
+        const lines = drawn.map(edge => {
             const from = graph.placed.get(edge.from);
             const to = graph.placed.get(edge.to);
             if (!from || !to) return null;
@@ -7027,7 +7054,7 @@
                 if (!drag) return;
                 const dx = event.clientX - drag.x;
                 const dy = event.clientY - drag.y;
-                if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+                if (!drag.moved && Math.hypot(dx, dy) < 18) return;
                 drag.moved = true;
                 drag.node.style.left = `${Math.max(8, drag.ox + dx)}px`;
                 drag.node.style.top = `${Math.max(8, drag.oy + dy)}px`;
@@ -7040,8 +7067,7 @@
                 const stage = stageSequence(editor.pick).find(item => item.id === drag.id);
                 if (!stage) return;
                 if (!drag.moved) {
-                    openSheet({ owner: stage });
-                    render();
+                    openCardMenu(stage);
                     return;
                 }
                 stage.x = Math.max(8, drag.ox + (event.clientX - drag.x));
@@ -7227,6 +7253,165 @@
     function closeSheet() {
         if (ui.editor) ui.editor.sheet = null;
         render();
+    }
+
+    function openCardMenu(stage) {
+        if (!ui.editor || !stage) return;
+        ui.editor.sheet = { mode: 'menu', owner: stage };
+        render();
+    }
+
+    function openCardWrite(stage) {
+        const editor = ui.editor;
+        const pick = editor && editor.pick;
+        if (!editor || !pick || !stage) return;
+        const outgoing = (pick.links || []).filter(link => link.from === stage.id).map(link => ({
+            ...link,
+            exclusiveWith: (link.exclusiveWith || []).slice(),
+        }));
+        editor.sheet = {
+            mode: 'write',
+            owner: stage,
+            name: stage.name,
+            body: typeof stage.body === 'string' ? stage.body : sliceRanges(pick.text, stage.ranges),
+            links: outgoing,
+        };
+        render();
+    }
+
+    function renderCardMenu(sheet) {
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg',
+            onclick: event => { if (event.target === backdrop) closeSheet(); },
+        });
+        const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '这张卡片' });
+        box.append(
+            el('h3', { text: sheet.owner.name || '未命名' }),
+            muted('编辑这一张里面的剧情，或者把这张卡片和连着它的线删掉。'),
+            el('div', { class: 'dga-sheet-actions' },
+                btn('编辑', () => openCardWrite(sheet.owner), { primary: true }),
+                btn('删除', () => deleteOwner(ui.editor, sheet.owner), { danger: true }),
+                btn('取消', closeSheet, { ghost: true })),
+        );
+        backdrop.append(box);
+        return backdrop;
+    }
+
+    function applyCardWrite(sheet) {
+        const editor = ui.editor;
+        const pick = editor && editor.pick;
+        const owner = sheet.owner;
+        const name = oneLine(sheet.name);
+        if (!name) {
+            sheet.error = '先写一个名字。';
+            render();
+            return;
+        }
+        owner.name = name;
+        owner.body = String(sheet.body == null ? '' : sheet.body);
+        const outgoing = (sheet.links || []).filter(link => link.to && link.to !== owner.id);
+        pick.links = (pick.links || []).filter(link => link.from !== owner.id).concat(outgoing.map(link => ({
+            id: link.id,
+            from: owner.id,
+            to: link.to,
+            optional: link.optional !== false,
+            exclusiveWith: link.optional === false ? (link.exclusiveWith || []).filter(id => id !== link.id) : [],
+        })));
+        pick.links = cleanStoryLinks(pick.links, stageSequence(pick).map(stage => stage.id));
+        editor.sheet = null;
+        editor.dirty = true;
+        render();
+    }
+
+    function renderCardWrite(sheet) {
+        const editor = ui.editor;
+        const pick = editor.pick;
+        const owner = sheet.owner;
+        const others = stageSequence(pick).filter(stage => stage !== owner);
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg',
+            onclick: event => { if (event.target === backdrop) closeSheet(); },
+        });
+        const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '编辑这张卡片' });
+        box.append(el('h3', { text: '编辑这张卡片' }));
+        if (sheet.error) box.append(messageBar({ type: 'error', text: sheet.error }));
+        const nameInput = el('input', {
+            type: 'text',
+            maxlength: 60,
+            placeholder: '这一张的名字',
+            oninput: event => { sheet.name = event.target.value; },
+        });
+        nameInput.value = sheet.name || '';
+        const body = el('textarea', {
+            class: 'dga-input',
+            rows: 8,
+            placeholder: '写这一张里面的剧情。可以是完整的一段，也可以只写这一步。留空就只当一个步骤。',
+            oninput: event => { sheet.body = event.target.value; },
+        });
+        body.value = sheet.body || '';
+        box.append(field('名称', nameInput), field('这一张的剧情', body));
+        box.append(el('h3', { text: '从这里拉出去的线' }));
+        if (!sheet.links.length) box.append(muted('还没有线。加上之后可以选择可选，或者和某几根线互斥。'));
+        sheet.links.forEach(link => {
+            const row = el('div', { class: 'dga-card' });
+            row.append(field('连到', selectControl(
+                [{ value: '', label: '选择另一张卡片' }].concat(others.map(stage => ({ value: stage.id, label: stage.name }))),
+                link.to || '',
+                value => { link.to = value; render(); },
+            )));
+            row.append(field('这条线', el('div', { class: 'dga-seg' },
+                ...[[true, '可选'], [false, '互斥']].map(([optional, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${(link.optional !== false) === optional ? ' is-on' : ''}`,
+                    onclick: () => {
+                        link.optional = optional;
+                        if (optional) link.exclusiveWith = [];
+                        render();
+                    },
+                }, label)))));
+            if (link.optional === false) {
+                const pool = (pick.links || []).filter(item => item.id !== link.id && item.from !== owner.id)
+                    .concat(sheet.links.filter(item => item !== link && item.to));
+                if (!pool.length) row.append(muted('图上还没有别的线可以互斥。'));
+                pool.forEach(other => {
+                    const from = stageSequence(pick).find(stage => stage.id === other.from);
+                    const to = stageSequence(pick).find(stage => stage.id === other.to);
+                    const label = `${from ? from.name : '这张'} → ${to ? to.name : '另一张'}`;
+                    const on = (link.exclusiveWith || []).includes(other.id);
+                    row.append(el('button', {
+                        type: 'button',
+                        class: `dga-seg-btn${on ? ' is-on' : ''}`,
+                        onclick: () => {
+                            const list = new Set(link.exclusiveWith || []);
+                            if (list.has(other.id)) list.delete(other.id);
+                            else list.add(other.id);
+                            link.exclusiveWith = Array.from(list);
+                            render();
+                        },
+                    }, on ? `互斥：${label}` : label));
+                });
+            }
+            row.append(btn('去掉这根线', () => {
+                sheet.links = sheet.links.filter(item => item !== link);
+                render();
+            }, { ghost: true }));
+            box.append(row);
+        });
+        box.append(btn('加一条线', () => {
+            sheet.links.push({
+                id: `link-${Date.now().toString(36)}-${sheet.links.length}`,
+                from: owner.id,
+                to: '',
+                optional: true,
+                exclusiveWith: [],
+            });
+            render();
+        }, { ghost: true }));
+        box.append(el('div', { class: 'dga-sheet-actions' },
+            btn('保存修改', () => applyCardWrite(sheet), { primary: true }),
+            btn('取消', closeSheet, { ghost: true })));
+        backdrop.append(box);
+        return backdrop;
     }
 
     function openConditionApiPage() {
@@ -7568,6 +7753,7 @@
             const index = order.indexOf(owner);
             const fallback = order[index + 1] || order[index - 1] || null;
             pick.stages = pick.stages.filter(item => item !== owner);
+            pick.links = (pick.links || []).filter(link => link.from !== owner.id && link.to !== owner.id);
             pick.addons.forEach(addon => {
                 if (addon.from === owner.name) addon.from = fallback ? fallback.name : '';
                 if (addon.to === owner.name) addon.to = fallback ? fallback.name : '';
@@ -7763,14 +7949,18 @@
             serial += 1;
         }
         const stage = newOwner(pick, 'stage', name);
-        const pos = storyPositions(pick.stages).placed.get(stage.id);
-        if (pos) {
-            stage.x = pos.x;
-            stage.y = pos.y;
+        stage.body = '';
+        const placed = pick.stages.filter(item => item !== stage && Number.isFinite(item.x) && Number.isFinite(item.y));
+        const anchor = placed[placed.length - 1];
+        stage.x = anchor ? anchor.x + MAP_NODE_W + MAP_GAP_X : 24;
+        stage.y = anchor ? anchor.y : 24;
+        if (stage.x > 640) {
+            stage.x = 24;
+            stage.y = (anchor ? anchor.y : 24) + MAP_NODE_H + MAP_GAP_Y;
         }
+        if (!pick.links) pick.links = [];
         editor.dirty = true;
-        editor.sheet = makeSheet(stage);
-        render();
+        openCardWrite(stage);
     }
 
     // 分配（v2.28）：把「待分配」交给一个归属目标——未分配 / 已有属主 / 新建阶段 / 新建附加。
@@ -8298,7 +8488,7 @@ ${P} .dga-log-tag { flex-shrink: 0; color: var(--dga-text-3); }
 ${P} .dga-log-text { overflow-wrap: anywhere; white-space: pre-wrap; }
 ${P} .dga-danger-text { color: var(--dga-danger); font-size: 13px; overflow-wrap: anywhere; }
 ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height: 44px; padding: 10px 12px; border-radius: 4px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
-${P} .dga-map { position: relative; min-height: 420px; overflow: auto; border: 1px solid var(--dga-border); border-radius: 6px; background: color-mix(in srgb, var(--dga-text-1) 3%, transparent); touch-action: none; }
+${P} .dga-map { position: relative; min-height: 420px; overflow: auto; border: 1px solid var(--dga-border); border-radius: 6px; background: color-mix(in srgb, var(--dga-text-1) 3%, transparent); touch-action: pan-x pan-y; }
 ${P} .dga-map-lines { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
 ${P} .dga-map-edge { stroke: var(--dga-border-2); stroke-width: 2; }
 ${P} .dga-map-node { position: absolute; width: 156px; min-height: 72px; padding: 10px 28px 10px 12px; border: 1px solid var(--dga-border-2); border-radius: 6px; background: var(--dga-bg-1); color: var(--dga-text-1); cursor: grab; user-select: none; }
@@ -8544,6 +8734,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         storyEdges,
         storyPositions,
         stageMapStatus,
+        cleanStoryLinks,
         bindingOrderMode,
         applyJudgeOutputRules,
         applyBoundaryRules,
