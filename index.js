@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.62
+     * 动态指导助手 v2.63
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.62';
+    const VERSION = '2.63';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -291,6 +291,7 @@
         from: ['从', '开始于', '什么时候出现', '出现时机', '出现条件', '开始条件', '触发时机'],
         to: ['到', '直到', '结束于', '什么时候消失', '消失时机', '消失条件'],
         merge: ['合并到', '并入', '归入', '归属到', '追加到', '属于', '归到'],
+        branch: ['分支', '分歧', '支线', '分支组'],
         type: ['类型', '内容类型', '分类'],
         prompt: ['告诉ai', '提示词', '指导内容', '发送给ai', '让ai知道'],
     };
@@ -461,6 +462,8 @@
                 // “完成：自动”表示这个阶段不预设具体条件，交给 AI 自己判断该不该进入下一段。
                 item.autoComplete = /^(自动|自动判断|auto)$/i.test(rawCompletion);
                 item.completion = item.autoComplete ? '' : rawCompletion;
+                // 分支：同一组名的阶段互斥，进入其中一个后其余分支这次聊天不再走。
+                item.branch = String(item.labels.branch || '').trim();
                 stages.push(item);
             } else {
                 item.anchorStage = Math.max(0, stages.length - 1);
@@ -599,6 +602,15 @@
         // 开了循环却停在「全部完成」时，进度还记在段数之外，小卡会写成不再发送。
         // 拉回第一段，镜像才能继续发。
         if (parsed.loop && parsed.stages.length > 0 && index >= parsed.stages.length) index = 0;
+        // 分支选择（v2.63）：按聊天记「组 → 选中的阶段 id」。阶段被删/换 id 后选择失效，清掉。
+        const branchChoices = branchChoicesOf(old);
+        Object.keys(branchChoices).forEach(group => {
+            if (!parsed.stages.some(stage => stage.branch === group && stage.id === branchChoices[group])) delete branchChoices[group];
+        });
+        // 进度落在已被否决的分支上（划分改过、状态串了），顺到下一个没被否决的阶段。
+        if (index < parsed.stages.length && stageBranchSkipped(parsed.stages[index], branchChoices)) {
+            index = nextVisibleIndex({ stages: parsed.stages }, { branchChoices }, index);
+        }
         const next = {
             stageIndex: index,
             stageName: parsed.stages[index] ? parsed.stages[index].name : '',
@@ -608,8 +620,9 @@
             preAdvanceIndex: Number.isInteger(old.preAdvanceIndex) ? old.preAdvanceIndex : null,
             updatedAt: old.updatedAt || new Date().toISOString(),
         };
+        if (Object.keys(branchChoices).length) next.branchChoices = branchChoices;
         if (old.lastJudgeYes === true || old.lastJudgeYes === false) next.lastJudgeYes = old.lastJudgeYes;
-        if (typeof old.lastJudgeBasis === 'string' && old.lastJudgeBasis) next.lastJudgeBasis = old.lastJudgeBasis.slice(0, 60);
+        if (typeof old.lastJudgeBasis === 'string' && old.lastJudgeBasis) next.lastJudgeBasis = old.lastJudgeBasis.slice(0, 500);
         return next;
     }
 
@@ -625,6 +638,7 @@
     function labelTexts(spec) {
         const out = [];
         if (spec.kind === 'stage' && oneLine(spec.completion)) out.push(`完成：${oneLine(spec.completion)}`);
+        if (spec.kind === 'stage' && oneLine(spec.branch)) out.push(`分支：${oneLine(spec.branch)}`);
         if (spec.kind === 'addon') {
             if (oneLine(spec.from)) out.push(`从：${oneLine(spec.from)}`);
             if (oneLine(spec.to)) out.push(`到：${oneLine(spec.to)}`);
@@ -1017,6 +1031,92 @@
         return ((target % count) + count) % count;
     }
 
+    // ---------------------------------------------------------------
+    // 分支阶段（v2.63）：同一「分支：组名」的阶段互斥。状态里按组记选中的阶段 id；
+    // 同组选了别人，这一段这次聊天就被跳过。未选时整组都是候选。
+    // ---------------------------------------------------------------
+
+    function branchChoicesOf(state) {
+        const raw = state && typeof state === 'object' ? state.branchChoices : null;
+        const out = {};
+        if (!raw || typeof raw !== 'object') return out;
+        Object.keys(raw).forEach(group => {
+            const id = raw[group];
+            if (typeof group === 'string' && group && typeof id === 'string' && id) out[group] = id;
+        });
+        return out;
+    }
+
+    // 被否决 = 有分支组、组里已经选了别的阶段。第二参是 branchChoicesOf 的结果。
+    function stageBranchSkipped(stage, choices) {
+        if (!stage || !stage.branch) return false;
+        const picked = choices && choices[stage.branch];
+        return Boolean(picked) && picked !== stage.id;
+    }
+
+    // 从 from+1 起第一个没被否决的阶段下标；一路到尾都没有就返回段数（全部完成）。
+    function nextVisibleIndex(parsed, state, from) {
+        const stages = parsed && Array.isArray(parsed.stages) ? parsed.stages : [];
+        const choices = branchChoicesOf(state);
+        let index = Math.floor(Number(from)) + 1;
+        while (index < stages.length && stageBranchSkipped(stages[index], choices)) index += 1;
+        return index;
+    }
+
+    // 从 from-1 起往前第一个没被否决的阶段下标；找不到返回 -1。
+    function prevVisibleIndex(parsed, state, from) {
+        const stages = parsed && Array.isArray(parsed.stages) ? parsed.stages : [];
+        const choices = branchChoicesOf(state);
+        let index = Math.floor(Number(from)) - 1;
+        while (index >= 0 && stageBranchSkipped(stages[index], choices)) index -= 1;
+        return index;
+    }
+
+    // stages[index] 属于「还没选、且候选不止一个」的分支组时，返回整组候选；否则 null。
+    function branchPendingChoices(parsed, state, index) {
+        const stages = parsed && Array.isArray(parsed.stages) ? parsed.stages : [];
+        const stage = stages[index];
+        if (!stage || !stage.branch) return null;
+        const choices = branchChoicesOf(state);
+        if (choices[stage.branch]) return null;
+        const candidates = stages.filter(item => item.branch === stage.branch && !stageBranchSkipped(item, choices));
+        return candidates.length > 1 ? candidates : null;
+    }
+
+    function branchChoiceRecord(state, stage) {
+        const choices = branchChoicesOf(state);
+        if (stage && stage.branch) choices[stage.branch] = stage.id;
+        return choices;
+    }
+
+    // 手动上一段/下一段（v2.63 起跳过被否决的分支）。返回落点、要不要清空分支（循环绕回 = 全部重来）。
+    // 下一段落在未决分支组时由调用处先弹选择（pending 就是候选列表）。
+    function stepTargetVisible(parsed, state, delta) {
+        const stages = parsed && Array.isArray(parsed.stages) ? parsed.stages : [];
+        const total = stages.length;
+        const loop = Boolean(parsed && parsed.loop);
+        const from = Math.floor(Number(state && state.stageIndex) || 0);
+        if (!total) return { target: 0, resetBranches: false, pending: null };
+        if (!loop) {
+            const target = delta > 0 ? nextVisibleIndex(parsed, state, from) : prevVisibleIndex(parsed, state, from);
+            return { target, resetBranches: false, pending: delta > 0 ? branchPendingChoices(parsed, state, target) : null };
+        }
+        const choices = branchChoicesOf(state);
+        let target = from;
+        let wrapped = false;
+        for (let step = 0; step < total; step += 1) {
+            target += delta > 0 ? 1 : -1;
+            if (target >= total) { target = 0; wrapped = true; }
+            if (target < 0) { target = total - 1; wrapped = true; }
+            if (!stageBranchSkipped(stages[target], choices)) break;
+        }
+        if (stageBranchSkipped(stages[target], choices)) return { target: from, resetBranches: false, pending: null };
+        // 往前走并绕过末尾 = 这一轮走完重新来，分支选择清空；往后退回第一段只是回看，不动选择。
+        const resetBranches = wrapped && delta > 0;
+        const pending = delta > 0 && !resetBranches ? branchPendingChoices(parsed, state, target) : null;
+        return { target, resetBranches, pending };
+    }
+
     // 原文改了几个字时，把阶段区间平移到新字符串上。只认一处连续改动：
     // 改动前面的位置不动，后面的位置整体挪，改动内部按比例缩。
     function rebasePickText(pick, newText) {
@@ -1101,6 +1201,7 @@
         sortedStages(pick).forEach((stage, index) => {
             const head = [`## ${pickSafeName(stage.name, `阶段 ${index + 1}`)}`];
             if (oneLine(stage.completion)) head.push(`完成：${oneLine(stage.completion)}`);
+            if (oneLine(stage.branch)) head.push(`分支：${oneLine(stage.branch)}`);
             entries.push({ owner: stage, section: [...head, bodyOf(stage.ranges)].filter(Boolean).join('\n') });
         });
         (pick.addons || []).forEach((addon, index) => {
@@ -2578,6 +2679,7 @@
             name: stage.name || `阶段 ${index + 1}`,
             completion: stage.completion || '',
             terminal: Boolean(stage.terminal),
+            branch: String(stage.branch || '').trim(),
             ranges: clampList(stage.ranges),
             color: STAGE_COLORS[index % STAGE_COLORS.length],
         }));
@@ -2612,6 +2714,7 @@
             name: block.name,
             completion: block.autoComplete ? '自动' : (block.completion || ''),
             terminal: false,
+            branch: block.branch || '',
             ranges: blockRange(source, block),
             color: block.color || STAGE_COLORS[index % STAGE_COLORS.length],
         }));
@@ -2665,6 +2768,7 @@
                 ...pack(stage),
                 completion: stage.completion || '',
                 terminal: Boolean(stage.terminal),
+                branch: String(stage.branch || '').trim(),
             })),
             addons: (pick.addons || []).map(addon => ({ ...pack(addon), from: addon.from || '', to: addon.to || '' })),
             always: pack(pick.always || { ranges: [] }),
@@ -2685,6 +2789,7 @@
                 completion: autoComplete ? '' : completion,
                 autoComplete,
                 terminal: Boolean(stage.terminal),
+                branch: String(stage.branch || '').trim(),
                 stageIndex: index,
             };
         });
@@ -3281,7 +3386,27 @@
         if (!context || context.autoAdvance !== 'story') return null;
         const stage = stageForGuide(context, generationType);
         if (!stage || stage.terminal) return null;
-        return completionInstruction(stage, true).join('\n').trim();
+        const target = nextVisibleIndex(context.parsed, context.state, context.state.stageIndex);
+        const pending = branchPendingChoices(context.parsed, context.state, target);
+        if (!pending || pending.length < 2) return completionInstruction(stage, true).join('\n').trim();
+        // 下一格是分支组：每个走向一行标记，正文 AI 按剧情选一个附加。
+        const lines = [];
+        if (stage.completion) {
+            lines.push(
+                '## 当前阶段的完成判定',
+                stage.completion,
+                '',
+                '只有当上面写出的事已经在本次回复里实际发生时才进入下一段；提到、计划、回忆或只完成一部分时绝对不要附加标记。',
+            );
+        } else {
+            lines.push(
+                '## 进入下一段的时机',
+                '当前阶段没有预设完成条件。只有当这一阶段要演的具体情节已经在本次回复里发生，才进入下一段；还在铺垫、只是提到或打算，都不要附加标记。',
+            );
+        }
+        lines.push('这一段之后有几个互斥的走向。按本次回复实际发生的剧情选一个，把它对应的那行 HTML 注释原样附加在回复末尾（只能选一行；还不该走就一行都不要附加）：');
+        pending.forEach(candidate => lines.push(`走向「${candidate.name}」：<!-- DGA_COMPLETE:${candidate.id} -->`));
+        return lines.join('\n').trim();
     }
 
     // 同步一条绑定的镜像。先在读到的副本上试跑，没变化就不写世界书；
@@ -3588,6 +3713,10 @@
         const total = context.parsed.stages.length;
         const loop = Boolean(context.parsed.loop);
         const index = loop && total > 0 && target >= total ? 0 : Math.max(0, Math.min(target, total));
+        // 分支选择默认沿用进度里的；选分支时由调用处传入新表；循环绕回时清空（全部重来）。
+        const branchChoices = settings.resetBranches
+            ? {}
+            : branchChoicesOf(settings.branchChoices !== undefined ? { branchChoices: settings.branchChoices } : context.state);
         const next = {
             stageIndex: index,
             stageName: context.parsed.stages[index] ? context.parsed.stages[index].name : '',
@@ -3600,6 +3729,7 @@
             ...(context.state.lastJudgeBasis ? { lastJudgeBasis: context.state.lastJudgeBasis } : {}),
             // 这条消息引起的推进才记下「从哪一段过来」。手动拨进度清掉，避免重新生成退错段。
             preAdvanceIndex: settings.messageId != null ? context.state.stageIndex : null,
+            ...(Object.keys(branchChoices).length ? { branchChoices } : {}),
             updatedAt: new Date().toISOString(),
         };
         await writeStateFor(context.key, next);
@@ -3845,6 +3975,35 @@
     // 没写完成条件时交给判断AI的标准。不能写成「充分展开就算完成」，否则几乎每层都会被放行。
     const JUDGE_EMPTY_CONDITION = '没有写完成条件。若本阶段写的是一段时间或持续状态，正文仍停在这个状态就是 NO，不能因为符合这段就写 YES。YES 只在正文已经离开这段、写到下一阶段时成立。若写的是要发生的具体事情，则这些事情都已发生才算 YES。';
 
+    // 分支走向判断（v2.63）：判断 AI 判定「当前段完成」后，下一格是未决分支组时补问一次。
+    // 输出与判断口径同款填表：<branch> 里写条目。走向写 0 = 对不上任何分支，不推进。
+    const BRANCH_PICK_SYSTEM_PROMPT = '你是剧情分支判断器。剧情刚演完一个阶段，前面有几个互斥的走向分支。读最近剧情，选一个剧情正要走进去的分支。';
+    const BRANCH_PICK_RULES_PROMPT = [
+        '【分支规则】',
+        '分支互斥：选一个之后，其余分支这条线就不再有。',
+        '只有最近剧情明确走向其中一个分支时才选它；还在铺垫、对不上任何分支时，走向写 0。',
+        '状态、总结、思维链不算剧情。',
+        '回复只填这张表，不要写别的：',
+        '<branch>',
+        '- 走向：分支的序号，例如 2；对不上时写 0',
+        '</branch>',
+    ].join('\n');
+    const BRANCH_PICK_ACK_PROMPT = '收到。我会按最近剧情选一个分支，只填表。';
+
+    // 解析分支判断的回答：<branch> 里写序号（从 1 起）或分支名。0、空、对不上都不选。
+    function judgePickedBranch(text, candidates) {
+        const list = Array.isArray(candidates) ? candidates : [];
+        const tag = String(text || '').match(/<branch>\s*([\s\S]*?)<\/branch>/i);
+        if (!tag) return null;
+        const inner = judgeFieldBody(tag[1]);
+        if (!inner || /^0+$/.test(inner)) return null;
+        if (/^\d+$/.test(inner)) {
+            const index = Number(inner) - 1;
+            return index >= 0 && index < list.length ? list[index] : null;
+        }
+        return list.find(stage => stage && stage.name === inner) || null;
+    }
+
     const PICK_STAGE_SYSTEM_PROMPT = [
         '你是剧情阶段定位器。你只决定现在该停在哪一段。',
         '你不写剧情、不续写、不评价文笔、不改大纲。',
@@ -3973,10 +4132,21 @@
         return messages;
     }
 
-    function nextJudgeStage(parsed, index) {
+    function nextJudgeStage(parsed, index, state) {
         const stages = parsed && parsed.stages || [];
         if (!stages.length) return null;
-        if (index + 1 < stages.length) return stages[index + 1];
+        const target = state ? nextVisibleIndex(parsed, state, index) : index + 1;
+        if (target < stages.length) {
+            // 下一格是未决分支组时，判断提示词里把候选都摆出来对照。
+            const pending = state ? branchPendingChoices(parsed, state, target) : null;
+            if (pending && pending.length > 1) {
+                return {
+                    name: `分支：${pending.map(item => item.name).join(' 或 ')}`,
+                    prompt: pending.map(item => `「${item.name}」${String(item.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 60)}`).join('；'),
+                };
+            }
+            return stages[target];
+        }
         if (parsed.loop && stages.length > 1) return stages[0];
         return null;
     }
@@ -3986,7 +4156,7 @@
             .split('\n')
             .map(line => line
                 .replace(/^\s*[-–—•]+\s*/, '')
-                .replace(/^(已发生|依据|结论|序号|basis|verdict|stage)\s*[:：]\s*/i, '')
+                .replace(/^(已发生|依据|结论|序号|走向|basis|verdict|stage)\s*[:：]\s*/i, '')
                 .trim())
             .filter(Boolean)
             .join(' ')
@@ -4018,7 +4188,7 @@
         const chinese = raw.match(/<依据>\s*([\s\S]*?)<\/依据>/i);
         const tag = english || chinese;
         const basis = tag ? judgeFieldBody(tag[1]) : raw.replace(/\s+/g, ' ').trim();
-        return basis.slice(0, 60);
+        return basis.slice(0, 500);
     }
 
     function judgeHasVerdictTag(text) {
@@ -4286,7 +4456,7 @@
             if (extra) condition = `${condition}\n本次只看这一次的附加要求：${extra}`;
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
             const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
-            const next = nextJudgeStage(context.parsed, context.state.stageIndex);
+            const next = nextJudgeStage(context.parsed, context.state.stageIndex, context.state);
             const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）', next);
             const cap = JUDGE_REPLY_CAP;
             const judgePreset = preset
@@ -4327,7 +4497,45 @@
                 LogModule.warn('判断AI', `「${bindingLabel}」结论是 YES，但检查期间进度已变化，放弃本次过期推进`);
                 return;
             }
-            await moveToIndex(latest, latest.state.stageIndex + 1, { messageId });
+            const targetIndex = nextVisibleIndex(latest.parsed, latest.state, latest.state.stageIndex);
+            const pending = branchPendingChoices(latest.parsed, latest.state, targetIndex);
+            if (pending && pending.length > 1) {
+                // 下一格是分支组：补问一次走向，选中了才推进；对不上就不推进（下次再查）。
+                const catalog = pending.map((item, order) => {
+                    const body = String(item.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+                    return `${order + 1}. ${item.name}${body ? `：${body}` : ''}`;
+                }).join('\n');
+                const caseText = `【刚演完的阶段】\n${stage.name}\n\n【分支】\n${catalog}\n\n【最近剧情】\n${history || '（没有取到聊天记录）'}`;
+                const branchMessages = [
+                    { role: 'system', content: BRANCH_PICK_SYSTEM_PROMPT },
+                    { role: 'user', content: BRANCH_PICK_RULES_PROMPT },
+                    { role: 'assistant', content: BRANCH_PICK_ACK_PROMPT },
+                    { role: 'user', content: caseText },
+                ];
+                LogModule.info('判断AI', `「${bindingLabel}」下一格是分支（${pending.map(item => item.name).join(' / ')}），补问走向`);
+                const branchText = await askJudge(branchMessages, judgePreset, { ...settings, judgeMaxTokens: cap });
+                const pickedBranch = judgePickedBranch(applyBoundaryRules(branchText, settings), pending);
+                if (!pickedBranch) {
+                    LogModule.info('判断AI', `「${bindingLabel}」分支走向不明，本次不推进`);
+                    return;
+                }
+                const guard = await loadContexts();
+                const now = guard.contexts.find(item => item.key === context.key);
+                if (!now || now.broken) return;
+                const guardMessageId = currentMessageId();
+                if (now.state.stageIndex !== startStageIndex
+                    || (guardMessageId != null && guardMessageId !== messageId)
+                    || now.state.lastCompletionMessageId === messageId) {
+                    LogModule.warn('判断AI', `「${bindingLabel}」分支已选，但期间进度已变化，放弃`);
+                    return;
+                }
+                const branchIndex = now.parsed.stages.findIndex(item => item.id === pickedBranch.id);
+                if (branchIndex < 0) return;
+                LogModule.info('判断AI', `「${bindingLabel}」进入分支「${pickedBranch.name}」`);
+                await moveToIndex(now, branchIndex, { messageId, branchChoices: branchChoiceRecord(now.state, pickedBranch) });
+                return;
+            }
+            await moveToIndex(latest, targetIndex, { messageId });
         } catch (error) {
             const reason = error && error.message ? error.message : String(error);
             LogModule.error('判断AI', `「${bindingLabel}」调用失败：${reason}`);
@@ -4383,12 +4591,17 @@
         const bindingLabel = entryName(context.entry);
         try {
             const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
-            const catalog = stages.map((stage, index) => {
+            // 分支被否决的阶段不进目录（v2.63）；序号就是目录里的序号。
+            const choices = branchChoicesOf(context.state);
+            const visible = stages.filter(item => !stageBranchSkipped(item, choices));
+            const catalog = visible.map((stage, index) => {
                 const body = String(stage.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-                return `${index + 1}. ${stage.name}${body ? `：${body}` : ''}`;
+                const branchTag = stage.branch && !choices[stage.branch] ? `（分支·${stage.branch}）` : '';
+                return `${index + 1}. ${stage.name}${branchTag}${body ? `：${body}` : ''}`;
             }).join('\n');
             const currentStage = stages[startStageIndex];
-            const current = currentStage ? `${startStageIndex + 1}. ${currentStage.name}` : '（还没有停在某一段）';
+            const currentOrder = visible.indexOf(currentStage);
+            const current = currentStage && currentOrder >= 0 ? `${currentOrder + 1}. ${currentStage.name}` : '（还没有停在某一段）';
             const extra = String(flags.extra || '').trim();
             let caseText = pickStageCase(catalog, current, history || '（没有取到聊天记录）');
             if (extra) caseText += `\n本次只看这一次的附加要求：${extra}`;
@@ -4404,18 +4617,19 @@
                 : null;
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：按正文选段（现在第 ${Math.min(startStageIndex, stages.length - 1) + 1} 段）`);
             const text = await askJudge(messages, judgePreset, { ...settings, judgeMaxTokens: cap });
-            const picked = judgePickedIndex(text, stages);
+            const picked = judgePickedIndex(text, visible);
+            const pickedStage = picked == null ? null : visible[picked];
             const basis = judgeBasisText(text);
             await patchStateFor(context.key, {
                 lastJudgeCheckedId: messageId,
-                lastJudgeYes: picked != null && picked !== startStageIndex,
+                lastJudgeYes: pickedStage != null && pickedStage !== currentStage,
                 lastJudgeBasis: basis,
             });
             judgeRuntime.lastRaw = String(text || '');
             judgeRuntime.lastFiltered = text;
             judgeRuntime.lastAt = Date.now();
-            judgeRuntime.lastYes = picked != null && picked !== startStageIndex;
-            if (picked == null || picked === startStageIndex) {
+            judgeRuntime.lastYes = pickedStage != null && pickedStage !== currentStage;
+            if (!pickedStage || pickedStage === currentStage) {
                 LogModule.info('判断AI', `「${bindingLabel}」停在当前段`);
                 return;
             }
@@ -4425,11 +4639,14 @@
             const nowMessageId = currentMessageId();
             if (latest.state.stageIndex !== startStageIndex
                 || (nowMessageId != null && nowMessageId !== messageId)) {
-                LogModule.warn('判断AI', `「${bindingLabel}」选了第 ${picked + 1} 段，但检查期间进度已变化，放弃`);
+                LogModule.warn('判断AI', `「${bindingLabel}」选了「${pickedStage.name}」，但检查期间进度已变化，放弃`);
                 return;
             }
-            LogModule.info('判断AI', `「${bindingLabel}」改到第 ${picked + 1} 段「${stages[picked].name}」`);
-            await moveToIndex(latest, picked, { messageId });
+            const realIndex = stages.indexOf(pickedStage);
+            if (realIndex < 0) return;
+            LogModule.info('判断AI', `「${bindingLabel}」改到第 ${realIndex + 1} 段「${pickedStage.name}」`);
+            // 选中未决分支即锁定：同组其他分支这次聊天不再走。
+            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, pickedStage) });
         } catch (error) {
             const reason = error && error.message ? error.message : String(error);
             LogModule.error('判断AI', `「${bindingLabel}」选段失败：${reason}`);
@@ -4480,8 +4697,20 @@
                 if (bindingOrderMode(context.binding) === 'pick') continue;
                 const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
                 if (context.state.lastCompletionFingerprint === fingerprint) continue;
+                const target = nextVisibleIndex(context.parsed, context.state, context.state.stageIndex);
+                const pending = branchPendingChoices(context.parsed, context.state, target);
+                if (pending && pending.length > 1) {
+                    const hit = pending.find(candidate => markers.some(match => match[1] === candidate.id));
+                    if (hit) {
+                        await moveToIndex(context, context.parsed.stages.indexOf(hit), { messageId, fingerprint, branchChoices: branchChoiceRecord(context.state, hit) });
+                    } else if (markers.some(match => match[1] === context.stage.id)) {
+                        // 旧标记只到「完成当前段」：落在第一个候选上并锁定，其余分支不再走。
+                        await moveToIndex(context, target, { messageId, fingerprint, branchChoices: branchChoiceRecord(context.state, pending[0]) });
+                    }
+                    continue;
+                }
                 if (!markers.some(match => match[1] === context.stage.id)) continue;
-                await moveToIndex(context, context.state.stageIndex + 1, { messageId, fingerprint });
+                await moveToIndex(context, target, { messageId, fingerprint });
             }
         }
 
@@ -4559,6 +4788,10 @@
         judgeExtras: {},
         guideSection: 'dga-card-bind',
         paceKey: '',
+        // 分支走向选择（v2.63）：值为绑定 key 时弹出走向选择层
+        branchPick: '',
+        // 小卡「上次结论」的展开态（绑定 key → true）
+        statusOpen: {},
         // 运行日志页：等级 + 标签筛选
         logLevelFilter: 'all',
         logTagFilter: 'all',
@@ -4752,6 +4985,10 @@
         if (ui.view === 'guide' && ui.paceKey) {
             const sheet = renderPaceSheet();
             if (sheet) shell.appendChild(sheet);
+        }
+        if (ui.view === 'guide' && ui.branchPick) {
+            const branchSheet = renderBranchSheet();
+            if (branchSheet) shell.appendChild(branchSheet);
         }
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
     }
@@ -5745,6 +5982,26 @@
         );
     }
 
+    // 上次结论/选段依据（v2.63）：字多就缩略，点「展开」看全文，再点「收起」。
+    function judgeStatusLine(context, text) {
+        const content = String(text || '');
+        if (!content) return null;
+        const LIMIT = 24;
+        if (content.length <= LIMIT) return el('p', { class: 'dga-judge-status', text: content });
+        const key = context ? context.key : '';
+        const open = Boolean(ui.statusOpen && ui.statusOpen[key]);
+        return el('p', { class: `dga-judge-status${open ? ' is-open' : ''}`, title: open ? '' : content },
+            el('span', { text: open ? content : `${content.slice(0, LIMIT)}…` }),
+            el('button', {
+                type: 'button',
+                class: 'dga-judge-toggle',
+                onclick: () => {
+                    ui.statusOpen = { ...(ui.statusOpen || {}), [key]: !open };
+                    render();
+                },
+            }, open ? '收起' : '展开'));
+    }
+
     // 改设置的公共入口：写回角色变量并重同步镜像（自动推进/判断AI相关设置都走这里）。
     function saveGuideSettings(patch, success) {
         return runAction('修改自动推进设置', async () => {
@@ -6021,10 +6278,18 @@
         const stageIndex = context.state.stageIndex;
         const finished = total > 0 && stageIndex >= total;
         const usable = !context.legacy && total > 0;
-        const move = (label, target) => runAction(label, async () => {
+        const move = (label, delta) => runAction(label, async () => {
             const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
             if (!fresh || fresh.broken) throw new Error('这条绑定不可用。');
-            return moveToIndex(fresh, target);
+            const plan = stepTargetVisible(fresh.parsed, fresh.state, delta);
+            const pending = delta > 0 ? branchPendingChoices(fresh.parsed, fresh.state, plan.target) : null;
+            // 下一格是未决分支组：先弹走向选择，选中了才推进（renderBranchSheet 里落子）。
+            if (pending && pending.length > 1) {
+                ui.branchPick = fresh.key;
+                render();
+                return false;
+            }
+            return moveToIndex(fresh, plan.target, { resetBranches: plan.resetBranches });
         });
         const percent = total > 0 ? Math.round(Math.min(stageIndex, total) / total * 100) : 0;
         const hints = [];
@@ -6032,6 +6297,7 @@
         if (orderMode === 'pick') hints.push('AI选段');
         else if (orderMode === 'loop' || context.parsed.loop) hints.push('循环');
         if (context.stage && context.stage.terminal) hints.push('到此结束');
+        if (context.stage && context.stage.branch) hints.push(`分支·${context.stage.branch}`);
         const hintText = hints.length ? ` · ${hints.join(' · ')}` : '';
         const stageText = total === 0 ? '未分段' : (finished && !context.parsed.loop ? `全部 ${total} 段完成` : `第 ${Math.min(stageIndex, total - 1) + 1} / ${total} 段${hintText}`);
         const nameText = total === 0 ? '分好阶段后才会发送'
@@ -6049,9 +6315,9 @@
                 ? messageBar({ type: 'warning', text: '旧版（1.x）划分，转换前不发送。' })
                 : null,
             el('div', { class: 'dga-stepper' },
-                btn('‹ 上一段', () => move('切换到上一段', stepTarget(stageIndex, -1, total, context.parsed.loop)), {
+                btn('‹ 上一段', () => move('切换到上一段', -1), {
                     ghost: true,
-                    disabled: !usable || (!context.parsed.loop && stageIndex <= 0),
+                    disabled: !usable || (!context.parsed.loop && prevVisibleIndex(context.parsed, context.state, stageIndex) < 0),
                 }),
                 // 步进器中间这块就是「划分阶段」的入口（v2.28）：点进去直接落在这一条
                 // 绑定当前的段上，于是不同小卡进去分的就是各自条目的段，不再依赖
@@ -6066,10 +6332,10 @@
                     el('span', { class: 'dga-stepper-stage', text: stageText }),
                     nameText ? el('span', { class: 'dga-stepper-name', text: nameText }) : null,
                     el('div', { class: 'dga-stepper-bar' }, el('i', { style: { width: `${percent}%` } }))),
-                btn('下一段 ›', () => move('切换到下一段', stepTarget(stageIndex, 1, total, context.parsed.loop)), {
+                btn('下一段 ›', () => move('切换到下一段', 1), {
                     ghost: !usable || (finished && !context.parsed.loop),
                     primary: usable && !(finished && !context.parsed.loop),
-                    disabled: !usable || (!context.parsed.loop && (finished || stageIndex >= total - 1)),
+                    disabled: !usable || (!context.parsed.loop && (finished || nextVisibleIndex(context.parsed, context.state, stageIndex) >= total)),
                 })),
             el('div', { class: 'dga-bind-actions' },
                 el('button', {
@@ -6088,9 +6354,7 @@
                     text: '设置 ›',
                     onclick: () => { ui.paceKey = context.key; render(); },
                 })),
-            judgeWaitText(context)
-                ? el('p', { class: 'dga-judge-status', text: judgeWaitText(context) })
-                : null,
+            judgeStatusLine(context, judgeWaitText(context)),
         );
     }
 
@@ -6110,6 +6374,50 @@
             bindingPace(context),
             el('div', { class: 'dga-sheet-actions' },
                 btn('完成', () => { ui.paceKey = ''; render(); }, { primary: true })),
+        );
+        backdrop.append(box);
+        return backdrop;
+    }
+
+    // 分支走向选择（v2.63）：手动点「下一段」落到未决分支组时弹出；选中即推进并锁定这组。
+    function renderBranchSheet() {
+        const contexts = ui.snapshot ? ui.snapshot.contexts : [];
+        const context = contexts.find(item => item.key === ui.branchPick && !item.broken);
+        if (!context) return null;
+        const plan = stepTargetVisible(context.parsed, context.state, 1);
+        const candidates = branchPendingChoices(context.parsed, context.state, plan.target) || [];
+        if (candidates.length < 2) return null;
+        const choose = candidate => runAction('选择分支', async () => {
+            const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
+            if (!fresh || fresh.broken) throw new Error('这条绑定不可用。');
+            const stage = fresh.parsed.stages.find(item => item.id === candidate.id);
+            if (!stage) throw new Error('这个分支已经不在了。');
+            ui.branchPick = '';
+            await moveToIndex(fresh, fresh.parsed.stages.indexOf(stage), { branchChoices: branchChoiceRecord(fresh.state, stage) });
+            return true;
+        }, { success: `进入分支「${candidate.name}」，其余分支这次聊天不再走` });
+        const backdrop = el('div', {
+            class: 'dga-sheet-bg',
+            onclick: event => {
+                if (event.target === backdrop) { ui.branchPick = ''; render(); }
+            },
+        });
+        const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '选择走向' });
+        box.append(
+            el('h3', { text: `「${entryName(context.entry)}」走向哪里` }),
+            muted('这一段之后有几个互斥的分支。选一个走向；选过之后，其余分支这次聊天就不再走。'),
+            ...candidates.map(candidate => {
+                const summary = String(candidate.prompt || '').replace(/\s+/g, ' ').trim();
+                return el('button', {
+                    type: 'button',
+                    class: 'dga-branch-option',
+                    onclick: () => choose(candidate),
+                },
+                el('b', { text: candidate.name }),
+                summary ? el('small', { text: summary.length > 60 ? `${summary.slice(0, 60)}…` : summary }) : null);
+            }),
+            el('div', { class: 'dga-sheet-actions' },
+                btn('先不走', () => { ui.branchPick = ''; render(); }, { ghost: true })),
         );
         backdrop.append(box);
         return backdrop;
@@ -6156,8 +6464,8 @@
                 if (Number.isFinite(n) && n >= 1) item.judgeInterval = n;
                 else delete item.judgeInterval;
             }), { success: '已记下这条的检查间隔' }))));
-            const wait = judgeWaitText(context);
-            if (wait) children.push(el('p', { class: 'dga-judge-status', text: wait }));
+            const statusNode = judgeStatusLine(context, judgeWaitText(context));
+            if (statusNode) children.push(statusNode);
             const canCheck = orderMode === 'pick'
                 ? context.parsed.stages.length > 0
                 : Boolean(context.stage && !context.stage.terminal);
@@ -6590,8 +6898,9 @@
 
     function segmentSubtitle(editor, owner) {
         if (owner.kind === 'stage') {
-            if (owner.completion === '自动') return '进入下一段：AI 自己判断';
-            return owner.completion ? `进入下一段：${owner.completion}` : '手动点「下一段」推进';
+            const branchTag = owner.branch ? ` · 分支「${owner.branch}」` : '';
+            if (owner.completion === '自动') return `进入下一段：AI 自己判断${branchTag}`;
+            return (owner.completion ? `进入下一段：${owner.completion}` : '手动点「下一段」推进') + branchTag;
         }
         if (owner.kind === 'addon') {
             if (!stageSequence(editor.pick).length) return '还没有剧情阶段';
@@ -6671,6 +6980,7 @@
             kind: owner.kind === 'addon' ? 'addon' : 'stage',
             completion: owner.kind === 'stage' ? (owner.completion || '') : '',
             terminal: owner.kind === 'stage' ? Boolean(owner.terminal) : false,
+            branch: owner.kind === 'stage' ? String(owner.branch || '') : '',
             mergeInto: '',
             from: owner.kind === 'addon' ? owner.from : '',
             to: owner.kind === 'addon' ? owner.to : '',
@@ -6888,6 +7198,15 @@
                     class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
                     onclick: () => { sheet.terminal = value; render(); },
                 }, label)))));
+            const branchInput = el('input', {
+                type: 'text',
+                maxlength: 20,
+                placeholder: '留空 = 不分支；互斥的几段写同一个组名',
+                oninput: event => { sheet.branch = event.target.value; },
+            });
+            branchInput.value = sheet.branch;
+            box.append(field('分支组', branchInput));
+            box.append(muted('同一组名的阶段互斥：进入其中一个，其余分支这次聊天就不再走。'));
             const others = stageSequence(editor.pick).filter(stage => stage !== owner);
             if (others.length) {
                 box.append(field('再分配', selectControl(
@@ -6944,6 +7263,7 @@
             pick.addons = pick.addons.filter(item => item !== owner);
             owner.kind = 'stage';
             owner.completion = '';
+            owner.branch = '';
             delete owner.from;
             delete owner.to;
             owner.color = STAGE_COLORS[pick.stages.length % STAGE_COLORS.length];
@@ -6952,6 +7272,7 @@
         }
         pick.stages = pick.stages.filter(item => item !== owner);
         owner.kind = 'addon';
+        delete owner.branch;
         const stages = stageSequence(pick);
         owner.from = stages.length ? stages[0].name : '';
         owner.to = stages.length ? stages[stages.length - 1].name : '';
@@ -6985,6 +7306,7 @@
         if (owner.kind === 'stage') {
             owner.completion = String(sheet.completion || '').trim();
             owner.terminal = Boolean(sheet.terminal);
+            owner.branch = String(sheet.branch || '').trim();
         }
         let mergedAway = false;
         if (owner.kind === 'stage' && sheet.mergeInto) {
@@ -7643,6 +7965,11 @@ ${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent;
 ${P} .dga-set-open { margin-left: 14px; }
 ${P} .dga-pace-open:hover, ${P} .dga-pace-open:focus-visible { color: var(--dga-accent); outline: none; }
 ${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; text-align: center; }
+${P} .dga-judge-toggle { margin-left: 6px; padding: 0 4px; border: 0; background: transparent; color: var(--dga-accent); font: inherit; font-size: 12px; line-height: 1.45; cursor: pointer; min-height: 0; }
+${P} .dga-judge-toggle:hover, ${P} .dga-judge-toggle:focus-visible { text-decoration: underline; outline: none; }
+${P} .dga-branch-option { display: flex; flex-direction: column; gap: 4px; width: 100%; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+${P} .dga-branch-option:hover, ${P} .dga-branch-option:focus-visible { border-color: var(--dga-accent); background: var(--dga-hover); outline: none; }
+${P} .dga-branch-option small { color: var(--dga-text-3); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
 ${P} .dga-panel-nav { flex: 0 0 auto; display: flex; gap: 0; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid var(--dga-border); background: var(--dga-bg-0); padding: 0 8px; }
 ${P} .dga-panel-nav::-webkit-scrollbar { display: none; }
 ${P} .dga-panel-nav-item { position: relative; flex: 0 0 auto; min-height: 32px; padding: 6px 10px; border: 0; border-radius: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 12px; font-weight: 650; line-height: 1.2; cursor: pointer; }
@@ -7892,8 +8219,12 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
     async function shiftStage(delta) {
         try {
             const context = await requireContext();
-            const target = stepTarget(context.state.stageIndex, delta, context.parsed.stages.length, context.parsed.loop);
-            await moveToIndex(context, target);
+            const plan = stepTargetVisible(context.parsed, context.state, delta);
+            if (delta > 0 && plan.pending && plan.pending.length > 1) {
+                notify('下一段有互斥分支，请在管理页这张小卡上点「下一段」选走向。', 'info');
+                return;
+            }
+            await moveToIndex(context, plan.target, { resetBranches: plan.resetBranches });
         } catch (error) {
             notify(error.message || String(error), 'error');
         }
@@ -7941,6 +8272,14 @@ ${P} input[type="number"], ${P} input[type="password"] { width: 100%; min-height
         judgeSaysYes,
         judgeBasisText,
         judgePickedIndex,
+        judgePickedBranch,
+        branchChoicesOf,
+        stageBranchSkipped,
+        nextVisibleIndex,
+        prevVisibleIndex,
+        branchPendingChoices,
+        branchChoiceRecord,
+        stepTargetVisible,
         bindingOrderMode,
         applyJudgeOutputRules,
         applyBoundaryRules,

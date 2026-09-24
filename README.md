@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v2.62**（发布标签：`v2.62`）
+当前版本：**v2.63**（发布标签：`v2.63`）
 
 把完整剧情大纲、物品规则和秘密写在角色世界书的条目里，用 `## 阶段名` 分段。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前阶段、当前有效的附加内容和常驻提示——相当于暂时让其余内容不被 AI 看到。可以同时添加好几个条目，各自独立推进、各自显示在自己的位置；想看回全文时点「解绑」就会删掉镜像、重新打开条目。阶段结构直接保存在世界书正文中；绑定列表记在角色变量里，每条绑定的进度只记在当前聊天里，新聊天从第一段开始。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.62 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.62)下载导入文件：
+在 [v2.63 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.63)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.62/dynamic-guide-offline-v2.62.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.62/dynamic-guide-online-v2.62.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.62/dynamic-guide-regex-marker-hide-v2.62.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.63/dynamic-guide-offline-v2.63.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.63/dynamic-guide-online-v2.63.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.63/dynamic-guide-regex-marker-hide-v2.63.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.62/index.js';
+import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.63/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.62`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.63`。
 
 ## v2.0 文本格式
 
@@ -72,6 +72,7 @@ import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.62
 | `## 阶段名` | 一个剧情阶段，占一个主线进度位置。 |
 | `完成：条件` | 由 AI 判断本次回复是否已满足条件，满足后自动推进。留空时按全局「自动推进」设置处理（默认手动点“下一段”）。 |
 | `完成：自动` | 不预设具体条件，由 AI 自己判断这一阶段何时算充分展开。只影响这一个阶段，跨档位生效。 |
+| `分支：组名` | 把这个阶段标记为某个分支组的候选。同一组名的阶段互斥：进入其中一个后，其余分支这次聊天就不再走。 |
 | `## 名称 [附加]` | 物品、地点规则、秘密等附加内容，不占主线进度。 |
 | `从：阶段名` / `到：阶段名` | 附加内容的有效范围，开始和结束阶段都包含在内。 |
 | `## 名称 [常驻]` | 在每个尚在进行的阶段中一起发送。全部阶段完成后也停止发送。 |
@@ -88,6 +89,28 @@ import 'https://gcore.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.62
 合并到：进入地下室
 岔路口的线索只在这一段出现。
 ```
+
+`分支：组名` 用来写互斥走向。给两个或几个连续的阶段写上同一个组名，它们就是一组分支：走到这里时按剧情进入其中一个，进入之后其余分支这次聊天就不再走、内容也不再发送。分支选择记在当前聊天里，新聊天从第一段开始时不带旧选择；开「循环」时绕回第一段会清空分支、全部重来。
+
+```text
+## 雨夜初遇
+完成：两人完成第一次正式交谈。
+{{char}}第一次在雨夜遇见{{user}}。
+
+## 留下避雨
+分支：去向
+两人决定留在屋檐下等雨停。
+
+## 冒雨分别
+分支：去向
+{{user}}转身走进雨里，两人就此分别。
+
+## 再联系
+完成：两人再次见面。
+无论避雨还是分别，之后都可能再联系。
+```
+
+上面这个例子里，「留下避雨」和「冒雨分别」互斥：进了「留下避雨」，「冒雨分别」就会被跳过，直接走向「再联系」。阶段属性弹层里也有「分支组」输入框，和在原文里写 `分支：组名` 是同一份设置。
 
 完成条件最好写成明确发生的事件，例如“双方已经交换真实姓名”。脚本不调用额外的 AI API：它把条件交给当前回复模型，要求模型满足条件后附加隐藏完成标记，再据此推进。判断有偏差时可手动修正。
 
@@ -173,6 +196,11 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 当前版本采用线性阶段，不支持分支剧情图。自动推进依赖模型遵守完成标记，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v2.63（2026-09-24）
+
+- **阶段可以写「分支：组名」。** 同一组名的阶段互斥：进入其中一个后，其余分支这次聊天就不再走、不再发送，小卡和编辑器里会标出「分支·组名」。走到分支时：手动点「下一段」会弹出走向选择；随正文 AI 会给每个走向各一行标记，回复带了哪行就进哪条；判断 AI 判定当前段完成后会补问一次走向（对不上就不推进，下次再查）；AI 选段的目录里被否决的分支不再出现。循环绕回时分支选择清空、全部重来。
+- **小卡上的上次结论字多了会缩略。** 超过一行的依据只显示开头，点「展开」看全部，再点「收起」。依据长度上限从 60 字放宽到 500 字。
 
 ### v2.62（2026-09-23）
 

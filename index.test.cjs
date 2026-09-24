@@ -3476,3 +3476,240 @@ test('判断AI档：流式关闭（默认）主 API 通道 should_stream=false',
     assert.equal(calls[0].should_stream, false, '默认不流式');
     assert.deepEqual(run.errors, []);
 });
+
+// ---------------------------------------------------------------
+// v2.63：分支阶段（进入一组后其余分支不再走）+ 状态缩略展开
+// ---------------------------------------------------------------
+
+const BRANCH_OUTLINE = '## 相遇\n相遇正文\n\n## 留下\n分支：去向\n留下正文\n\n## 离开\n分支：去向\n离开正文\n\n## 尾声\n尾声正文';
+
+test('分支：解析「分支：组名」，同义词与重建往返都保留', () => {
+    const parsed = core.parseOutline(BRANCH_OUTLINE);
+    assert.deepEqual(plain(parsed.stages.map(item => item.branch || '')), ['', '去向', '去向', '']);
+    assert.equal(core.parseOutline('## 甲\n支线：路\n甲正文').stages[0].branch, '路', '支线是同义词');
+    const pick = {
+        text: '相遇正文\n\n留下正文\n\n离开正文',
+        stages: [
+            { id: 'a', kind: 'stage', name: '相遇', ranges: [{ start: 0, end: 4 }] },
+            { id: 'b', kind: 'stage', name: '留下', branch: '去向', ranges: [{ start: 6, end: 10 }] },
+            { id: 'c', kind: 'stage', name: '离开', branch: '去向', ranges: [{ start: 12, end: 16 }] },
+        ],
+        addons: [],
+        always: { id: 'always', kind: 'always', ranges: [] },
+        note: { id: 'note', kind: 'note', ranges: [] },
+        pendingRanges: [],
+    };
+    const rebuilt = core.pickBuild(pick);
+    assert.match(rebuilt, /## 留下\n分支：去向/, '重建正文要写上分支行');
+    const again = core.parseOutline(rebuilt);
+    assert.deepEqual(plain(again.stages.map(item => item.branch || '')), ['', '去向', '去向'], '再解析仍认得分支组');
+});
+
+test('分支：进入一组后其余分支被跳过', () => {
+    const parsed = core.parseOutline(BRANCH_OUTLINE);
+    const state = { branchChoices: { 去向: parsed.stages[2].id } };
+    assert.equal(core.nextVisibleIndex(parsed, state, 0), 2, '从 0 往后跳过被否决的「留下」');
+    assert.equal(core.nextVisibleIndex(parsed, state, 2), 3);
+    assert.equal(core.nextVisibleIndex(parsed, state, 3), 4, '走完返回段数（全部完成）');
+    assert.equal(core.prevVisibleIndex(parsed, state, 3), 2, '往回也跳过「留下」');
+    assert.equal(core.prevVisibleIndex(parsed, state, 0), -1);
+    assert.equal(core.stageBranchSkipped(parsed.stages[1], core.branchChoicesOf(state)), true);
+    assert.equal(core.stageBranchSkipped(parsed.stages[2], core.branchChoicesOf(state)), false);
+    assert.equal(core.branchPendingChoices(parsed, {}, 1).length, 2, '未决时整组都是候选');
+    assert.equal(core.branchPendingChoices(parsed, state, 1), null, '已选定后不再是未决');
+    assert.equal(core.branchPendingChoices(parsed, {}, 0), null, '普通阶段没有分支候选');
+});
+
+test('分支：进度落在被否决的分支上时顺到下一个可见段', () => {
+    const parsed = core.parseOutline(BRANCH_OUTLINE);
+    const state = core.reconcileState({ stageIndex: 1, stageName: '留下', branchChoices: { 去向: parsed.stages[2].id, 旧组: '不存在的id' } }, parsed, 0);
+    assert.equal(state.stageIndex, 2, '「留下」被否决，顺到「离开」');
+    assert.equal(state.stageName, '离开');
+    assert.deepEqual(plain(state.branchChoices), { 去向: parsed.stages[2].id }, '失效的分支选择要清掉');
+});
+
+test('分支：手动步进跳过被否决分支，未决组给候选，循环绕回清空选择', () => {
+    const parsed = core.parseOutline(BRANCH_OUTLINE);
+    const chosen = { 去向: parsed.stages[2].id };
+    assert.equal(core.stepTargetVisible(parsed, { stageIndex: 0, branchChoices: chosen }, 1).target, 2);
+    assert.equal(core.stepTargetVisible(parsed, { stageIndex: 3, branchChoices: chosen }, -1).target, 2);
+    const pending = core.stepTargetVisible(parsed, { stageIndex: 0 }, 1);
+    assert.equal(pending.target, 1);
+    assert.equal(pending.pending.length, 2, '下一段落在未决分支组时要先选走向');
+    parsed.loop = true;
+    const wrap = core.stepTargetVisible(parsed, { stageIndex: 3, branchChoices: chosen }, 1);
+    assert.equal(wrap.target, 0);
+    assert.equal(wrap.resetBranches, true, '循环绕回 = 全部重来，清空分支选择');
+    const back = core.stepTargetVisible(parsed, { stageIndex: 0, branchChoices: chosen }, -1);
+    assert.equal(back.target, 3);
+    assert.equal(back.resetBranches, false, '退回上一轮只是回看，不清选择');
+});
+
+test('分支走向解析：序号、名字、0 与空表', () => {
+    const candidates = [{ id: 'a', name: '留下' }, { id: 'b', name: '离开' }];
+    assert.equal(core.judgePickedBranch('<branch>\n- 走向：2\n</branch>', candidates).id, 'b');
+    assert.equal(core.judgePickedBranch('<branch>留下</branch>', candidates).id, 'a');
+    assert.equal(core.judgePickedBranch('<branch>\n- 走向：0\n</branch>', candidates), null);
+    assert.equal(core.judgePickedBranch('<branch></branch>', candidates), null);
+    assert.equal(core.judgePickedBranch('没有表', candidates), null);
+    assert.equal(core.judgePickedBranch('<branch>\n- 走向：9\n</branch>', candidates), null);
+});
+
+test('随正文AI判断：下一格是分支时列出各走向标记，回复选中即锁定', async () => {
+    const stages = core.parseOutline(BRANCH_OUTLINE).stages;
+    const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'story' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: `他们道别了 <!-- DGA_COMPLETE:${stages[2].id} -->` };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let called = 0;
+    helper.generateRaw = async () => { called += 1; return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const cue = state.books.书A.find(item => item.name === '大纲A（动态指导·标记）');
+    assert.ok(cue, '分支时仍有标记说明条目');
+    assert.match(cue.content, /走向「留下」/);
+    assert.match(cue.content, /走向「离开」/);
+    assert.ok(cue.content.includes(`DGA_COMPLETE:${stages[1].id}`), '每个走向各一行标记');
+    assert.ok(cue.content.includes(`DGA_COMPLETE:${stages[2].id}`));
+    assert.ok(!cue.content.includes(`DGA_COMPLETE:${stages[0].id}`), '分支时不再给当前段自己的标记');
+    await state.events.get('message_received')(5);
+    assert.equal(called, 0, '随正文判断不另开请求');
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+    assert.equal(saved.stageIndex, 2, '回复选了「离开」就进「离开」');
+    assert.deepEqual(plain(saved.branchChoices), { 去向: stages[2].id }, '分支选择记进进度');
+    const mirror = state.books.书A.find(item => item.name === '大纲A（动态指导）');
+    assert.match(mirror.content, /离开正文/);
+    assert.doesNotMatch(mirror.content, /留下正文/, '没选的分支不再发送');
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：YES 后下一格是分支组时补问走向，选中才推进', async () => {
+    const stages = core.parseOutline(BRANCH_OUTLINE).stages;
+    const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复，没有隐藏标记。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const calls = [];
+    helper.generateRaw = async options => {
+        calls.push(options);
+        if (String(options.user_input).includes('【分支】')) return '<branch>\n- 走向：2\n</branch>';
+        return '<basis>演完了</basis>\n<verdict>\n- 结论：YES\n</verdict>';
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    assert.equal(calls.length, 2, 'YES 后补问一次分支走向');
+    assert.match(String(calls[1].user_input), /【刚演完的阶段】\n相遇/);
+    assert.match(String(calls[1].user_input), /1\. 留下/);
+    assert.match(String(calls[1].user_input), /2\. 离开/);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+    assert.equal(saved.stageIndex, 2, '选了第 2 个分支「离开」');
+    assert.deepEqual(plain(saved.branchChoices), { 去向: stages[2].id });
+    assert.match(state.books.书A.find(item => item.name === '大纲A（动态指导）').content, /离开正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI档：分支走向写 0 时不推进', async () => {
+    const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const calls = [];
+    helper.generateRaw = async options => {
+        calls.push(options);
+        if (String(options.user_input).includes('【分支】')) return '<branch>\n- 走向：0\n</branch>';
+        return '<verdict>YES</verdict>';
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    assert.equal(calls.length, 2);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+    assert.equal(saved.stageIndex, 0, '对不上分支就不推进');
+    assert.equal(saved.lastJudgeCheckedId, 5, '但这一层记为已检查，不反复问');
+    assert.deepEqual(run.errors, []);
+});
+
+test('AI 选段：已被否决的分支不进目录，目录序号映射回真实阶段', async () => {
+    const stages = core.parseOutline(BRANCH_OUTLINE).stages;
+    const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
+    const key = keyOf('书A', 1);
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', orderMode: 'pick' }],
+            settings: { autoAdvance: 'off' },
+        },
+        chatState: {
+            version: 2,
+            bindings: {
+                [key]: { stageIndex: 0, stageName: '相遇', lastCompletionMessageId: null, lastJudgeCheckedId: null, branchChoices: { 去向: stages[2].id } },
+            },
+        },
+        messages: [{ message_id: 8, role: 'assistant', message: '剧情继续。' }],
+        lastMessageId: 8,
+    });
+    const sent = [];
+    helper.generateRaw = async options => { sent.push(options); return '<stage>3</stage>'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(8);
+    assert.equal(sent.length, 1);
+    const catalog = String(sent[0].user_input);
+    assert.match(catalog, /1\. 相遇/);
+    assert.match(catalog, /2\. 离开/);
+    assert.match(catalog, /3\. 尾声/);
+    assert.doesNotMatch(catalog, /留下/, '被否决的分支不进目录');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[key].stageIndex, 3, '目录序号 3 映射到真实的「尾声」');
+    assert.deepEqual(run.errors, []);
+});
+
+test('状态依据：长结论保留到 500 字，不再截到 60', () => {
+    const long = '这是一段很长的依据。'.repeat(50);
+    const basis = core.judgeBasisText(`<basis>${long}</basis>`);
+    assert.ok(basis.length > 60, '长依据要留下来给「展开」看');
+    assert.ok(basis.length <= 500);
+});
+
+test('小卡状态字多就缩略，点「展开」看全文、再点「收起」', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    const longBasis = `依据${'很'.repeat(80)}长`;
+    state.variables.character.$dynamicGuideAssistant = {
+        config: { version: 2, bindings: [{ worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' }], settings: { autoAdvance: 'judge' } },
+    };
+    state.variables.chat.$dynamicGuideAssistant = {
+        state: { version: 2, bindings: { [keyOf('测试世界书', 1)]: { stageIndex: 0, stageName: '第一幕', lastJudgeCheckedId: 5, lastJudgeYes: false, lastJudgeBasis: longBasis } } },
+    };
+    const { errors } = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const status = panel().querySelector('.dga-judge-status');
+    assert.ok(status, '有状态行');
+    assert.ok(!status.textContent.includes('很'.repeat(80)), '默认缩略，不把全文摆出来');
+    const toggle = panel().querySelector('.dga-judge-toggle');
+    assert.ok(toggle, '长状态带展开按钮');
+    assert.equal(toggle.textContent, '展开');
+    toggle.listeners.click[0]();
+    const opened = panel().querySelector('.dga-judge-status');
+    assert.ok(opened.textContent.includes('很'.repeat(80)), '展开后看到全文');
+    assert.equal(panel().querySelector('.dga-judge-toggle').textContent, '收起');
+    panel().querySelector('.dga-judge-toggle').listeners.click[0]();
+    assert.ok(!panel().querySelector('.dga-judge-status').textContent.includes('很'.repeat(80)), '收起后回到缩略');
+    assert.deepEqual(errors, []);
+});
