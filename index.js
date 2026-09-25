@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.77
+     * 动态指导助手 v2.78
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.77';
+    const VERSION = '2.78';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6711,8 +6711,8 @@
         });
         const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '选择走向' });
         box.append(
-            el('h3', { text: '这里要选一段' }),
-            muted('下面几段里只能走一段。选完以后，另外几段这次就不再走。'),
+            el('h3', { text: '选一条路' }),
+            muted('只能点一条。没点到的，这次就不走。'),
             ...candidates.map(candidate => {
                 const summary = String(candidate.prompt || '').replace(/\s+/g, ' ').trim();
                 return el('button', {
@@ -7900,30 +7900,26 @@
                     }, { ghost: true }));
             });
             const stages = stageSequence(editor.pick);
-            const forkWhen = stage => {
-                const at = stages.indexOf(owner);
-                const other = stages.indexOf(stage);
-                if (other < at) return 'before';
-                if (other > at) return 'after';
-                return 'now';
-            };
-            const forkWhenText = { before: '在前面', now: '就是这段', after: '在后面' };
             const others = stages.filter(stage => stage !== owner);
             const chosen = others.filter(stage => (sheet.exclusiveIds || []).includes(stage.id));
             const available = others.filter(stage => !(sheet.exclusiveIds || []).includes(stage.id));
             const picking = chosen.length > 0 || sheet.forkOpen === true;
-            const forkRow = (stage, when) => el('div', { class: `dga-fork-row is-${when}` },
-                el('span', { class: 'dga-fork-when', text: forkWhenText[when] }),
+            const roadIds = new Set(picking ? [owner.id, ...chosen.map(stage => stage.id)] : [owner.id]);
+            const lastRoad = stages.reduce((at, stage, index) => (roadIds.has(stage.id) ? index : at), -1);
+            const gather = stages.slice(lastRoad + 1).find(stage => !roadIds.has(stage.id));
+            const forkRow = stage => el('div', { class: `dga-fork-row${stage === owner ? ' is-now' : ''}` },
                 el('b', { text: stage.name }),
-                stage === owner ? null : btn('拿掉', () => {
-                    sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
-                    render();
-                }, { ghost: true }));
+                stage === owner
+                    ? el('span', { class: 'dga-fork-when', text: '正在改' })
+                    : btn('拿掉', () => {
+                        sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
+                        render();
+                    }, { ghost: true }));
             const forkRows = [owner, ...chosen]
                 .sort((left, right) => stages.indexOf(left) - stages.indexOf(right))
-                .map(stage => forkRow(stage, forkWhen(stage)));
+                .map(forkRow);
             const forkAdd = available.length ? selectControl(
-                [{ value: '', label: '把一段放进来' }].concat(available.map(stage => ({ value: stage.id, label: `${forkWhenText[forkWhen(stage)]} · ${stage.name}` }))),
+                [{ value: '', label: '再加一条路' }].concat(available.map(stage => ({ value: stage.id, label: stage.name }))),
                 '',
                 value => {
                     if (!value) return;
@@ -7944,9 +7940,9 @@
                         class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
                         onclick: () => { sheet.terminal = value; render(); },
                     }, label))))));
-            box.append(sheetSection('走到这里',
+            box.append(sheetSection('几条路',
                 el('div', { class: 'dga-seg' },
-                    ...[[false, '接着往下'], [true, '从几段里挑一段']].map(([value, label]) => el('button', {
+                    ...[[false, '接着往下'], [true, '分成几条路']].map(([value, label]) => el('button', {
                         type: 'button',
                         class: `dga-seg-btn${picking === value ? ' is-on' : ''}`,
                         disabled: value && !others.length,
@@ -7958,10 +7954,11 @@
                     }, label))),
                 picking
                     ? el('div', { class: 'dga-fork-pick' },
-                        muted('下面几段里只能走一段。走了一段，另外几段这次就不走。'),
+                        muted('读者会看到下面这几条路，只能点一条。没点到的，这次就不走。'),
                         el('div', { class: 'dga-fork-list' }, ...forkRows),
-                        forkAdd)
-                    : muted(others.length ? '走完这一段，就去下一段。' : '还没有别的段。')));
+                        forkAdd,
+                        muted(gather ? `走完，都到「${gather.name}」。` : '走完，就到此结束。'))
+                    : muted(gather ? `走完这一段，就去「${gather.name}」。` : '走完这一段，就到此结束。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
@@ -8721,12 +8718,8 @@ ${P} .dga-fork-pick { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-fork-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; padding: 4px 4px 4px 12px; border: 1px solid var(--dga-border); border-left-width: 5px; border-radius: 6px; }
 ${P} .dga-fork-row b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 ${P} .dga-fork-when { flex: 0 0 auto; font-size: 12px; font-weight: 700; }
-${P} .dga-fork-row.is-before { border-left-color: var(--dga-warning); background: color-mix(in srgb, var(--dga-warning) 16%, transparent); }
-${P} .dga-fork-row.is-before .dga-fork-when { color: var(--dga-warning); }
 ${P} .dga-fork-row.is-now { border-left-color: var(--dga-accent); background: color-mix(in srgb, var(--dga-accent) 16%, transparent); }
 ${P} .dga-fork-row.is-now .dga-fork-when { color: var(--dga-accent); }
-${P} .dga-fork-row.is-after { border-left-color: #7DCEA0; background: color-mix(in srgb, #7DCEA0 16%, transparent); }
-${P} .dga-fork-row.is-after .dga-fork-when { color: #7DCEA0; }
 ${P} .dga-fork-row .dga-btn { flex: 0 0 auto; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
