@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.78
+     * 动态指导助手 v2.79
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.78';
+    const VERSION = '2.79';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1097,6 +1097,18 @@
         const loop = Boolean(parsed && parsed.loop);
         const from = Math.floor(Number(state && state.stageIndex) || 0);
         if (!total) return { target: 0, resetBranches: false, pending: null };
+        if (delta > 0) {
+            const leaving = stages[from];
+            const backId = leaving && !leaving.terminal ? String(leaving.loopTo || '').trim() : '';
+            const backIndex = backId ? stages.findIndex(stage => stage.id === backId) : -1;
+            if (backIndex >= 0 && backIndex !== from) {
+                return {
+                    target: backIndex,
+                    resetBranches: parsed.loopKeepBranch !== true,
+                    pending: parsed.loopKeepBranch === true ? null : branchPendingChoices(parsed, state, backIndex),
+                };
+            }
+        }
         if (!loop) {
             const target = delta > 0 ? nextVisibleIndex(parsed, state, from) : prevVisibleIndex(parsed, state, from);
             return { target, resetBranches: false, pending: delta > 0 ? branchPendingChoices(parsed, state, target) : null };
@@ -2814,6 +2826,7 @@
             completion: stage.completion || '',
             terminal: Boolean(stage.terminal),
             branch: String(stage.branch || '').trim(),
+            loopTo: String(stage.loopTo || '').trim(),
             ranges: clampList(stage.ranges),
             color: STAGE_COLORS[index % STAGE_COLORS.length],
             ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
@@ -2980,6 +2993,7 @@
                     completion: stage.completion || '',
                     terminal: Boolean(stage.terminal),
                     branch: String(stage.branch || '').trim(),
+                    loopTo: String(stage.loopTo || '').trim(),
                     beforeIds: cleanIdList(stage.beforeIds, (pick.residents || []).map(item => item.id)),
                     afterIds: cleanIdList(stage.afterIds, (pick.residents || []).map(item => item.id)),
                     extras: cleanExtras(stage.extras),
@@ -3016,6 +3030,7 @@
                 autoComplete,
                 terminal: Boolean(stage.terminal),
                 branch: String(stage.branch || '').trim(),
+                loopTo: String(stage.loopTo || '').trim(),
                 stageIndex: index,
             };
         });
@@ -6585,10 +6600,7 @@
                     text: '时间线 ›',
                     onclick: () => {
                         ui.workKey = context.key;
-                        ui.timelineKey = context.key;
-                        ui.paceKey = '';
-                        ui.view = 'timeline';
-                        render();
+                        return runAction('打开时间线', () => openWorkPage('timeline'), { refresh: false });
                     },
                 }),
                 el('button', {
@@ -6647,14 +6659,20 @@
         const context = workContext();
         if (!context || context.broken || !context.entry) throw new Error('这条绑定不可用。');
         ui.workKey = context.key;
-        if (page === 'editor') {
-            ui.timelineKey = '';
+        if (page === 'editor' || page === 'timeline') {
             ui.paceKey = '';
-            await openEditorAt(context.worldbookName, context.entry, {
-                focusStageIndex: context.parsed && context.parsed.stages.length
-                    ? Math.min(Math.max(0, Math.floor(Number(context.state && context.state.stageIndex) || 0)), context.parsed.stages.length - 1)
-                    : null,
-            });
+            const same = ui.editor && ui.editor.entry && context.entry && ui.editor.entry.uid === context.entry.uid
+                && ui.editor.worldbookName === context.worldbookName;
+            if (!same) {
+                await openEditorAt(context.worldbookName, context.entry, {
+                    focusStageIndex: context.parsed && context.parsed.stages.length
+                        ? Math.min(Math.max(0, Math.floor(Number(context.state && context.state.stageIndex) || 0)), context.parsed.stages.length - 1)
+                        : null,
+                });
+            }
+            ui.editor.mode = page === 'timeline' ? 'road' : 'seg';
+            ui.timelineKey = page === 'timeline' ? context.key : '';
+            ui.view = 'editor';
             return false;
         }
         if (ui.editor) discardEditor();
@@ -7049,7 +7067,7 @@
         const mode = editor.mode;
         // 分段是默认视图（v2.28）：第一次进来就要把派生模型和文档级拖选监听准备好，
         // 否则拖选事件没人接（旧版要先点「选区划分」那一档才会挂）。
-        if (mode === 'seg' || mode === 'map') {
+        if (mode === 'seg' || mode === 'map' || mode === 'road') {
             if (!editor.pick) rebuildPick(editor, { dirty: false });
         }
         if (mode === 'seg' && !editor.pickListeners) pickAttach(editor);
@@ -7075,14 +7093,16 @@
         );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
-            : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走在小卡的设置里。';
+            : (mode === 'road'
+                ? '这是一整条剧情。点卡片改这一段。在后面加一段。并排的几段是要选的路。'
+                : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走在小卡的设置里。');
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
-            workSwitch('editor'),
+            workSwitch(mode === 'road' ? 'timeline' : 'editor'),
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
-            toolbar,
-            mode === 'raw' ? rawArea : renderSegments(editor),
+            mode === 'road' ? null : toolbar,
+            mode === 'road' ? renderRoad(editor) : (mode === 'raw' ? rawArea : renderSegments(editor)),
             // 一个标题都还没有：原始正文就是不分段的，分段完全由用户自己划。
             // 想省事可以先按空行切块，再逐块拖选归属。
             mode === 'seg' && !parsed.blocks.length && parsed.items.length > 0
@@ -7115,7 +7135,7 @@
             onclick: () => { ui.editorTip = !ui.editorTip; render(); },
         }, '⚙');
         const parts = [
-            header('编辑', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear, { subpage: true }),
+            header(mode === 'road' ? '时间线' : '编辑', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear, { subpage: true }),
             body,
             foot,
         ];
@@ -7180,6 +7200,76 @@
         if ((mode === 'seg' || mode === 'map') && !editor.pick) rebuildPick(editor, { dirty: false });
         if (mode === 'seg') pickAttach(editor);
         render();
+    }
+
+    function insertRoadStage(editor, anchor, asRoad) {
+        const pick = editor && editor.pick;
+        if (!pick) return;
+        let name = '新阶段';
+        let serial = 2;
+        while (pick.stages.some(stage => stage.name === name)) {
+            name = `新阶段 ${serial}`;
+            serial += 1;
+        }
+        const stage = {
+            id: `pick-stage-${Date.now().toString(36)}-${pick.stages.length}`,
+            kind: 'stage',
+            name,
+            completion: '',
+            ranges: [],
+            body: '',
+            color: STAGE_COLORS[pick.stages.length % STAGE_COLORS.length],
+            branch: '',
+            loopTo: '',
+        };
+        const at = anchor ? pick.stages.indexOf(anchor) : -1;
+        if (asRoad && anchor && at >= 0) {
+            const group = String(anchor.branch || '').trim() || `岔路-${anchor.id}`;
+            anchor.branch = group;
+            stage.branch = group;
+            pick.stages.splice(at + 1, 0, stage);
+        } else if (at >= 0) {
+            pick.stages.splice(at + 1, 0, stage);
+        } else {
+            pick.stages.push(stage);
+        }
+        editor.dirty = true;
+        openSheet({ owner: stage });
+    }
+
+    function renderRoad(editor) {
+        if (!editor.pick) rebuildPick(editor, { dirty: false });
+        if (!stageSequence(editor.pick).length) {
+            const sourced = pickFromSource(editor.lines.join('\n'));
+            if (stageSequence(sourced).length) {
+                sourced.loop = Boolean(editor.bindingLoop);
+                editor.pick = sourced;
+            }
+        }
+        const stages = stageSequence(editor.pick);
+        const rows = storyRows(stages);
+        if (!stages.length) {
+            return el('div', { class: 'dga-road' },
+                btn('加第一段', () => insertRoadStage(editor, null, false), { primary: true }));
+        }
+        const list = el('div', { class: 'dga-road' });
+        rows.forEach(row => {
+            const anchor = row[row.length - 1];
+            list.append(el('div', { class: `dga-road-row${row.length > 1 ? ' is-choice' : ''}` },
+                ...row.map(stage => {
+                    const back = stages.find(item => item.id === stage.loopTo);
+                    const note = stage.terminal ? '到此结束' : (back ? `走完回到「${back.name}」` : '点开修改');
+                    return el('button', {
+                        type: 'button',
+                        class: 'dga-road-card',
+                        onclick: () => openSheet({ owner: stage }),
+                    }, el('b', { text: stage.name || '未命名' }), el('small', { text: note }));
+                })));
+            list.append(el('div', { class: 'dga-road-actions' },
+                btn('再加一条路', () => insertRoadStage(editor, anchor, true), { ghost: true }),
+                btn('在后面加一段', () => insertRoadStage(editor, anchor, false), { ghost: true })));
+        });
+        return list;
     }
 
     function renderTimeline() {
@@ -7420,6 +7510,7 @@
             kind: owner.kind === 'addon' ? 'addon' : 'stage',
             completion: owner.kind === 'stage' ? (owner.completion || '') : '',
             terminal: owner.kind === 'stage' ? Boolean(owner.terminal) : false,
+            loopTo: owner.kind === 'stage' ? String(owner.loopTo || '') : '',
             branch: owner.kind === 'stage' ? String(owner.branch || '') : '',
             mergeInto: '',
             exclusiveIds: exclusivePartnerIds(ui.editor && ui.editor.pick, owner),
@@ -7901,33 +7992,7 @@
             });
             const stages = stageSequence(editor.pick);
             const others = stages.filter(stage => stage !== owner);
-            const chosen = others.filter(stage => (sheet.exclusiveIds || []).includes(stage.id));
-            const available = others.filter(stage => !(sheet.exclusiveIds || []).includes(stage.id));
-            const picking = chosen.length > 0 || sheet.forkOpen === true;
-            const roadIds = new Set(picking ? [owner.id, ...chosen.map(stage => stage.id)] : [owner.id]);
-            const lastRoad = stages.reduce((at, stage, index) => (roadIds.has(stage.id) ? index : at), -1);
-            const gather = stages.slice(lastRoad + 1).find(stage => !roadIds.has(stage.id));
-            const forkRow = stage => el('div', { class: `dga-fork-row${stage === owner ? ' is-now' : ''}` },
-                el('b', { text: stage.name }),
-                stage === owner
-                    ? el('span', { class: 'dga-fork-when', text: '正在改' })
-                    : btn('拿掉', () => {
-                        sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
-                        render();
-                    }, { ghost: true }));
-            const forkRows = [owner, ...chosen]
-                .sort((left, right) => stages.indexOf(left) - stages.indexOf(right))
-                .map(forkRow);
-            const forkAdd = available.length ? selectControl(
-                [{ value: '', label: '再加一条路' }].concat(available.map(stage => ({ value: stage.id, label: stage.name }))),
-                '',
-                value => {
-                    if (!value) return;
-                    sheet.exclusiveIds = [...(sheet.exclusiveIds || []), value];
-                    sheet.forkOpen = true;
-                    render();
-                },
-            ) : null;
+            const loopChoices = [{ value: '', label: '不回去' }].concat(others.map(stage => ({ value: stage.id, label: stage.name })));
             box.append(sheetSection('离开这一段',
                 field('什么时候进入下一段', completion),
                 el('div', { class: 'dga-inline-action' },
@@ -7939,26 +8004,12 @@
                         type: 'button',
                         class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
                         onclick: () => { sheet.terminal = value; render(); },
-                    }, label))))));
-            box.append(sheetSection('几条路',
-                el('div', { class: 'dga-seg' },
-                    ...[[false, '接着往下'], [true, '分成几条路']].map(([value, label]) => el('button', {
-                        type: 'button',
-                        class: `dga-seg-btn${picking === value ? ' is-on' : ''}`,
-                        disabled: value && !others.length,
-                        onclick: () => {
-                            sheet.forkOpen = value;
-                            if (!value) sheet.exclusiveIds = [];
-                            render();
-                        },
-                    }, label))),
-                picking
-                    ? el('div', { class: 'dga-fork-pick' },
-                        muted('读者会看到下面这几条路，只能点一条。没点到的，这次就不走。'),
-                        el('div', { class: 'dga-fork-list' }, ...forkRows),
-                        forkAdd,
-                        muted(gather ? `走完，都到「${gather.name}」。` : '走完，就到此结束。'))
-                    : muted(gather ? `走完这一段，就去「${gather.name}」。` : '走完这一段，就到此结束。')));
+                    }, label)))),
+                sheet.terminal ? muted('到此结束，不回到前面。') : field('走完回到', selectControl(
+                    loopChoices,
+                    sheet.loopTo || '',
+                    value => { sheet.loopTo = value; },
+                ), '选一段的话，走完这一段就回到那里。图上会写出来。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
@@ -8025,7 +8076,7 @@
             btn('保存修改', applySheet, { primary: true }),
             btn('取消', closeSheet),
         ];
-        actions.push(btn('删除', () => deleteOwner(editor, owner), { danger: true }));
+        actions.push(btn(owner.kind === 'stage' ? '删掉这段' : '删除', () => deleteOwner(editor, owner), { danger: true }));
         box.append(el('div', { class: 'dga-sheet-actions' }, ...actions));
         backdrop.append(box);
         return backdrop;
@@ -8080,6 +8131,8 @@
         if (owner.kind === 'stage') {
             owner.completion = String(sheet.completion || '').trim();
             owner.terminal = Boolean(sheet.terminal);
+            const loopId = String(sheet.loopTo || '').trim();
+            owner.loopTo = owner.terminal || !editor.pick.stages.some(stage => stage !== owner && stage.id === loopId) ? '' : loopId;
             owner.extras = cleanExtras(sheet.extras);
             if (!sheet.mergeInto) applyExclusiveGroup(editor.pick, owner, sheet.exclusiveIds);
         }
@@ -8713,6 +8766,13 @@ ${P} .dga-sheet-section { display: flex; flex-direction: column; gap: 8px; paddi
 ${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--dga-text-2); }
 ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
+${P} .dga-road { display: flex; flex-direction: column; gap: 8px; }
+${P} .dga-road-row { display: flex; gap: 8px; overflow-x: auto; }
+${P} .dga-road-card { flex: 1 0 140px; min-height: 72px; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+${P} .dga-road-card b, ${P} .dga-road-card small { display: block; }
+${P} .dga-road-card small { color: var(--dga-text-3); font-size: 12px; }
+${P} .dga-road-row.is-choice .dga-road-card { border-left: 5px solid var(--dga-accent); }
+${P} .dga-road-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-fork-list { display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-fork-pick { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-fork-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; padding: 4px 4px 4px 12px; border: 1px solid var(--dga-border); border-left-width: 5px; border-radius: 6px; }

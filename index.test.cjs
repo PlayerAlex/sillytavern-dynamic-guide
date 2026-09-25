@@ -1939,7 +1939,7 @@ test('分段视图：从选中文字新建阶段，弹层确认后还能退回�
     const sheet = panel().querySelector('.dga-sheet');
     assert.ok(sheet, '新建后要直接打开属性弹层让用户确认名称');
     assert.match(findTag(sheet, 'H3').textContent, /修改「开头介绍」/);
-    assert.equal(findButton(sheet, '删除') ? true : false, true, '弹层要有删除出口');
+    assert.equal(findButton(sheet, '删掉这段') ? true : false, true, '弹层要有删除出口');
     findButton(sheet, '取消').listeners.click[0]();
 
     // 再把这个阶段的文字选一遍，改成「未分配」→ 文字退回去，阶段消失
@@ -3825,17 +3825,13 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
 
-    findButton(panel(), '时间线 ›').listeners.click[0]();
-    assert.equal(panel().querySelector('.dga-map-delete'), null, '时间线没有删除');
-    assert.equal(findButton(panel(), '新建'), null, '时间线不能新建');
-    const timelineNodes = collectByClass(panel(), 'dga-map-node', []);
+    await findButton(panel(), '时间线 ›').listeners.click[0]();
+    const timelineNodes = collectByClass(panel(), 'dga-road-card', []);
     assert.equal(timelineNodes.length, 2, '时间线能看到全部阶段');
-    assert.ok(collectByClass(panel(), 'is-now', []).length, '当前阶段要标出来');
+    assert.ok(findButton(panel(), '在后面加一段'), '每一站可以在后面加一段');
+    assert.ok(findButton(panel(), '再加一条路'), '并排可以再加一条路');
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '时间线是二级页');
-    assert.ok(panel().querySelector('.dga-map-edge'), '时间线按阶段自动画出箭头');
-    assert.equal(findButton(panel(), '可选'), null, '时间线上不能改可选或互斥');
     assert.equal(timelineNodes[0].listeners.pointerdown, undefined, '时间线卡片不能拖');
-    assert.equal(panel().querySelector('.dga-map').listeners.pointermove, undefined, '时间线不能拖动画布');
     assert.ok(findButton(panel(), '时间线'), '时间线页顶上能去时间线');
     assert.ok(findButton(panel(), '编辑'), '时间线页顶上能去编辑');
     assert.ok(findButton(panel(), '设置'), '时间线页顶上能去设置');
@@ -3846,8 +3842,8 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     await findButton(panel(), '编辑').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '从设置能进到分段编辑');
     await findButton(panel(), '时间线').listeners.click[0]();
-    assert.ok(panel().querySelector('.dga-map'), '从编辑能回到时间线');
-    panel().querySelector('.dga-close').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-road'), '从编辑能回到时间线');
+    await panel().querySelector('.dga-close').listeners.click[0]();
 
     await findButton(panel(), '编辑 ›').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '编辑打开的是原来的分段');
@@ -3962,26 +3958,10 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     panel().querySelector('.dga-segbar').listeners.click[0]();
     const sheet = () => panel().querySelector('.dga-sheet');
     assert.match(sheet().textContent, /离开这一段/);
-    assert.match(sheet().textContent, /几条路/);
     assert.match(sheet().textContent, /发给 AI/);
-    assert.match(sheet().textContent, /走完这一段，就去「第二幕」/);
+    assert.match(sheet().textContent, /走完回到/);
     assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
-    const findForkSelect = root => (function findSelects(node, out) {
-        if (node.tagName === 'SELECT' && optionsOf(node).some(option => option.textContent === '再加一条路')) out.push(node);
-        (node.children || []).forEach(child => findSelects(child, out));
-        return out;
-    })(root, []);
-    assert.equal(findForkSelect(sheet()).length, 0, '没分成几条路时不放出下拉框');
-    findButton(sheet(), '分成几条路').listeners.click[0]();
-    const forkSelect = findForkSelect(sheet());
-    assert.equal(forkSelect.length, 1);
-    const option = optionsOf(forkSelect[0]).find(item => item.textContent === '第二幕');
-    forkSelect[0].value = optionValue(option);
-    forkSelect[0].listeners.change[0]({ target: forkSelect[0] });
-    assert.match(sheet().textContent, /正在改/);
-    assert.match(sheet().textContent, /只能点一条/);
-    assert.match(sheet().textContent, /第二幕/, '加上之后才出现在岔路里');
-    assert.ok(findButton(sheet(), '拿掉'));
+    assert.ok(findButton(sheet(), '删掉这段'));
     findButton(sheet(), '加一条附加').listeners.click[0]();
     const areas = [];
     const walk = node => {
@@ -3997,7 +3977,5 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     const saved = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
     const stage = saved.stages.find(item => item.name === '第一幕');
     assert.equal(stage.extras[0].body, '戒指能看见灵体');
-    assert.ok(stage.branch, '勾过的段要记下互斥');
-    assert.equal(saved.stages.find(item => item.name === '第二幕').branch, stage.branch);
     assert.deepEqual(errors, []);
 });
