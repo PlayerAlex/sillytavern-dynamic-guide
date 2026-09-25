@@ -3828,8 +3828,10 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     await findButton(panel(), '时间线 ›').listeners.click[0]();
     const timelineNodes = collectByClass(panel(), 'dga-road-card', []);
     assert.equal(timelineNodes.length, 2, '时间线能看到全部阶段');
-    assert.ok(findButton(panel(), '在后面加一段'), '每一站可以在后面加一段');
-    assert.ok(findButton(panel(), '再加一条路'), '并排可以再加一条路');
+    timelineNodes[0].listeners.click[0]();
+    assert.ok(findButton(panel(), '往下接一段'), '点中卡片后可以往下接');
+    assert.ok(findButton(panel(), '从这里分开'), '点中卡片后可以再分开');
+    assert.ok(findButton(panel(), '标成支线'), '点中卡片后可以标成支线');
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '时间线是二级页');
     assert.equal(timelineNodes[0].listeners.pointerdown, undefined, '时间线卡片不能拖');
     assert.ok(findButton(panel(), '时间线'), '时间线页顶上能去时间线');

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.81
+     * 动态指导助手 v2.82
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.81';
+    const VERSION = '2.82';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2828,6 +2828,8 @@
             terminal: Boolean(stage.terminal),
             branch: String(stage.branch || '').trim(),
             loopTo: String(stage.loopTo || '').trim(),
+            side: Boolean(stage.side),
+            lineTo: cleanLineTo(stage.lineTo),
             ranges: clampList(stage.ranges),
             color: STAGE_COLORS[index % STAGE_COLORS.length],
             ...(typeof stage.body === 'string' ? { body: stage.body } : {}),
@@ -2978,6 +2980,14 @@
         };
     }
 
+    function cleanLineTo(raw) {
+        const kinds = { split: true, side: true, transfer: true, down: true };
+        return (Array.isArray(raw) ? raw : []).map(item => ({
+            to: String(item && item.to || '').trim(),
+            kind: kinds[item && item.kind] ? item.kind : 'down',
+        })).filter(item => item.to);
+    }
+
     function storyDocument(pick) {
         const source = String(pick && pick.text || '');
         return stageSequence(pick).map(stage => {
@@ -3005,6 +3015,8 @@
                     terminal: Boolean(stage.terminal),
                     branch: String(stage.branch || '').trim(),
                     loopTo: String(stage.loopTo || '').trim(),
+                    side: Boolean(stage.side),
+                    lineTo: cleanLineTo(stage.lineTo),
                     beforeIds: cleanIdList(stage.beforeIds, (pick.residents || []).map(item => item.id)),
                     afterIds: cleanIdList(stage.afterIds, (pick.residents || []).map(item => item.id)),
                     extras: cleanExtras(stage.extras),
@@ -7270,7 +7282,7 @@
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
             : (mode === 'road'
-                ? '这是一整条剧情。点卡片改这一段。在后面加一段。并排的几段是要选的路。'
+                ? '点一张卡片。往下接是继续，分开是再分几条，转到另一条是换线，支线是从这里出去走到头。'
                 : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走在小卡的设置里。');
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
@@ -7378,16 +7390,8 @@
         render();
     }
 
-    function insertRoadStage(editor, anchor, asRoad) {
-        const pick = editor && editor.pick;
-        if (!pick) return;
-        let name = '新阶段';
-        let serial = 2;
-        while (pick.stages.some(stage => stage.name === name)) {
-            name = `新阶段 ${serial}`;
-            serial += 1;
-        }
-        const stage = {
+    function freshStage(pick, name) {
+        return {
             id: `pick-stage-${Date.now().toString(36)}-${pick.stages.length}`,
             kind: 'stage',
             name,
@@ -7397,19 +7401,65 @@
             color: STAGE_COLORS[pick.stages.length % STAGE_COLORS.length],
             branch: '',
             loopTo: '',
+            side: false,
+            lineTo: [],
         };
-        const at = anchor ? pick.stages.indexOf(anchor) : -1;
-        if (asRoad && anchor && at >= 0) {
-            const group = String(anchor.branch || '').trim() || `岔路-${anchor.id}`;
-            anchor.branch = group;
-            stage.branch = group;
-            pick.stages.splice(at + 1, 0, stage);
-        } else if (at >= 0) {
-            pick.stages.splice(at + 1, 0, stage);
-        } else {
-            pick.stages.push(stage);
+    }
+
+    function uniqueStageName(pick) {
+        let name = '新阶段';
+        let serial = 2;
+        while (pick.stages.some(stage => stage.name === name)) {
+            name = `新阶段 ${serial}`;
+            serial += 1;
         }
+        return name;
+    }
+
+    function storyLines(stages) {
+        const stored = [];
+        stages.forEach(stage => {
+            cleanLineTo(stage.lineTo).forEach(link => {
+                if (stages.some(item => item.id === link.to)) stored.push({ from: stage.id, to: link.to, kind: link.kind });
+            });
+        });
+        if (stored.length) return stored;
+        const rows = storyRows(stages);
+        const lines = [];
+        for (let index = 0; index < rows.length - 1; index += 1) {
+            const froms = rows[index];
+            const tos = rows[index + 1];
+            const kind = tos.length > 1 || froms.length > 1 ? 'split' : 'down';
+            if (froms.length === 1) tos.forEach(to => lines.push({ from: froms[0].id, to: to.id, kind }));
+            else if (tos.length === 1) froms.forEach(from => lines.push({ from: from.id, to: tos[0].id, kind: 'down' }));
+            else froms.forEach((from, at) => { if (tos[at]) lines.push({ from: from.id, to: tos[at].id, kind: 'down' }); });
+        }
+        return lines;
+    }
+
+    function addStoryLine(editor, from, to, kind) {
+        if (!from.lineTo || !from.lineTo.length) {
+            storyLines(stageSequence(editor.pick)).forEach(link => {
+                const owner = editor.pick.stages.find(stage => stage.id === link.from);
+                if (!owner) return;
+                owner.lineTo = cleanLineTo(owner.lineTo);
+                if (!owner.lineTo.some(item => item.to === link.to && item.kind === link.kind)) owner.lineTo.push({ to: link.to, kind: link.kind });
+            });
+        }
+        from.lineTo = cleanLineTo(from.lineTo);
+        if (!from.lineTo.some(item => item.to === to && item.kind === kind)) from.lineTo.push({ to, kind });
         editor.dirty = true;
+    }
+
+    function insertLinkedStage(editor, anchor, kind) {
+        const pick = editor && editor.pick;
+        if (!pick || !anchor) return;
+        const stage = freshStage(pick, uniqueStageName(pick));
+        if (kind === 'side') stage.side = true;
+        const at = pick.stages.indexOf(anchor);
+        pick.stages.splice(at + 1, 0, stage);
+        addStoryLine(editor, anchor, stage.id, kind);
+        editor.roadFocus = stage.id;
         openSheet({ owner: stage });
     }
 
@@ -7423,29 +7473,115 @@
             }
         }
         const stages = stageSequence(editor.pick);
-        const rows = storyRows(stages);
         if (!stages.length) {
             return el('div', { class: 'dga-road' },
-                btn('加第一段', () => insertRoadStage(editor, null, false), { primary: true }));
+                btn('加第一段', () => {
+                    const stage = freshStage(editor.pick, '第一段');
+                    editor.pick.stages.push(stage);
+                    editor.dirty = true;
+                    editor.roadFocus = stage.id;
+                    openSheet({ owner: stage });
+                }, { primary: true }));
         }
-        const list = el('div', { class: 'dga-road' });
-        rows.forEach(row => {
-            const anchor = row[row.length - 1];
-            list.append(el('div', { class: `dga-road-row${row.length > 1 ? ' is-choice' : ''}` },
-                ...row.map(stage => {
-                    const back = stages.find(item => item.id === stage.loopTo);
-                    const note = stage.terminal ? '到此结束' : (back ? `走完回到「${back.name}」` : '点开修改');
-                    return el('button', {
-                        type: 'button',
-                        class: 'dga-road-card',
-                        onclick: () => openSheet({ owner: stage }),
-                    }, el('b', { text: stage.name || '未命名' }), el('small', { text: note }));
-                })));
-            list.append(el('div', { class: 'dga-road-actions' },
-                btn('再加一条路', () => insertRoadStage(editor, anchor, true), { ghost: true }),
-                btn('在后面加一段', () => insertRoadStage(editor, anchor, false), { ghost: true })));
+        const lines = storyLines(stages);
+        const structural = lines.filter(link => link.kind !== 'transfer');
+        const incoming = new Set(structural.map(link => link.to));
+        const depth = new Map();
+        const queue = stages.filter(stage => !incoming.has(stage.id)).map(stage => stage.id);
+        if (!queue.length && stages[0]) queue.push(stages[0].id);
+        queue.forEach(id => depth.set(id, 0));
+        for (let guard = 0; guard < stages.length * 4 && queue.length; guard += 1) {
+            const id = queue.shift();
+            const nextDepth = (depth.get(id) || 0) + 1;
+            structural.filter(link => link.from === id).forEach(link => {
+                if ((depth.get(link.to) || 0) < nextDepth) {
+                    depth.set(link.to, nextDepth);
+                    queue.push(link.to);
+                }
+            });
+        }
+        stages.forEach((stage, index) => { if (!depth.has(stage.id)) depth.set(stage.id, index); });
+        const columns = new Map();
+        stages.forEach(stage => {
+            const row = depth.get(stage.id) || 0;
+            if (!columns.has(row)) columns.set(row, []);
+            columns.get(row).push(stage);
         });
-        return list;
+        const cardW = 168;
+        const cardH = 72;
+        const gapX = 36;
+        const gapY = 64;
+        const placed = new Map();
+        let maxX = 320;
+        columns.forEach(row => {
+            const width = row.length * cardW + Math.max(0, row.length - 1) * gapX;
+            maxX = Math.max(maxX, width + 48);
+        });
+        let maxY = 160;
+        columns.forEach((row, rowIndex) => {
+            const width = row.length * cardW + Math.max(0, row.length - 1) * gapX;
+            const left = Math.max(16, Math.round((maxX - width) / 2));
+            row.forEach((stage, index) => {
+                const x = left + index * (cardW + gapX);
+                const y = 16 + rowIndex * (cardH + gapY);
+                placed.set(stage.id, { x, y });
+                maxY = Math.max(maxY, y + cardH + 24);
+            });
+        });
+        const byId = new Map(stages.map(stage => [stage.id, stage]));
+        const board = el('div', { class: 'dga-graph', style: { height: `${maxY}px` } });
+        lines.forEach(link => {
+            const from = placed.get(link.from);
+            const to = placed.get(link.to);
+            if (!from || !to) return;
+            const x1 = from.x + cardW / 2;
+            const y1 = from.y + cardH;
+            const x2 = to.x + cardW / 2;
+            const y2 = to.y;
+            const klass = link.kind === 'transfer' ? 'is-transfer' : (link.kind === 'side' ? 'is-side' : '');
+            board.append(el('div', {
+                class: `dga-graph-line ${klass}`,
+                style: {
+                    left: `${Math.min(x1, x2)}px`,
+                    top: `${Math.min(y1, y2)}px`,
+                    width: `${Math.max(2, Math.abs(x2 - x1))}px`,
+                    height: `${Math.max(2, Math.abs(y2 - y1))}px`,
+                },
+            }));
+        });
+        stages.forEach(stage => {
+            const pos = placed.get(stage.id);
+            const focused = editor.roadFocus === stage.id;
+            const note = stage.side ? '支线' : (lines.some(link => link.from === stage.id && link.kind === 'split') ? '从这里分开' : '往下走');
+            board.append(el('button', {
+                type: 'button',
+                class: `dga-road-card${focused ? ' is-on' : ''}${stage.side ? ' is-side' : ''}`,
+                style: { left: `${pos.x}px`, top: `${pos.y}px`, width: `${cardW}px` },
+                onclick: () => { editor.roadFocus = stage.id; render(); },
+            }, el('b', { text: stage.name || '未命名' }), el('small', { text: note })));
+        });
+        const focus = byId.get(editor.roadFocus) || null;
+        const others = focus ? stages.filter(stage => stage !== focus) : [];
+        const bar = focus ? el('div', { class: 'dga-road-actions' },
+            btn('往下接一段', () => insertLinkedStage(editor, focus, 'down'), { ghost: true }),
+            btn('从这里分开', () => insertLinkedStage(editor, focus, 'split'), { ghost: true }),
+            btn(focus.side ? '改回主路' : '标成支线', () => {
+                focus.side = !focus.side;
+                editor.dirty = true;
+                render();
+            }, { ghost: true }),
+            others.length ? selectControl(
+                [{ value: '', label: '转到另一条' }].concat(others.map(stage => ({ value: stage.id, label: stage.name }))),
+                '',
+                value => {
+                    if (!value) return;
+                    addStoryLine(editor, focus, value, 'transfer');
+                    render();
+                },
+            ) : null,
+            btn('改这段', () => openSheet({ owner: focus }), { ghost: true }),
+        ) : muted('点一张卡片，再决定往下接、分开、转线，或标成支线。');
+        return el('div', { class: 'dga-road' }, board, bar);
     }
 
     function renderTimeline() {
@@ -8973,7 +9109,14 @@ ${P} .dga-sheet-section { display: flex; flex-direction: column; gap: 8px; paddi
 ${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--dga-text-2); }
 ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
-${P} .dga-road { display: flex; flex-direction: column; gap: 8px; }
+${P} .dga-road { display: flex; flex-direction: column; gap: 12px; }
+${P} .dga-graph { position: relative; min-height: 220px; }
+${P} .dga-graph .dga-road-card { position: absolute; height: 72px; }
+${P} .dga-road-card.is-on { border-color: var(--dga-accent); }
+${P} .dga-road-card.is-side { border-left: 5px solid var(--dga-warning); }
+${P} .dga-graph-line { position: absolute; border-left: 2px solid var(--dga-text-3); border-bottom: 2px solid var(--dga-text-3); pointer-events: none; }
+${P} .dga-graph-line.is-transfer { border-color: var(--dga-accent); }
+${P} .dga-graph-line.is-side { border-color: var(--dga-warning); }
 ${P} .dga-road-row { display: flex; gap: 8px; overflow-x: auto; }
 ${P} .dga-road-card { flex: 1 0 140px; min-height: 72px; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; text-align: left; cursor: pointer; }
 ${P} .dga-road-card b, ${P} .dga-road-card small { display: block; }
