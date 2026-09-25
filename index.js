@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.91
+     * 动态指导助手 v2.92
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.91';
+    const VERSION = '2.92';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -7327,7 +7327,7 @@
         );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
-            : '拖选正文再选归属。原文不会被改写，也不会换位置。↑↓ 只改进入下一阶段的顺序。依附、循环在小卡的设置里。';
+            : '拖选正文再选归属。原文不会被改写，也不会换位置。按住滑杆可以拖着调整上下顺序。依附、循环在小卡的设置里。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
             messageBar(),
@@ -7830,11 +7830,45 @@
         }, label);
         const canMove = owner.kind === 'stage' && stageIndex != null && stageIndex >= 0;
         const stageTotal = stageSequence(editor.pick).length;
+        const grip = canMove ? el('span', {
+            class: 'dga-grip',
+            title: '按住上下拖，调整顺序',
+            text: '⋮',
+            onclick: event => event.stopPropagation(),
+            onpointerdown: event => {
+                event.preventDefault();
+                event.stopPropagation();
+                const bar = event.currentTarget.parentNode;
+                const startY = event.clientY;
+                const slots = Array.from(bar.parentNode.querySelectorAll('.dga-segbar[data-stage-index]')).map(node => {
+                    const rect = node.getBoundingClientRect();
+                    return { index: Number(node.getAttribute('data-stage-index')), mid: rect.top + rect.height / 2 };
+                });
+                let target = stageIndex;
+                bar.classList.add('is-dragging');
+                const onMove = ev => {
+                    bar.style.transform = `translateY(${ev.clientY - startY}px)`;
+                    target = 0;
+                    slots.forEach(slot => { if (ev.clientY >= slot.mid) target = slot.index; });
+                };
+                const onUp = () => {
+                    hostWindow.removeEventListener('pointermove', onMove);
+                    hostWindow.removeEventListener('pointerup', onUp);
+                    bar.style.transform = '';
+                    bar.classList.remove('is-dragging');
+                    placeSegment(editor, owner, target);
+                };
+                hostWindow.addEventListener('pointermove', onMove);
+                hostWindow.addEventListener('pointerup', onUp);
+            },
+        }) : null;
         return el('div', pressable({
             class: 'dga-segbar',
             'data-dga-skip': '1',
+            ...(canMove ? { 'data-stage-index': String(stageIndex) } : {}),
             style: { '--dga-c': owner.color },
         }, () => openSheet({ owner })),
+            grip,
             el('span', { class: 'dga-tag', text: tag }),
             el('div', { class: 'dga-heading-text' },
                 el('b', { text: owner.name }),
@@ -7856,6 +7890,19 @@
         if (index < 0 || target < 0 || target >= stages.length) return;
         const [item] = stages.splice(index, 1);
         stages.splice(target, 0, item);
+        editor.dirty = true;
+        editor.sheet = null;
+        render();
+    }
+
+    function placeSegment(editor, owner, toIndex) {
+        if (owner.kind !== 'stage') return;
+        const stages = editor.pick.stages;
+        const from = stages.indexOf(owner);
+        const to = Math.max(0, Math.min(stages.length - 1, toIndex));
+        if (from < 0 || from === to) return;
+        const [item] = stages.splice(from, 1);
+        stages.splice(to, 0, item);
         editor.dirty = true;
         editor.sheet = null;
         render();
@@ -9028,7 +9075,9 @@ ${P} .dga-heading-text b { font-size: 14px; overflow-wrap: anywhere; }
 ${P} .dga-heading-text small { color: var(--dga-text-2); font-size: 13px; overflow-wrap: anywhere; }
 ${P} .dga-tag { flex: 0 0 auto; padding: 2px 8px; border-radius: 4px; background: var(--dga-c, #8b5cf6); color: var(--dga-on-accent); font-size: 11px; font-weight: 700; white-space: nowrap; }
 ${P} .dga-chev { color: var(--dga-text-3); font-size: 16px; }
-${P} .dga-move-wrap { display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto; }
+${P} .dga-grip { flex: 0 0 auto; width: 16px; align-self: stretch; display: flex; align-items: center; justify-content: center; cursor: grab; color: var(--dga-text-3); touch-action: none; user-select: none; font-size: 14px; letter-spacing: -1px; }
+${P} .dga-grip:active { cursor: grabbing; }
+${P} .dga-segbar.is-dragging { position: relative; z-index: 3; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35); }
 ${P} .dga-move { width: 32px; min-height: 26px; padding: 0; border-radius: 4px; border: 1px solid var(--dga-border-2); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); color: inherit; font: inherit; font-size: 12px; line-height: 1; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-move:hover { background: var(--dga-hover); }
 ${P} .dga-move:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
