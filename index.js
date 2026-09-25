@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.99
+     * 动态指导助手 v2.99.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.99';
+    const VERSION = '2.99.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2186,6 +2186,15 @@
     }
 
     // 配置条目只给插件读：关掉，并清掉从模板克隆来的关键词和常驻开关，避免被重新打开后发给 AI。
+    // 酒馆助手的次要关键词是 { logic, keys }，不能写成数组，否则保存时 keys.map 会报错。
+    function sealedSecondaryKeys(strategy) {
+        const raw = strategy && strategy.keys_secondary;
+        const logic = raw && typeof raw === 'object' && !Array.isArray(raw) && typeof raw.logic === 'string' && raw.logic
+            ? raw.logic
+            : 'and_any';
+        return { logic, keys: [] };
+    }
+
     function sealConfigEntry(entry) {
         entry.enabled = false;
         entry.disable = true;
@@ -2196,7 +2205,12 @@
         entry.secondary_keys = [];
         entry.keysecondary = [];
         if (entry.strategy && typeof entry.strategy === 'object') {
-            entry.strategy = { ...entry.strategy, type: 'selective', keys: [], keys_secondary: [] };
+            entry.strategy = {
+                ...entry.strategy,
+                type: 'selective',
+                keys: [],
+                keys_secondary: sealedSecondaryKeys(entry.strategy),
+            };
         }
         return entry;
     }

@@ -1342,7 +1342,7 @@ test('跟角色卡走时，配置条目关掉且不带关键词，短正文靠�
     const storage = memoryStorage({ 'dynamic-guide-assistant:config-storage:v1': 'card' });
     const books = {
         甲书: [
-            { uid: 1, name: '大纲', content: '## 开场\n走\n\n## 离开\n跑', enabled: false, keys: ['大纲'], constant: true },
+            { uid: 1, name: '大纲', content: '## 开场\n走\n\n## 离开\n跑', enabled: false, keys: ['大纲'], constant: true, strategy: { type: 'selective', keys: ['大纲'], keys_secondary: { logic: 'and_all', keys: ['秘密'] } } },
             { uid: 9, name: '大纲（动态指导）', content: '## 当前阶段：离开\n跑', enabled: true, keys: ['大纲'] },
         ],
     };
@@ -1359,6 +1359,8 @@ test('跟角色卡走时，配置条目关掉且不带关键词，短正文靠�
     assert.equal(configEntry.disable, true);
     assert.equal(configEntry.constant, false);
     assert.equal(JSON.stringify(configEntry.keys), '[]');
+    assert.equal(JSON.stringify(configEntry.strategy.keys), '[]');
+    assert.equal(JSON.stringify(configEntry.strategy.keys_secondary), JSON.stringify({ logic: 'and_all', keys: [] }));
     const parsed = JSON.parse(configEntry.content);
     assert.equal(parsed.settings.judgePreset, undefined, '写进世界书的配置要去掉 API 预设名');
     assert.equal(parsed.settings.conditionPreset, undefined, '生成用的 API 预设名也不跟卡走');
