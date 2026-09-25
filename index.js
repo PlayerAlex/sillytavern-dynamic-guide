@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.99.1
+     * 动态指导助手 v2.99.2
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.99.1';
+    const VERSION = '2.99.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -5577,17 +5577,19 @@
                 { value: 'loop', label: '循环' },
                 { value: 'pick', label: 'AI 选下一段' },
             ];
+            const order = selectControl(orderOptions, bindingOrderMode(binding), value => {
+                const label = { order: '按顺序', loop: '循环', pick: 'AI 选下一段' }[value] || '按顺序';
+                runAction('保存阶段怎么走', () => saveBindingOrder(binding, value), {
+                    success: `「${binding.entryName || '条目'}」改为${label}`,
+                });
+            });
             return el('div', { class: 'dga-dev-line' },
-                el('div', { class: 'dga-heading-text' },
-                    el('b', { text: binding.entryName || '未命名条目' }),
-                    el('small', { text: stageName || '还没有阶段' })),
-                field('从第几步', input),
-                field('怎么走', selectControl(orderOptions, bindingOrderMode(binding), value => {
-                    const label = { order: '按顺序', loop: '循环', pick: 'AI 选下一段' }[value] || '按顺序';
-                    runAction('保存阶段怎么走', () => saveBindingOrder(binding, value), {
-                        success: `「${binding.entryName || '条目'}」改为${label}`,
-                    });
-                })),
+                el('b', { text: binding.entryName || '未命名条目' }),
+                el('span', { class: 'dga-dev-cap', text: '从第几步' }),
+                el('span', { class: 'dga-dev-cap', text: '怎么走' }),
+                el('small', { text: stageName || '还没有阶段' }),
+                input,
+                order,
             );
         });
         return [header('开发者模式', '作者向设置', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
@@ -9321,17 +9323,14 @@ ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
 ${P} .dga-dev-meta { margin: 0; font-size: 12px; color: var(--dga-text-2); }
-${P} .dga-dev-line { display: grid; grid-template-columns: minmax(0, 1fr) 88px 132px; gap: 8px 10px; align-items: end; }
-${P} .dga-dev-line + .dga-dev-line { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--dga-border); }
-${P} .dga-dev-line .dga-heading-text { align-self: center; }
-${P} .dga-dev-line .dga-field { min-width: 0; gap: 4px; }
-${P} .dga-dev-line .dga-field > span { font-size: 12px; }
-${P} .dga-dev-line input.dga-dev-num { width: 100%; min-height: 36px; padding: 6px 8px; text-align: center; }
-${P} .dga-dev-line select { min-height: 36px; padding: 6px 8px; }
-@media (max-width: 520px) {
-    ${P} .dga-dev-line { grid-template-columns: minmax(0, 1fr) 72px; }
-    ${P} .dga-dev-line .dga-field:last-child { grid-column: 1 / -1; }
-}
+${P} .dga-dev-line { display: grid; grid-template-columns: minmax(0, 1fr) 88px 140px; grid-template-rows: auto 36px; column-gap: 12px; row-gap: 6px; align-items: center; }
+${P} .dga-dev-line + .dga-dev-line { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dga-border); }
+${P} .dga-dev-line b { font-size: 14px; line-height: 1.2; overflow-wrap: anywhere; }
+${P} .dga-dev-line small { color: var(--dga-text-2); font-size: 13px; line-height: 36px; overflow-wrap: anywhere; }
+${P} .dga-dev-cap { font-size: 12px; line-height: 1.2; color: var(--dga-text-3); }
+${P} .dga-dev-line input.dga-dev-num,
+${P} .dga-dev-line select { width: 100%; height: 36px; min-height: 36px; padding: 0 8px; line-height: 34px; }
+${P} .dga-dev-line input.dga-dev-num { text-align: center; }
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; gap: 4px; }
 ${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
