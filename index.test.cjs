@@ -1939,6 +1939,8 @@ test('分段视图：从选中文字新建阶段，弹层确认后还能退回�
     const sheet = panel().querySelector('.dga-sheet');
     assert.ok(sheet, '新建后要直接打开属性弹层让用户确认名称');
     assert.match(findTag(sheet, 'H3').textContent, /修改「开头介绍」/);
+    assert.equal(findButton(sheet, '并入'), null);
+    assert.doesNotMatch(sheet.textContent, /并入/);
     assert.equal(findButton(sheet, '删掉这段') ? true : false, true, '弹层要有删除出口');
     findButton(sheet, '取消').listeners.click[0]();
 

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.88
+     * 动态指导助手 v2.89
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.88';
+    const VERSION = '2.89';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -7871,7 +7871,7 @@
 
     // 唯一属性编辑器（v2.28）：一个属主（阶段/附加/常驻/备注）的全部属性都在这里改。
     // 弹层按按钮才落盘，所以不存在边打字边重建正文的焦点问题。
-    function makeSheet(owner) {
+    function makeSheet(owner, options) {
         return {
             owner,
             name: owner.name,
@@ -7881,6 +7881,7 @@
             loopTo: owner.kind === 'stage' ? String(owner.loopTo || '') : '',
             branch: owner.kind === 'stage' ? String(owner.branch || '') : '',
             mergeInto: '',
+            creating: Boolean(options && options.creating),
             exclusiveIds: exclusivePartnerIds(ui.editor && ui.editor.pick, owner),
             extras: cleanExtras(owner.extras).map(item => ({ ...item })),
             from: owner.kind === 'addon' ? owner.from : '',
@@ -8343,7 +8344,7 @@
                     btn('AI 生成', () => runAction('生成完成条件', () => generateCondition(sheet, completion), {
                         success: '已生成，确认后点「保存修改」。',
                     }), { ghost: true }))));
-            if (others.length) {
+            if (others.length && !sheet.creating) {
                 box.append(sheetSection('整理',
                     others.length ? field('再分配', selectControl(
                         [{ value: '', label: '不并入' }].concat(others.map(stage => ({ value: stage.id, label: `并入「${stage.name}」` }))),
@@ -8683,7 +8684,7 @@
         pick.pendingRanges = [];
         clearNativeSelection();
         editor.dirty = true;
-        if (created) editor.sheet = makeSheet(created);
+        if (created) editor.sheet = makeSheet(created, { creating: true });
         render();
     }
 
