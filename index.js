@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.87
+     * 动态指导助手 v2.88
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.87';
+    const VERSION = '2.88';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6764,11 +6764,21 @@
         if (page === 'timeline') page = 'editor';
         if ((page === 'editor' && ui.view === 'editor')
             || (page === 'pace' && ui.view === 'pace')) return false;
+        const context = workContext();
+        if (!context || context.broken || !context.entry) throw new Error('这条绑定不可用。');
+        const sameEditor = ui.editor && ui.editor.entry && context.entry
+            && ui.editor.entry.uid === context.entry.uid
+            && ui.editor.worldbookName === context.worldbookName;
+        // 设置算编辑的一页：切过去不丢掉没保存的分段，也不再问要不要放弃。
+        if (page === 'pace' && sameEditor) {
+            ui.workKey = context.key;
+            ui.paceKey = context.key;
+            ui.view = 'pace';
+            return false;
+        }
         if (page !== 'editor' && ui.view === 'editor' && editorUnsaved(ui.editor)) {
             if (!hostWindow.confirm('还有没保存的修改，确定放弃？')) return false;
         }
-        const context = workContext();
-        if (!context || context.broken || !context.entry) throw new Error('这条绑定不可用。');
         ui.workKey = context.key;
         if (page === 'editor') {
             ui.paceKey = '';
@@ -6848,6 +6858,12 @@
     function renderPacePage() {
         const context = workContext();
         const back = () => {
+            if (ui.editor) {
+                ui.view = 'editor';
+                ui.paceKey = '';
+                render();
+                return;
+            }
             ui.view = 'guide';
             ui.paceKey = '';
             ui.workKey = '';
