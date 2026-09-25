@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.99.2
+     * 动态指导助手 v2.99.3
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.99.2';
+    const VERSION = '2.99.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -5583,11 +5583,12 @@
                     success: `「${binding.entryName || '条目'}」改为${label}`,
                 });
             });
+            order.className = 'dga-dev-order';
             return el('div', { class: 'dga-dev-line' },
-                el('b', { text: binding.entryName || '未命名条目' }),
-                el('span', { class: 'dga-dev-cap', text: '从第几步' }),
-                el('span', { class: 'dga-dev-cap', text: '怎么走' }),
-                el('small', { text: stageName || '还没有阶段' }),
+                el('b', { class: 'dga-dev-name', text: binding.entryName || '未命名条目' }),
+                el('span', { class: 'dga-dev-cap dga-dev-cap-step', text: '从第几步' }),
+                el('span', { class: 'dga-dev-cap dga-dev-cap-order', text: '怎么走' }),
+                el('small', { class: 'dga-dev-stage', text: stageName || '还没有阶段' }),
                 input,
                 order,
             );
@@ -9323,14 +9324,21 @@ ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
 ${P} .dga-dev-meta { margin: 0; font-size: 12px; color: var(--dga-text-2); }
-${P} .dga-dev-line { display: grid; grid-template-columns: minmax(0, 1fr) 88px 140px; grid-template-rows: auto 36px; column-gap: 12px; row-gap: 6px; align-items: center; }
+${P} .dga-dev-line { display: grid; grid-template-columns: minmax(0, 1fr) 88px minmax(120px, 160px); grid-template-areas: "name stepcap ordercap" "stage step order"; column-gap: 12px; row-gap: 6px; align-items: center; }
 ${P} .dga-dev-line + .dga-dev-line { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dga-border); }
-${P} .dga-dev-line b { font-size: 14px; line-height: 1.2; overflow-wrap: anywhere; }
-${P} .dga-dev-line small { color: var(--dga-text-2); font-size: 13px; line-height: 36px; overflow-wrap: anywhere; }
+${P} .dga-dev-name { grid-area: name; font-size: 14px; line-height: 1.35; }
+${P} .dga-dev-stage { grid-area: stage; color: var(--dga-text-2); font-size: 13px; line-height: 1.35; }
 ${P} .dga-dev-cap { font-size: 12px; line-height: 1.2; color: var(--dga-text-3); }
+${P} .dga-dev-cap-step { grid-area: stepcap; }
+${P} .dga-dev-cap-order { grid-area: ordercap; }
+${P} .dga-dev-line input.dga-dev-num { grid-area: step; }
+${P} .dga-dev-line select.dga-dev-order { grid-area: order; }
 ${P} .dga-dev-line input.dga-dev-num,
-${P} .dga-dev-line select { width: 100%; height: 36px; min-height: 36px; padding: 0 8px; line-height: 34px; }
+${P} .dga-dev-line select.dga-dev-order { width: 100%; height: 36px; min-height: 36px; padding: 0 8px; line-height: 34px; }
 ${P} .dga-dev-line input.dga-dev-num { text-align: center; }
+@media (max-width: 720px) {
+    ${P} .dga-dev-line { grid-template-columns: 1fr 1fr; grid-template-areas: "name name" "stage stage" "stepcap ordercap" "step order"; }
+}
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; gap: 4px; }
 ${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
