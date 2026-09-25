@@ -3974,9 +3974,11 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
         return out;
     })(sheet(), []);
     assert.equal(forkSelect.length, 1);
-    const option = optionsOf(forkSelect[0]).find(item => item.textContent === '第二幕');
+    const option = optionsOf(forkSelect[0]).find(item => item.textContent === '之后 · 第二幕');
     forkSelect[0].value = optionValue(option);
     forkSelect[0].listeners.change[0]({ target: forkSelect[0] });
+    assert.match(sheet().textContent, /同时/, '正在改的这一段标成同时');
+    assert.match(sheet().textContent, /之后/, '排在后面的段标成之后');
     assert.match(sheet().textContent, /第二幕/, '加上之后才出现在岔路里');
     assert.equal(findButton(sheet(), '第二幕'), null, '岔路里的段不是一排开关');
     findButton(sheet(), '加一条附加').listeners.click[0]();

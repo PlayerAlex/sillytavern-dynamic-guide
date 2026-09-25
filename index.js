@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.75
+     * 动态指导助手 v2.76
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.75';
+    const VERSION = '2.76';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -7899,20 +7899,30 @@
                         render();
                     }, { ghost: true }));
             });
-            const others = stageSequence(editor.pick).filter(stage => stage !== owner);
+            const stages = stageSequence(editor.pick);
+            const forkWhen = stage => {
+                const at = stages.indexOf(owner);
+                const other = stages.indexOf(stage);
+                if (other < at) return 'before';
+                if (other > at) return 'after';
+                return 'now';
+            };
+            const forkWhenText = { before: '之前', now: '同时', after: '之后' };
+            const others = stages.filter(stage => stage !== owner);
             const chosen = others.filter(stage => (sheet.exclusiveIds || []).includes(stage.id));
             const available = others.filter(stage => !(sheet.exclusiveIds || []).includes(stage.id));
-            const forkRows = [
-                el('div', { class: 'dga-fork-row is-self' }, el('b', { text: '正在改的这一段' })),
-                ...chosen.map(stage => el('div', { class: 'dga-fork-row' },
-                    el('b', { text: stage.name }),
-                    btn('不要这段', () => {
-                        sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
-                        render();
-                    }, { ghost: true }))),
-            ];
+            const forkRow = (stage, when) => el('div', { class: `dga-fork-row is-${when}` },
+                el('span', { class: 'dga-fork-when', text: forkWhenText[when] }),
+                el('b', { text: stage === owner ? '正在改的这一段' : stage.name }),
+                stage === owner ? null : btn('不要这段', () => {
+                    sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
+                    render();
+                }, { ghost: true }));
+            const forkRows = [owner, ...chosen]
+                .sort((left, right) => stages.indexOf(left) - stages.indexOf(right))
+                .map(stage => forkRow(stage, forkWhen(stage)));
             const forkAdd = available.length ? selectControl(
-                [{ value: '', label: '再加一段可以选' }].concat(available.map(stage => ({ value: stage.id, label: stage.name }))),
+                [{ value: '', label: '再加一段可以选' }].concat(available.map(stage => ({ value: stage.id, label: `${forkWhenText[forkWhen(stage)]} · ${stage.name}` }))),
                 '',
                 value => {
                     if (!value) return;
@@ -7935,7 +7945,7 @@
             box.append(sheetSection('走到这里要选一段',
                 chosen.length ? el('div', { class: 'dga-fork-list' }, ...forkRows) : muted(others.length ? '不用选。按顺序往下走就行。' : '还没有别的段。'),
                 forkAdd,
-                muted(chosen.length ? '上面这几段里，只能走一段。没写在这里的段，不会在这里让人选。' : '如果走到这里必须挑一段，用上面的框把那段加进来。')));
+                muted(chosen.length ? '上面这几段里，只能走一段。黄的是前面。蓝的是同时。绿的是后面。' : '如果走到这里必须挑一段，用上面的框把那段加进来。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
@@ -8691,7 +8701,15 @@ ${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color
 ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
 ${P} .dga-fork-list { display: flex; flex-direction: column; gap: 6px; }
-${P} .dga-fork-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; padding: 4px 4px 4px 12px; border: 1px solid var(--dga-border); border-radius: 6px; }
+${P} .dga-fork-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; padding: 4px 4px 4px 12px; border: 1px solid var(--dga-border); border-left-width: 5px; border-radius: 6px; }
+${P} .dga-fork-row b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+${P} .dga-fork-when { flex: 0 0 auto; font-size: 12px; font-weight: 700; }
+${P} .dga-fork-row.is-before { border-left-color: var(--dga-warning); background: color-mix(in srgb, var(--dga-warning) 16%, transparent); }
+${P} .dga-fork-row.is-before .dga-fork-when { color: var(--dga-warning); }
+${P} .dga-fork-row.is-now { border-left-color: var(--dga-accent); background: color-mix(in srgb, var(--dga-accent) 16%, transparent); }
+${P} .dga-fork-row.is-now .dga-fork-when { color: var(--dga-accent); }
+${P} .dga-fork-row.is-after { border-left-color: #7DCEA0; background: color-mix(in srgb, #7DCEA0 16%, transparent); }
+${P} .dga-fork-row.is-after .dga-fork-when { color: #7DCEA0; }
 ${P} .dga-fork-row .dga-btn { flex: 0 0 auto; }
 ${P} .dga-sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-sheet-actions .dga-btn { flex: 1 1 40%; }
