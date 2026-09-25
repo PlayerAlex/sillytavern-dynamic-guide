@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.79
+     * 动态指导助手 v2.80
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.79';
+    const VERSION = '2.80';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2343,6 +2343,7 @@
             if (Number.isFinite(ownInterval) && ownInterval >= 1) binding.judgeInterval = ownInterval;
             const layout = cleanLayout(item.layout);
             if (layout) binding.layout = layout;
+            if (item.storyGuide === true) binding.storyGuide = true;
             const key = bindingKey(binding);
             if (seen.has(key)) return;
             seen.add(key);
@@ -2975,6 +2976,16 @@
             pendingRanges: [],
             tapHead: null,
         };
+    }
+
+    function storyDocument(pick) {
+        const source = String(pick && pick.text || '');
+        return stageSequence(pick).map(stage => {
+            const name = String(stage && stage.name || '未命名').trim() || '未命名';
+            const card = stage && typeof stage.body === 'string' ? stage.body.trim() : '';
+            const body = card || sliceRanges(source, stage && stage.ranges);
+            return body ? `## ${name}\n${body}` : `## ${name}`;
+        }).join('\n\n');
     }
 
     function layoutFromPick(pick) {
@@ -4002,6 +4013,90 @@
     // 绑定（v2.27）：不再弹确认框——绑定是非破坏性的，随时可以在小卡上点 × 解绑
     // 回退，而弹窗会让「连绑多条」变成反复确认。条目会被关闭这件事写在卡片提示
     // 与运行日志里；解绑（会删掉当前聊天进度）仍然保留二次确认。
+    async function createStoryGuide(spec) {
+        const worldbookName = spec.worldbookName;
+        const name = String(spec.name || '').trim();
+        if (!worldbookName) throw new Error('先选一本世界书。');
+        if (!name) throw new Error('先写剧情指导的名字。');
+        const position = {
+            type: spec.positionType || 'before_character_definition',
+            order: Math.max(0, Math.floor(Number(spec.order) || 0)),
+        };
+        const content = '## 第一段\n';
+        let created = null;
+        await updateWorldbook(worldbookName, worldbook => {
+            if (worldbookEntries(worldbook).some(item => entryName(item) === name)) {
+                throw new Error('这本世界书里已经有同名条目。');
+            }
+            const template = worldbookEntries(worldbook).find(entry => entry && typeof entry === 'object') || {};
+            const full = {
+                ...template,
+                uid: freshUid(worldbook),
+                comment: name,
+                name,
+                title: name,
+                content,
+                enabled: false,
+                disable: true,
+                position,
+                order: position.order,
+                insertion_order: position.order,
+                key: [],
+                keysecondary: [],
+                constant: true,
+            };
+            addEntryToWorldbook(worldbook, full);
+            const small = buildMirrorEntry(full, freshUid(worldbook), mirrorNameFor(name), '');
+            small.position = { ...position };
+            small.order = position.order;
+            small.insertion_order = position.order;
+            small.enabled = true;
+            if ('disable' in small) small.disable = false;
+            addEntryToWorldbook(worldbook, small);
+            created = full;
+            return worldbook;
+        });
+        const layout = {
+            version: 3,
+            loop: false,
+            stages: [{
+                id: 'stage-1',
+                name: '第一段',
+                completion: '',
+                terminal: false,
+                branch: '',
+                ranges: [{ start: content.indexOf('第一段') + '第一段'.length + 1, end: content.length }],
+                body: '',
+            }],
+            addons: [],
+            always: { ranges: [] },
+            note: { ranges: [] },
+        };
+        const config = await readConfig();
+        const candidate = {
+            worldbookName,
+            entryUid: created.uid,
+            entryName: name,
+            boundAt: new Date().toISOString(),
+            layout,
+            storyGuide: true,
+        };
+        await writeConfig(configWithBindings(config, [...config.bindings, candidate]));
+        await writeStateFor(bindingKey(candidate), {
+            stageIndex: 0,
+            stageName: '第一段',
+            lastCompletionMessageId: null,
+            lastCompletionFingerprint: '',
+            lastJudgeCheckedId: null,
+            updatedAt: new Date().toISOString(),
+        });
+        await syncMirrors('normal');
+        ui.storyNew = null;
+        ui.workKey = bindingKey(candidate);
+        await openEditorAt(worldbookName, created, { focusStageIndex: 0 });
+        if (ui.editor) ui.editor.mode = 'road';
+    }
+
     async function addBinding(worldbookName, entry) {
         if (!worldbookName || !entry) throw new Error('请先选择世界书和大纲条目。');
         const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
@@ -5036,6 +5131,7 @@
         judgeRuleTestResult: null,
         // 条目搜索，以及每条小卡「本次附加要求」（只对下一次现在检查生效）
         entryQuery: '',
+        storyNew: null,
         entryQueryFocus: false,
         judgeExtras: {},
         guideSection: 'dga-card-bind',
@@ -6868,6 +6964,43 @@
                 ui.addEntryKey = null;
             }),
         )));
+        const draft = ui.storyNew;
+        children.push(btn('新建剧情指导', () => {
+            ui.storyNew = draft ? null : {
+                name: '剧情指导',
+                positionType: 'before_character_definition',
+                order: '100',
+            };
+            render();
+        }, { ghost: true }));
+        if (draft) {
+            const nameInput = el('input', {
+                type: 'text',
+                maxlength: 60,
+                oninput: event => { draft.name = event.target.value; },
+            });
+            nameInput.value = draft.name || '';
+            const orderInput = el('input', {
+                type: 'text',
+                inputmode: 'numeric',
+                oninput: event => { draft.order = event.target.value; },
+            });
+            orderInput.value = draft.order == null ? '100' : String(draft.order);
+            children.push(field('名字', nameInput));
+            children.push(field('放在哪', selectControl([
+                { value: 'before_character_definition', label: '角色定义前' },
+                { value: 'after_character_definition', label: '角色定义后' },
+                { value: 'before_example_messages', label: '示例消息前' },
+                { value: 'after_example_messages', label: '示例消息后' },
+            ], draft.positionType, value => { draft.positionType = value; })));
+            children.push(field('顺序', orderInput, '数字越小越靠前。'));
+            children.push(btn('创建', () => runAction('新建剧情指导', () => createStoryGuide({
+                worldbookName: ui.selectedWorldbook,
+                name: draft.name,
+                positionType: draft.positionType,
+                order: draft.order,
+            })), { primary: true }));
+        }
         const needle = String(ui.entryQuery || '').trim().toLowerCase();
         const visibleEntries = ui.entries.filter(entry => !needle || entryName(entry).toLowerCase().includes(needle));
         const entryOptions = visibleEntries.length > 0
@@ -8618,17 +8751,46 @@
         return bar;
     }
 
+    function placeStoryRanges(pick) {
+        const content = storyDocument(pick);
+        pick.text = content;
+        let cursor = 0;
+        stageSequence(pick).forEach(stage => {
+            const name = String(stage.name || '未命名').trim() || '未命名';
+            const header = `## ${name}`;
+            const at = content.indexOf(header, cursor);
+            if (at < 0) {
+                stage.ranges = [];
+                return;
+            }
+            const after = at + header.length;
+            const start = content[after] === '\n' ? after + 1 : after;
+            const next = content.indexOf('\n## ', after);
+            const end = next < 0 ? content.length : next;
+            stage.ranges = end > start ? [{ start, end }] : [];
+            stage.body = content.slice(start, end).trim();
+            cursor = end;
+        });
+        return content;
+    }
+
     async function saveEditor() {
         const editor = ui.editor;
-        const layout = editor.pick ? layoutFromPick(editor.pick) : null;
+        const config = editor.bound ? await readConfig() : null;
+        const binding = config ? findBindingForEntry(config, editor.worldbookName, editor.entry) : null;
+        const storyGuide = Boolean(binding && binding.storyGuide && editor.pick);
         let saved;
-        if (editor.mode === 'raw') {
+        if (storyGuide) {
+            const content = placeStoryRanges(editor.pick);
+            saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
+        } else if (editor.mode === 'raw') {
             if (editor.pick) rebasePickText(editor.pick, editor.lines.join('\n'));
             const content = editor.pick ? String(editor.pick.text || '') : editor.lines.join('\n');
             saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
         } else {
             saved = findEntry(await getWorldbook(editor.worldbookName), editor.entry.uid, entryName(editor.entry)) || editor.entry;
         }
+        const layout = editor.pick ? layoutFromPick(editor.pick) : null;
         editor.entry = saved;
         editor.lines = normalizeText(saved.content).split('\n');
         editor.baseLayout = layout;
@@ -8644,9 +8806,11 @@
             editor.pick.pendingRanges = [];
             pickAttach(editor);
         }
-        setMessage(editor.mode === 'raw'
+        setMessage(storyGuide
+            ? '已按顺序写入世界书。全文那条关着，开着的只有当前这一段。'
+            : (editor.mode === 'raw'
             ? '已保存你改过的原文。'
-            : (editor.bound ? '已保存划分，原文没有改动。' : '已保存划分，原文没有改动。回「动态指导」页点「绑定」开始使用。'), 'success');
+            : (editor.bound ? '已保存划分，原文没有改动。' : '已保存划分，原文没有改动。回「动态指导」页点「绑定」开始使用。')), 'success');
     }
 
     // ---------------------------------------------------------------
@@ -9178,6 +9342,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         stepTargetVisible,
         storyRows,
         storyEdges,
+        storyDocument,
         storyLaneSegments,
         storyPositions,
         stageMapStatus,

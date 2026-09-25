@@ -3979,3 +3979,14 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     assert.equal(stage.extras[0].body, '戒指能看见灵体');
     assert.deepEqual(errors, []);
 });
+
+test('剧情指导全文按阶段顺序写，后补的开头插在前面', () => {
+    const text = core.storyDocument({
+        text: '',
+        stages: [
+            { name: '开头', body: '后来补上的开头' },
+            { name: '结尾', body: '先写的结尾' },
+        ],
+    });
+    assert.equal(text, '## 开头\n后来补上的开头\n\n## 结尾\n先写的结尾');
+});
