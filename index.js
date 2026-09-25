@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.85
+     * 动态指导助手 v2.86
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.85';
+    const VERSION = '2.86';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -7200,7 +7200,6 @@
             : '拖选正文再选归属。原文不会被改写，也不会换位置。↑↓ 只改进入下一阶段的顺序。依附、循环在小卡的设置里。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
-            dock,
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
             mode === 'raw' ? rawArea : renderSegments(editor),
@@ -7237,6 +7236,7 @@
         }, '⚙');
         const parts = [
             header('编辑', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear, { subpage: true }),
+            dock,
             body,
             foot,
         ];
@@ -8212,7 +8212,6 @@
                 oninput: event => { sheet.completion = event.target.value; },
             });
             completion.value = sheet.completion;
-            const preview = stageSheetPreview(editor, owner, sheet);
             const stages = stageSequence(editor.pick);
             const others = stages.filter(stage => stage !== owner);
             box.append(sheetSection('离开这一段',
@@ -8221,9 +8220,6 @@
                     btn('AI 生成', () => runAction('生成完成条件', () => generateCondition(sheet, completion), {
                         success: '已生成，确认后点「保存修改」。',
                     }), { ghost: true }))));
-            box.append(sheetSection('发给 AI',
-                el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
-                muted('上面是走到这一段时会发给 AI 的字。')));
             if (others.length) {
                 box.append(sheetSection('整理',
                     others.length ? field('再分配', selectControl(
@@ -8232,15 +8228,6 @@
                         value => { sheet.mergeInto = value; },
                     ), '并入会把文字归到选中的阶段，这一段删掉。原文不动。') : null));
             }
-        }
-        if (owner.kind === 'always') {
-            box.append(field('位置', el('div', { class: 'dga-seg' },
-                ...[['top', '排在阶段内容之前'], ['bottom', '排在阶段内容之后']].map(([value, label]) => el('button', {
-                    type: 'button',
-                    class: `dga-seg-btn${(sheet.alwaysTop ? 'top' : 'bottom') === value ? ' is-on' : ''}`,
-                    onclick: () => { sheet.alwaysTop = value === 'top'; render(); },
-                }, label)))));
-            box.append(muted('这部分每一段都会发送，直到全部阶段结束。'));
         }
         if (owner.kind === 'note') box.append(muted('这部分只给作者自己看，不会发给 AI。'));
 
@@ -8928,7 +8915,7 @@ ${P} .dga-seg-btn:hover { background: var(--dga-hover); }
 ${P} .dga-seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-seg-btn.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); font-weight: 700; }
 ${P} .dga-work-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
-${P} .dga-editor-dock { position: sticky; top: 0; z-index: 2; display: flex; flex-direction: column; gap: 8px; margin: -12px -16px 0; padding: 12px 16px 8px; background: var(--dga-bg-0); }
+${P} .dga-editor-dock { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; background: var(--dga-bg-0); }
 ${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: var(--dga-radius-md) var(--dga-radius-md) 0 0; background: var(--dga-bg-1); border-top: 1px solid var(--dga-border-2); display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-sheet h3 { margin: 0; font-size: 15px; }

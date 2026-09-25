@@ -3950,7 +3950,8 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     panel().querySelector('.dga-segbar').listeners.click[0]();
     const sheet = () => panel().querySelector('.dga-sheet');
     assert.match(sheet().textContent, /离开这一段/);
-    assert.match(sheet().textContent, /发给 AI/);
+    assert.doesNotMatch(sheet().textContent, /发给 AI/);
+    assert.doesNotMatch(sheet().textContent, /排在阶段内容之前/);
     assert.doesNotMatch(sheet().textContent, /走完回到/);
     assert.doesNotMatch(sheet().textContent, /到了这里/);
     assert.doesNotMatch(sheet().textContent, /附在这一段/);
