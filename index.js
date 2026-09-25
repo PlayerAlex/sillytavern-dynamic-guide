@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.98
+     * 动态指导助手 v2.99
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.98';
+    const VERSION = '2.99';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -5544,10 +5544,11 @@
             const stageName = stages[shown - 1] ? stages[shown - 1].name : '';
             const input = el('input', {
                 type: 'number',
+                class: 'dga-dev-num',
                 min: '1',
                 max: total > 0 ? String(total) : null,
                 value: String(shown),
-                'aria-label': `${binding.entryName || '条目'}导出后从第几步开始`,
+                'aria-label': `${binding.entryName || '条目'}从第几步开始`,
                 onchange: event => {
                     const n = Math.floor(Number(event.target.value));
                     let index = Number.isFinite(n) && n >= 1 ? n - 1 : 0;
@@ -5562,12 +5563,12 @@
                 { value: 'loop', label: '循环' },
                 { value: 'pick', label: 'AI 选下一段' },
             ];
-            return el('div', { class: 'dga-bind-item' },
+            return el('div', { class: 'dga-dev-line' },
                 el('div', { class: 'dga-heading-text' },
                     el('b', { text: binding.entryName || '未命名条目' }),
-                    el('small', { text: stageName ? `第 ${shown} 步：${stageName}` : `第 ${shown} 步` })),
-                field('导出后从第几步开始', input),
-                field('阶段怎么走', selectControl(orderOptions, bindingOrderMode(binding), value => {
+                    el('small', { text: stageName || '还没有阶段' })),
+                field('从第几步', input),
+                field('怎么走', selectControl(orderOptions, bindingOrderMode(binding), value => {
                     const label = { order: '按顺序', loop: '循环', pick: 'AI 选下一段' }[value] || '按顺序';
                     runAction('保存阶段怎么走', () => saveBindingOrder(binding, value), {
                         success: `「${binding.entryName || '条目'}」改为${label}`,
@@ -5579,10 +5580,9 @@
             el('div', { class: 'dga-body dga-split' },
                 messageBar(),
                 card('配置存哪',
-                    muted('绑定、循环和起始步可以随卡走。API 预设名只留在这台电脑，导出时不会带上。'),
                     field('存放位置', selectControl([
-                        { value: 'user', label: '只本机（记在这张卡的角色变量里，不写入世界书）' },
-                        { value: 'card', label: '跟角色卡走（再写一份到世界书）' },
+                        { value: 'user', label: '只本机' },
+                        { value: 'card', label: '跟角色卡走' },
                     ], mode, value => {
                         runAction('保存存放位置', () => persistStorageMode(value), {
                             success: value === 'card'
@@ -5591,18 +5591,14 @@
                         });
                     })),
                     muted(mode === 'card'
-                        ? '跟卡走的那份写在关着的「（动态指导·配置）」里，不发给 AI。角色变量和这份配置都不含 API 预设名。'
-                        : '绑定记在这张卡的角色变量里。API 预设名另存在本机，导出角色卡时不会带上。'),
+                        ? '世界书里多一份关着的配置，不含 API 预设名。'
+                        : '记在这张卡的角色变量里，不写入世界书。API 预设名留在这台电脑。'),
+                    el('p', { class: 'dga-dev-meta', text: `绑定 ${bindings.length} 条` }),
                 ),
                 card('导出后从第几步开始',
-                    muted('新开的聊天，以及导入这张卡的人，从这里开始。当前这次聊天的进度不会被改掉。循环不一定从第一段开始。'),
+                    muted('新开的聊天和导入这张卡的人从这里开始。这次聊天的进度不动。'),
                     bindings.length ? null : muted('还没有绑定条目。'),
                     ...startRows,
-                ),
-                card('当前状态',
-                    muted(`存放位置：${mode === 'card' ? '跟角色卡走' : '只本机'}`),
-                    muted(`绑定条目：${bindings.length} 条`),
-                    muted('正本是这张卡的角色变量。跟卡走时，角色变量空了才会读世界书里的配置条目。'),
                 ),
             )];
     }
@@ -9310,6 +9306,18 @@ ${P} .dga-add-row-sub { display: flex; gap: 8px; align-items: center; flex-wrap:
 ${P} .dga-add-row-sub .dga-muted { flex: 1 1 auto; }
 ${P} .dga-add-row-sub .dga-btn { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; }
 ${P} .dga-bind-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
+${P} .dga-dev-meta { margin: 0; font-size: 12px; color: var(--dga-text-2); }
+${P} .dga-dev-line { display: grid; grid-template-columns: minmax(0, 1fr) 88px 132px; gap: 8px 10px; align-items: end; }
+${P} .dga-dev-line + .dga-dev-line { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--dga-border); }
+${P} .dga-dev-line .dga-heading-text { align-self: center; }
+${P} .dga-dev-line .dga-field { min-width: 0; gap: 4px; }
+${P} .dga-dev-line .dga-field > span { font-size: 12px; }
+${P} .dga-dev-line input.dga-dev-num { width: 100%; min-height: 36px; padding: 6px 8px; text-align: center; }
+${P} .dga-dev-line select { min-height: 36px; padding: 6px 8px; }
+@media (max-width: 520px) {
+    ${P} .dga-dev-line { grid-template-columns: minmax(0, 1fr) 72px; }
+    ${P} .dga-dev-line .dga-field:last-child { grid-column: 1 / -1; }
+}
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; gap: 4px; }
 ${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
