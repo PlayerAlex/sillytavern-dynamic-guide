@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.86
+     * 动态指导助手 v2.87
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.86';
+    const VERSION = '2.87';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2342,6 +2342,15 @@
             if (binding.attachKey && Number.isFinite(attachStage) && attachStage >= 1) binding.attachStage = attachStage;
             if (binding.attachKey && (item.attachKind === 'side' || item.attachKind === 'fork')) binding.attachKind = item.attachKind;
             else if (binding.attachKey) binding.attachKind = 'fork';
+            if (binding.attachKey && Array.isArray(item.passes)) {
+                binding.passes = item.passes.map(pass => {
+                    const left = Math.floor(Number(pass && pass.left));
+                    const right = Math.floor(Number(pass && pass.right));
+                    const dir = pass && (pass.dir === 'back' || pass.dir === 'over' || pass.dir === 'both') ? pass.dir : 'both';
+                    if (!Number.isFinite(left) || left < 1 || !Number.isFinite(right) || right < 1) return null;
+                    return { left, right, dir };
+                }).filter(Boolean);
+            }
             const ownMode = item.advanceMode === 'marker' ? 'story' : item.advanceMode;
             if (['off', 'story', 'judge'].includes(ownMode)) binding.advanceMode = ownMode;
             const ownInterval = Math.floor(Number(item.judgeInterval));
@@ -6601,6 +6610,50 @@
                     }
                 }
             }
+            if (delta > 0) {
+                const crowd = (await loadContexts()).contexts;
+                const stageNo = fresh.state.stageIndex + 1;
+                const offers = [];
+                ((fresh.binding && fresh.binding.passes) || []).forEach(pass => {
+                    if (pass.left !== stageNo || (pass.dir !== 'over' && pass.dir !== 'both')) return;
+                    const host = crowd.find(item => item.key === fresh.binding.attachKey && !item.broken);
+                    if (!host) return;
+                    offers.push({ dest: host, stage: pass.right - 1, word: '从那边过来' });
+                });
+                crowd.forEach(item => {
+                    if (!item.binding || item.binding.attachKey !== fresh.key || item.broken) return;
+                    (item.binding.passes || []).forEach(pass => {
+                        if (pass.right !== stageNo || (pass.dir !== 'back' && pass.dir !== 'both')) return;
+                        offers.push({ dest: item, stage: pass.left - 1, word: '回去' });
+                    });
+                });
+                if (offers.length && !(fresh.state && fresh.state.passedPass === stageNo)) {
+                    const lines = ['0 留在这条'];
+                    offers.forEach((offer, index) => {
+                        const stage = offer.dest.parsed && offer.dest.parsed.stages[offer.stage];
+                        lines.push(`${index + 1} ${offer.word} · ${stage && stage.name ? stage.name : `第 ${offer.stage + 1} 段`}`);
+                    });
+                    const askPass = typeof hostWindow.prompt === 'function' ? hostWindow.prompt : null;
+                    const passAnswer = askPass ? askPass(`到了这里可以换边：\n${lines.join('\n')}`, '0') : '0';
+                    if (passAnswer == null || String(passAnswer).trim() === '') return false;
+                    const passPick = Math.floor(Number(passAnswer));
+                    if (!Number.isFinite(passPick) || passPick < 0 || passPick > offers.length) return false;
+                    if (passPick === 0) await patchStateFor(fresh.key, { passedPass: stageNo });
+                    else {
+                        const offer = offers[passPick - 1];
+                        const landed = offer.dest.parsed && offer.dest.parsed.stages[offer.stage];
+                        await patchStateFor(fresh.key, { sideOut: offer.dest.key });
+                        await patchStateFor(offer.dest.key, {
+                            stageIndex: Math.max(0, offer.stage),
+                            stageName: landed && landed.name ? landed.name : '',
+                            lineCut: false,
+                            sideOut: '',
+                        });
+                        await syncMirrors('normal');
+                        return false;
+                    }
+                }
+            }
             const again = (await loadContexts()).contexts.find(item => item.key === context.key) || fresh;
             const plan = stepTargetVisible(again.parsed, again.state, delta);
             const pending = delta > 0 ? branchPendingChoices(again.parsed, again.state, plan.target) : null;
@@ -6740,6 +6793,58 @@
         return false;
     }
 
+    function stageChoiceOptions(stages) {
+        const list = stages && stages.length ? stages : [null];
+        return list.map((stage, index) => ({
+            value: String(index + 1),
+            label: stage && stage.name ? `第 ${index + 1} 段 · ${stage.name}` : `第 ${index + 1} 段`,
+        }));
+    }
+
+    function renderPassList(context, binding, leftStages, rightStages) {
+        const passes = Array.isArray(binding.passes) ? binding.passes : [];
+        const leftOptions = stageChoiceOptions(leftStages);
+        const rightOptions = stageChoiceOptions(rightStages);
+        const save = next => updateBinding(context.key, item => {
+            item.passes = next;
+        });
+        const rows = passes.map((pass, index) => el('div', { class: 'dga-pass-row' },
+            selectControl(leftOptions, String(pass.left), value => runAction('保存换边', () => save(passes.map((item, at) => (
+                at === index ? { ...item, left: Math.max(1, Math.floor(Number(value) || 1)) } : item
+            ))))),
+            el('div', { class: 'dga-seg dga-pass-dir' },
+                ...[['back', '←', '回去'], ['over', '→', '从那边过来'], ['both', '↔', '互通']].map(([dir, mark, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${pass.dir === dir ? ' is-on' : ''}`,
+                    title: label,
+                    text: `${mark} ${label}`,
+                    onclick: () => runAction('保存换边方向', () => save(passes.map((item, at) => (
+                        at === index ? { ...item, dir } : item
+                    )))),
+                }))),
+            selectControl(rightOptions, String(pass.right), value => runAction('保存换边', () => save(passes.map((item, at) => (
+                at === index ? { ...item, right: Math.max(1, Math.floor(Number(value) || 1)) } : item
+            ))))),
+            el('button', {
+                type: 'button',
+                class: 'dga-icon-btn dga-icon-danger',
+                title: '去掉这一条',
+                text: '×',
+                onclick: () => runAction('去掉换边', () => save(passes.filter((_, at) => at !== index))),
+            })));
+        return el('div', { class: 'dga-pass' },
+            el('div', { class: 'dga-pass-head' },
+                el('span', { text: '到了可以换边' }),
+                el('button', {
+                    type: 'button',
+                    class: 'dga-btn dga-ghost',
+                    text: '新增',
+                    onclick: () => runAction('新增换边', () => save(passes.concat([{ left: 1, right: 1, dir: 'both' }]))),
+                })),
+            muted('左边是这条的阶段，右边是依附那条的阶段。← 回去，→ 从那边过来，↔ 两边到了都能选。'),
+            ...rows);
+    }
+
     function renderPacePage() {
         const context = workContext();
         const back = () => {
@@ -6858,6 +6963,7 @@
                         delete item.attachKey;
                         delete item.attachStage;
                         delete item.attachKind;
+                        delete item.passes;
                     }
                 }), { success: value ? '这条会从指定那一段挂到所选条目上' : '这条自己单独走' }),
             )),
@@ -6877,6 +6983,7 @@
                     }), { success: value === 'side' ? '可以走，走完回到原来那条接着往下' : '选了这条，原来那条就断掉' }),
                 }, label)))) : null,
             binding.attachKey ? muted('分岔口：选了这条，原来那条不能再往下。支线：可以走也可以不走，走完回到原来那一幕的下一段。分岔口上还能再依附别的条目。') : null,
+            binding.attachKey ? renderPassList(context, binding, (context.parsed && context.parsed.stages) || [], hostStages) : null,
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
                 if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
                 else delete item.advanceMode;
@@ -8915,6 +9022,11 @@ ${P} .dga-seg-btn:hover { background: var(--dga-hover); }
 ${P} .dga-seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-seg-btn.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); font-weight: 700; }
 ${P} .dga-work-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+${P} .dga-pass { display: flex; flex-direction: column; gap: 8px; }
+${P} .dga-pass-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+${P} .dga-pass-row { display: flex; align-items: center; gap: 6px; }
+${P} .dga-pass-row select { flex: 1 1 0; min-width: 0; }
+${P} .dga-pass-dir { flex: 0 0 auto; grid-template-columns: repeat(3, minmax(0, auto)); }
 ${P} .dga-editor-dock { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; background: var(--dga-bg-0); }
 ${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: var(--dga-radius-md) var(--dga-radius-md) 0 0; background: var(--dga-bg-1); border-top: 1px solid var(--dga-border-2); display: flex; flex-direction: column; gap: 12px; }
