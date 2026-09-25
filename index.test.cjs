@@ -1978,10 +1978,9 @@ test('小卡步进器中间那块是划分阶段的入口，点进去落在当�
     assert.ok(mid, '小卡步进器中间那块就是划分阶段的入口');
     assert.match(mid.textContent, /第 2 \/ 3 段/);
     const actions = panel().querySelector('.dga-bind-actions');
-    assert.ok(actions, '时间线、编辑和设置排在上一段、下一段下面');
-    assert.equal(actions.children[0].textContent, '时间线 ›');
-    assert.equal(actions.children[1].textContent, '编辑 ›');
-    assert.equal(actions.children[2].textContent, '设置 ›');
+    assert.ok(actions, '编辑和设置排在上一段、下一段下面');
+    assert.equal(actions.children[0].textContent, '编辑 ›');
+    assert.equal(actions.children[1].textContent, '设置 ›');
     await mid.listeners.click[0]();
 
     const focused = collectByClass(panel(), 'is-focus', []);
@@ -3810,7 +3809,7 @@ test('时间线状态：走过、现在、被否决', () => {
     assert.equal(core.stageMapStatus(stages[2], 2, state), 'skipped');
 });
 
-test('时间线按阶段自动排好，不能拖；编辑仍是分段', async () => {
+test('没有时间线；编辑仍是分段，设置里可以依附', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
     helper.getWorldbookNames = () => ['测试世界书'];
@@ -3825,26 +3824,17 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
 
-    await findButton(panel(), '时间线 ›').listeners.click[0]();
-    const timelineNodes = collectByClass(panel(), 'dga-road-card', []);
-    assert.equal(timelineNodes.length, 2, '时间线能看到全部阶段');
-    timelineNodes[0].listeners.click[0]();
-    assert.ok(findButton(panel(), '往下接一段'), '点中卡片后可以往下接');
-    assert.ok(findButton(panel(), '从这里分开'), '点中卡片后可以再分开');
-    assert.ok(findButton(panel(), '标成支线'), '点中卡片后可以标成支线');
-    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '时间线是二级页');
-    assert.equal(timelineNodes[0].listeners.pointerdown, undefined, '时间线卡片不能拖');
-    assert.ok(findButton(panel(), '时间线'), '时间线页顶上能去时间线');
-    assert.ok(findButton(panel(), '编辑'), '时间线页顶上能去编辑');
-    assert.ok(findButton(panel(), '设置'), '时间线页顶上能去设置');
-    await findButton(panel(), '设置').listeners.click[0]();
+    assert.equal(findButton(panel(), '时间线 ›'), null, '小卡上没有时间线');
+    await findButton(panel(), '设置 ›').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
+    assert.match(panel().textContent, /依附于/, '设置页能依附别的条目');
     assert.match(panel().textContent, /走到最后回到第一段/);
-    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置也是二级页');
+    assert.equal(findButton(panel(), '时间线'), null, '页顶没有时间线');
+    assert.ok(findButton(panel(), '编辑'), '页顶能去编辑');
+    assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置是二级页');
     await findButton(panel(), '编辑').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '从设置能进到分段编辑');
-    await findButton(panel(), '时间线').listeners.click[0]();
-    assert.ok(panel().querySelector('.dga-road'), '从编辑能回到时间线');
+    assert.equal(panel().querySelector('.dga-road'), null, '编辑页没有时间线');
     await panel().querySelector('.dga-close').listeners.click[0]();
 
     await findButton(panel(), '编辑 ›').listeners.click[0]();
@@ -3980,15 +3970,4 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     const stage = saved.stages.find(item => item.name === '第一幕');
     assert.equal(stage.extras[0].body, '戒指能看见灵体');
     assert.deepEqual(errors, []);
-});
-
-test('剧情指导全文按阶段顺序写，后补的开头插在前面', () => {
-    const text = core.storyDocument({
-        text: '',
-        stages: [
-            { name: '开头', body: '后来补上的开头' },
-            { name: '结尾', body: '先写的结尾' },
-        ],
-    });
-    assert.equal(text, '## 开头\n后来补上的开头\n\n## 结尾\n先写的结尾');
 });

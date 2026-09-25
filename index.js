@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.83
+     * 动态指导助手 v2.84
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.83';
+    const VERSION = '2.84';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -2337,13 +2337,17 @@
                 binding.loop = true;
                 if (item.loopBranch === 'keep') binding.loopBranch = 'keep';
             }
+            if (typeof item.attachKey === 'string' && item.attachKey.trim()) binding.attachKey = item.attachKey.trim();
+            const attachStage = Math.floor(Number(item.attachStage));
+            if (binding.attachKey && Number.isFinite(attachStage) && attachStage >= 1) binding.attachStage = attachStage;
+            if (binding.attachKey && (item.attachKind === 'side' || item.attachKind === 'fork')) binding.attachKind = item.attachKind;
+            else if (binding.attachKey) binding.attachKind = 'fork';
             const ownMode = item.advanceMode === 'marker' ? 'story' : item.advanceMode;
             if (['off', 'story', 'judge'].includes(ownMode)) binding.advanceMode = ownMode;
             const ownInterval = Math.floor(Number(item.judgeInterval));
             if (Number.isFinite(ownInterval) && ownInterval >= 1) binding.judgeInterval = ownInterval;
             const layout = cleanLayout(item.layout);
             if (layout) binding.layout = layout;
-            if (item.storyGuide === true) binding.storyGuide = true;
             const key = bindingKey(binding);
             if (seen.has(key)) return;
             seen.add(key);
@@ -2988,16 +2992,6 @@
         })).filter(item => item.to);
     }
 
-    function storyDocument(pick) {
-        const source = String(pick && pick.text || '');
-        return stageSequence(pick).map(stage => {
-            const name = String(stage && stage.name || '未命名').trim() || '未命名';
-            const card = stage && typeof stage.body === 'string' ? stage.body.trim() : '';
-            const body = card || sliceRanges(source, stage && stage.ranges);
-            return body ? `## ${name}\n${body}` : `## ${name}`;
-        }).join('\n\n');
-    }
-
     function layoutFromPick(pick) {
         const pack = owner => ({
             id: owner.id,
@@ -3628,6 +3622,7 @@
     // 当前进度应该显示给 AI 的正文；没有可显示的内容（旧布局、没阶段）时返回 null。
     function stageForGuide(context, generationType) {
         if (!context || !context.configured) return null;
+        if (context.state && (context.state.lineCut === true || context.state.sideOut)) return null;
         if (context.legacy || !context.parsed || context.parsed.stages.length === 0) return null;
         let index = context.state.stageIndex;
         if (context.parsed.loop && index >= context.parsed.stages.length) index = 0;
@@ -4008,6 +4003,10 @@
             // 这条消息引起的推进才记下「从哪一段过来」。手动拨进度清掉，避免重新生成退错段。
             preAdvanceIndex: settings.messageId != null ? context.state.stageIndex : null,
             ...(Object.keys(branchChoices).length ? { branchChoices } : {}),
+            ...(context.state.lineCut === true ? { lineCut: true } : {}),
+            ...(context.state.sideOut ? { sideOut: context.state.sideOut } : {}),
+            ...(context.state.returnKey ? { returnKey: context.state.returnKey, returnIndex: context.state.returnIndex } : {}),
+            ...(Number.isInteger(context.state.passedAttach) ? { passedAttach: context.state.passedAttach } : {}),
             updatedAt: new Date().toISOString(),
         };
         await writeStateFor(context.key, next);
@@ -4028,103 +4027,6 @@
     // 绑定（v2.27）：不再弹确认框——绑定是非破坏性的，随时可以在小卡上点 × 解绑
     // 回退，而弹窗会让「连绑多条」变成反复确认。条目会被关闭这件事写在卡片提示
     // 与运行日志里；解绑（会删掉当前聊天进度）仍然保留二次确认。
-    async function createStoryGuide(spec) {
-        const worldbookName = spec.worldbookName;
-        const name = String(spec.name || '').trim();
-        if (!worldbookName) throw new Error('先选一本世界书。');
-        if (!name) throw new Error('先写剧情指导的名字。');
-        const positionType = spec.positionType || 'before_character_definition';
-        const order = Math.max(0, Math.floor(Number(spec.order) || 0));
-        let position;
-        if (positionType === 'at_depth_system' || positionType === 'at_depth_user' || positionType === 'at_depth_assistant') {
-            position = {
-                type: 'at_depth',
-                role: positionType === 'at_depth_user' ? 'user' : (positionType === 'at_depth_assistant' ? 'assistant' : 'system'),
-                depth: Math.max(0, Math.floor(Number(spec.depth) || 0)),
-                order,
-            };
-        } else if (positionType === 'outlet') {
-            const outletName = String(spec.outletName || '').trim();
-            if (!outletName) throw new Error('锚点要写一个名字，和 {{outlet::名字}} 对上。');
-            position = { type: 'outlet', name: outletName, order };
-        } else {
-            position = { type: positionType, order };
-        }
-        const content = '## 第一段\n';
-        let created = null;
-        await updateWorldbook(worldbookName, worldbook => {
-            if (worldbookEntries(worldbook).some(item => entryName(item) === name)) {
-                throw new Error('这本世界书里已经有同名条目。');
-            }
-            const template = worldbookEntries(worldbook).find(entry => entry && typeof entry === 'object') || {};
-            const full = {
-                ...template,
-                uid: freshUid(worldbook),
-                comment: name,
-                name,
-                title: name,
-                content,
-                enabled: false,
-                disable: true,
-                position,
-                order: position.order,
-                insertion_order: position.order,
-                key: [],
-                keysecondary: [],
-                constant: true,
-            };
-            addEntryToWorldbook(worldbook, full);
-            const small = buildMirrorEntry(full, freshUid(worldbook), mirrorNameFor(name), '');
-            small.position = { ...position };
-            small.order = position.order;
-            small.insertion_order = position.order;
-            small.enabled = true;
-            if ('disable' in small) small.disable = false;
-            addEntryToWorldbook(worldbook, small);
-            created = full;
-            return worldbook;
-        });
-        const layout = {
-            version: 3,
-            loop: false,
-            stages: [{
-                id: 'stage-1',
-                name: '第一段',
-                completion: '',
-                terminal: false,
-                branch: '',
-                ranges: [{ start: content.indexOf('第一段') + '第一段'.length + 1, end: content.length }],
-                body: '',
-            }],
-            addons: [],
-            always: { ranges: [] },
-            note: { ranges: [] },
-        };
-        const config = await readConfig();
-        const candidate = {
-            worldbookName,
-            entryUid: created.uid,
-            entryName: name,
-            boundAt: new Date().toISOString(),
-            layout,
-            storyGuide: true,
-        };
-        await writeConfig(configWithBindings(config, [...config.bindings, candidate]));
-        await writeStateFor(bindingKey(candidate), {
-            stageIndex: 0,
-            stageName: '第一段',
-            lastCompletionMessageId: null,
-            lastCompletionFingerprint: '',
-            lastJudgeCheckedId: null,
-            updatedAt: new Date().toISOString(),
-        });
-        await syncMirrors('normal');
-        ui.storyNew = null;
-        ui.workKey = bindingKey(candidate);
-        await openEditorAt(worldbookName, created, { focusStageIndex: 0 });
-        if (ui.editor) ui.editor.mode = 'road';
-    }
-
     async function addBinding(worldbookName, entry) {
         if (!worldbookName || !entry) throw new Error('请先选择世界书和大纲条目。');
         const fresh = findEntry(await getWorldbook(worldbookName), entry.uid, entryName(entry));
@@ -5159,7 +5061,6 @@
         judgeRuleTestResult: null,
         // 条目搜索，以及每条小卡「本次附加要求」（只对下一次现在检查生效）
         entryQuery: '',
-        storyNew: null,
         entryQueryFocus: false,
         judgeExtras: {},
         guideSection: 'dga-card-bind',
@@ -5332,15 +5233,14 @@
         const oldBody = shell.querySelector('.dga-body');
         const scrollTop = oldBody && ui.renderedView === ui.view ? oldBody.scrollTop : 0;
         const page = ui.view === 'editor' ? renderEditor()
-            : (ui.view === 'timeline' ? renderTimeline()
-                : (ui.view === 'pace' ? renderPacePage()
+            : (ui.view === 'pace' ? renderPacePage()
                     : (ui.view === 'api' ? renderApiPage()
                         : (ui.view === 'judgePrompt' ? renderJudgePromptPage()
                             : (ui.view === 'logs' ? renderLogPage()
                                 : (ui.view === 'dev' ? renderDevPage()
-                                    : (ui.view === 'guide' ? renderGuidePage() : renderManager())))))));
+                                    : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
         // 电脑端和数据库一样：目录页左侧常驻导航，右侧是当前页。编辑、时间线、设置、判断AI提示词仍是二级页，不放这列。
-        const showRail = ui.view !== 'editor' && ui.view !== 'timeline' && ui.view !== 'pace' && ui.view !== 'judgePrompt';
+        const showRail = ui.view !== 'editor' && ui.view !== 'pace' && ui.view !== 'judgePrompt';
         const main = el('div', { class: 'dga-main' }, ...page);
         shell.replaceChildren(...(showRail ? [renderNavRail(), main] : [main]));
         // 新绑定小卡的入场高亮只播一次（v2.27）：节点已经带上 is-new，这里立刻清掉
@@ -6660,15 +6560,57 @@
         const move = (label, delta) => runAction(label, async () => {
             const fresh = (await loadContexts()).contexts.find(item => item.key === context.key);
             if (!fresh || fresh.broken) throw new Error('这条绑定不可用。');
-            const plan = stepTargetVisible(fresh.parsed, fresh.state, delta);
-            const pending = delta > 0 ? branchPendingChoices(fresh.parsed, fresh.state, plan.target) : null;
+            if (delta > 0 && fresh.state && fresh.state.lineCut) return false;
+            if (delta > 0 && fresh.state && fresh.state.returnKey) {
+                const leaving = stepTargetVisible(fresh.parsed, fresh.state, 1);
+                if (!fresh.parsed.loop && leaving.target >= fresh.parsed.stages.length) {
+                    const hostKey = fresh.state.returnKey;
+                    const back = Number.isInteger(fresh.state.returnIndex) ? fresh.state.returnIndex : fresh.state.stageIndex;
+                    await patchStateFor(fresh.key, { returnKey: '', returnIndex: null, stageIndex: fresh.parsed.stages.length, stageName: '' });
+                    await patchStateFor(hostKey, { sideOut: '', stageIndex: back });
+                    await syncMirrors('normal');
+                    return false;
+                }
+            }
+            if (delta > 0 && !(fresh.state && fresh.state.passedAttach === fresh.state.stageIndex + 1)) {
+                const all = (await loadContexts()).contexts;
+                const here = all.filter(item => item.binding && item.binding.attachKey === fresh.key
+                    && Number(item.binding.attachStage) === fresh.state.stageIndex + 1 && !item.broken);
+                if (here.length) {
+                    const lines = ['0 继续这条'];
+                    here.forEach((item, index) => lines.push(`${index + 1} ${item.binding.attachKind === 'side' ? '支线' : '分岔口'} · ${entryName(item.entry)}`));
+                    const ask = typeof hostWindow.prompt === 'function' ? hostWindow.prompt : null;
+                    const answer = ask ? ask(`走到这里要选一条：\n${lines.join('\n')}`, '0') : '0';
+                    if (answer == null || String(answer).trim() === '') return false;
+                    const pick = Math.floor(Number(answer));
+                    if (!Number.isFinite(pick) || pick < 0 || pick > here.length) return false;
+                    if (pick === 0) await patchStateFor(fresh.key, { passedAttach: fresh.state.stageIndex + 1 });
+                    else {
+                        const chosen = here[pick - 1];
+                        if (chosen.binding.attachKind === 'side') {
+                            await patchStateFor(fresh.key, { sideOut: chosen.key });
+                            await patchStateFor(chosen.key, {
+                                stageIndex: 0, lineCut: false, returnKey: fresh.key, returnIndex: fresh.state.stageIndex + 1,
+                            });
+                        } else {
+                            await patchStateFor(fresh.key, { lineCut: true, sideOut: '' });
+                            await patchStateFor(chosen.key, { stageIndex: 0, lineCut: false, returnKey: '', returnIndex: null });
+                        }
+                        await syncMirrors('normal');
+                        return false;
+                    }
+                }
+            }
+            const again = (await loadContexts()).contexts.find(item => item.key === context.key) || fresh;
+            const plan = stepTargetVisible(again.parsed, again.state, delta);
+            const pending = delta > 0 ? branchPendingChoices(again.parsed, again.state, plan.target) : null;
             // 下一格是未决分支组：先弹走向选择，选中了才推进（renderBranchSheet 里落子）。
             if (pending && pending.length > 1) {
                 ui.branchPick = fresh.key;
                 render();
                 return false;
             }
-            return moveToIndex(fresh, plan.target, { resetBranches: plan.resetBranches });
+            return moveToIndex(again, plan.target, { resetBranches: plan.resetBranches });
         });
         const percent = total > 0 ? Math.round(Math.min(stageIndex, total) / total * 100) : 0;
         const hints = [];
@@ -6676,6 +6618,8 @@
         if (orderMode === 'pick') hints.push('AI选段');
         else if (orderMode === 'loop' || context.parsed.loop) hints.push('循环');
         if (context.stage && context.stage.terminal) hints.push('到此结束');
+        if (context.state && context.state.lineCut) hints.push('这条已断');
+        if (context.state && context.state.sideOut) hints.push('正在走另一条');
         if (context.stage && context.stage.branch) hints.push(`分支·${context.stage.branch}`);
         const hintText = hints.length ? ` · ${hints.join(' · ')}` : '';
         const stageText = total === 0 ? '未分段' : (finished && !context.parsed.loop ? `全部 ${total} 段完成` : `第 ${Math.min(stageIndex, total - 1) + 1} / ${total} 段${hintText}`);
@@ -6714,19 +6658,9 @@
                 btn('下一段 ›', () => move('切换到下一段', 1), {
                     ghost: !usable || (finished && !context.parsed.loop),
                     primary: usable && !(finished && !context.parsed.loop),
-                    disabled: !usable || (!context.parsed.loop && (finished || nextVisibleIndex(context.parsed, context.state, stageIndex) >= total)),
+                    disabled: !usable || (context.state && context.state.lineCut) || (!context.parsed.loop && (finished || nextVisibleIndex(context.parsed, context.state, stageIndex) >= total)),
                 })),
             el('div', { class: 'dga-bind-actions' },
-                el('button', {
-                    type: 'button',
-                    class: 'dga-pace-open',
-                    'aria-label': '时间线',
-                    text: '时间线 ›',
-                    onclick: () => {
-                        ui.workKey = context.key;
-                        return runAction('打开时间线', () => openWorkPage('timeline'), { refresh: false });
-                    },
-                }),
                 el('button', {
                     type: 'button',
                     class: 'dga-pace-open',
@@ -6764,7 +6698,7 @@
         const context = workContext();
         if (!context || context.broken) return null;
         return el('div', { class: 'dga-work-switch', role: 'tablist', 'aria-label': '这一条的页面' },
-            ...[['timeline', '时间线'], ['editor', '编辑'], ['pace', '设置']].map(([id, label]) => el('button', {
+            ...[['editor', '编辑'], ['pace', '设置']].map(([id, label]) => el('button', {
                 type: 'button',
                 role: 'tab',
                 class: `dga-seg-btn${active === id ? ' is-on' : ''}`,
@@ -6774,8 +6708,8 @@
     }
 
     async function openWorkPage(page) {
-        if ((page === 'timeline' && ui.view === 'timeline')
-            || (page === 'editor' && ui.view === 'editor')
+        if (page === 'timeline') page = 'editor';
+        if ((page === 'editor' && ui.view === 'editor')
             || (page === 'pace' && ui.view === 'pace')) return false;
         if (page !== 'editor' && ui.view === 'editor' && editorUnsaved(ui.editor)) {
             if (!hostWindow.confirm('还有没保存的修改，确定放弃？')) return false;
@@ -6783,7 +6717,7 @@
         const context = workContext();
         if (!context || context.broken || !context.entry) throw new Error('这条绑定不可用。');
         ui.workKey = context.key;
-        if (page === 'editor' || page === 'timeline') {
+        if (page === 'editor') {
             ui.paceKey = '';
             const same = ui.editor && ui.editor.entry && context.entry && ui.editor.entry.uid === context.entry.uid
                 && ui.editor.worldbookName === context.worldbookName;
@@ -6794,8 +6728,8 @@
                         : null,
                 });
             }
-            ui.editor.mode = page === 'timeline' ? 'road' : 'seg';
-            ui.timelineKey = page === 'timeline' ? context.key : '';
+            if (ui.editor.mode === 'road') ui.editor.mode = 'seg';
+            ui.timelineKey = '';
             ui.view = 'editor';
             return false;
         }
@@ -6904,7 +6838,43 @@
                         else delete item.loopBranch;
                     }), { success: value === 'keep' ? '回到开头后，还走刚才选的那段' : '回到开头后，再在那几段里挑一次' }),
                 }, label)))) : null,
-            orderMode === 'loop' ? muted('再选一次：又要挑一段。还走刚才那段：不用再挑。') : null,
+            orderMode === 'loop' ? muted('再选一次：又要挑一段。还走刚才那段：不用再挑。被分岔口断掉的线不会因为循环再接上。') : null,
+            field('依附于', selectControl(
+                [{ value: '', label: '不依附，自己走' }].concat((ui.snapshot && ui.snapshot.contexts || [])
+                    .filter(item => item.key !== context.key && !item.broken)
+                    .map(item => ({ value: item.key, label: entryName(item.entry) }))),
+                binding.attachKey || '',
+                value => runAction('保存依附', () => updateBinding(context.key, item => {
+                    if (value) {
+                        item.attachKey = value;
+                        if (!item.attachStage) item.attachStage = 1;
+                        if (item.attachKind !== 'side' && item.attachKind !== 'fork') item.attachKind = 'fork';
+                    } else {
+                        delete item.attachKey;
+                        delete item.attachStage;
+                        delete item.attachKind;
+                    }
+                }), { success: value ? '这条会从指定那一段挂到所选条目上' : '这条自己单独走' }),
+            )),
+            binding.attachKey ? field('从第几段开始', selectControl(
+                Array.from({ length: Math.max(1, ((((ui.snapshot && ui.snapshot.contexts) || []).find(item => item.key === binding.attachKey) || {}).parsed || { stages: [null] }).stages.length) }, (_, index) => ({
+                    value: String(index + 1),
+                    label: `第 ${index + 1} 段`,
+                })),
+                String(binding.attachStage || 1),
+                value => runAction('保存依附起点', () => updateBinding(context.key, item => {
+                    item.attachStage = Math.max(1, Math.floor(Number(value) || 1));
+                }), { success: `从第 ${value} 段开始依附` }),
+            )) : null,
+            binding.attachKey ? field('到了那里', el('div', { class: 'dga-seg' },
+                ...[['fork', '分岔口'], ['side', '支线']].map(([value, label]) => el('button', {
+                    type: 'button',
+                    class: `dga-seg-btn${(binding.attachKind === 'side' ? 'side' : 'fork') === value ? ' is-on' : ''}`,
+                    onclick: () => runAction('保存依附类型', () => updateBinding(context.key, item => {
+                        item.attachKind = value;
+                    }), { success: value === 'side' ? '可以走，走完回到原来那条接着往下' : '选了这条，原来那条就断掉' }),
+                }, label)))) : null,
+            binding.attachKey ? muted('分岔口：选了这条，原来那条不能再往下。支线：可以走也可以不走，走完回到原来那一幕的下一段。分岔口上还能再依附别的条目。') : null,
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
                 if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
                 else delete item.advanceMode;
@@ -6992,70 +6962,6 @@
                 ui.addEntryKey = null;
             }),
         )));
-        const draft = ui.storyNew;
-        children.push(btn('新建剧情指导', () => {
-            ui.storyNew = draft ? null : {
-                name: '剧情指导',
-                positionType: 'before_character_definition',
-                order: '100',
-            };
-            render();
-        }, { ghost: true }));
-        if (draft) {
-            const nameInput = el('input', {
-                type: 'text',
-                maxlength: 60,
-                oninput: event => { draft.name = event.target.value; },
-            });
-            nameInput.value = draft.name || '';
-            const orderInput = el('input', {
-                type: 'text',
-                inputmode: 'numeric',
-                oninput: event => { draft.order = event.target.value; },
-            });
-            orderInput.value = draft.order == null ? '100' : String(draft.order);
-            children.push(field('名字', nameInput));
-            children.push(field('放在哪', selectControl([
-                { value: 'before_character_definition', label: '角色定义前' },
-                { value: 'after_character_definition', label: '角色定义后' },
-                { value: 'before_example_messages', label: '示例消息前' },
-                { value: 'after_example_messages', label: '示例消息后' },
-                { value: 'before_author_note', label: '作者注释前' },
-                { value: 'after_author_note', label: '作者注释后' },
-                { value: 'at_depth_system', label: '[系统] 插入深度' },
-                { value: 'at_depth_user', label: '[用户] 插入深度' },
-                { value: 'at_depth_assistant', label: '[AI] 插入深度' },
-                { value: 'outlet', label: '锚点' },
-            ], draft.positionType, value => { draft.positionType = value; render(); })));
-            if (String(draft.positionType || '').startsWith('at_depth')) {
-                const depthInput = el('input', {
-                    type: 'text',
-                    inputmode: 'numeric',
-                    oninput: event => { draft.depth = event.target.value; },
-                });
-                depthInput.value = draft.depth == null ? '4' : String(draft.depth);
-                children.push(field('深度', depthInput, '0 是最新一层。'));
-            }
-            if (draft.positionType === 'outlet') {
-                const outletInput = el('input', {
-                    type: 'text',
-                    maxlength: 60,
-                    placeholder: '和酒馆锚点名称一样',
-                    oninput: event => { draft.outletName = event.target.value; },
-                });
-                outletInput.value = draft.outletName || '';
-                children.push(field('锚点名称', outletInput));
-            }
-            children.push(field('顺序', orderInput, '数字越小越靠前。'));
-            children.push(btn('创建', () => runAction('新建剧情指导', () => createStoryGuide({
-                worldbookName: ui.selectedWorldbook,
-                name: draft.name,
-                positionType: draft.positionType,
-                order: draft.order,
-                depth: draft.depth,
-                outletName: draft.outletName,
-            })), { primary: true }));
-        }
         const needle = String(ui.entryQuery || '').trim().toLowerCase();
         const visibleEntries = ui.entries.filter(entry => !needle || entryName(entry).toLowerCase().includes(needle));
         const entryOptions = visibleEntries.length > 0
@@ -7252,7 +7158,7 @@
     function renderEditor() {
         const editor = ui.editor;
         const parsed = editor.parsed;
-        const mode = editor.mode;
+        const mode = editor.mode === 'raw' ? 'raw' : 'seg';
         // 分段是默认视图（v2.28）：第一次进来就要把派生模型和文档级拖选监听准备好，
         // 否则拖选事件没人接（旧版要先点「选区划分」那一档才会挂）。
         if (mode === 'seg' || mode === 'map' || mode === 'road') {
@@ -7281,16 +7187,14 @@
         );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
-            : (mode === 'road'
-                ? '点一张卡片。往下接是继续，分开是再分几条，转到另一条是换线，支线是从这里出去走到头。'
-                : '拖选正文再选归属。原文不会被改写，也不会换位置；↑↓ 只改进入下一阶段的顺序。阶段怎么走在小卡的设置里。');
+            : '拖选正文再选归属。原文不会被改写，也不会换位置。↑↓ 只改进入下一阶段的顺序。依附、循环在小卡的设置里。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
-            workSwitch(mode === 'road' ? 'timeline' : 'editor'),
+            workSwitch('editor'),
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
-            mode === 'road' ? null : toolbar,
-            mode === 'road' ? renderRoad(editor) : (mode === 'raw' ? rawArea : renderSegments(editor)),
+            toolbar,
+            mode === 'raw' ? rawArea : renderSegments(editor),
             // 一个标题都还没有：原始正文就是不分段的，分段完全由用户自己划。
             // 想省事可以先按空行切块，再逐块拖选归属。
             mode === 'seg' && !parsed.blocks.length && parsed.items.length > 0
@@ -7323,7 +7227,7 @@
             onclick: () => { ui.editorTip = !ui.editorTip; render(); },
         }, '⚙');
         const parts = [
-            header(mode === 'road' ? '时间线' : '编辑', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear, { subpage: true }),
+            header('编辑', `${entryName(editor.entry)}${editorUnsaved(editor) ? ' · 未保存' : ''}`, () => closeEditor(false), '返回', gear, { subpage: true }),
             body,
             foot,
         ];
@@ -8932,7 +8836,6 @@
                 { value: '__unassigned', label: '未分配（不发送）' },
                 ...stageSequence(pick).map((stage, index) => ({ value: stage.id, label: `第 ${index + 1} 段 · ${stage.name}` })),
                 ...pick.addons.map(addon => ({ value: addon.id, label: `附加 · ${addon.name}` })),
-                { value: 'always', label: '常驻提示（每段都发送）' },
                 { value: 'note', label: '备注（只给自己看）' },
                 { value: '__new-stage', label: '＋ 新阶段…' },
                 { value: '__new-addon', label: '＋ 新附加…' },
@@ -8950,39 +8853,10 @@
         return bar;
     }
 
-    function placeStoryRanges(pick) {
-        const content = storyDocument(pick);
-        pick.text = content;
-        let cursor = 0;
-        stageSequence(pick).forEach(stage => {
-            const name = String(stage.name || '未命名').trim() || '未命名';
-            const header = `## ${name}`;
-            const at = content.indexOf(header, cursor);
-            if (at < 0) {
-                stage.ranges = [];
-                return;
-            }
-            const after = at + header.length;
-            const start = content[after] === '\n' ? after + 1 : after;
-            const next = content.indexOf('\n## ', after);
-            const end = next < 0 ? content.length : next;
-            stage.ranges = end > start ? [{ start, end }] : [];
-            stage.body = content.slice(start, end).trim();
-            cursor = end;
-        });
-        return content;
-    }
-
     async function saveEditor() {
         const editor = ui.editor;
-        const config = editor.bound ? await readConfig() : null;
-        const binding = config ? findBindingForEntry(config, editor.worldbookName, editor.entry) : null;
-        const storyGuide = Boolean(binding && binding.storyGuide && editor.pick);
         let saved;
-        if (storyGuide) {
-            const content = placeStoryRanges(editor.pick);
-            saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
-        } else if (editor.mode === 'raw') {
+        if (editor.mode === 'raw') {
             if (editor.pick) rebasePickText(editor.pick, editor.lines.join('\n'));
             const content = editor.pick ? String(editor.pick.text || '') : editor.lines.join('\n');
             saved = await writeEntryContent(editor.worldbookName, editor.entry.uid, entryName(editor.entry), content);
@@ -9005,11 +8879,9 @@
             editor.pick.pendingRanges = [];
             pickAttach(editor);
         }
-        setMessage(storyGuide
-            ? '已按顺序写入世界书。全文那条关着，开着的只有当前这一段。'
-            : (editor.mode === 'raw'
+        setMessage(editor.mode === 'raw'
             ? '已保存你改过的原文。'
-            : (editor.bound ? '已保存划分，原文没有改动。' : '已保存划分，原文没有改动。回「动态指导」页点「绑定」开始使用。')), 'success');
+            : (editor.bound ? '已保存划分，原文没有改动。' : '已保存划分，原文没有改动。回「动态指导」页点「绑定」开始使用。'), 'success');
     }
 
     // ---------------------------------------------------------------
@@ -9551,7 +9423,6 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         stepTargetVisible,
         storyRows,
         storyEdges,
-        storyDocument,
         storyLaneSegments,
         storyPositions,
         stageMapStatus,
