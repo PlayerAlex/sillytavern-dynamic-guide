@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.93
+     * 动态指导助手 v2.94
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.93';
+    const VERSION = '2.94';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3648,7 +3648,20 @@
         return context.parsed.stages[index] || null;
     }
 
-    function guideTextFor(context, generationType) {
+    function attachmentAsleep(context, contexts) {
+        const binding = context && context.binding;
+        if (!binding || !binding.attachKey || !Array.isArray(contexts)) return false;
+        const host = (contexts || []).find(item => item.key === binding.attachKey);
+        if (!host || !host.state) return true;
+        const at = Math.max(1, Math.floor(Number(binding.attachStage) || 1));
+        if ((Number(host.state.stageIndex) || 0) + 1 < at) return true;
+        if (binding.attachKind === 'side') return host.state.sideOut !== context.key;
+        return host.state.forkInto !== context.key;
+    }
+
+    function guideTextFor(context, generationType, contexts) {
+        if (context && context.state && context.state.lineCut === true) return '当前剧情走入了分叉';
+        if (attachmentAsleep(context, contexts)) return null;
         const stage = stageForGuide(context, generationType);
         if (!stage) return null;
         return formatInjection(stage, activeAddons(context.parsed, context.parsed.stages.indexOf(stage)));
@@ -3719,8 +3732,8 @@
         return changed;
     }
 
-    async function syncMirrorFor(context, generationType) {
-        const text = guideTextFor(context, generationType);
+    async function syncMirrorFor(context, generationType, contexts) {
+        const text = guideTextFor(context, generationType, contexts);
         const cue = storyCueText(context, generationType);
         const preview = await getWorldbook(context.worldbookName);
         const plan = syncMirrorInPlace(preview, context, text);
@@ -3891,7 +3904,7 @@
                 context.binding.loop = true;
                 configChanged = true;
             }
-            const plan = await syncMirrorFor(context, generationType);
+            const plan = await syncMirrorFor(context, generationType, all.contexts);
             const before = context.binding.mirrorUid == null ? null : String(context.binding.mirrorUid);
             const after = plan.mirrorUid == null ? null : String(plan.mirrorUid);
             if (before !== after) {
@@ -4013,6 +4026,7 @@
             preAdvanceIndex: settings.messageId != null ? context.state.stageIndex : null,
             ...(Object.keys(branchChoices).length ? { branchChoices } : {}),
             ...(context.state.lineCut === true ? { lineCut: true } : {}),
+            ...(context.state.forkInto ? { forkInto: context.state.forkInto } : {}),
             ...(context.state.sideOut ? { sideOut: context.state.sideOut } : {}),
             ...(context.state.returnKey ? { returnKey: context.state.returnKey, returnIndex: context.state.returnIndex } : {}),
             ...(Number.isInteger(context.state.passedAttach) ? { passedAttach: context.state.passedAttach } : {}),
@@ -4701,6 +4715,7 @@
     async function maybeJudgeAdvance(context, messageId, config, options) {
         const flags = options || {};
         if (!context || context.broken || !context.stage || context.stage.terminal) return;
+        if (attachmentAsleep(context, flags.contexts)) return;
         if (!flags.force && context.autoAdvance !== 'judge') return;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到判断AI跳过。
         if (context.state.lastCompletionMessageId === messageId) return;
@@ -4987,6 +5002,7 @@
             // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
             for (const context of all.contexts) {
                 if (context.broken || !context.stage || context.stage.terminal) continue;
+                if (attachmentAsleep(context, all.contexts)) continue;
                 if (bindingOrderMode(context.binding) === 'pick') continue;
                 const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
                 if (context.state.lastCompletionFingerprint === fingerprint) continue;
@@ -5012,6 +5028,7 @@
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
                 if (context.broken || !context.stage || context.autoAdvance !== 'judge') return null;
+                if (attachmentAsleep(context, fresh.contexts)) return null;
                 if (bindingOrderMode(context.binding) === 'pick') return null;
                 return maybeJudgeAdvance(context, messageId, fresh.config);
             }));
@@ -5020,6 +5037,7 @@
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
                 if (context.broken || bindingOrderMode(context.binding) !== 'pick') return null;
+                if (attachmentAsleep(context, fresh.contexts)) return null;
                 return maybePickStage(context, messageId, fresh.config);
             }));
         }
@@ -6610,7 +6628,7 @@
                                 stageIndex: 0, lineCut: false, returnKey: fresh.key, returnIndex: fresh.state.stageIndex + 1,
                             });
                         } else {
-                            await patchStateFor(fresh.key, { lineCut: true, sideOut: '' });
+                            await patchStateFor(fresh.key, { lineCut: true, sideOut: '', forkInto: chosen.key });
                             await patchStateFor(chosen.key, { stageIndex: 0, lineCut: false, returnKey: '', returnIndex: null });
                         }
                         await syncMirrors('normal');
