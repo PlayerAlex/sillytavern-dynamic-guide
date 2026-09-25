@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.96
+     * 动态指导助手 v2.97
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.96';
+    const VERSION = '2.97';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -623,6 +623,15 @@
         if (Object.keys(branchChoices).length) next.branchChoices = branchChoices;
         if (old.lastJudgeYes === true || old.lastJudgeYes === false) next.lastJudgeYes = old.lastJudgeYes;
         if (typeof old.lastJudgeBasis === 'string' && old.lastJudgeBasis) next.lastJudgeBasis = old.lastJudgeBasis.slice(0, 500);
+        if (old.lineCut === true) next.lineCut = true;
+        if (typeof old.forkInto === 'string' && old.forkInto) next.forkInto = old.forkInto;
+        if (typeof old.sideOut === 'string' && old.sideOut) next.sideOut = old.sideOut;
+        if (typeof old.returnKey === 'string' && old.returnKey) {
+            next.returnKey = old.returnKey;
+            next.returnIndex = Number.isInteger(old.returnIndex) ? old.returnIndex : null;
+        }
+        if (Number.isInteger(old.passedAttach)) next.passedAttach = old.passedAttach;
+        if (Number.isInteger(old.passedPass)) next.passedPass = old.passedPass;
         return next;
     }
 
@@ -4179,6 +4188,7 @@
         '你是阶段完成判定器。你只回答一件事：现在该不该离开当前这一段、进入这一条自己的下一段。',
         '你不写新内容、不续写、不评价文笔、不改原文、不做授权范围外的任何事。',
         '走进别的分支后，被依附的那条由脚本关掉，不再发给你。你只判断还开着的这一段。',
+        '到了分岔口时，选出要走进的那一条。选出之后，后台进入那条分叉，并暂时关闭被依附的这条。没走进就留在这条。',
         '',
         '先在心里做完这三步，再填最后的空表：看清当前阶段是一段时间或持续状态，还是一件要发生的事；到正文里核对；三档里只选一档。',
         '一段时间或持续状态还在，就不是完成。正文仍像当前这段，写 NO。只有正文已经换成下一阶段的状态，才写 YES。',
@@ -4222,6 +4232,7 @@
         '15. 走进别的分支后，被依附的那条由脚本关掉，不再发给你。你只判断还开着的这一段。',
         '16. 分岔、支线、换到另一条，都是人来选的。碰到另一条上的事，不能当成这一段已经完成。',
         '17. YES 只表示这一条该走进自己的下一段。',
+        '18. 这一段挂着分岔时，看正文已经走进哪一条。在 <road> 里写它的序号。写了序号，后台进入那条分叉，并暂时关闭被依附的这条。还没走进，路写 0。',
     ].join('\n');
 
     const DEFAULT_JUDGE_ASSISTANT_PROMPT = [
@@ -4234,6 +4245,7 @@
         '6. 最后三个标签都按里面的条目填，标签外不要写字。',
         '7. 一段时间还停在当前这段时写 NO；只有正文已经换成下一阶段的状态才写 YES。',
         '8. 被依附的那条走进别的分支后会由脚本关掉。我只判断还开着的这一段，不因此写 YES。',
+        '9. 到了分岔口，我在 <road> 里写走进的序号；写 0 就是还留在这条。',
     ].join('\n');
 
     const DEFAULT_JUDGE_CASE_PROMPT = [
@@ -4255,6 +4267,9 @@
         '【最近演到哪了】',
         '{{history}}',
         '',
+        '【分岔口】',
+        '{{roads}}',
+        '',
         '<checklist>',
         '- 当前时间：从正文里人正在做的事看，现在还在当前阶段，还是已经换成下一阶段。',
         '- 还停在当前阶段里的日常，不是离开这段。状态、总结、思维链不算。',
@@ -4268,6 +4283,9 @@
         '<verdict>',
         '- 结论：只写 YES 或 NO',
         '</verdict>',
+        '<road>',
+        '- 路：0',
+        '</road>',
     ].join('\n');
 
     const DEFAULT_JUDGE_SEGMENTS = [
@@ -4407,7 +4425,7 @@
         return null;
     }
 
-    function fillJudgePlaceholders(template, stage, condition, history, next) {
+    function fillJudgePlaceholders(template, stage, condition, history, next, roads) {
         const following = next || {};
         return String(template || '')
             .replace(/\{\{\s*stage\s*\}\}/g, stage.name)
@@ -4415,7 +4433,8 @@
             .replace(/\{\{\s*condition\s*\}\}/g, condition)
             .replace(/\{\{\s*history\s*\}\}/g, history)
             .replace(/\{\{\s*next\s*\}\}/g, following.name || '（没有下一阶段）')
-            .replace(/\{\{\s*nextPrompt\s*\}\}/g, following.prompt || '（没有）');
+            .replace(/\{\{\s*nextPrompt\s*\}\}/g, following.prompt || '（没有）')
+            .replace(/\{\{\s*roads\s*\}\}/g, roads || '这一段没有分岔。路写 0。');
     }
 
     // 兼容旧版：settings.judgePrompt 单模板字符串仍然生效（相当于 system 段 + 单个 user 段）；
@@ -4430,10 +4449,10 @@
     }
 
     // 组装判断AI消息：逐段替换占位符；空内容段丢弃。
-    function judgeMessagesFor(settings, stage, condition, history, next) {
+    function judgeMessagesFor(settings, stage, condition, history, next, roads) {
         const messages = judgeMessageSpecs(settings)
             .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role) && typeof seg.content === 'string' && seg.content.trim())
-            .map(seg => ({ role: seg.role, content: fillJudgePlaceholders(seg.content, stage, condition, history, next) }));
+            .map(seg => ({ role: seg.role, content: fillJudgePlaceholders(seg.content, stage, condition, history, next, roads) }));
         if (!messages.length) {
             messages.push({ role: 'user', content: fillJudgePlaceholders('当前阶段「{{stage}}」演完了吗？下一阶段是「{{next}}」。还停在当前这段就回答 NO，已经换成下一段才回答 YES。', stage, condition, history, next) });
         }
@@ -4464,7 +4483,7 @@
             .split('\n')
             .map(line => line
                 .replace(/^\s*[-–—•]+\s*/, '')
-                .replace(/^(已发生|依据|结论|序号|走向|basis|verdict|stage)\s*[:：]\s*/i, '')
+                .replace(/^(已发生|依据|结论|序号|走向|路|basis|verdict|stage)\s*[:：]\s*/i, '')
                 .trim())
             .filter(Boolean)
             .join(' ')
@@ -4713,6 +4732,37 @@
             : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
     }
 
+    function forksAtStage(context, contexts) {
+        const stageNo = (Number(context && context.state && context.state.stageIndex) || 0) + 1;
+        return (contexts || []).filter(item => item && !item.broken && item.binding
+            && item.binding.attachKey === context.key
+            && Number(item.binding.attachStage) === stageNo
+            && item.binding.attachKind !== 'side');
+    }
+
+    function roadListText(forks) {
+        if (!forks || !forks.length) return '这一段没有分岔。路写 0。';
+        const lines = forks.map((item, index) => `${index + 1}. ${entryName(item.entry)}`);
+        return [
+            '到了这里要判断走进哪一条。',
+            ...lines,
+            '还没走进任何一条，路写 0，留在这条。',
+            '写了序号，后台进入那条分叉，并暂时关闭被依附的这条。',
+        ].join('\n');
+    }
+
+    function judgePickedFork(text, forks) {
+        const tag = String(text || '').match(/<road>\s*([\s\S]*?)<\/road>/i);
+        if (!tag) return null;
+        const inner = judgeFieldBody(tag[1]);
+        if (!inner || /^0+$/.test(inner)) return null;
+        if (/^\d+$/.test(inner)) {
+            const index = Number(inner) - 1;
+            return index >= 0 && index < forks.length ? forks[index] : null;
+        }
+        return forks.find(item => entryName(item.entry) === inner) || null;
+    }
+
     async function maybeJudgeAdvance(context, messageId, config, options) {
         const flags = options || {};
         if (!context || context.broken || !context.stage || context.stage.terminal) return;
@@ -4767,7 +4817,8 @@
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
             const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
             const next = nextJudgeStage(context.parsed, context.state.stageIndex, context.state);
-            const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）', next);
+            const forks = forksAtStage(context, flags.contexts);
+            const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）', next, roadListText(forks));
             const cap = JUDGE_REPLY_CAP;
             const judgePreset = preset
                 ? { ...preset, maxTokens: Math.min(Math.floor(Number(preset.maxTokens)) || cap, cap) }
@@ -4794,6 +4845,22 @@
                 LogModule.debug('判断AI', `输出过滤生效：${judgeRuntime.lastRaw.length} → ${filtered.length} 字`);
             }
             LogModule.info('判断AI', `「${bindingLabel}」阶段「${stage.name}」结论：${yes ? 'YES（演完了）' : 'NO（继续）'}，耗时 ${Date.now() - startedAt} ms`);
+            const pickedFork = forks.length ? judgePickedFork(filtered, forks) : null;
+            if (pickedFork) {
+                const guard = await loadContexts();
+                const now = guard.contexts.find(item => item.key === context.key);
+                const nowMessageId = currentMessageId();
+                if (!now || now.broken || now.state.stageIndex !== startStageIndex
+                    || (nowMessageId != null && nowMessageId !== messageId)) {
+                    LogModule.warn('判断AI', `「${bindingLabel}」要进入分叉，但期间进度已变化，放弃`);
+                    return;
+                }
+                LogModule.info('判断AI', `「${bindingLabel}」进入分叉「${entryName(pickedFork.entry)}」，暂时关闭被依附的这条`);
+                await patchStateFor(now.key, { lineCut: true, sideOut: '', forkInto: pickedFork.key, lastCompletionMessageId: messageId });
+                await patchStateFor(pickedFork.key, { stageIndex: 0, lineCut: false, returnKey: '', returnIndex: null, sideOut: '' });
+                await syncMirrors('normal');
+                return;
+            }
             if (!yes) return;
             // 防误判守卫：判断AI是异步的，期间标记流程或用户操作可能已推进、又收到了新回复，
             // 这些情况下这次 YES 已经过期，必须放弃推进。
@@ -4857,7 +4924,7 @@
             if (queued && String(queued.messageId) !== String(messageId)) {
                 const fresh = await loadContexts();
                 const latest = fresh.contexts.find(item => item.key === context.key);
-                if (latest) await maybeJudgeAdvance(latest, queued.messageId, fresh.config);
+                if (latest) await maybeJudgeAdvance(latest, queued.messageId, fresh.config, { contexts: fresh.contexts });
             }
         }
     }
@@ -5034,7 +5101,7 @@
                 if (context.state && (context.state.lineCut === true || context.state.sideOut)) return null;
                 if (attachmentAsleep(context, fresh.contexts)) return null;
                 if (bindingOrderMode(context.binding) === 'pick') return null;
-                return maybeJudgeAdvance(context, messageId, fresh.config);
+                return maybeJudgeAdvance(context, messageId, fresh.config, { contexts: fresh.contexts });
             }));
         }
         if (all.configured && pickNeeded) {
@@ -7081,7 +7148,7 @@
                     if (messageId == null) throw new Error('当前没有可检查的回复。');
                     const hint = String((ui.judgeExtras && ui.judgeExtras[context.key]) || '').trim();
                     if (orderMode === 'pick') await maybePickStage(fresh, messageId, loaded.config, { force: true, extra: hint });
-                    else await maybeJudgeAdvance(fresh, messageId, loaded.config, { force: true, extra: hint });
+                    else await maybeJudgeAdvance(fresh, messageId, loaded.config, { force: true, extra: hint, contexts: loaded.contexts });
                     ui.judgeExtras[context.key] = '';
                     return true;
                 }, { success: '已检查这一段' }), { ghost: true }));

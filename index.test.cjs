@@ -2502,6 +2502,60 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.deepEqual(run.errors, []);
 });
 
+test('判断AI档：分岔口写了路就进入那条，并关掉被依附的这条', async () => {
+    const host = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const fork = '## 岔一\n岔一正文\n\n## 岔二\n岔二正文';
+    const books = {
+        书A: [
+            { uid: 1, name: '大纲A', content: host, enabled: false },
+            { uid: 2, name: '岔路', content: fork, enabled: false },
+        ],
+    };
+    const config = {
+        version: 2,
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null },
+            {
+                worldbookName: '书A', entryUid: 2, entryName: '岔路', boundAt: null,
+                attachKey: keyOf('书A', 1), attachStage: 1, attachKind: 'fork',
+            },
+        ],
+        settings: { autoAdvance: 'judge' },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '人已经走进岔路。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const asked = [];
+    helper.generateRaw = async options => {
+        asked.push(options);
+        return [
+            '<basis>',
+            '- 已发生：人走进了岔路',
+            '</basis>',
+            '<verdict>',
+            '- 结论：NO',
+            '</verdict>',
+            '<road>',
+            '- 路：1',
+            '</road>',
+        ].join('\n');
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.equal(state.books.书A.find(item => item.name === '岔路（动态指导）'), undefined, '还没走进时分叉不发给 AI');
+
+    await state.events.get('message_received')(5);
+    assert.match(String(asked[0].user_input), /1\. 岔路/);
+    assert.match(String(asked[0].user_input), /写了序号，后台进入那条分叉，并暂时关闭被依附的这条/);
+    const bindings = state.variables.chat.$dynamicGuideAssistant.state.bindings;
+    assert.equal(bindings[keyOf('书A', 1)].lineCut, true, '被依附的这条要暂时关掉');
+    assert.equal(bindings[keyOf('书A', 1)].forkInto, keyOf('书A', 2));
+    assert.equal(bindings[keyOf('书A', 1)].stageIndex, 0, '关掉这条，不要顺手推进它');
+    assert.equal(bindings[keyOf('书A', 2)].stageIndex, 0);
+    assert.equal(state.books.书A.find(item => item.name === '大纲A（动态指导）'), undefined, '关掉后这条的镜像要撤掉');
+    assert.match(state.books.书A.find(item => item.name === '岔路（动态指导）').content, /岔一正文/);
+    assert.deepEqual(run.errors, []);
+});
+
 test('AI 选段：可以从第 3 段跳回第 1 段', async () => {
     const content = '## 甲\n甲正文\n\n## 乙\n乙正文\n\n## 丙\n丙正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
