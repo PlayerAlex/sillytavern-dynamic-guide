@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.90
+     * 动态指导助手 v2.91
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.90';
+    const VERSION = '2.91';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6619,13 +6619,13 @@
                     if (pass.left !== stageNo || (pass.dir !== 'over' && pass.dir !== 'both')) return;
                     const host = crowd.find(item => item.key === fresh.binding.attachKey && !item.broken);
                     if (!host) return;
-                    offers.push({ dest: host, stage: pass.right - 1, word: '从那边过来' });
+                    offers.push({ dest: host, stage: pass.right - 1, word: '去那边' });
                 });
                 crowd.forEach(item => {
                     if (!item.binding || item.binding.attachKey !== fresh.key || item.broken) return;
                     (item.binding.passes || []).forEach(pass => {
                         if (pass.right !== stageNo || (pass.dir !== 'back' && pass.dir !== 'both')) return;
-                        offers.push({ dest: item, stage: pass.left - 1, word: '回去' });
+                        offers.push({ dest: item, stage: pass.left - 1, word: '回这条' });
                     });
                 });
                 if (offers.length && !(fresh.state && fresh.state.passedPass === stageNo)) {
@@ -6817,60 +6817,42 @@
         const leftOptions = stageChoiceOptions(leftStages);
         const rightOptions = stageChoiceOptions(rightStages);
         const dirs = [
-            ['both', '↔', '互通'],
-            ['back', '←', '回去'],
-            ['over', '→', '从那边过来'],
+            ['back', '←', '回这条'],
+            ['over', '→', '去那边'],
+            ['both', '↔', '两边'],
         ];
         const save = next => updateBinding(context.key, item => {
             item.passes = next;
         });
-        const cards = passes.map((pass, index) => {
-            const current = dirs.find(item => item[0] === pass.dir) || dirs[0];
-            const menuKey = `${context.key}:${index}`;
-            const open = ui.passMenu === menuKey;
-            return el('div', { class: 'dga-pass-card' },
-                el('div', { class: 'dga-pass-caps' },
-                    el('span', { text: '这条' }),
-                    el('span', { text: '' }),
-                    el('span', { text: '那边' }),
-                    el('span', { text: '' })),
-                el('div', { class: 'dga-pass-row' },
-                    selectControl(leftOptions, String(pass.left), value => runAction('保存换边', () => save(passes.map((item, at) => (
-                        at === index ? { ...item, left: Math.max(1, Math.floor(Number(value) || 1)) } : item
-                    ))))),
-                    el('button', {
-                        type: 'button',
-                        class: `dga-seg-btn is-on dga-pass-dir-btn${open ? ' is-open' : ''}`,
-                        text: `${current[1]} ${current[2]}`,
-                        onclick: () => {
-                            ui.passMenu = open ? '' : menuKey;
-                            render();
-                        },
-                    }),
-                    selectControl(rightOptions, String(pass.right), value => runAction('保存换边', () => save(passes.map((item, at) => (
-                        at === index ? { ...item, right: Math.max(1, Math.floor(Number(value) || 1)) } : item
-                    ))))),
-                    el('button', {
-                        type: 'button',
-                        class: 'dga-icon-btn dga-icon-danger',
-                        title: '去掉这一条',
-                        text: '×',
-                        onclick: () => runAction('去掉换边', () => {
-                            if (ui.passMenu === menuKey) ui.passMenu = '';
-                            return save(passes.filter((_, at) => at !== index));
-                        }),
-                    })),
-                open ? el('div', { class: 'dga-pass-menu' },
+        const cards = passes.map((pass, index) => el('div', { class: 'dga-pass-card' },
+            el('div', { class: 'dga-pass-caps' },
+                el('span', { text: '这条' }),
+                el('span', { text: '方向' }),
+                el('span', { text: '那边' }),
+                el('span', { text: '' })),
+            el('div', { class: 'dga-pass-row' },
+                selectControl(leftOptions, String(pass.left), value => runAction('保存换边', () => save(passes.map((item, at) => (
+                    at === index ? { ...item, left: Math.max(1, Math.floor(Number(value) || 1)) } : item
+                ))))),
+                el('div', { class: 'dga-pass-dirs' },
                     ...dirs.map(([dir, mark, label]) => el('button', {
                         type: 'button',
-                        class: `dga-seg-btn${pass.dir === dir ? ' is-on' : ''}`,
+                        class: `dga-pass-chip${pass.dir === dir ? ' is-on' : ''}`,
                         text: `${mark} ${label}`,
-                        onclick: () => runAction('保存换边方向', () => {
-                            ui.passMenu = '';
-                            return save(passes.map((item, at) => (at === index ? { ...item, dir } : item)));
-                        }),
-                    }))) : null);
-        });
+                        onclick: () => runAction('保存换边方向', () => save(passes.map((item, at) => (
+                            at === index ? { ...item, dir } : item
+                        )))),
+                    }))),
+                selectControl(rightOptions, String(pass.right), value => runAction('保存换边', () => save(passes.map((item, at) => (
+                    at === index ? { ...item, right: Math.max(1, Math.floor(Number(value) || 1)) } : item
+                ))))),
+                el('button', {
+                    type: 'button',
+                    class: 'dga-icon-btn dga-icon-danger',
+                    title: '去掉这一条',
+                    text: '×',
+                    onclick: () => runAction('去掉换边', () => save(passes.filter((_, at) => at !== index))),
+                }))));
         return el('div', { class: 'dga-pass' },
             el('div', { class: 'dga-pass-head' },
                 el('span', { text: '到了可以换边' }),
@@ -6880,7 +6862,6 @@
                     text: '新增',
                     onclick: () => runAction('新增换边', () => save(passes.concat([{ left: 1, right: 1, dir: 'both' }]))),
                 })),
-            muted('「这条」是当前条目，「那边」是依附的条目。点中间的方向，再选回去、从那边过来，或互通。'),
             ...cards);
     }
 
@@ -6983,7 +6964,6 @@
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
                 success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
             }))),
-            muted('按顺序：一段接一段，走到最后停下。循环：走到最后回到第一段。AI 选下一段：让 AI 看正文，决定停在哪一段。'),
             orderMode === 'loop' ? field('回到第一段之后', el('div', { class: 'dga-seg' },
                 ...[['fresh', '再选一次'], ['keep', '还走刚才那段']].map(([value, label]) => el('button', {
                     type: 'button',
@@ -6993,7 +6973,6 @@
                         else delete item.loopBranch;
                     }), { success: value === 'keep' ? '回到开头后，还走刚才选的那段' : '回到开头后，再在那几段里挑一次' }),
                 }, label)))) : null,
-            orderMode === 'loop' ? muted('再选一次：又要挑一段。还走刚才那段：不用再挑。被分岔口断掉的线不会因为循环再接上。') : null,
             field('依附于', selectControl(
                 [{ value: '', label: '不依附，自己走' }].concat((ui.snapshot && ui.snapshot.contexts || [])
                     .filter(item => item.key !== context.key && !item.broken)
@@ -7027,7 +7006,6 @@
                         item.attachKind = value;
                     }), { success: value === 'side' ? '可以走，走完回到原来那条接着往下' : '选了这条，原来那条就断掉' }),
                 }, label)))) : null,
-            binding.attachKey ? muted('分岔口：选了这条，原来那条不能再往下。支线：可以走也可以不走，走完回到原来那一幕的下一段。分岔口上还能再依附别的条目。') : null,
             binding.attachKey ? renderPassList(context, binding, (context.parsed && context.parsed.stages) || [], hostStages) : null,
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
                 if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
@@ -9071,11 +9049,12 @@ ${P} .dga-work-switch { display: grid; grid-template-columns: repeat(2, minmax(0
 ${P} .dga-pass { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-pass-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 ${P} .dga-pass-card { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--dga-border); border-radius: 6px; background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
-${P} .dga-pass-caps, ${P} .dga-pass-row { display: grid; grid-template-columns: minmax(0, 1fr) 112px minmax(0, 1fr) 32px; gap: 6px; align-items: center; }
+${P} .dga-pass-caps, ${P} .dga-pass-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) 32px; gap: 8px; align-items: center; }
 ${P} .dga-pass-caps { font-size: 12px; color: var(--dga-text-3); }
 ${P} .dga-pass-row select { width: 100%; min-width: 0; }
-${P} .dga-pass-dir-btn { width: 100%; min-height: 40px; }
-${P} .dga-pass-menu { display: flex; flex-direction: column; gap: 4px; }
+${P} .dga-pass-dirs { display: flex; gap: 4px; }
+${P} .dga-pass-chip { min-height: 28px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--dga-border-2); background: transparent; color: var(--dga-text-2); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+${P} .dga-pass-chip.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); }
 ${P} .dga-editor-dock { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; background: var(--dga-bg-0); }
 ${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: var(--dga-radius-md) var(--dga-radius-md) 0 0; background: var(--dga-bg-1); border-top: 1px solid var(--dga-border-2); display: flex; flex-direction: column; gap: 12px; }

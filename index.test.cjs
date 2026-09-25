@@ -3830,7 +3830,7 @@ test('没有时间线；编辑仍是分段，设置里可以依附', async () =>
     await findButton(panel(), '设置 ›').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
     assert.match(panel().textContent, /依附于/, '设置页能依附别的条目');
-    assert.match(panel().textContent, /走到最后回到第一段/);
+    assert.match(panel().textContent, /循环/);
     assert.equal(findButton(panel(), '时间线'), null, '页顶没有时间线');
     assert.ok(findButton(panel(), '编辑'), '页顶能去编辑');
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置是二级页');
