@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.76
+     * 动态指导助手 v2.77
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.76';
+    const VERSION = '2.77';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -7907,14 +7907,15 @@
                 if (other > at) return 'after';
                 return 'now';
             };
-            const forkWhenText = { before: '之前', now: '同时', after: '之后' };
+            const forkWhenText = { before: '在前面', now: '就是这段', after: '在后面' };
             const others = stages.filter(stage => stage !== owner);
             const chosen = others.filter(stage => (sheet.exclusiveIds || []).includes(stage.id));
             const available = others.filter(stage => !(sheet.exclusiveIds || []).includes(stage.id));
+            const picking = chosen.length > 0 || sheet.forkOpen === true;
             const forkRow = (stage, when) => el('div', { class: `dga-fork-row is-${when}` },
                 el('span', { class: 'dga-fork-when', text: forkWhenText[when] }),
-                el('b', { text: stage === owner ? '正在改的这一段' : stage.name }),
-                stage === owner ? null : btn('不要这段', () => {
+                el('b', { text: stage.name }),
+                stage === owner ? null : btn('拿掉', () => {
                     sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
                     render();
                 }, { ghost: true }));
@@ -7922,11 +7923,12 @@
                 .sort((left, right) => stages.indexOf(left) - stages.indexOf(right))
                 .map(stage => forkRow(stage, forkWhen(stage)));
             const forkAdd = available.length ? selectControl(
-                [{ value: '', label: '再加一段可以选' }].concat(available.map(stage => ({ value: stage.id, label: `${forkWhenText[forkWhen(stage)]} · ${stage.name}` }))),
+                [{ value: '', label: '把一段放进来' }].concat(available.map(stage => ({ value: stage.id, label: `${forkWhenText[forkWhen(stage)]} · ${stage.name}` }))),
                 '',
                 value => {
                     if (!value) return;
                     sheet.exclusiveIds = [...(sheet.exclusiveIds || []), value];
+                    sheet.forkOpen = true;
                     render();
                 },
             ) : null;
@@ -7942,10 +7944,24 @@
                         class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
                         onclick: () => { sheet.terminal = value; render(); },
                     }, label))))));
-            box.append(sheetSection('走到这里要选一段',
-                chosen.length ? el('div', { class: 'dga-fork-list' }, ...forkRows) : muted(others.length ? '不用选。按顺序往下走就行。' : '还没有别的段。'),
-                forkAdd,
-                muted(chosen.length ? '上面这几段里，只能走一段。黄的是前面。蓝的是同时。绿的是后面。' : '如果走到这里必须挑一段，用上面的框把那段加进来。')));
+            box.append(sheetSection('走到这里',
+                el('div', { class: 'dga-seg' },
+                    ...[[false, '接着往下'], [true, '从几段里挑一段']].map(([value, label]) => el('button', {
+                        type: 'button',
+                        class: `dga-seg-btn${picking === value ? ' is-on' : ''}`,
+                        disabled: value && !others.length,
+                        onclick: () => {
+                            sheet.forkOpen = value;
+                            if (!value) sheet.exclusiveIds = [];
+                            render();
+                        },
+                    }, label))),
+                picking
+                    ? el('div', { class: 'dga-fork-pick' },
+                        muted('下面几段里只能走一段。走了一段，另外几段这次就不走。'),
+                        el('div', { class: 'dga-fork-list' }, ...forkRows),
+                        forkAdd)
+                    : muted(others.length ? '走完这一段，就去下一段。' : '还没有别的段。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
@@ -8701,6 +8717,7 @@ ${P} .dga-sheet-section h4 { margin: 0; font-size: 13px; font-weight: 600; color
 ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 6px; background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; line-height: 1.5; }
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
 ${P} .dga-fork-list { display: flex; flex-direction: column; gap: 6px; }
+${P} .dga-fork-pick { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-fork-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; padding: 4px 4px 4px 12px; border: 1px solid var(--dga-border); border-left-width: 5px; border-radius: 6px; }
 ${P} .dga-fork-row b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 ${P} .dga-fork-when { flex: 0 0 auto; font-size: 12px; font-weight: 700; }

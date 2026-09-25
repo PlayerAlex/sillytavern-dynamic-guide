@@ -3962,25 +3962,30 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     panel().querySelector('.dga-segbar').listeners.click[0]();
     const sheet = () => panel().querySelector('.dga-sheet');
     assert.match(sheet().textContent, /离开这一段/);
-    assert.match(sheet().textContent, /走到这里要选一段/);
+    assert.match(sheet().textContent, /走到这里/);
+    assert.match(sheet().textContent, /走完这一段，就去下一段/);
+    assert.equal(sheet().textContent.includes('走到这里要选一段'), false);
     assert.match(sheet().textContent, /发给 AI/);
     assert.match(sheet().textContent, /暑假正文/);
     assert.ok(findButton(sheet(), '加一条附加'));
     assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
     assert.equal(findButton(sheet(), '第二幕'), null, '没加入岔路的段不出现在列表里');
-    const forkSelect = (function findSelects(node, out) {
-        if (node.tagName === 'SELECT' && optionsOf(node).some(option => option.textContent === '再加一段可以选')) out.push(node);
+    const findForkSelect = root => (function findSelects(node, out) {
+        if (node.tagName === 'SELECT' && optionsOf(node).some(option => option.textContent === '把一段放进来')) out.push(node);
         (node.children || []).forEach(child => findSelects(child, out));
         return out;
-    })(sheet(), []);
+    })(root, []);
+    assert.equal(findForkSelect(sheet()).length, 0, '没要挑路时不放出下拉框');
+    findButton(sheet(), '从几段里挑一段').listeners.click[0]();
+    const forkSelect = findForkSelect(sheet());
     assert.equal(forkSelect.length, 1);
-    const option = optionsOf(forkSelect[0]).find(item => item.textContent === '之后 · 第二幕');
+    const option = optionsOf(forkSelect[0]).find(item => item.textContent === '在后面 · 第二幕');
     forkSelect[0].value = optionValue(option);
     forkSelect[0].listeners.change[0]({ target: forkSelect[0] });
-    assert.match(sheet().textContent, /同时/, '正在改的这一段标成同时');
-    assert.match(sheet().textContent, /之后/, '排在后面的段标成之后');
+    assert.match(sheet().textContent, /就是这段/);
+    assert.match(sheet().textContent, /在后面/);
     assert.match(sheet().textContent, /第二幕/, '加上之后才出现在岔路里');
-    assert.equal(findButton(sheet(), '第二幕'), null, '岔路里的段不是一排开关');
+    assert.ok(findButton(sheet(), '拿掉'));
     findButton(sheet(), '加一条附加').listeners.click[0]();
     const areas = [];
     const walk = node => {
