@@ -3951,23 +3951,11 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     const sheet = () => panel().querySelector('.dga-sheet');
     assert.match(sheet().textContent, /离开这一段/);
     assert.match(sheet().textContent, /发给 AI/);
-    assert.match(sheet().textContent, /走完回到/);
+    assert.doesNotMatch(sheet().textContent, /走完回到/);
+    assert.doesNotMatch(sheet().textContent, /到了这里/);
+    assert.doesNotMatch(sheet().textContent, /附在这一段/);
+    assert.equal(findButton(sheet(), '加一条附加'), null, '附加内容不在这一段的页面里加');
     assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
     assert.ok(findButton(sheet(), '删掉这段'));
-    findButton(sheet(), '加一条附加').listeners.click[0]();
-    const areas = [];
-    const walk = node => {
-        if (node.tagName === 'TEXTAREA' && String(node.getAttribute('placeholder') || '').includes('一起发给 AI')) areas.push(node);
-        (node.children || []).forEach(walk);
-    };
-    walk(sheet());
-    assert.equal(areas.length, 1);
-    areas[0].value = '戒指能看见灵体';
-    areas[0].listeners.input[0]({ target: areas[0] });
-    findButton(sheet(), '保存修改').listeners.click[0]();
-    await findButton(panel(), '保存').listeners.click[0]();
-    const saved = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'];
-    const stage = saved.stages.find(item => item.name === '第一幕');
-    assert.equal(stage.extras[0].body, '戒指能看见灵体');
     assert.deepEqual(errors, []);
 });

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.84
+     * 动态指导助手 v2.85
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.84';
+    const VERSION = '2.85';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -6824,6 +6824,11 @@
             { value: 'loop', label: '循环' },
             { value: 'pick', label: 'AI 选下一段' },
         ];
+        const hostStages = ((((ui.snapshot && ui.snapshot.contexts) || []).find(item => item.key === binding.attachKey) || {}).parsed || {}).stages || [];
+        const attachStageOptions = (hostStages.length ? hostStages : [null]).map((stage, index) => ({
+            value: String(index + 1),
+            label: stage && stage.name ? `第 ${index + 1} 段 · ${stage.name}` : `第 ${index + 1} 段`,
+        }));
         const children = [
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
                 success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
@@ -6857,14 +6862,11 @@
                 }), { success: value ? '这条会从指定那一段挂到所选条目上' : '这条自己单独走' }),
             )),
             binding.attachKey ? field('从第几段开始', selectControl(
-                Array.from({ length: Math.max(1, ((((ui.snapshot && ui.snapshot.contexts) || []).find(item => item.key === binding.attachKey) || {}).parsed || { stages: [null] }).stages.length) }, (_, index) => ({
-                    value: String(index + 1),
-                    label: `第 ${index + 1} 段`,
-                })),
+                attachStageOptions,
                 String(binding.attachStage || 1),
                 value => runAction('保存依附起点', () => updateBinding(context.key, item => {
                     item.attachStage = Math.max(1, Math.floor(Number(value) || 1));
-                }), { success: `从第 ${value} 段开始依附` }),
+                }), { success: `从${attachStageOptions[Math.max(0, Math.floor(Number(value) || 1) - 1)].label}开始依附` }),
             )) : null,
             binding.attachKey ? field('到了那里', el('div', { class: 'dga-seg' },
                 ...[['fork', '分岔口'], ['side', '支线']].map(([value, label]) => el('button', {
@@ -7151,8 +7153,12 @@
         if (typeof container.getBoundingClientRect !== 'function') return;
         const box = container.getBoundingClientRect();
         const item = target.getBoundingClientRect();
-        const top = container.scrollTop + (item.top - box.top) - Math.max(0, (container.clientHeight - item.height) / 2);
-        container.scrollTop = Math.max(0, top);
+        const dock = container.querySelector('.dga-editor-dock');
+        const reserve = (dock && dock.offsetHeight ? dock.offsetHeight : 0) + 8;
+        const delta = item.top - box.top - reserve;
+        // 这一段已经在顶栏下面，就停在页顶。对得很齐会把「编辑 / 分段」卷出屏幕。
+        if (delta < 24) return;
+        container.scrollTop = Math.max(0, container.scrollTop + delta);
     }
 
     function renderEditor() {
@@ -7185,15 +7191,18 @@
                 modeButton('分段', 'seg'),
                 modeButton('编辑原文', 'raw')),
         );
+        const dock = el('div', { class: 'dga-editor-dock' },
+            workSwitch('editor'),
+            toolbar,
+        );
         const helpText = mode === 'raw'
             ? '直接改原文。已经划好的阶段会跟着改动后的文字走，点保存写的就是这里的正文。'
             : '拖选正文再选归属。原文不会被改写，也不会换位置。↑↓ 只改进入下一阶段的顺序。依附、循环在小卡的设置里。';
         const mergedCount = parsed.blocks.filter(block => block.kind === 'merged').length;
         const body = el('div', { class: 'dga-body' },
-            workSwitch('editor'),
+            dock,
             messageBar(),
             el('p', { class: 'dga-help', text: helpText }),
-            toolbar,
             mode === 'raw' ? rawArea : renderSegments(editor),
             // 一个标题都还没有：原始正文就是不分段的，分段完全由用户自己划。
             // 想省事可以先按空行切块，再逐块拖选归属。
@@ -7212,7 +7221,7 @@
                 ? messageBar({ type: 'info', text: `这个条目有 ${mergedCount} 处「合并到」。分段保存不会改原文，归属记在条目旁边。` })
                 : null,
             mode === 'seg' && ((editor.pick && stageSequence(editor.pick).length) || parsed.stages.length)
-                ? messageBar({ type: 'info', text: `现在有 ${(editor.pick ? stageSequence(editor.pick) : parsed.stages).length} 个剧情阶段${(editor.pick ? editor.pick.addons.length : parsed.addons.length) ? `、${editor.pick ? editor.pick.addons.length : parsed.addons.length} 个附加内容` : ''}${editor.pick && editor.pick.loop ? '，循环开着' : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` })
+                ? messageBar({ type: 'info', text: `现在有 ${(editor.pick ? stageSequence(editor.pick) : parsed.stages).length} 个剧情阶段${editor.pick && editor.pick.loop ? '，循环开着' : ''}。${parsed.warnings.length ? `\n${parsed.warnings.join('\n')}` : ''}` })
                 : null,
         );
         const foot = el('footer', { class: 'dga-foot' },
@@ -8204,98 +8213,25 @@
             });
             completion.value = sheet.completion;
             const preview = stageSheetPreview(editor, owner, sheet);
-            const extraNodes = (sheet.extras || []).map(extra => {
-                const nameBox = el('input', {
-                    type: 'text',
-                    maxlength: 40,
-                    placeholder: '附加的名字',
-                    oninput: event => { extra.name = event.target.value; },
-                });
-                nameBox.value = extra.name || '';
-                const bodyBox = el('textarea', {
-                    rows: 2,
-                    placeholder: '走到这一段时，一起发给 AI',
-                    oninput: event => { extra.body = event.target.value; },
-                });
-                bodyBox.value = extra.body || '';
-                return el('div', { class: 'dga-extra-row' },
-                    nameBox,
-                    bodyBox,
-                    btn('去掉', () => {
-                        sheet.extras = sheet.extras.filter(item => item !== extra);
-                        render();
-                    }, { ghost: true }));
-            });
             const stages = stageSequence(editor.pick);
             const others = stages.filter(stage => stage !== owner);
-            const loopChoices = [{ value: '', label: '不回去' }].concat(others.map(stage => ({ value: stage.id, label: stage.name })));
             box.append(sheetSection('离开这一段',
                 field('什么时候进入下一段', completion),
                 el('div', { class: 'dga-inline-action' },
                     btn('AI 生成', () => runAction('生成完成条件', () => generateCondition(sheet, completion), {
                         success: '已生成，确认后点「保存修改」。',
-                    }), { ghost: true })),
-                field('到了这里', el('div', { class: 'dga-seg' },
-                    ...[[false, '继续往后'], [true, '到此结束']].map(([value, label]) => el('button', {
-                        type: 'button',
-                        class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
-                        onclick: () => { sheet.terminal = value; render(); },
-                    }, label)))),
-                sheet.terminal ? muted('到此结束，不回到前面。') : field('走完回到', selectControl(
-                    loopChoices,
-                    sheet.loopTo || '',
-                    value => { sheet.loopTo = value; },
-                ), '选一段的话，走完这一段就回到那里。图上会写出来。')));
+                    }), { ghost: true }))));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
-            box.append(sheetSection('附在这一段',
-                ...extraNodes,
-                btn('加一条附加', () => {
-                    sheet.extras = sheet.extras || [];
-                    sheet.extras.push({ id: `extra-${Date.now().toString(36)}-${sheet.extras.length}`, name: '附加', body: '' });
-                    render();
-                }, { ghost: true })));
-            if (others.length || owner.kind === 'stage') {
+            if (others.length) {
                 box.append(sheetSection('整理',
-                    field('这是什么', el('div', { class: 'dga-seg' },
-                        ...[['stage', '剧情阶段'], ['addon', '附加内容']].map(([kind, label]) => el('button', {
-                            type: 'button',
-                            class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
-                            onclick: () => { sheet.kind = kind; render(); },
-                        }, label)))),
                     others.length ? field('再分配', selectControl(
                         [{ value: '', label: '不并入' }].concat(others.map(stage => ({ value: stage.id, label: `并入「${stage.name}」` }))),
                         sheet.mergeInto || '',
                         value => { sheet.mergeInto = value; },
                     ), '并入会把文字归到选中的阶段，这一段删掉。原文不动。') : null));
             }
-        } else if (owner.kind === 'stage' || owner.kind === 'addon') {
-            box.append(field('这是什么', el('div', { class: 'dga-seg' },
-                ...[['stage', '剧情阶段'], ['addon', '附加内容']].map(([kind, label]) => el('button', {
-                    type: 'button',
-                    class: `dga-seg-btn${sheet.kind === kind ? ' is-on' : ''}`,
-                    onclick: () => { sheet.kind = kind; render(); },
-                }, label)))));
-        }
-        if (sheet.kind === 'addon') {
-            const stages = stageSequence(editor.pick);
-            if (stages.length === 0) {
-                box.append(muted('还没有剧情阶段。先分段，再给附加内容选生效范围。'));
-            } else {
-                const options = stages.map((stage, index) => ({ value: stage.name, label: `第 ${index + 1} 段 · ${stage.name}` }));
-                if (!options.some(option => option.value === sheet.from)) sheet.from = options[0].value;
-                if (!options.some(option => option.value === sheet.to)) sheet.to = sheet.from;
-                box.append(field('从哪一段开始有效', selectControl(options, sheet.from, value => {
-                    sheet.from = value;
-                    render();
-                })));
-                box.append(field('到哪一段为止（含这一段）', selectControl(options, sheet.to, value => {
-                    sheet.to = value;
-                    render();
-                })));
-            }
-            box.append(muted('不占进度，只在指定几段里一起发送。'));
         }
         if (owner.kind === 'always') {
             box.append(field('位置', el('div', { class: 'dga-seg' },
@@ -8835,10 +8771,8 @@
                 { value: '', label: '选择归属…' },
                 { value: '__unassigned', label: '未分配（不发送）' },
                 ...stageSequence(pick).map((stage, index) => ({ value: stage.id, label: `第 ${index + 1} 段 · ${stage.name}` })),
-                ...pick.addons.map(addon => ({ value: addon.id, label: `附加 · ${addon.name}` })),
                 { value: 'note', label: '备注（只给自己看）' },
                 { value: '__new-stage', label: '＋ 新阶段…' },
-                { value: '__new-addon', label: '＋ 新附加…' },
             ];
             bar.append(selectControl(options, '', value => {
                 if (value) assignPending(editor, value);
@@ -8993,7 +8927,8 @@ ${P} .dga-seg-btn { min-height: 40px; border-radius: 4px; border: 1px solid var(
 ${P} .dga-seg-btn:hover { background: var(--dga-hover); }
 ${P} .dga-seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-seg-btn.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); font-weight: 700; }
-${P} .dga-work-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+${P} .dga-work-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+${P} .dga-editor-dock { position: sticky; top: 0; z-index: 2; display: flex; flex-direction: column; gap: 8px; margin: -12px -16px 0; padding: 12px 16px 8px; background: var(--dga-bg-0); }
 ${P} .dga-sheet-bg { position: absolute; inset: 0; z-index: 2; display: flex; align-items: flex-end; justify-content: center; background: rgba(0, 0, 0, 0.55); }
 ${P} .dga-sheet { width: 100%; max-height: 88%; overflow: auto; padding: 16px 16px 20px; border-radius: var(--dga-radius-md) var(--dga-radius-md) 0 0; background: var(--dga-bg-1); border-top: 1px solid var(--dga-border-2); display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-sheet h3 { margin: 0; font-size: 15px; }
