@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.80
+     * 动态指导助手 v2.81
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.80';
+    const VERSION = '2.81';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3467,11 +3467,14 @@
             case 'after_character_definition': return '角色定义后';
             case 'before_example_messages': return '示例消息前';
             case 'after_example_messages': return '示例消息后';
+            case 'before_author_note': return '作者注释前';
+            case 'after_author_note': return '作者注释后';
             case 'at_depth': {
                 const depth = Math.max(0, Number(spot.depth) || 0);
                 const role = spot.role === 'user' ? '用户' : spot.role === 'assistant' ? 'AI' : '系统';
-                return `聊天深度 ${depth} · ${role}`;
+                return `插入深度 ${depth} · ${role}`;
             }
+            case 'outlet': return spot.name ? `锚点 · ${spot.name}` : '锚点';
             default: return spot.type ? String(spot.type) : '未设置（跟随世界书默认位置）';
         }
     }
@@ -4018,10 +4021,23 @@
         const name = String(spec.name || '').trim();
         if (!worldbookName) throw new Error('先选一本世界书。');
         if (!name) throw new Error('先写剧情指导的名字。');
-        const position = {
-            type: spec.positionType || 'before_character_definition',
-            order: Math.max(0, Math.floor(Number(spec.order) || 0)),
-        };
+        const positionType = spec.positionType || 'before_character_definition';
+        const order = Math.max(0, Math.floor(Number(spec.order) || 0));
+        let position;
+        if (positionType === 'at_depth_system' || positionType === 'at_depth_user' || positionType === 'at_depth_assistant') {
+            position = {
+                type: 'at_depth',
+                role: positionType === 'at_depth_user' ? 'user' : (positionType === 'at_depth_assistant' ? 'assistant' : 'system'),
+                depth: Math.max(0, Math.floor(Number(spec.depth) || 0)),
+                order,
+            };
+        } else if (positionType === 'outlet') {
+            const outletName = String(spec.outletName || '').trim();
+            if (!outletName) throw new Error('锚点要写一个名字，和 {{outlet::名字}} 对上。');
+            position = { type: 'outlet', name: outletName, order };
+        } else {
+            position = { type: positionType, order };
+        }
         const content = '## 第一段\n';
         let created = null;
         await updateWorldbook(worldbookName, worldbook => {
@@ -6992,13 +7008,40 @@
                 { value: 'after_character_definition', label: '角色定义后' },
                 { value: 'before_example_messages', label: '示例消息前' },
                 { value: 'after_example_messages', label: '示例消息后' },
-            ], draft.positionType, value => { draft.positionType = value; })));
+                { value: 'before_author_note', label: '作者注释前' },
+                { value: 'after_author_note', label: '作者注释后' },
+                { value: 'at_depth_system', label: '[系统] 插入深度' },
+                { value: 'at_depth_user', label: '[用户] 插入深度' },
+                { value: 'at_depth_assistant', label: '[AI] 插入深度' },
+                { value: 'outlet', label: '锚点' },
+            ], draft.positionType, value => { draft.positionType = value; render(); })));
+            if (String(draft.positionType || '').startsWith('at_depth')) {
+                const depthInput = el('input', {
+                    type: 'text',
+                    inputmode: 'numeric',
+                    oninput: event => { draft.depth = event.target.value; },
+                });
+                depthInput.value = draft.depth == null ? '4' : String(draft.depth);
+                children.push(field('深度', depthInput, '0 是最新一层。'));
+            }
+            if (draft.positionType === 'outlet') {
+                const outletInput = el('input', {
+                    type: 'text',
+                    maxlength: 60,
+                    placeholder: '和酒馆锚点名称一样',
+                    oninput: event => { draft.outletName = event.target.value; },
+                });
+                outletInput.value = draft.outletName || '';
+                children.push(field('锚点名称', outletInput));
+            }
             children.push(field('顺序', orderInput, '数字越小越靠前。'));
             children.push(btn('创建', () => runAction('新建剧情指导', () => createStoryGuide({
                 worldbookName: ui.selectedWorldbook,
                 name: draft.name,
                 positionType: draft.positionType,
                 order: draft.order,
+                depth: draft.depth,
+                outletName: draft.outletName,
             })), { primary: true }));
         }
         const needle = String(ui.entryQuery || '').trim().toLowerCase();
