@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.82
+     * 动态指导助手 v2.83
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.82';
+    const VERSION = '2.83';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -7507,10 +7507,10 @@
             if (!columns.has(row)) columns.set(row, []);
             columns.get(row).push(stage);
         });
-        const cardW = 168;
-        const cardH = 72;
-        const gapX = 36;
-        const gapY = 64;
+        const cardW = 220;
+        const cardH = 88;
+        const gapX = 48;
+        const gapY = 72;
         const placed = new Map();
         let maxX = 320;
         columns.forEach(row => {
@@ -7529,26 +7529,46 @@
             });
         });
         const byId = new Map(stages.map(stage => [stage.id, stage]));
-        const board = el('div', { class: 'dga-graph', style: { height: `${maxY}px` } });
-        lines.forEach(link => {
+        const board = el('div', { class: 'dga-graph', style: { width: `${maxX}px`, height: `${maxY}px` } });
+        const arrowId = `${PANEL_ID}-story-arrow`;
+        const polylines = lines.map(link => {
             const from = placed.get(link.from);
             const to = placed.get(link.to);
-            if (!from || !to) return;
-            const x1 = from.x + cardW / 2;
-            const y1 = from.y + cardH;
-            const x2 = to.x + cardW / 2;
-            const y2 = to.y;
+            if (!from || !to) return null;
             const klass = link.kind === 'transfer' ? 'is-transfer' : (link.kind === 'side' ? 'is-side' : '');
-            board.append(el('div', {
-                class: `dga-graph-line ${klass}`,
-                style: {
-                    left: `${Math.min(x1, x2)}px`,
-                    top: `${Math.min(y1, y2)}px`,
-                    width: `${Math.max(2, Math.abs(x2 - x1))}px`,
-                    height: `${Math.max(2, Math.abs(y2 - y1))}px`,
-                },
-            }));
-        });
+            let points;
+            if (link.kind === 'transfer') {
+                const y = Math.round((from.y + to.y) / 2 + cardH / 2);
+                const left = from.x < to.x ? from : to;
+                const right = from.x < to.x ? to : from;
+                points = `${left.x + cardW},${y} ${right.x},${y}`;
+            } else {
+                const x1 = from.x + Math.round(cardW / 2);
+                const y1 = from.y + cardH;
+                const x2 = to.x + Math.round(cardW / 2);
+                const y2 = to.y;
+                const mid = Math.round((y1 + y2) / 2);
+                points = `${x1},${y1} ${x1},${mid} ${x2},${mid} ${x2},${y2 - 2}`;
+            }
+            return svgNode('polyline', {
+                class: `dga-graph-edge ${klass}`,
+                points,
+                fill: 'none',
+                'marker-end': `url(#${arrowId})`,
+            });
+        }).filter(Boolean);
+        board.append(svgNode('svg', {
+            class: 'dga-graph-svg',
+            width: String(maxX),
+            height: String(maxY),
+        }, svgNode('defs', null, svgNode('marker', {
+            id: arrowId,
+            markerWidth: '8',
+            markerHeight: '8',
+            refX: '7',
+            refY: '4',
+            orient: 'auto',
+        }, svgNode('path', { d: 'M0,0 L8,4 L0,8 Z', class: 'dga-graph-arrow' }))), ...polylines));
         stages.forEach(stage => {
             const pos = placed.get(stage.id);
             const focused = editor.roadFocus === stage.id;
@@ -9111,12 +9131,15 @@ ${P} .dga-stage-preview { margin: 0; max-height: 160px; overflow: auto; white-sp
 ${P} .dga-extra-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--dga-border); border-radius: 6px; }
 ${P} .dga-road { display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-graph { position: relative; min-height: 220px; }
-${P} .dga-graph .dga-road-card { position: absolute; height: 72px; }
+${P} .dga-graph-svg { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+${P} .dga-graph-edge { stroke: var(--dga-text-3); stroke-width: 2; }
+${P} .dga-graph-edge.is-transfer { stroke: var(--dga-accent); }
+${P} .dga-graph-edge.is-side { stroke: var(--dga-warning); }
+${P} .dga-graph-arrow { fill: var(--dga-text-3); }
+${P} .dga-graph .dga-road-card { position: absolute; width: 220px; min-height: 88px; height: auto; z-index: 1; }
 ${P} .dga-road-card.is-on { border-color: var(--dga-accent); }
 ${P} .dga-road-card.is-side { border-left: 5px solid var(--dga-warning); }
-${P} .dga-graph-line { position: absolute; border-left: 2px solid var(--dga-text-3); border-bottom: 2px solid var(--dga-text-3); pointer-events: none; }
-${P} .dga-graph-line.is-transfer { border-color: var(--dga-accent); }
-${P} .dga-graph-line.is-side { border-color: var(--dga-warning); }
+${P} .dga-road-card b { font-size: 13px; line-height: 1.35; }
 ${P} .dga-road-row { display: flex; gap: 8px; overflow-x: auto; }
 ${P} .dga-road-card { flex: 1 0 140px; min-height: 72px; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; text-align: left; cursor: pointer; }
 ${P} .dga-road-card b, ${P} .dga-road-card small { display: block; }
