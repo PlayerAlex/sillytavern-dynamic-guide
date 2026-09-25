@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.95
+     * 动态指导助手 v2.96
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.95';
+    const VERSION = '2.96';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3660,12 +3660,6 @@
     }
 
     function guideTextFor(context, generationType, contexts) {
-        if (context && context.state && context.state.lineCut === true) {
-            const key = context.state.forkInto;
-            const fork = key && Array.isArray(contexts) ? contexts.find(item => item.key === key) : null;
-            const name = fork ? entryName(fork.entry || { name: fork.binding && fork.binding.entryName }) : '';
-            return name ? `当前走进了${name}分支` : '当前走进了分支';
-        }
         if (attachmentAsleep(context, contexts)) return null;
         const stage = stageForGuide(context, generationType);
         if (!stage) return null;
@@ -4184,7 +4178,7 @@
     const DEFAULT_JUDGE_SYSTEM_PROMPT = [
         '你是阶段完成判定器。你只回答一件事：现在该不该离开当前这一段、进入这一条自己的下一段。',
         '你不写新内容、不续写、不评价文笔、不改原文、不做授权范围外的任何事。',
-        '正文若是「当前走进了某某分支」，这一条已经走进那个分支。写 NO，不要再推进这一条。',
+        '走进别的分支后，被依附的那条由脚本关掉，不再发给你。你只判断还开着的这一段。',
         '',
         '先在心里做完这三步，再填最后的空表：看清当前阶段是一段时间或持续状态，还是一件要发生的事；到正文里核对；三档里只选一档。',
         '一段时间或持续状态还在，就不是完成。正文仍像当前这段，写 NO。只有正文已经换成下一阶段的状态，才写 YES。',
@@ -4224,8 +4218,8 @@
         '· 阶段写的是一段时间还在持续，下一段是另一段时间。正文仍是这段里的日常 → NO。还停在这段，不能因为符合这段就进入下一段。',
         '· 同一阶段。正文已经写成下一段的状态 → YES。已经离开这段。',
         '',
-        '五、走进分支以后',
-        '15. 正文若是「当前走进了某某分支」，这一条已经走进那个分支。写 NO，不要再推进这一条。',
+        '五、走进别的分支',
+        '15. 走进别的分支后，被依附的那条由脚本关掉，不再发给你。你只判断还开着的这一段。',
         '16. 分岔、支线、换到另一条，都是人来选的。碰到另一条上的事，不能当成这一段已经完成。',
         '17. YES 只表示这一条该走进自己的下一段。',
     ].join('\n');
@@ -4239,7 +4233,7 @@
         '5. 拿不准就写 NO，不用听起来合理的细节把空白填上；',
         '6. 最后三个标签都按里面的条目填，标签外不要写字。',
         '7. 一段时间还停在当前这段时写 NO；只有正文已经换成下一阶段的状态才写 YES。',
-        '8. 正文是「当前走进了某某分支」时写 NO。分岔、支线和换边由人来选，我不因此写 YES。',
+        '8. 被依附的那条走进别的分支后会由脚本关掉。我只判断还开着的这一段，不因此写 YES。',
     ].join('\n');
 
     const DEFAULT_JUDGE_CASE_PROMPT = [
@@ -4265,7 +4259,7 @@
         '- 当前时间：从正文里人正在做的事看，现在还在当前阶段，还是已经换成下一阶段。',
         '- 还停在当前阶段里的日常，不是离开这段。状态、总结、思维链不算。',
         '- 完成条件逐件核对，少一件就是 NO。计划、预告、回忆和用户台词不算已发生。',
-        '- 正文是「当前走进了某某分支」时写 NO。另一条上的事不算这一段已经完成。',
+        '- 被依附的那条若已走进别的分支，脚本会关掉它。另一条上的事不算这一段已经完成。',
         '</checklist>',
         '',
         '<basis>',
@@ -4722,6 +4716,7 @@
     async function maybeJudgeAdvance(context, messageId, config, options) {
         const flags = options || {};
         if (!context || context.broken || !context.stage || context.stage.terminal) return;
+        if (context.state && (context.state.lineCut === true || context.state.sideOut)) return;
         if (attachmentAsleep(context, flags.contexts)) return;
         if (!flags.force && context.autoAdvance !== 'judge') return;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到判断AI跳过。
@@ -5009,6 +5004,7 @@
             // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
             for (const context of all.contexts) {
                 if (context.broken || !context.stage || context.stage.terminal) continue;
+                if (context.state && (context.state.lineCut === true || context.state.sideOut)) continue;
                 if (attachmentAsleep(context, all.contexts)) continue;
                 if (bindingOrderMode(context.binding) === 'pick') continue;
                 const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
@@ -5035,6 +5031,7 @@
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
                 if (context.broken || !context.stage || context.autoAdvance !== 'judge') return null;
+                if (context.state && (context.state.lineCut === true || context.state.sideOut)) return null;
                 if (attachmentAsleep(context, fresh.contexts)) return null;
                 if (bindingOrderMode(context.binding) === 'pick') return null;
                 return maybeJudgeAdvance(context, messageId, fresh.config);
@@ -5044,6 +5041,7 @@
             const fresh = await loadContexts();
             await Promise.all(fresh.contexts.map(context => {
                 if (context.broken || bindingOrderMode(context.binding) !== 'pick') return null;
+                if (context.state && (context.state.lineCut === true || context.state.sideOut)) return null;
                 if (attachmentAsleep(context, fresh.contexts)) return null;
                 return maybePickStage(context, messageId, fresh.config);
             }));
@@ -6680,6 +6678,7 @@
                             stageIndex: Math.max(0, offer.stage),
                             stageName: landed && landed.name ? landed.name : '',
                             lineCut: false,
+                            forkInto: '',
                             sideOut: '',
                         });
                         await syncMirrors('normal');
