@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.97
+     * 动态指导助手 v2.98
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.97';
+    const VERSION = '2.98';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -4188,7 +4188,7 @@
         '你是阶段完成判定器。你只回答一件事：现在该不该离开当前这一段、进入这一条自己的下一段。',
         '你不写新内容、不续写、不评价文笔、不改原文、不做授权范围外的任何事。',
         '走进别的分支后，被依附的那条由脚本关掉，不再发给你。你只判断还开着的这一段。',
-        '到了分岔口时，选出要走进的那一条。选出之后，后台进入那条分叉，并暂时关闭被依附的这条。没走进就留在这条。',
+        '到了分岔口时，选出要走进的那一条。分叉点只给你这一层预设，当前正文给全，不给上一层。选出之后，后台进入那条分叉，并暂时关闭被依附的这条。没走进就留在这条。',
         '',
         '先在心里做完这三步，再填最后的空表：看清当前阶段是一段时间或持续状态，还是一件要发生的事；到正文里核对；三档里只选一档。',
         '一段时间或持续状态还在，就不是完成。正文仍像当前这段，写 NO。只有正文已经换成下一阶段的状态，才写 YES。',
@@ -4230,9 +4230,9 @@
         '',
         '五、走进别的分支',
         '15. 走进别的分支后，被依附的那条由脚本关掉，不再发给你。你只判断还开着的这一段。',
-        '16. 分岔、支线、换到另一条，都是人来选的。碰到另一条上的事，不能当成这一段已经完成。',
+        '16. 支线、换到另一条，是人来选的。分岔口要对照当前正文和分叉点这一层预设，自己写序号。碰到另一条上的事，不能当成这一段已经完成。',
         '17. YES 只表示这一条该走进自己的下一段。',
-        '18. 这一段挂着分岔时，看正文已经走进哪一条。在 <road> 里写它的序号。写了序号，后台进入那条分叉，并暂时关闭被依附的这条。还没走进，路写 0。',
+        '18. 这一段挂着分岔时，【分岔口】里有被依附这条和每条依附的分叉点预设，各只一层。对照当前正文，像哪一层就在 <road> 里写它的序号。写了序号，后台进入那条分叉，并暂时关闭被依附的这条。还没走进，路写 0。不看上一层正文。',
     ].join('\n');
 
     const DEFAULT_JUDGE_ASSISTANT_PROMPT = [
@@ -4245,7 +4245,7 @@
         '6. 最后三个标签都按里面的条目填，标签外不要写字。',
         '7. 一段时间还停在当前这段时写 NO；只有正文已经换成下一阶段的状态才写 YES。',
         '8. 被依附的那条走进别的分支后会由脚本关掉。我只判断还开着的这一段，不因此写 YES。',
-        '9. 到了分岔口，我在 <road> 里写走进的序号；写 0 就是还留在这条。',
+        '9. 到了分岔口，我对照当前正文和分叉点这一层预设，在 <road> 里写序号；写 0 就是还留在被依附的这条。',
     ].join('\n');
 
     const DEFAULT_JUDGE_CASE_PROMPT = [
@@ -4740,15 +4740,28 @@
             && item.binding.attachKind !== 'side');
     }
 
-    function roadListText(forks) {
+    function forkPointPreset(stage, number) {
+        if (!stage) return '（这一层没有预设）';
+        const body = String(stage.prompt || '').trim();
+        const title = `第 ${number} 段 · ${stage.name || '未命名'}`;
+        return body ? `${title}\n${body}` : title;
+    }
+
+    function roadListText(context, forks) {
         if (!forks || !forks.length) return '这一段没有分岔。路写 0。';
-        const lines = forks.map((item, index) => `${index + 1}. ${entryName(item.entry)}`);
-        return [
-            '到了这里要判断走进哪一条。',
-            ...lines,
-            '还没走进任何一条，路写 0，留在这条。',
-            '写了序号，后台进入那条分叉，并暂时关闭被依附的这条。',
-        ].join('\n');
+        const stages = context && context.parsed && context.parsed.stages || [];
+        const here = Number(context && context.state && context.state.stageIndex) || 0;
+        const lines = [
+            '对照当前正文，和下面分叉点这一层的预设。只这一层，不带上一层。',
+            `0. 被依附的这条\n${forkPointPreset(stages[here], here + 1)}`,
+        ];
+        forks.forEach((item, index) => {
+            const first = item.parsed && item.parsed.stages && item.parsed.stages[0];
+            lines.push(`${index + 1}. 依附 · ${entryName(item.entry)}\n${forkPointPreset(first, 1)}`);
+        });
+        lines.push('还没走进任何一条，路写 0，留在被依附的这条。');
+        lines.push('写了序号，后台进入那条分叉，并暂时关闭被依附的这条。');
+        return lines.join('\n');
     }
 
     function judgePickedFork(text, forks) {
@@ -4815,10 +4828,12 @@
             let condition = stage.completion ? stage.completion : JUDGE_EMPTY_CONDITION;
             if (extra) condition = `${condition}\n本次只看这一次的附加要求：${extra}`;
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
-            const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
-            const next = nextJudgeStage(context.parsed, context.state.stageIndex, context.state);
+            // 到了分岔口只给当前这一层正文，不带上一层。
             const forks = forksAtStage(context, flags.contexts);
-            const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）', next, roadListText(forks));
+            const historyCount = forks.length ? 1 : judgeHistoryCount(settings);
+            const history = await recentHistoryText(messageId, historyCount, settings);
+            const next = nextJudgeStage(context.parsed, context.state.stageIndex, context.state);
+            const messages = judgeMessagesFor(settings, stage, condition, history || '（没有取到聊天记录）', next, roadListText(context, forks));
             const cap = JUDGE_REPLY_CAP;
             const judgePreset = preset
                 ? { ...preset, maxTokens: Math.min(Math.floor(Number(preset.maxTokens)) || cap, cap) }

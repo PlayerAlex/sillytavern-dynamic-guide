@@ -2522,8 +2522,10 @@ test('判断AI档：分岔口写了路就进入那条，并关掉被依附的这
         ],
         settings: { autoAdvance: 'judge' },
     };
-    const message = { message_id: 5, role: 'assistant', message: '人已经走进岔路。' };
-    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const earlier = { message_id: 4, role: 'assistant', message: '上一层不该出现的句子。' };
+    const message = { message_id: 5, role: 'assistant', message: '人已经走进岔路，当前这一层要完整留下。' };
+    config.settings.judgeHistoryCount = 3;
+    const { state, helper } = multiWorld(books, { config, messages: [earlier, message], lastMessageId: 5 });
     const asked = [];
     helper.generateRaw = async options => {
         asked.push(options);
@@ -2544,8 +2546,13 @@ test('判断AI档：分岔口写了路就进入那条，并关掉被依附的这
     assert.equal(state.books.书A.find(item => item.name === '岔路（动态指导）'), undefined, '还没走进时分叉不发给 AI');
 
     await state.events.get('message_received')(5);
-    assert.match(String(asked[0].user_input), /1\. 岔路/);
-    assert.match(String(asked[0].user_input), /写了序号，后台进入那条分叉，并暂时关闭被依附的这条/);
+    const askedText = String(asked[0].user_input);
+    assert.match(askedText, /人已经走进岔路，当前这一层要完整留下/);
+    assert.doesNotMatch(askedText, /上一层不该出现的句子/);
+    assert.match(askedText, /0\. 被依附的这条\n第 1 段 · 甲一\n甲一正文/);
+    assert.match(askedText, /1\. 依附 · 岔路\n第 1 段 · 岔一\n岔一正文/);
+    assert.doesNotMatch(askedText, /岔二正文/);
+    assert.match(askedText, /写了序号，后台进入那条分叉，并暂时关闭被依附的这条/);
     const bindings = state.variables.chat.$dynamicGuideAssistant.state.bindings;
     assert.equal(bindings[keyOf('书A', 1)].lineCut, true, '被依附的这条要暂时关掉');
     assert.equal(bindings[keyOf('书A', 1)].forkInto, keyOf('书A', 2));
