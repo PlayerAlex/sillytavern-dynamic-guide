@@ -3759,6 +3759,27 @@ test('小卡状态字多就缩略，点「展开」看全文、再点「收起�
     assert.deepEqual(errors, []);
 });
 
+test('时间线一组收成一根，不把两排每张都斜连在一起', () => {
+    const stages = [
+        { id: 'a', name: '开始', branch: '' },
+        { id: 'b', name: '留下', branch: '去向' },
+        { id: 'c', name: '离开', branch: '去向' },
+        { id: 'd', name: '结尾', branch: '' },
+    ];
+    const graph = core.storyPositions(stages);
+    const lanes = core.storyLaneSegments(graph.rows, graph.placed);
+    const arrows = lanes.filter(lane => lane.arrow);
+    assert.equal(arrows.length, 3, '两段岔路各一根箭头，再加结尾一根，不是两排交叉');
+    lanes.forEach(lane => {
+        const points = lane.points.split(' ').map(item => item.split(',').map(Number));
+        for (let index = 1; index < points.length; index += 1) {
+            const dx = points[index][0] - points[index - 1][0];
+            const dy = points[index][1] - points[index - 1][1];
+            assert.ok(dx === 0 || dy === 0, '线只走横竖，不斜穿卡片');
+        }
+    });
+});
+
 test('导图：分支并排，前后主线散开再收回', () => {
     const stages = [
         { id: 'a', name: '雨夜', branch: '' },
@@ -3820,7 +3841,7 @@ test('时间线按阶段自动排好，不能拖；编辑仍是分段', async ()
     assert.ok(findButton(panel(), '设置'), '时间线页顶上能去设置');
     await findButton(panel(), '设置').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
-    assert.match(panel().textContent, /只列出和它一起选的段/);
+    assert.match(panel().textContent, /走到最后回到第一段/);
     assert.equal(panel().querySelector('.dga-nav-toggle'), null, '设置也是二级页');
     await findButton(panel(), '编辑').listeners.click[0]();
     assert.ok(panel().querySelector('.dga-pick-surface'), '从设置能进到分段编辑');
@@ -3941,14 +3962,14 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     panel().querySelector('.dga-segbar').listeners.click[0]();
     const sheet = () => panel().querySelector('.dga-sheet');
     assert.match(sheet().textContent, /离开这一段/);
-    assert.match(sheet().textContent, /岔路/);
+    assert.match(sheet().textContent, /走到这里要选一段/);
     assert.match(sheet().textContent, /发给 AI/);
     assert.match(sheet().textContent, /暑假正文/);
     assert.ok(findButton(sheet(), '加一条附加'));
     assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
     assert.equal(findButton(sheet(), '第二幕'), null, '没加入岔路的段不出现在列表里');
     const forkSelect = (function findSelects(node, out) {
-        if (node.tagName === 'SELECT' && optionsOf(node).some(option => option.textContent === '加上一段…')) out.push(node);
+        if (node.tagName === 'SELECT' && optionsOf(node).some(option => option.textContent === '再加一段可以选')) out.push(node);
         (node.children || []).forEach(child => findSelects(child, out));
         return out;
     })(sheet(), []);

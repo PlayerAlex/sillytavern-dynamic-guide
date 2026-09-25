@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v2.74
+     * 动态指导助手 v2.75
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '2.74';
+    const VERSION = '2.75';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1144,6 +1144,44 @@
             }
         }
         return rows;
+    }
+
+    // 时间线连线：一组收成一根，再分到下一组。不把上一排每一张都斜连到下一排每一张。
+    function storyLaneSegments(rows, placed) {
+        const segments = [];
+        const centerX = pos => pos.x + MAP_NODE_W / 2;
+        const bottom = pos => pos.y + MAP_NODE_H;
+        const top = pos => pos.y;
+        const list = Array.isArray(rows) ? rows : [];
+        for (let index = 1; index < list.length; index += 1) {
+            const prev = list[index - 1].map(stage => placed.get(stage.id)).filter(Boolean);
+            const next = list[index].map(stage => placed.get(stage.id)).filter(Boolean);
+            if (!prev.length || !next.length) continue;
+            const prevBottom = Math.max(...prev.map(bottom));
+            const nextTop = Math.min(...next.map(top));
+            if (nextTop <= prevBottom + 8) continue;
+            const mid = prevBottom + Math.round((nextTop - prevBottom) / 2);
+            const prevXs = prev.map(centerX);
+            const nextXs = next.map(centerX);
+            prev.forEach(pos => {
+                const x = centerX(pos);
+                segments.push({ points: `${x},${bottom(pos)} ${x},${mid}`, arrow: false });
+            });
+            if (Math.min(...prevXs) !== Math.max(...prevXs)) {
+                segments.push({ points: `${Math.min(...prevXs)},${mid} ${Math.max(...prevXs)},${mid}`, arrow: false });
+            }
+            const fromX = prev.length === 1 ? prevXs[0] : Math.round(prevXs.reduce((sum, x) => sum + x, 0) / prevXs.length);
+            const toX = next.length === 1 ? nextXs[0] : Math.round(nextXs.reduce((sum, x) => sum + x, 0) / nextXs.length);
+            if (fromX !== toX) segments.push({ points: `${fromX},${mid} ${toX},${mid}`, arrow: false });
+            if (Math.min(...nextXs) !== Math.max(...nextXs)) {
+                segments.push({ points: `${Math.min(...nextXs)},${mid} ${Math.max(...nextXs)},${mid}`, arrow: false });
+            }
+            next.forEach(pos => {
+                const x = centerX(pos);
+                segments.push({ points: `${x},${mid} ${x},${top(pos) - 2}`, arrow: true });
+            });
+        }
+        return segments;
     }
 
     function storyEdges(rows) {
@@ -6673,8 +6711,8 @@
         });
         const box = el('div', { class: 'dga-sheet', role: 'dialog', 'aria-label': '选择走向' });
         box.append(
-            el('h3', { text: `「${entryName(context.entry)}」走向哪里` }),
-            muted('这一段之后有几个互斥的分支。选一个走向；选过之后，其余分支这次聊天就不再走。'),
+            el('h3', { text: '这里要选一段' }),
+            muted('下面几段里只能走一段。选完以后，另外几段这次就不再走。'),
             ...candidates.map(candidate => {
                 const summary = String(candidate.prompt || '').replace(/\s+/g, ' ').trim();
                 return el('button', {
@@ -6714,17 +6752,17 @@
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
                 success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
             }))),
-            muted('按顺序、循环、AI 选段管的是这一轮怎么往下走。岔路是点进某一段后，只列出和它一起选的段：走进一个，其余这次不再走。开了循环后，绕回时走同一条还是重新选择，在这里先定好。'),
-            orderMode === 'loop' ? field('循环绕回时', el('div', { class: 'dga-seg' },
-                ...[['fresh', '重新选择'], ['keep', '走同一条']].map(([value, label]) => el('button', {
+            muted('按顺序：一段接一段，走到最后停下。循环：走到最后回到第一段。AI 选下一段：让 AI 看正文，决定停在哪一段。'),
+            orderMode === 'loop' ? field('回到第一段之后', el('div', { class: 'dga-seg' },
+                ...[['fresh', '再选一次'], ['keep', '还走刚才那段']].map(([value, label]) => el('button', {
                     type: 'button',
                     class: `dga-seg-btn${(binding.loopBranch === 'keep' ? 'keep' : 'fresh') === value ? ' is-on' : ''}`,
                     onclick: () => runAction('保存循环分支', () => updateBinding(context.key, item => {
                         if (value === 'keep') item.loopBranch = 'keep';
                         else delete item.loopBranch;
-                    }), { success: value === 'keep' ? '绕回后仍走这次选过的分支' : '绕回后可以重新选择分支' }),
+                    }), { success: value === 'keep' ? '回到开头后，还走刚才选的那段' : '回到开头后，再在那几段里挑一次' }),
                 }, label)))) : null,
-            orderMode === 'loop' ? muted('走同一条：下一圈还走这次选过的分支。重新选择：绕回后岔路可以再选。') : null,
+            orderMode === 'loop' ? muted('再选一次：又要挑一段。还走刚才那段：不用再挑。') : null,
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
                 if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
                 else delete item.advanceMode;
@@ -7215,7 +7253,7 @@
             return copy;
         });
         const graph = storyPositions(list);
-        const drawn = storyEdges(graph.rows).map(edge => ({ ...edge, optional: false }));
+        const lanes = storyLaneSegments(graph.rows, graph.placed);
         let maxX = 360;
         let maxY = 280;
         graph.placed.forEach(pos => {
@@ -7223,20 +7261,12 @@
             maxY = Math.max(maxY, pos.y + MAP_NODE_H + 48);
         });
         const arrowId = `${PANEL_ID}-arrow`;
-        const lines = drawn.map(edge => {
-            const from = graph.placed.get(edge.from);
-            const to = graph.placed.get(edge.to);
-            if (!from || !to) return null;
-            const ends = mapArrowEnds(from, to);
-            return svgNode('line', {
-                class: `dga-map-edge${edge.optional ? ' is-optional' : ''}`,
-                x1: ends.x1,
-                y1: ends.y1,
-                x2: ends.x2,
-                y2: ends.y2,
-                'marker-end': `url(#${arrowId})`,
-            });
-        });
+        const lines = lanes.map(lane => svgNode('polyline', {
+            class: 'dga-map-edge',
+            points: lane.points,
+            fill: 'none',
+            'marker-end': lane.arrow ? `url(#${arrowId})` : null,
+        }));
         const board = el('div', { class: 'dga-map is-readonly' });
         board.append(svgNode('svg', { class: 'dga-map-lines', width: String(maxX), height: String(maxY) },
             svgNode('defs', null,
@@ -7251,7 +7281,7 @@
             ...lines));
         if (!list.length) {
             board.append(el('p', { class: 'dga-hint', text: '还没有卡片。点「新建」加第一张。' }));
-        } else if (!drawn.length) {
+        } else if (!lanes.length) {
             board.append(el('p', { class: 'dga-hint', text: '还没有能连起来的阶段。' }));
         }
         list.forEach((stage, index) => {
@@ -7260,10 +7290,11 @@
             const classes = ['dga-map-node'];
             if (status) classes.push(`is-${status}`);
             if (settings.focusIndex === index) classes.push('is-focus');
+            const mates = list.filter(item => item !== stage && item.branch && item.branch === stage.branch).map(item => item.name);
             const note = status === 'now' ? '现在'
                 : (status === 'done' ? '已走过'
                     : (status === 'skipped' ? '这次不走'
-                        : (status === 'later' ? '还没到' : (stage.branch ? `分支·${stage.branch}` : '阶段'))));
+                        : (status === 'later' ? '还没到' : (mates.length ? `和${mates.join('、')}里选一段` : '往下走'))));
             const node = el('div', {
                 class: classes.join(' '),
                 style: { left: `${pos.x}px`, top: `${pos.y}px` },
@@ -7306,7 +7337,7 @@
     function segmentSubtitle(editor, owner) {
         if (owner.kind === 'stage') {
             const partners = stageSequence(editor.pick).filter(stage => exclusivePartnerIds(editor.pick, owner).includes(stage.id)).map(stage => stage.name);
-            const branchTag = partners.length ? ` · 和${partners.join('、')}互斥` : '';
+            const branchTag = partners.length ? ` · 和${partners.join('、')}里选一段` : '';
             if (owner.completion === '自动') return `进入下一段：AI 自己判断${branchTag}`;
             return (owner.completion ? `进入下一段：${owner.completion}` : '手动点「下一段」推进') + branchTag;
         }
@@ -7871,14 +7902,17 @@
             const others = stageSequence(editor.pick).filter(stage => stage !== owner);
             const chosen = others.filter(stage => (sheet.exclusiveIds || []).includes(stage.id));
             const available = others.filter(stage => !(sheet.exclusiveIds || []).includes(stage.id));
-            const forkRows = chosen.map(stage => el('div', { class: 'dga-fork-row' },
-                el('b', { text: stage.name }),
-                btn('移出', () => {
-                    sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
-                    render();
-                }, { ghost: true })));
+            const forkRows = [
+                el('div', { class: 'dga-fork-row is-self' }, el('b', { text: '正在改的这一段' })),
+                ...chosen.map(stage => el('div', { class: 'dga-fork-row' },
+                    el('b', { text: stage.name }),
+                    btn('不要这段', () => {
+                        sheet.exclusiveIds = (sheet.exclusiveIds || []).filter(id => id !== stage.id);
+                        render();
+                    }, { ghost: true }))),
+            ];
             const forkAdd = available.length ? selectControl(
-                [{ value: '', label: '加上一段…' }].concat(available.map(stage => ({ value: stage.id, label: stage.name }))),
+                [{ value: '', label: '再加一段可以选' }].concat(available.map(stage => ({ value: stage.id, label: stage.name }))),
                 '',
                 value => {
                     if (!value) return;
@@ -7898,10 +7932,10 @@
                         class: `dga-seg-btn${Boolean(sheet.terminal) === value ? ' is-on' : ''}`,
                         onclick: () => { sheet.terminal = value; render(); },
                     }, label))))));
-            box.append(sheetSection('岔路',
-                chosen.length ? el('div', { class: 'dga-fork-list' }, ...forkRows) : muted(others.length ? '这一段还没有岔路。' : '还没有别的段。'),
+            box.append(sheetSection('走到这里要选一段',
+                chosen.length ? el('div', { class: 'dga-fork-list' }, ...forkRows) : muted(others.length ? '不用选。按顺序往下走就行。' : '还没有别的段。'),
                 forkAdd,
-                muted('这里只列出和这一段一起选的段。走进其中一个，其余这次不再走。')));
+                muted(chosen.length ? '上面这几段里，只能走一段。没写在这里的段，不会在这里让人选。' : '如果走到这里必须挑一段，用上面的框把那段加进来。')));
             box.append(sheetSection('发给 AI',
                 el('pre', { class: 'dga-stage-preview', text: preview || '这一段还没有要发的字。' }),
                 muted('上面是走到这一段时会发给 AI 的字。')));
@@ -9056,6 +9090,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         stepTargetVisible,
         storyRows,
         storyEdges,
+        storyLaneSegments,
         storyPositions,
         stageMapStatus,
         cleanStoryLinks,
