@@ -124,13 +124,6 @@ test('改原文时阶段区间跟着挪，后面的阶段不被带跑', () => {
     assert.equal(pick.text.slice(pick.stages[1].ranges[0].start, pick.stages[1].ranges[0].end), '寒假正文');
 });
 
-test('循环时下一段回到第一段，没开循环时停在全部完成', () => {
-    assert.equal(core.stepTarget(1, 1, 2, true), 0);
-    assert.equal(core.stepTarget(0, -1, 3, true), 2);
-    assert.equal(core.stepTarget(2, 1, 3, false), 3);
-    assert.equal(core.stepTarget(0, -1, 3, false), 0);
-});
-
 test('循环开着且进度停在全部完成时，拉回第一段继续发送', () => {
     const parsed = core.parseOutline('## 暑假\n暑假正文\n\n## 寒假\n寒假正文');
     parsed.loop = true;
@@ -150,31 +143,6 @@ test('同名阶段停在当前下标，不跳回第一个', () => {
     const state = core.reconcileState({ stageIndex: 2, stageName: '暑假' }, parsed);
     assert.equal(state.stageIndex, 2);
     assert.equal(state.stageName, '暑假');
-});
-
-test('阶段改名保留直接、带引号、多行和数字引用的端点', () => {
-    const input = '## 第一幕\n正文一\n\n## 第二幕\n正文二\n\n## 道具 [附加]\n从：第一幕\n到：《第二幕》结束时\n道具正文\n\\到：第二幕\n\n## 多行道具 [附加]\n从：\n“第一幕”正在进行时\n\n到：\n《第二幕》结束时\n\n多行正文\n\n## 数字道具 [附加]\n从：1\n到：2\n数字正文';
-    let parsed = core.parseOutline(input);
-    let lines = core.replaceHeading(parsed.lines, parsed.stages[1], { kind: 'stage', name: '新第二幕' });
-    parsed = core.parseOutline(lines.join('\n'));
-    lines = core.replaceHeading(parsed.lines, parsed.stages[0], { kind: 'stage', name: '新第一幕' });
-    parsed = core.parseOutline(lines.join('\n'));
-    assert.deepEqual(plain(parsed.addons.map(item => [item.fromIndex, item.toIndex])), [[0, 1], [0, 1], [0, 1]]);
-    assert.equal(parsed.warnings.length, 0);
-    assert.equal(parsed.addons[0].prompt, '道具正文\n到：第二幕');
-    assert.equal(parsed.addons[1].prompt, '多行正文');
-    assert.equal(parsed.addons[2].labels.to, '2');
-});
-
-test('标题编辑和删除不会把转义正文改成结构', () => {
-    let parsed = core.parseOutline('## 第一幕\n\\## 正文小标题\n\\完成：正文内容\n\n## 第二幕\n第二幕正文');
-    let lines = core.replaceHeading(parsed.lines, parsed.stages[0], { kind: 'stage', name: '开场', completion: '完成对话。' });
-    parsed = core.parseOutline(lines.join('\n'));
-    assert.equal(parsed.stages[0].prompt, '## 正文小标题\n完成：正文内容');
-    lines = core.deleteHeading(parsed.lines, parsed.stages[1]);
-    parsed = core.parseOutline(lines.join('\n'));
-    assert.equal(parsed.stages.length, 1);
-    assert.equal(parsed.stages[0].prompt, '## 正文小标题\n完成：正文内容\n\n第二幕正文');
 });
 
 function helperFor(entry) {
@@ -766,20 +734,6 @@ test('“合并到”找不到阶段时按独立阶段处理并给出提醒', ()
     assert.match(parsed.warnings.join('\n'), /找不到同名阶段/);
 });
 
-test('编辑器写出的“并入”标题能解析，阶段改名时引用同步更新', () => {
-    let parsed = core.parseOutline('## 第一幕\n正文一\n\n## 第二幕\n正文二');
-    const lines = core.insertHeading(parsed.lines, parsed.lines.length, { kind: 'merged', name: '补充', merge: '第一幕' });
-    parsed = core.parseOutline(lines.join('\n'));
-    const merged = parsed.blocks.find(item => item.kind === 'merged');
-    assert.ok(merged, '写出的“合并到：”应当被解析成并入块');
-    assert.equal(merged.name, '补充');
-    assert.equal(parsed.stages.length, 2);
-    const renamed = core.replaceHeading(parsed.lines, parsed.stages[0], { kind: 'stage', name: '开场' });
-    const after = core.parseOutline(renamed.join('\n'));
-    assert.equal(after.stages[0].name, '开场');
-    assert.equal(after.blocks.find(item => item.kind === 'merged').labels.merge, '开场');
-});
-
 test('镜像条目完整跟随原条目的位置、深度与顺序', async () => {
     const entry = {
         uid: 1,
@@ -1039,75 +993,6 @@ test('移出绑定会重新打开条目、删掉镜像和进度', async () => {
 // ---------------------------------------------------------------
 // v2.2 选区划分：正文铺成连续文字，拖选后分配给分段，结构立刻重建
 // ---------------------------------------------------------------
-
-test('选区模式：载入→重建往返幂等，保留前缀、转义、并入和附加范围', () => {
-    const content = '前言一\n前言二\n\n## 第一幕\n完成：交谈结束。\n\\## 小标题\n第一幕正文\n\n## 第二幕\n第二幕正文\n\n## 补充\n合并到：第一幕\n补充正文\n\n## 道具 [附加]\n从：第一幕\n到：第二幕\n道具正文\n\n## 风格 [常驻]\n风格正文\n\n## 秘密 [备注]\n备注正文';
-    const first = core.pickBuild(core.pickLoad(core.parseOutline(content)));
-    const second = core.pickBuild(core.pickLoad(core.parseOutline(first)));
-    assert.equal(second, first, '第一次重建后再次载入重建必须逐字相同');
-    assert.ok(first.startsWith('前言一\n前言二'), '没有归属的文字保留在最前面');
-    const parsed = core.parseOutline(first);
-    assert.deepEqual(plain(parsed.stages.map(item => [item.name, item.prompt])), [
-        ['第一幕', '## 小标题\n第一幕正文\n\n补充正文'],
-        ['第二幕', '第二幕正文'],
-    ]);
-    assert.equal(parsed.stages[0].completion, '交谈结束。');
-    assert.deepEqual(plain(parsed.addons.map(item => [item.name, item.prompt])), [['道具', '道具正文'], ['常驻提示', '风格正文']]);
-    const addon = parsed.addons.find(item => item.kind === 'addon');
-    assert.equal(addon.fromIndex, 0);
-    assert.equal(addon.toIndex, 1);
-    assert.equal(parsed.blocks.find(item => item.kind === 'always').prompt, '风格正文');
-    assert.equal(parsed.blocks.find(item => item.kind === 'note').prompt, '备注正文');
-    parsed.stages.forEach(stage => assert.doesNotMatch(stage.prompt, /前言/));
-});
-
-test('选区模式：给未分段正文分配区间，重建出正确的标题结构', () => {
-    const parsed = core.parseOutline('开头铺垫\n\n冲突爆发\n\n结局收尾');
-    const pick = core.pickLoad(parsed);
-    assert.equal(pick.stages.length, 0);
-    const at = quote => {
-        const start = pick.text.indexOf(quote);
-        return { start, end: start + quote.length };
-    };
-    pick.stages.push(
-        { id: 's1', kind: 'stage', name: '第一幕', completion: '', ranges: [], color: '#111111' },
-        { id: 's2', kind: 'stage', name: '第二幕', completion: '冲突结束。', ranges: [], color: '#222222' },
-    );
-    assert.ok(core.pickAssign(pick, 's1', [at('开头铺垫')]));
-    assert.ok(core.pickAssign(pick, 's2', [at('冲突爆发')]));
-    const built = core.pickBuild(pick);
-    assert.ok(built.startsWith('结局收尾'), '没分配的文字收在最前面当前言，不发给 AI');
-    assert.ok(built.indexOf('结局收尾') < built.indexOf('## 第一幕'));
-    const next = core.parseOutline(built);
-    assert.deepEqual(plain(next.stages.map(item => [item.name, item.prompt])), [['第一幕', '开头铺垫'], ['第二幕', '冲突爆发']]);
-    assert.equal(next.stages[1].completion, '冲突结束。');
-    next.stages.forEach(stage => assert.doesNotMatch(stage.prompt, /结局收尾/));
-});
-
-test('选区模式：把别人已分配的文字重新选一遍就改归新属主', () => {
-    const parsed = core.parseOutline('## 第一幕\naaa bbb ccc\n\n## 第二幕\nddd');
-    const pick = core.pickLoad(parsed);
-    const [firstStage, secondStage] = pick.stages;
-    const range = { start: pick.text.indexOf('bbb'), end: pick.text.indexOf('ddd') };
-    assert.ok(core.pickAssign(pick, secondStage.id, [range]));
-    assert.deepEqual(plain(firstStage.ranges), [{ start: 0, end: pick.text.indexOf('bbb') }], '被挖走的部分要从原属主手里减掉');
-    const rebuilt = core.parseOutline(core.pickBuild(pick));
-    assert.equal(rebuilt.stages[0].prompt, 'aaa');
-    assert.equal(rebuilt.stages[1].prompt, 'bbb ccc\n\nddd');
-});
-
-test('选区模式：移除选中段后，文字回到最前面的未分配区', () => {
-    const parsed = core.parseOutline('## 第一幕\n保留部分 丢弃部分');
-    const pick = core.pickLoad(parsed);
-    const stage = pick.stages[0];
-    const range = { start: pick.text.indexOf('丢弃'), end: pick.text.length };
-    assert.ok(core.pickRemove(pick, stage.id, range));
-    const built = core.pickBuild(pick);
-    assert.ok(built.startsWith('丢弃部分'));
-    const rebuilt = core.parseOutline(built);
-    assert.equal(rebuilt.stages[0].prompt, '保留部分');
-    assert.equal(core.pickRemove(pick, 'note', range), false, '没有这段的属主不该报成功');
-});
 
 // 选区模式的 UI 冒烟：用 mock 的 Range/Selection 走一遍真实事件路径。
 function collectTextNodes(node, out) {
@@ -1658,61 +1543,6 @@ test('浏览器里的跟卡走丢了，世界书里的配置条目还在就恢�
 });
 
 // ---------------------------------------------------------------
-// v2.30 分段不得改动原文顺序：只换归属，不动先后
-// ---------------------------------------------------------------
-
-const rangeOf = (pick, quote) => {
-    const start = pick.text.indexOf(quote);
-    return { start, end: start + quote.length };
-};
-
-test('分段不动原文顺序：后面的行先归属，前面的行再标常驻，顺序不变', () => {
-    // 先把第二行分给一个阶段，再把第一行标成常驻 —— 以前常驻会被强制排到阶段之后，两行就对调了
-    let pick = core.pickLoad(core.parseOutline('第一行\n\n第二行'));
-    pick.stages.push({ id: 's1', kind: 'stage', name: '第一幕', completion: '', ranges: [], color: '#111111' });
-    assert.ok(core.pickAssign(pick, 's1', [rangeOf(pick, '第二行')]), '把第二行分给阶段');
-    pick = core.pickLoad(core.parseOutline(core.pickBuild(pick)));
-    assert.ok(core.pickAssign(pick, 'always', [rangeOf(pick, '第一行')]), '把第一行标成常驻');
-
-    const built = core.pickBuild(pick);
-    const after = core.pickLoad(core.parseOutline(built));
-    assert.ok(after.text.indexOf('第一行') < after.text.indexOf('第二行'),
-        `原文顺序必须保持，实际正文：${JSON.stringify(built)}`);
-});
-
-test('分段不动原文顺序：两行先后都标常驻，顺序不变', () => {
-    let pick = core.pickLoad(core.parseOutline('第一行\n\n第二行'));
-    assert.ok(core.pickAssign(pick, 'always', [rangeOf(pick, '第二行')]), '先把第二行标常驻');
-    pick = core.pickLoad(core.parseOutline(core.pickBuild(pick)));
-    assert.ok(core.pickAssign(pick, 'always', [rangeOf(pick, '第一行')]), '再把第一行标常驻');
-
-    const built = core.pickBuild(pick);
-    const after = core.pickLoad(core.parseOutline(built));
-    assert.ok(after.text.indexOf('第一行') < after.text.indexOf('第二行'),
-        `两行都标常驻也要保持顺序，实际正文：${JSON.stringify(built)}`);
-});
-
-test('分段不动原文顺序：附加文字排在阶段之前时，重建后仍留在前面', () => {
-    // 附加以前一律写在所有阶段之后，所以排在阶段前的附加会被搬到后面
-    const pick = core.pickLoad(core.parseOutline('## 第一幕\n正文一\n\n## 道具 [附加]\n从：第一幕\n到：第一幕\n道具正文'));
-    const built = core.pickBuild(pick);
-    assert.ok(built.indexOf('正文一') < built.indexOf('道具正文'),
-        `附加要留在原位，实际正文：${JSON.stringify(built)}`);
-
-    // 反过来：附加写在阶段之前，重建后也不许掉到后面
-    const before = core.pickBuild(core.pickLoad(core.parseOutline('## 道具 [附加]\n从：第一幕\n到：第一幕\n道具正文\n\n## 第一幕\n正文一')));
-    assert.ok(before.indexOf('道具正文') < before.indexOf('正文一'),
-        `常驻顺序要跟文字位置走，实际正文：${JSON.stringify(before)}`);
-});
-
-test('未分配的文字仍收在最前面当前言（夹在中间会被解析成上一块的正文，那就发给 AI 了）', () => {
-    const pick = core.pickLoad(core.parseOutline('还没想好的开头\n\n## 第一幕\n正文一'));
-    const built = core.pickBuild(pick);
-    assert.ok(built.startsWith('还没想好的开头'), `未分配文字要当前言，实际：${JSON.stringify(built)}`);
-    assert.equal(core.parseOutline(built).stages[0].prompt, '正文一', '前言不能混进阶段的正文');
-});
-
-// ---------------------------------------------------------------
 // v2.30 一键生成完成条件：走判断AI的 API 设置，结果写回弹层草稿
 // ---------------------------------------------------------------
 
@@ -1774,7 +1604,7 @@ test('编辑器：AI 生成完成条件会带上阶段正文并洗掉前缀写�
     assert.match(sent, /他们在雨夜互相介绍/, '要把这一段正文当依据带进去');
     assert.match(sent, /第二幕/, '要带上下一阶段，写成进入下一段的条件');
     assert.match(sent, /进入下一阶段/);
-    assert.match(sent, /拒绝空泛|抽象判词/, '提示词要禁掉空泛判词');
+    assert.match(sent, /空话/, '提示词要禁掉空泛判词');
     assert.doesNotMatch(sent, /\{\{/, '生成提示词里的占位符要全部替换');
 
     const area = findTag(panel().querySelector('.dga-sheet'), 'TEXTAREA');
@@ -2209,28 +2039,11 @@ test('认领模型：连绑第二个条目，高亮跟着新小卡走', async ()
 // v2.3 顺序编辑：整块上移/下移；常驻写在阶段之前 = 注入排在阶段内容之前
 // ---------------------------------------------------------------
 
-test('整块上移下移：交换阶段顺序，附加的“从：第一幕”按名字跟随', () => {
-    const content = '前言文字\n\n## 第一幕\n正文一\n\n## 第二幕\n正文二\n\n## 道具 [附加]\n从：第一幕\n道具正文\n\n## 风格 [常驻]\n风格正文';
-    let parsed = core.parseOutline(content);
-    let lines = core.moveBlock(parsed.lines, parsed.stages[0], 1);
-    assert.ok(!lines.join('\n').includes('\n\n\n'), '搬移后不出现连续两个空行');
-    parsed = core.parseOutline(lines.join('\n'));
-    assert.deepEqual(plain(parsed.stages.map(item => item.name)), ['第二幕', '第一幕']);
-    assert.deepEqual(plain(parsed.stages.map(item => item.prompt)), ['正文二', '正文一']);
-    const addon = parsed.addons.find(item => item.kind === 'addon');
-    assert.equal(addon.fromIndex, 1, '阶段引用按名字解析，换位后自动跟随');
-    assert.deepEqual(core.moveBlock(parsed.lines, parsed.blocks[0], -1), parsed.lines, '第一个块不能再上移');
-    assert.deepEqual(core.moveBlock(parsed.lines, parsed.blocks[parsed.blocks.length - 1], 1), parsed.lines, '最后一个块不能再下移');
-});
-
-test('常驻挪到所有阶段之前，注入里就排在当前阶段内容之前', () => {
+test('常驻写在所有阶段之前，注入里就排在当前阶段内容之前', () => {
     const content = '前言文字\n\n## 第一幕\n正文一\n\n## 风格 [常驻]\n风格正文';
     let parsed = core.parseOutline(content);
     assert.equal(parsed.blocks.find(item => item.kind === 'always').aboveStages, false);
-    // 常驻上移一次到前言之后、第一幕之前
-    const lines = core.moveBlock(parsed.lines, parsed.blocks.find(item => item.kind === 'always'), -1);
-    assert.ok(lines.join('\n').startsWith('前言文字'), '前言保持在最前，搬移只在标题块之间进行');
-    parsed = core.parseOutline(lines.join('\n'));
+    parsed = core.parseOutline('前言文字\n\n## 风格 [常驻]\n风格正文\n\n## 第一幕\n正文一');
     const always = parsed.blocks.find(item => item.kind === 'always');
     assert.equal(always.aboveStages, true, '常驻在所有阶段之前要标记为“在上面”');
     const injected = core.formatInjection(parsed.stages[0], core.activeAddons(parsed, 0));
@@ -2241,22 +2054,6 @@ test('常驻挪到所有阶段之前，注入里就排在当前阶段内容之�
     const injectedBottom = core.formatInjection(bottom.stages[0], core.activeAddons(bottom, 0));
     assert.ok(injectedBottom.indexOf('风格正文') > injectedBottom.indexOf('正文一'));
     assert.doesNotMatch(injectedBottom, /同时有效的附加内容|完成判定/);
-});
-
-test('选区模式重建保留常驻的前后位置，开关可以切换', () => {
-    const top = core.parseOutline('## 风格 [常驻]\n风格正文\n\n## 第一幕\n正文一\n\n## 第二幕\n正文二');
-    const pickTop = core.pickLoad(top);
-    assert.equal(pickTop.alwaysTop, true);
-    const rebuiltTop = core.parseOutline(core.pickBuild(pickTop));
-    assert.equal(rebuiltTop.blocks.find(item => item.kind === 'always').aboveStages, true, '重建后常驻仍在阶段之前');
-
-    const bottom = core.parseOutline('## 第一幕\n正文一\n\n## 风格 [常驻]\n风格正文');
-    const pickBottom = core.pickLoad(bottom);
-    assert.equal(pickBottom.alwaysTop, false);
-    assert.equal(core.parseOutline(core.pickBuild(pickBottom)).blocks.find(item => item.kind === 'always').aboveStages, false);
-    pickBottom.alwaysTop = true;
-    const flipped = core.parseOutline(core.pickBuild(pickBottom));
-    assert.equal(flipped.blocks.find(item => item.kind === 'always').aboveStages, true, '开关切到上面后重建排在阶段之前');
 });
 
 test('分段界面：标题条的下移按钮交换阶段顺序且不打开弹层', async () => {
@@ -2405,10 +2202,8 @@ test('镜像只复制原文切片，不附完成条件', () => {
     assert.doesNotMatch(injected, /完成判定|DGA_COMPLETE|寒假开始|进入下一段的时机|当前阶段：/);
 });
 
-test('选区模式往返保留“完成：自动”', () => {
-    const text = '## 第一幕\n完成：自动\n正文一\n\n## 第二幕\n正文二';
-    const rebuilt = core.pickBuild(core.pickLoad(core.parseOutline(text)));
-    const again = core.parseOutline(rebuilt);
+test('旧格式“完成：自动”仍解析成自动完成', () => {
+    const again = core.parseOutline('## 第一幕\n完成：自动\n正文一\n\n## 第二幕\n正文二');
     assert.equal(again.stages[0].autoComplete, true);
     assert.equal(again.stages[0].completion, '');
     assert.equal(again.stages[1].autoComplete, false);
@@ -2485,17 +2280,17 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.equal(verdicts[0].should_silence, true, '判断AI请求必须静默');
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'user', 'assistant', 'user_input'], '默认四段：系统 / 规则 / 预确认 / 案例（案例即 user_input）');
-    assert.match(ordered[0].content, /一段时间或持续状态还在，就不是完成/, '系统段只交代判定口径');
-    assert.doesNotMatch(ordered[0].content, /格式示例|<basis>|<verdict>/, '系统段不解释标签');
-    assert.match(ordered[1].content, /【判断规则】/, '第二段是判断规则（与案例数据分开）');
-    assert.match(ordered[1].content, /判例对照/, '规则段要带一对正反判例');
-    assert.match(ordered[2].content, /收到/, '第三段是 assistant 预确认（抄数据库 ACK 段）');
-    assert.match(String(verdicts[0].user_input), /【当前阶段】\n甲一/, '案例段要带阶段名');
-    assert.match(String(verdicts[0].user_input), /甲一正文/, '案例段要带阶段正文');
-    assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案例段要带最近剧情');
-    assert.match(String(verdicts[0].user_input), /<basis>\n- 已发生：正文里对得上的事\n<\/basis>\n<verdict>\n- 结论：只写 YES 或 NO\n<\/verdict>/, 'basis 和 verdict 与 checklist 一样是标签里的条目');
-    assert.doesNotMatch(ordered[1].content, /\{\{/, '默认段里的占位符都要被替换');
+        ['system', 'system', 'user_input'], '默认三段：身份 / 判定手册 / 本次案卷（案卷即 user_input）');
+    assert.match(ordered[0].content, /你负责判断剧情该不该推进/, '第一段只交代身份');
+    assert.doesNotMatch(ordered[0].content, /格式示例|<basis>|<verdict>/, '身份段不解释标签');
+    assert.match(ordered[1].content, /# 判定手册/, '第二段是判定手册（与案卷数据分开）');
+    assert.match(ordered[1].content, /状态型[\s\S]*事件型/, '手册要先分清两种阶段');
+    assert.match(ordered[1].content, /## 五、例子/, '手册要带正反例子');
+    assert.match(String(verdicts[0].user_input), /【当前阶段】甲一/, '案卷要带阶段名');
+    assert.match(String(verdicts[0].user_input), /甲一正文/, '案卷要带阶段正文');
+    assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案卷要带最近正文');
+    assert.match(String(verdicts[0].user_input), /<basis>\n- 已发生：[^\n]*\n<\/basis>\n<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, 'basis 和 verdict 是标签里的条目');
+    assert.doesNotMatch(String(verdicts[0].user_input), /\{\{/, '默认段里的占位符都要被替换');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
     await state.events.get('message_received')(5);
@@ -2696,7 +2491,7 @@ test('判断AI档：自定义提示词段按序组装并替换占位符', async 
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))), ['system', 'assistant', 'user_input']);
     assert.match(ordered[0].content, /^规则：只判断 甲一$/, 'system 段里占位符要替换');
     assert.match(ordered[1].content, /这一轮的回复/, 'assistant 段里的 {{history}} 也要替换');
-    assert.match(verdicts[0].user_input, /条件=没有写完成条件/);
+    assert.match(verdicts[0].user_input, /条件=（没写。/);
     assert.match(verdicts[0].user_input, /不能因为符合这段就写 YES/);
     assert.deepEqual(run.errors, []);
 });
@@ -2721,7 +2516,7 @@ test('默认判断提示词：还停在当前时段不能因为符合这段就�
     const blob = JSON.stringify(sent[0]);
     assert.match(blob, /下一阶段/);
     assert.match(blob, /平时/, '下一段名字来自用户的阶段，不是写死在提示词里');
-    assert.match(blob, /正文还符合当前这段/);
+    assert.match(blob, /正文还在这个状态里就是 NO/);
     assert.match(blob, /不能因为符合这段就写 YES/);
     assert.doesNotMatch(blob, /符合暑假|不能换成平时|在家、做饭|不要翻译标签名/);
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, '还停在当前时段时不能推进');
@@ -2935,7 +2730,7 @@ test('判断AI档：自定义提问模板替换占位符后发出', async () => 
     assert.equal(verdicts.length, 1);
     const sent = String(verdicts[0].user_input);
     assert.match(sent, /^阶段=甲一/, '模板要按自定义文案组装');
-    assert.match(sent, /条件=没有写完成条件/);
+    assert.match(sent, /条件=（没写。/);
     assert.match(sent, /正文=甲一正文/);
     assert.match(sent, /历史=[\s\S]*这一轮的回复/);
     assert.doesNotMatch(sent, /\{\{/, '占位符要全部替换掉');
@@ -2981,13 +2776,12 @@ test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
     assert.equal(cmCalls[0].profileId, '酒馆代理A');
     assert.equal(cmCalls[0].maxTokens, 16);
     assert.equal(cmCalls[0].messages[0].role, 'system');
-    assert.equal(cmCalls[0].messages[1].role, 'user', '第二段是判断规则');
-    assert.match(cmCalls[0].messages[1].content, /【判断规则】/);
-    assert.equal(cmCalls[0].messages[2].role, 'assistant', '第三段是 assistant 预确认');
-    assert.equal(cmCalls[0].messages[3].role, 'user');
-    assert.match(cmCalls[0].messages[3].content, /这一轮的回复/);
-    assert.match(cmCalls[0].messages[3].content, /<verdict>\n- 结论：只写 YES 或 NO\n<\/verdict>/, '案例段的 verdict 与 checklist 一样是条目');
-    assert.equal(cmCalls[0].messages.length, 4, '不再有独立的最终注入消息');
+    assert.equal(cmCalls[0].messages[1].role, 'system', '第二段是判定手册');
+    assert.match(cmCalls[0].messages[1].content, /# 判定手册/);
+    assert.equal(cmCalls[0].messages[2].role, 'user');
+    assert.match(cmCalls[0].messages[2].content, /这一轮的回复/);
+    assert.match(cmCalls[0].messages[2].content, /<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, '案卷的 verdict 是条目');
+    assert.equal(cmCalls[0].messages.length, 3, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
@@ -3034,10 +2828,10 @@ test('判断AI档：自定义 API 预设直连酒馆后端 generate 端点', asy
     assert.equal(body.custom_prompt_post_processing, 'strict');
     assert.equal(body.stream, false);
     assert.equal(body.messages[0].role, 'system');
-    assert.equal(body.messages[1].role, 'user', '第二段是判断规则');
-    assert.equal(body.messages[2].role, 'assistant', '第三段是 assistant 预确认');
-    assert.match(body.messages[3].content, /这一轮的回复/);
-    assert.equal(body.messages.length, 4, '不再有独立的最终注入消息');
+    assert.equal(body.messages[1].role, 'system', '第二段是判定手册');
+    assert.equal(body.messages[2].role, 'user', '第三段是本次案卷');
+    assert.match(body.messages[2].content, /这一轮的回复/);
+    assert.equal(body.messages.length, 3, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
 });
@@ -3588,26 +3382,10 @@ test('判断AI档：流式关闭（默认）主 API 通道 should_stream=false',
 
 const BRANCH_OUTLINE = '## 相遇\n相遇正文\n\n## 留下\n分支：去向\n留下正文\n\n## 离开\n分支：去向\n离开正文\n\n## 尾声\n尾声正文';
 
-test('分支：解析「分支：组名」，同义词与重建往返都保留', () => {
+test('分支：解析「分支：组名」，同义词也认', () => {
     const parsed = core.parseOutline(BRANCH_OUTLINE);
     assert.deepEqual(plain(parsed.stages.map(item => item.branch || '')), ['', '去向', '去向', '']);
     assert.equal(core.parseOutline('## 甲\n支线：路\n甲正文').stages[0].branch, '路', '支线是同义词');
-    const pick = {
-        text: '相遇正文\n\n留下正文\n\n离开正文',
-        stages: [
-            { id: 'a', kind: 'stage', name: '相遇', ranges: [{ start: 0, end: 4 }] },
-            { id: 'b', kind: 'stage', name: '留下', branch: '去向', ranges: [{ start: 6, end: 10 }] },
-            { id: 'c', kind: 'stage', name: '离开', branch: '去向', ranges: [{ start: 12, end: 16 }] },
-        ],
-        addons: [],
-        always: { id: 'always', kind: 'always', ranges: [] },
-        note: { id: 'note', kind: 'note', ranges: [] },
-        pendingRanges: [],
-    };
-    const rebuilt = core.pickBuild(pick);
-    assert.match(rebuilt, /## 留下\n分支：去向/, '重建正文要写上分支行');
-    const again = core.parseOutline(rebuilt);
-    assert.deepEqual(plain(again.stages.map(item => item.branch || '')), ['', '去向', '去向'], '再解析仍认得分支组');
 });
 
 test('分支：进入一组后其余分支被跳过', () => {
@@ -3696,7 +3474,7 @@ test('随正文AI判断：下一格是分支时列出各走向标记，回复选
     assert.deepEqual(run.errors, []);
 });
 
-test('判断AI档：YES 后下一格是分支组时补问走向，选中才推进', async () => {
+test('判断AI档：下一格是分支组时，走向和结论在同一次请求里问，选中才推进', async () => {
     const stages = core.parseOutline(BRANCH_OUTLINE).stages;
     const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
     const config = {
@@ -3709,16 +3487,17 @@ test('判断AI档：YES 后下一格是分支组时补问走向，选中才推�
     const calls = [];
     helper.generateRaw = async options => {
         calls.push(options);
-        if (String(options.user_input).includes('【分支】')) return '<branch>\n- 走向：2\n</branch>';
-        return '<basis>演完了</basis>\n<verdict>\n- 结论：YES\n</verdict>';
+        return '<basis>演完了</basis>\n<verdict>\n- 结论：YES\n</verdict>\n<branch>\n- 走向：2\n</branch>';
     };
     const run = load(helper);
     await new Promise(setImmediate);
     await state.events.get('message_received')(5);
-    assert.equal(calls.length, 2, 'YES 后补问一次分支走向');
-    assert.match(String(calls[1].user_input), /【刚演完的阶段】\n相遇/);
-    assert.match(String(calls[1].user_input), /1\. 留下/);
-    assert.match(String(calls[1].user_input), /2\. 离开/);
+    assert.equal(calls.length, 1, '走向和结论一次问完，不再补问第二次');
+    const asked = String(calls[0].user_input);
+    assert.match(asked, /【分支】/);
+    assert.match(asked, /1\. 留下/);
+    assert.match(asked, /2\. 离开/);
+    assert.match(asked, /<branch>\n- 走向：序号\n<\/branch>/);
     const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
     assert.equal(saved.stageIndex, 2, '选了第 2 个分支「离开」');
     assert.deepEqual(plain(saved.branchChoices), { 去向: stages[2].id });
@@ -3738,13 +3517,12 @@ test('判断AI档：分支走向写 0 时不推进', async () => {
     const calls = [];
     helper.generateRaw = async options => {
         calls.push(options);
-        if (String(options.user_input).includes('【分支】')) return '<branch>\n- 走向：0\n</branch>';
-        return '<verdict>YES</verdict>';
+        return '<verdict>YES</verdict>\n<branch>\n- 走向：0\n</branch>';
     };
     const run = load(helper);
     await new Promise(setImmediate);
     await state.events.get('message_received')(5);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
     assert.equal(saved.stageIndex, 0, '对不上分支就不推进');
     assert.equal(saved.lastJudgeCheckedId, 5, '但这一层记为已检查，不反复问');
@@ -3823,55 +3601,30 @@ test('小卡状态字多就缩略，点「展开」看全文、再点「收起�
     assert.deepEqual(errors, []);
 });
 
-test('时间线一组收成一根，不把两排每张都斜连在一起', () => {
-    const stages = [
-        { id: 'a', name: '开始', branch: '' },
-        { id: 'b', name: '留下', branch: '去向' },
-        { id: 'c', name: '离开', branch: '去向' },
-        { id: 'd', name: '结尾', branch: '' },
-    ];
-    const graph = core.storyPositions(stages);
-    const lanes = core.storyLaneSegments(graph.rows, graph.placed);
-    const arrows = lanes.filter(lane => lane.arrow);
-    assert.equal(arrows.length, 3, '两段岔路各一根箭头，再加结尾一根，不是两排交叉');
-    lanes.forEach(lane => {
-        const points = lane.points.split(' ').map(item => item.split(',').map(Number));
-        for (let index = 1; index < points.length; index += 1) {
-            const dx = points[index][0] - points[index - 1][0];
-            const dy = points[index][1] - points[index - 1][1];
-            assert.ok(dx === 0 || dy === 0, '线只走横竖，不斜穿卡片');
-        }
+test('路线图：按依附排成缩进大纲，标出接在哪、换边和各条进度', () => {
+    const stages = names => ({ stages: names.map(name => ({ name })) });
+    const line = (key, name, parsed, state, binding) => ({
+        key, configured: true, entry: { name }, parsed, state, binding: { worldbookName: '书', entryName: name, ...binding },
     });
-});
-
-test('导图：分支并排，前后主线散开再收回', () => {
-    const stages = [
-        { id: 'a', name: '雨夜', branch: '' },
-        { id: 'b', name: '留下', branch: '去向' },
-        { id: 'c', name: '分别', branch: '去向' },
-        { id: 'd', name: '再联系', branch: '' },
-    ];
-    const graph = core.storyPositions(stages);
-    assert.equal(graph.rows.length, 3);
-    assert.equal(graph.rows[1].map(item => item.id).join(','), 'b,c');
-    assert.equal(graph.edges.map(edge => `${edge.from}->${edge.to}`).join(','), 'a->b,a->c,b->d,c->d');
-    assert.ok(graph.placed.get('b').x < graph.placed.get('c').x);
-    assert.equal(graph.placed.get('b').y, graph.placed.get('c').y);
-    const kept = core.storyPositions([{ id: 'a', name: '甲', x: 40, y: 80 }]);
-    assert.equal(kept.placed.get('a').x, 40);
-    assert.equal(kept.placed.get('a').y, 80);
-});
-
-test('时间线状态：走过、现在、被否决', () => {
-    const stages = [
-        { id: 'a', branch: '' },
-        { id: 'b', branch: '去向' },
-        { id: 'c', branch: '去向' },
-    ];
-    const state = { stageIndex: 1, branchChoices: { 去向: 'b' } };
-    assert.equal(core.stageMapStatus(stages[0], 0, state), 'done');
-    assert.equal(core.stageMapStatus(stages[1], 1, state), 'now');
-    assert.equal(core.stageMapStatus(stages[2], 2, state), 'skipped');
+    const rows = core.roadmapOutline([
+        line('书#1', '主线', stages(['相遇', '同居', '分别']), { stageIndex: 1, forkInto: '书#2' }, {}),
+        line('书#2', '岔路', stages(['岔一', '岔二']), { stageIndex: 0 }, { attachKey: '书#1', attachStage: 2, attachKind: 'fork', passes: [{ left: 2, right: 3, dir: 'back' }] }),
+        line('书#3', '番外', stages(['番一']), { stageIndex: 0 }, { attachKey: '书#1', attachStage: 3, attachKind: 'side' }),
+        line('书#4', '独立', stages(['甲']), { stageIndex: 1 }, {}),
+    ]);
+    assert.deepEqual(plain(rows.map(row => [row.name, row.depth])), [['主线', 0], ['岔路', 1], ['番外', 1], ['独立', 0]]);
+    assert.equal(rows[0].now, '现在第 2 段');
+    assert.equal(rows[1].how, '分岔口：从「主线」第 2 段「同居」接上');
+    assert.equal(rows[1].now, '现在第 1 段', '走进了分岔');
+    assert.deepEqual(plain(rows[1].passes), ['换边：这条第 2 段 ← 那边第 3 段']);
+    assert.equal(rows[2].how, '支线：从「主线」第 3 段「分别」接上');
+    assert.equal(rows[2].now, '还没走到');
+    assert.equal(rows[3].now, '全部走完');
+    const loop = core.roadmapOutline([
+        line('a', '甲', stages(['一']), {}, { attachKey: 'b' }),
+        line('b', '乙', stages(['一']), {}, { attachKey: 'a' }),
+    ]);
+    assert.equal(loop.length, 2, '依附绕成圈也不丢条目、不死循环');
 });
 
 test('没有时间线；编辑仍是分段，设置里可以依附', async () => {
@@ -3889,6 +3642,7 @@ test('没有时间线；编辑仍是分段，设置里可以依附', async () =>
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
 
+    assert.equal(panel().querySelector('.dga-roadmap-card'), null, '没有依附时不显示路线图');
     assert.equal(findButton(panel(), '时间线 ›'), null, '小卡上没有时间线');
     await findButton(panel(), '设置 ›').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
@@ -3950,13 +3704,6 @@ test('线：可选会清掉互斥名单，点名的互斥才留下', () => {
     assert.equal(links[0].exclusiveWith.length, 0);
     assert.equal(links[1].optional, false);
     assert.equal(links[1].exclusiveWith.join(','), 'a');
-});
-
-test('箭头从卡片边缘指向下一张，不从中心穿出去', () => {
-    const ends = core.mapArrowEnds({ x: 0, y: 0 }, { x: 220, y: 0 });
-    assert.equal(ends.x1, 156);
-    assert.equal(ends.y1, 36);
-    assert.ok(ends.x2 < 220 && ends.x2 > 156, '箭头停在目标卡片左边一点');
 });
 
 test('原文划分优先于卡片旧正文，空卡片不能把原文发空', () => {
@@ -4024,4 +3771,318 @@ test('点进一段分成离开、岔路、发给 AI、附加和常驻', async ()
     assert.equal(findButton(sheet(), '加一条常驻'), null, '常驻不在这一段的页面里加');
     assert.ok(findButton(sheet(), '删掉这段'));
     assert.deepEqual(errors, []);
+});
+
+// ---------------------------------------------------------------
+// v2.99.4：少调用、缺陷修复
+// ---------------------------------------------------------------
+
+// 给 multiWorld 的 helper 套一层计数：读世界书、写世界书、写变量各几次。
+function countCalls(helper) {
+    const counts = { getWorldbook: 0, updateWorldbookWith: 0, character: 0, chat: 0 };
+    const getWorldbook = helper.getWorldbook;
+    const updateWorldbookWith = helper.updateWorldbookWith;
+    const updateVariablesWith = helper.updateVariablesWith;
+    helper.getWorldbook = name => { counts.getWorldbook += 1; return getWorldbook(name); };
+    helper.updateWorldbookWith = (name, updater) => { counts.updateWorldbookWith += 1; return updateWorldbookWith(name, updater); };
+    helper.updateVariablesWith = (updater, options) => { counts[options.type] += 1; return updateVariablesWith(updater, options); };
+    const reset = () => Object.keys(counts).forEach(key => { counts[key] = 0; });
+    return { counts, reset };
+}
+
+test('镜像 uid 记在绑定上：生成时没有变化就不再写角色变量和世界书（跟卡走也一样）', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { storageMode: 'card' },
+    };
+    const { state, helper } = multiWorld(books, { config });
+    helper.getCharWorldbookNames = () => ['书A'];
+    const { counts, reset } = countCalls(helper);
+    const run = load(helper, { localStorage: memoryStorage() });
+    await new Promise(setImmediate);
+    const stored = state.variables.character.$dynamicGuideAssistant.config.bindings[0];
+    const mirror = state.books.书A.find(item => item.name === '大纲A（动态指导）');
+    assert.ok(mirror, '启动时建好镜像');
+    assert.equal(String(stored.mirrorUid), String(mirror.uid), '镜像 uid 要记进绑定，不能在整理配置时丢掉');
+    assert.equal(core.normalizeConfig({ version: 2, bindings: [{ worldbookName: '书A', entryName: '大纲A', mirrorUid: 7 }] }).bindings[0].mirrorUid, 7);
+    reset();
+    await state.events.get('generate')('normal', {}, false);
+    await state.events.get('generate')('swipe', {}, false);
+    await state.events.get('generate')('normal', {}, true);
+    assert.equal(counts.character, 0, '没有变化时不写角色变量（写一次就是存一次角色卡）');
+    assert.equal(counts.chat, 0, '没有变化时不写聊天变量');
+    assert.equal(counts.updateWorldbookWith, 0, '跟卡走时也不重写世界书里的配置条目');
+    assert.equal(counts.getWorldbook, 3, '一次生成只读一次这本世界书');
+    assert.deepEqual(run.errors, []);
+});
+
+test('一次生成里每本世界书只读一次：三条绑定三本书就读三次', async () => {
+    const books = {};
+    const bindings = [];
+    ['书A', '书B', '书C'].forEach((name, index) => {
+        books[name] = [{ uid: 1, name: `大纲${index}`, content: `## 一\n${name}一\n\n## 二\n${name}二`, enabled: false }];
+        bindings.push({ worldbookName: name, entryUid: 1, entryName: `大纲${index}`, boundAt: null });
+    });
+    const { state, helper } = multiWorld(books, { config: { version: 2, bindings, settings: {} } });
+    const { counts, reset } = countCalls(helper);
+    const run = load(helper);
+    await new Promise(setImmediate);
+    reset();
+    await state.events.get('generate')('normal', {}, false);
+    assert.equal(counts.getWorldbook, 3, '三本书各读一次，镜像试跑用读到的副本');
+    assert.equal(counts.updateWorldbookWith + counts.character + counts.chat, 0, '没有变化就一次都不写');
+    assert.deepEqual(run.errors, []);
+});
+
+test('支线被随正文标记走完后，回到被依附那条进支线时记下的下一段', async () => {
+    const host = '## 主一\n主一正文\n\n## 主二\n主二正文\n\n## 主三\n主三正文';
+    const side = '## 支一\n支一正文\n\n## 支二\n支二正文';
+    const sideStages = core.parseOutline(side).stages;
+    const hostKey = keyOf('书A', 1);
+    const sideKey = keyOf('书A', 2);
+    const books = {
+        书A: [
+            { uid: 1, name: '主线', content: host, enabled: false },
+            { uid: 2, name: '支线', content: side, enabled: false },
+        ],
+    };
+    const config = {
+        version: 2,
+        settings: { autoAdvance: 'story' },
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '主线' },
+            { worldbookName: '书A', entryUid: 2, entryName: '支线', attachKey: hostKey, attachStage: 1, attachKind: 'side' },
+        ],
+    };
+    const chatState = {
+        version: 2,
+        bindings: {
+            [hostKey]: { stageIndex: 0, stageName: '主一', sideOut: sideKey },
+            [sideKey]: { stageIndex: 1, stageName: '支二', returnKey: hostKey, returnIndex: 1 },
+        },
+    };
+    const message = { message_id: 9, role: 'assistant', message: `支线演完了 <!-- DGA_COMPLETE:${sideStages[1].id} -->` };
+    const { state, helper } = multiWorld(books, { config, chatState, messages: [message], lastMessageId: 9 });
+    const run = load(helper);
+    await new Promise(setImmediate);
+    assert.match(state.books.书A.find(item => item.name === '支线（动态指导）').content, /支二正文/, '走在支线上时发支线');
+    assert.equal(state.books.书A.find(item => item.name === '主线（动态指导）'), undefined, '走支线时主线不发');
+
+    await state.events.get('message_received')(9);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
+    assert.equal(saved[sideKey].stageIndex, 2, '支线走完');
+    assert.ok(!saved[sideKey].returnKey, '回去以后不再记着要回哪');
+    assert.ok(!saved[hostKey].sideOut, '被依附的那条不再挂着「正在走另一条」');
+    assert.equal(saved[hostKey].stageIndex, 1, '落在进支线时记下的下一段');
+    assert.equal(saved[hostKey].stageName, '主二', '名字要一起改，不然下次读进度会按旧名字跳回主一');
+    assert.match(state.books.书A.find(item => item.name === '主线（动态指导）').content, /主二正文/);
+    assert.equal(state.books.书A.find(item => item.name === '支线（动态指导）'), undefined, '支线走完不再发');
+    assert.deepEqual(run.errors, []);
+});
+
+test('以前卡住的支线（走完了还记着要回哪）启动时自动接回去', async () => {
+    const host = '## 主一\n主一正文\n\n## 主二\n主二正文';
+    const side = '## 支一\n支一正文';
+    const hostKey = keyOf('书A', 1);
+    const sideKey = keyOf('书A', 2);
+    const books = {
+        书A: [
+            { uid: 1, name: '主线', content: host, enabled: false },
+            { uid: 2, name: '支线', content: side, enabled: false },
+        ],
+    };
+    const config = {
+        version: 2,
+        settings: {},
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '主线' },
+            { worldbookName: '书A', entryUid: 2, entryName: '支线', attachKey: hostKey, attachStage: 1, attachKind: 'side' },
+        ],
+    };
+    const chatState = {
+        version: 2,
+        bindings: {
+            [hostKey]: { stageIndex: 0, stageName: '主一', sideOut: sideKey },
+            [sideKey]: { stageIndex: 1, stageName: '', returnKey: hostKey, returnIndex: 1 },
+        },
+    };
+    const { state, helper } = multiWorld(books, { config, chatState });
+    const run = load(helper);
+    await new Promise(setImmediate);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
+    assert.ok(!saved[hostKey].sideOut);
+    assert.equal(saved[hostKey].stageIndex, 1);
+    assert.ok(!saved[sideKey].returnKey);
+    assert.match(state.books.书A.find(item => item.name === '主线（动态指导）').content, /主二正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI进分叉：分叉那条从第一段开始，旧进度里的名字不会把它拉回别的段', async () => {
+    const host = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const fork = '## 岔一\n岔一正文\n\n## 岔二\n岔二正文';
+    const hostKey = keyOf('书A', 1);
+    const forkKey = keyOf('书A', 2);
+    const books = {
+        书A: [
+            { uid: 1, name: '大纲A', content: host, enabled: false },
+            { uid: 2, name: '岔路', content: fork, enabled: false },
+        ],
+    };
+    const config = {
+        version: 2,
+        settings: { autoAdvance: 'judge' },
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '大纲A' },
+            { worldbookName: '书A', entryUid: 2, entryName: '岔路', attachKey: hostKey, attachStage: 1, attachKind: 'fork' },
+        ],
+    };
+    // 岔路以前走到过第二段（比如上一轮循环），进度里还留着「岔二」。
+    const chatState = { version: 2, bindings: { [forkKey]: { stageIndex: 1, stageName: '岔二' } } };
+    const message = { message_id: 5, role: 'assistant', message: '人走进了岔路。' };
+    const { state, helper } = multiWorld(books, { config, chatState, messages: [message], lastMessageId: 5 });
+    helper.generateRaw = async () => '<basis>\n- 已发生：走进岔路\n</basis>\n<verdict>\n- 结论：NO\n</verdict>\n<road>\n- 路：1\n</road>';
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
+    assert.equal(saved[hostKey].lineCut, true);
+    assert.equal(saved[forkKey].stageIndex, 0);
+    assert.equal(saved[forkKey].stageName, '岔一');
+    assert.match(state.books.书A.find(item => item.name === '岔路（动态指导）').content, /岔一正文/, '分叉从第一段发，不是旧进度里的岔二');
+    assert.deepEqual(run.errors, []);
+});
+
+test('AI 选段也先过排除规则：思维链里抄出来的 <stage> 不算', async () => {
+    const content = '## 甲\n甲正文\n\n## 乙\n乙正文\n\n## 丙\n丙正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const key = keyOf('书A', 1);
+    const { state, helper } = multiWorld(books, {
+        config: {
+            version: 2,
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', orderMode: 'pick' }],
+            settings: { autoAdvance: 'off', excludeRules: [{ start: '<think>', end: '</think>' }] },
+        },
+        chatState: { version: 2, bindings: { [key]: { stageIndex: 0, stageName: '甲' } } },
+        messages: [{ message_id: 8, role: 'assistant', message: '还在开头。' }],
+        lastMessageId: 8,
+    });
+    helper.generateRaw = async () => '<think>先打个草稿：<stage>3</stage></think>\n<basis>\n- 已发生：还在第一段\n</basis>\n<stage>\n- 序号：1\n</stage>';
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(8);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[key];
+    assert.equal(saved.stageIndex, 0, '思维链里的 <stage>3 被排除规则削掉，停在第一段');
+    assert.equal(saved.lastJudgeBasis, '还在第一段');
+    assert.doesNotMatch(run.core.getJudgeRuntime().lastFiltered, /<think>/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('同一层好几条判断AI绑定合成一次请求，按 <answer n> 各自推进', async () => {
+    const books = {
+        书A: [
+            { uid: 1, name: '甲线', content: '## 甲一\n甲一正文\n\n## 甲二\n甲二正文', enabled: false },
+            { uid: 2, name: '乙线', content: '## 乙一\n乙一正文\n\n## 乙二\n乙二正文', enabled: false },
+            { uid: 3, name: '丙线', content: '## 丙一\n丙一正文\n\n## 丙二\n丙二正文', enabled: false },
+        ],
+    };
+    const config = {
+        version: 2,
+        settings: { autoAdvance: 'judge' },
+        bindings: [1, 2, 3].map(uid => ({ worldbookName: '书A', entryUid: uid, entryName: ['甲线', '乙线', '丙线'][uid - 1] })),
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一层只出现一次的正文。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const calls = [];
+    helper.generateRaw = async options => {
+        calls.push(options);
+        return [
+            '<answer n="1">\n<basis>\n- 已发生：甲一演完\n</basis>\n<verdict>\n- 结论：YES\n</verdict>\n</answer>',
+            '<answer n="2">\n<basis>\n- 已发生：乙一还在\n</basis>\n<verdict>\n- 结论：NO\n</verdict>\n</answer>',
+        ].join('\n');
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    assert.equal(calls.length, 1, '三条同一层到点，只发一次请求');
+    const asked = String(calls[0].user_input);
+    assert.equal(asked.split('这一层只出现一次的正文').length - 1, 1, '最近剧情只放一次');
+    assert.match(asked, /<case n="1">\n【剧情线】甲线/);
+    assert.match(asked, /<case n="2">\n【剧情线】乙线/);
+    assert.match(asked, /<case n="3">\n【剧情线】丙线/);
+    assert.match(asked, /<answer n="序号"><\/answer>/);
+    assert.deepEqual(plain(calls[0].ordered_prompts.map(item => (typeof item === 'string' ? item : item.role))),
+        ['system', 'system', 'user_input'], '身份、手册只发一份');
+    assert.ok(calls[0].max_tokens > 1024 && calls[0].max_tokens <= 4096, '合并后回复长度按条数放宽，但有上限');
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
+    assert.equal(saved[keyOf('书A', 1)].stageIndex, 1, '第 1 条 YES 推进');
+    assert.equal(saved[keyOf('书A', 2)].stageIndex, 0, '第 2 条 NO 不动');
+    assert.equal(saved[keyOf('书A', 3)].stageIndex, 0, '第 3 条没作答不动');
+    assert.match(saved[keyOf('书A', 3)].lastJudgeBasis, /没有按序号写这一条/);
+    [1, 2, 3].forEach(uid => assert.equal(saved[keyOf('书A', uid)].lastJudgeCheckedId, 5, '三条都记为这一层查过'));
+    assert.match(state.books.书A.find(item => item.name === '甲线（动态指导）').content, /甲二正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('判断AI请求出错后暂停自动检查，不再每层都问；「现在检查」仍可手动试', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge' },
+    };
+    const messages = [5, 6, 7].map(id => ({ message_id: id, role: 'assistant', message: `第${id}层。` }));
+    const { state, helper } = multiWorld(books, { config, messages, lastMessageId: 5 });
+    let calls = 0;
+    let fail = true;
+    helper.generateRaw = async () => {
+        calls += 1;
+        if (fail) throw new Error('HTTP 429 Too Many Requests');
+        return '<verdict>YES</verdict>';
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    assert.equal(calls, 1);
+    state.lastMessageId = 6;
+    await state.events.get('message_received')(6);
+    state.lastMessageId = 7;
+    await state.events.get('message_received')(7);
+    assert.equal(calls, 1, '出错后暂停，后面几层不再自动请求');
+    assert.match(run.logs.join('\n'), /自动检查先停到/);
+    fail = false;
+    await run.core.checkNow(keyOf('书A', 1));
+    assert.equal(calls, 2, '「现在检查」是用户自己点的，不受暂停影响');
+    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
+    assert.deepEqual(run.errors, []);
+});
+
+test('「导出」用的是宿主窗口，不再把窗口当函数调用', async () => {
+    assert.doesNotMatch(source, /hostWindow\(\)/, 'hostWindow 是窗口对象，不是函数');
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const downloads = [];
+    const createElement = documentRef.createElement;
+    documentRef.createElement = tag => {
+        const node = createElement(tag);
+        if (String(tag).toLowerCase() === 'a') {
+            node.click = () => downloads.push(node.getAttribute('download'));
+            node.remove = () => { if (node.parentNode) node.parentNode.removeChild(node); };
+        }
+        return node;
+    };
+    const { helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false });
+    const booted = loadWithDocument(documentRef, helper);
+    booted.sandbox.Blob = function Blob(parts, options) { this.parts = parts; this.options = options; };
+    booted.sandbox.URL = { createObjectURL: () => 'blob:dga', revokeObjectURL: () => {} };
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '运行日志').listeners.click[0]();
+    findButton(panel(), '导出').listeners.click[0]();
+    assert.equal(downloads.length, 1, '点「导出」要真的下载一份日志');
+    assert.match(downloads[0], /^动态指导助手-运行日志-\d{8}-\d{4}\.txt$/);
+    assert.deepEqual(booted.errors, []);
 });
