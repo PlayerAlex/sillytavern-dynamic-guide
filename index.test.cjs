@@ -927,7 +927,7 @@ test('两条绑定各自在自己的世界书里建镜像、各自推进', async
     assert.deepEqual(run.errors, []);
 });
 
-test('一条消息里的完成标记只推进匹配的那条绑定', async () => {
+test('回复里的旧完成标记不再推进，只从这条回复里擦掉', async () => {
     const contentA = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const contentB = '## 乙一\n乙一正文\n\n## 乙二\n乙二正文';
     const books = {
@@ -947,13 +947,12 @@ test('一条消息里的完成标记只推进匹配的那条绑定', async () =>
     const run = load(helper);
     await new Promise(setImmediate);
     await state.events.get('message_received')(5);
-    const chatState = state.variables.chat.$dynamicGuideAssistant.state;
-    assert.equal(chatState.bindings[keyOf('书A', 1)].stageIndex, 0, 'A 不该被推进');
-    assert.equal(chatState.bindings[keyOf('书B', 2)].stageIndex, 1, 'B 要被推进');
-    assert.equal(message.message.includes('DGA_COMPLETE'), false, '标记要从消息里清掉');
-    const mirrorB = state.books.书B.find(isMirror);
-    assert.match(mirrorB.content, /乙二正文/, '推进后 B 的镜像换成新阶段');
-    assert.doesNotMatch(mirrorB.content, /乙一正文/);
+    const saved = (state.variables.chat.$dynamicGuideAssistant && state.variables.chat.$dynamicGuideAssistant.state && state.variables.chat.$dynamicGuideAssistant.state.bindings) || {};
+    assert.notEqual(saved[keyOf('书A', 1)] && saved[keyOf('书A', 1)].stageIndex, 1);
+    assert.notEqual(saved[keyOf('书B', 2)] && saved[keyOf('书B', 2)].stageIndex, 1, '旧标记不能再推进');
+    assert.equal(message.message.includes('DGA_COMPLETE'), false, '标记要从这条回复里清掉');
+    assert.match(state.books.书B.find(isMirror).content, /乙一正文/);
+    assert.equal(state.books.书B.find(item => /（动态指导·标记）/.test(item.name)), undefined);
     assert.deepEqual(run.errors, []);
 });
 
@@ -2209,12 +2208,17 @@ test('旧格式“完成：自动”仍解析成自动完成', () => {
     assert.equal(again.stages[1].autoComplete, false);
 });
 
-test('标记判断档的镜像仍是原文切片，不附完成条件', async () => {
+test('旧的标记档不再建标记说明，镜像仍是原文切片', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
-    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const books = {
+        书A: [
+            { uid: 1, name: '大纲A', content, enabled: false },
+            { uid: 9, name: '大纲A（动态指导·标记）', content: '旧标记说明', enabled: true },
+        ],
+    };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null, advanceMode: 'story' }],
         settings: { autoAdvance: 'marker' },
     };
     const { state, helper } = multiWorld(books, { config });
@@ -2225,37 +2229,9 @@ test('标记判断档的镜像仍是原文切片，不附完成条件', async ()
     assert.equal(source.content, content, '绑定的原文不能被改');
     assert.match(mirror.content, /甲一正文/);
     assert.doesNotMatch(mirror.content, /甲二正文|进入下一段的时机|DGA_COMPLETE|完成判定/);
-    assert.deepEqual(run.errors, []);
-});
-
-test('随正文AI判断：标记说明单独一条，回复里的标记切到下一段', async () => {
-    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
-    const stageId = core.parseOutline(content).stages[0].id;
-    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
-    const config = {
-        version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'story' },
-    };
-    const message = { message_id: 5, role: 'assistant', message: `这一段写完了 <!-- DGA_COMPLETE:${stageId} -->` };
-    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    let called = 0;
-    helper.generateRaw = async () => { called += 1; return 'YES'; };
-    const run = load(helper);
-    await new Promise(setImmediate);
-    const source = state.books.书A.find(item => item.uid === 1);
-    const mirror = state.books.书A.find(item => item.name === '大纲A（动态指导）');
-    const cue = state.books.书A.find(item => item.name === '大纲A（动态指导·标记）');
-    assert.equal(source.content, content, '原文不能被改');
-    assert.match(mirror.content, /甲一正文/);
-    assert.doesNotMatch(mirror.content, /DGA_COMPLETE|完成判定/);
-    assert.ok(cue, '标记说明要单独一条，给写正文的 AI 看');
-    assert.match(cue.content, new RegExp(`DGA_COMPLETE:${stageId}`));
-    await state.events.get('message_received')(5);
-    assert.equal(called, 0, '随正文 AI 判断不能再开一次请求');
-    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
-    assert.match(state.books.书A.find(item => item.name === '大纲A（动态指导）').content, /甲二正文/);
-    assert.equal(state.books.书A.find(item => item.uid === 1).content, content);
+    assert.equal(state.books.书A.find(item => item.name === '大纲A（动态指导·标记）'), undefined, '旧的标记说明要清掉');
+    assert.equal(core.normalizeConfig(config).settings.autoAdvance, 'off');
+    assert.equal(core.normalizeConfig(config).bindings[0].advanceMode, 'off');
     assert.deepEqual(run.errors, []);
 });
 
@@ -3442,38 +3418,6 @@ test('分支走向解析：序号、名字、0 与空表', () => {
     assert.equal(core.judgePickedBranch('<branch>\n- 走向：9\n</branch>', candidates), null);
 });
 
-test('随正文AI判断：下一格是分支时列出各走向标记，回复选中即锁定', async () => {
-    const stages = core.parseOutline(BRANCH_OUTLINE).stages;
-    const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
-    const config = {
-        version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'story' },
-    };
-    const message = { message_id: 5, role: 'assistant', message: `他们道别了 <!-- DGA_COMPLETE:${stages[2].id} -->` };
-    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    let called = 0;
-    helper.generateRaw = async () => { called += 1; return 'YES'; };
-    const run = load(helper);
-    await new Promise(setImmediate);
-    const cue = state.books.书A.find(item => item.name === '大纲A（动态指导·标记）');
-    assert.ok(cue, '分支时仍有标记说明条目');
-    assert.match(cue.content, /走向「留下」/);
-    assert.match(cue.content, /走向「离开」/);
-    assert.ok(cue.content.includes(`DGA_COMPLETE:${stages[1].id}`), '每个走向各一行标记');
-    assert.ok(cue.content.includes(`DGA_COMPLETE:${stages[2].id}`));
-    assert.ok(!cue.content.includes(`DGA_COMPLETE:${stages[0].id}`), '分支时不再给当前段自己的标记');
-    await state.events.get('message_received')(5);
-    assert.equal(called, 0, '随正文判断不另开请求');
-    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
-    assert.equal(saved.stageIndex, 2, '回复选了「离开」就进「离开」');
-    assert.deepEqual(plain(saved.branchChoices), { 去向: stages[2].id }, '分支选择记进进度');
-    const mirror = state.books.书A.find(item => item.name === '大纲A（动态指导）');
-    assert.match(mirror.content, /离开正文/);
-    assert.doesNotMatch(mirror.content, /留下正文/, '没选的分支不再发送');
-    assert.deepEqual(run.errors, []);
-});
-
 test('判断AI档：下一格是分支组时，走向和结论在同一次请求里问，选中才推进', async () => {
     const stages = core.parseOutline(BRANCH_OUTLINE).stages;
     const books = { 书A: [{ uid: 1, name: '大纲A', content: BRANCH_OUTLINE, enabled: false }] };
@@ -3680,11 +3624,12 @@ test('被依附的条目不能再选回依附它的那条，支线插在那一�
     findButton(panel(), '动态指导').listeners.click[0]();
     const roadmap = panel().querySelector('.dga-roadmap');
     const text = roadmap.textContent;
-    const firstRule = text.indexOf('——————');
-    const secondRule = text.lastIndexOf('——————');
-    assert.ok(text.indexOf('1. 内容1') < firstRule, '支线接在内容1后面');
-    assert.ok(firstRule < text.indexOf('└ 支线') && text.indexOf('└ 支线') < text.indexOf('1. 支线内容1'));
-    assert.ok(text.indexOf('2. 支线内容2') < secondRule && secondRule < text.indexOf('2. 内容2'));
+    const css = documentRef.getElementById('dynamic-guide-assistant-style').textContent;
+    assert.match(css, /\.dga-roadmap-stages \{[^}]*flex-direction:\s*column/, '每个阶段单独一行');
+    assert.equal(text.includes('——————'), false, '支线上下不画横线');
+    assert.ok(text.indexOf('1. 内容1') < text.indexOf('└ 支线'), '支线接在内容1后面');
+    assert.ok(text.indexOf('└ 支线') < text.indexOf('1. 支线内容1') && text.indexOf('1. 支线内容1') < text.indexOf('2. 支线内容2'));
+    assert.ok(text.indexOf('2. 支线内容2') < text.indexOf('2. 内容2'));
     const buttons = [];
     const walk = node => {
         if (node.tagName === 'BUTTON' && node.textContent === '设置 ›') buttons.push(node);
@@ -3916,10 +3861,9 @@ test('一次生成里每本世界书只读一次：三条绑定三本书就读�
     assert.deepEqual(run.errors, []);
 });
 
-test('支线被随正文标记走完后，回到被依附那条进支线时记下的下一段', async () => {
+test('支线被判断AI走完后，回到被依附那条进支线时记下的下一段', async () => {
     const host = '## 主一\n主一正文\n\n## 主二\n主二正文\n\n## 主三\n主三正文';
     const side = '## 支一\n支一正文\n\n## 支二\n支二正文';
-    const sideStages = core.parseOutline(side).stages;
     const hostKey = keyOf('书A', 1);
     const sideKey = keyOf('书A', 2);
     const books = {
@@ -3930,7 +3874,7 @@ test('支线被随正文标记走完后，回到被依附那条进支线时记�
     };
     const config = {
         version: 2,
-        settings: { autoAdvance: 'story' },
+        settings: { autoAdvance: 'judge' },
         bindings: [
             { worldbookName: '书A', entryUid: 1, entryName: '主线' },
             { worldbookName: '书A', entryUid: 2, entryName: '支线', attachKey: hostKey, attachStage: 1, attachKind: 'side' },
@@ -3943,8 +3887,9 @@ test('支线被随正文标记走完后，回到被依附那条进支线时记�
             [sideKey]: { stageIndex: 1, stageName: '支二', returnKey: hostKey, returnIndex: 1 },
         },
     };
-    const message = { message_id: 9, role: 'assistant', message: `支线演完了 <!-- DGA_COMPLETE:${sideStages[1].id} -->` };
+    const message = { message_id: 9, role: 'assistant', message: '支线演完了' };
     const { state, helper } = multiWorld(books, { config, chatState, messages: [message], lastMessageId: 9 });
+    helper.generateRaw = async () => '<verdict>YES</verdict>';
     const run = load(helper);
     await new Promise(setImmediate);
     assert.match(state.books.书A.find(item => item.name === '支线（动态指导）').content, /支二正文/, '走在支线上时发支线');

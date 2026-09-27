@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.0.1
+     * 动态指导助手 v3.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.0.1';
+    const VERSION = '3.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -529,32 +529,6 @@
     function activeAddons(parsed, stageIndex) {
         if (!parsed || stageIndex < 0 || stageIndex >= parsed.stages.length) return [];
         return parsed.addons.filter(item => stageIndex >= item.fromIndex && stageIndex <= item.toIndex && item.prompt);
-    }
-
-    // 只在「随正文 AI 判断」时，单独写进「（动态指导·标记）」条目。
-    // 不放进原文，也不放进镜像。正文 AI 和这条说明一起看到，完成了就在回复末尾带标记。
-    function completionInstruction(stage, auto) {
-        if (!stage) return [];
-        const marker = `<!-- DGA_COMPLETE:${stage.id} -->`;
-        if (stage.completion) {
-            return [
-                '',
-                '## 当前阶段的完成判定',
-                stage.completion,
-                '',
-                '只有当上面写出的事已经在本次回复里实际发生，才在回复末尾原样附加下面这行 HTML 注释。提到、计划、回忆或只完成一部分时不要附加：',
-                marker,
-            ];
-        }
-        if (auto) {
-            return [
-                '',
-                '## 进入下一段的时机',
-                '当前阶段没有预设完成条件。只有当这一阶段要演的具体情节已经在本次回复里发生，才在回复末尾原样附加下面这行 HTML 注释。还在铺垫、只是提到或打算，都不要附加：',
-                marker,
-            ];
-        }
-        return [];
     }
 
     function formatInjection(stage, addons) {
@@ -1934,8 +1908,8 @@
                     return { left, right, dir };
                 }).filter(Boolean);
             }
-            const ownMode = item.advanceMode === 'marker' ? 'story' : item.advanceMode;
-            if (['off', 'story', 'judge'].includes(ownMode)) binding.advanceMode = ownMode;
+            const ownMode = item.advanceMode === 'marker' || item.advanceMode === 'story' ? 'off' : item.advanceMode;
+            if (ownMode === 'off' || ownMode === 'judge') binding.advanceMode = ownMode;
             const ownInterval = Math.floor(Number(item.judgeInterval));
             if (Number.isFinite(ownInterval) && ownInterval >= 1) binding.judgeInterval = ownInterval;
             const layout = cleanLayout(item.layout);
@@ -1947,8 +1921,8 @@
         });
         // settings 原样保留，逐个字段校验（目前只有 autoAdvance 三档）。
         const settings = raw.settings && typeof raw.settings === 'object' ? { ...raw.settings } : {};
-        if (settings.autoAdvance === 'marker') settings.autoAdvance = 'story';
-        if (!['off', 'story', 'judge'].includes(settings.autoAdvance)) settings.autoAdvance = 'off';
+        if (settings.autoAdvance === 'marker' || settings.autoAdvance === 'story') settings.autoAdvance = 'off';
+        if (settings.autoAdvance !== 'judge') settings.autoAdvance = 'off';
         // 判断AI的提问模板：空值回落到默认文案；引擎非法值归 auto。
         if (settings.judgePrompt != null && typeof settings.judgePrompt !== 'string') {
             settings.judgePrompt = String(settings.judgePrompt);
@@ -2016,15 +1990,15 @@
     }
 
     function autoAdvanceMode(config) {
-        let mode = config && config.settings ? config.settings.autoAdvance : 'off';
-        if (mode === 'marker') mode = 'story';
-        return ['off', 'story', 'judge'].includes(mode) ? mode : 'off';
+        const mode = config && config.settings ? config.settings.autoAdvance : 'off';
+        return mode === 'judge' ? 'judge' : 'off';
     }
 
-    // 某条绑定没单独写时，跟着页面上的全局设置。
+    // 某条绑定没单独写时，跟着页面上的全局设置。旧的「随正文标记」当成手动。
     function bindingAdvanceMode(binding, config) {
-        const own = binding && binding.advanceMode === 'marker' ? 'story' : (binding && binding.advanceMode);
-        if (['off', 'story', 'judge'].includes(own)) return own;
+        const own = binding && binding.advanceMode;
+        if (own === 'marker' || own === 'story' || own === 'off') return 'off';
+        if (own === 'judge') return 'judge';
         return autoAdvanceMode(config);
     }
 
@@ -2043,7 +2017,6 @@
 
     const AUTO_ADVANCE_LABELS = {
         off: '手动推进（不调用 AI）',
-        story: '随正文 AI 判断',
         judge: '判断 AI（单独再问一次）',
     };
 
@@ -3401,34 +3374,6 @@
         return `${name}${CUE_SUFFIX}`;
     }
 
-    // 随正文 AI 判断：标记说明单独一条，镜像仍然只是原文切片。
-    function storyCueText(context, generationType) {
-        if (!context || context.autoAdvance !== 'story') return null;
-        const stage = stageForGuide(context, generationType);
-        if (!stage || stage.terminal) return null;
-        const target = nextVisibleIndex(context.parsed, context.state, context.state.stageIndex);
-        const pending = branchPendingChoices(context.parsed, context.state, target);
-        if (!pending || pending.length < 2) return completionInstruction(stage, true).join('\n').trim();
-        // 下一格是分支组：每个走向一行标记，正文 AI 按剧情选一个附加。
-        const lines = [];
-        if (stage.completion) {
-            lines.push(
-                '## 当前阶段的完成判定',
-                stage.completion,
-                '',
-                '只有当上面写出的事已经在本次回复里实际发生时才进入下一段；提到、计划、回忆或只完成一部分时绝对不要附加标记。',
-            );
-        } else {
-            lines.push(
-                '## 进入下一段的时机',
-                '当前阶段没有预设完成条件。只有当这一阶段要演的具体情节已经在本次回复里发生，才进入下一段；还在铺垫、只是提到或打算，都不要附加标记。',
-            );
-        }
-        lines.push('这一段之后有几个互斥的走向。按本次回复实际发生的剧情选一个，把它对应的那行 HTML 注释原样附加在回复末尾（只能选一行；还不该走就一行都不要附加）：');
-        pending.forEach(candidate => lines.push(`走向「${candidate.name}」：<!-- DGA_COMPLETE:${candidate.id} -->`));
-        return lines.join('\n').trim();
-    }
-
     // 同步一条绑定的镜像。先在读到的副本上试跑，没变化就不写世界书；
     // 有变化才写，写后读回验证内容，防止世界书接口把字段吞掉。
     function syncCueInPlace(worldbook, context, text) {
@@ -3462,14 +3407,14 @@
 
     async function syncMirrorFor(context, generationType, contexts) {
         const text = guideTextFor(context, generationType, contexts);
-        const cue = storyCueText(context, generationType);
         const preview = await getWorldbook(context.worldbookName);
         const plan = syncMirrorInPlace(preview, context, text);
-        const cueChanged = syncCueInPlace(preview, context, cue);
+        // 旧的「（动态指导·标记）」不再使用，同步时清掉。
+        const cueChanged = syncCueInPlace(preview, context, null);
         if (!plan.changed && !cueChanged) return plan;
         await updateWorldbook(context.worldbookName, worldbook => {
             syncMirrorInPlace(worldbook, context, text);
-            syncCueInPlace(worldbook, context, cue);
+            syncCueInPlace(worldbook, context, null);
             return worldbook;
         });
         const saved = findMirrorEntries(await getWorldbook(context.worldbookName), context, plan.mirrorName)[0] || null;
@@ -3696,7 +3641,7 @@
             push('自动推进', true, AUTO_ADVANCE_LABELS[mode]);
             if (mode === 'judge') {
                 push('接口 generateRaw', Boolean(api('generateRaw', false)),
-                    api('generateRaw', false) ? '可用' : '缺失——判断AI用不了，请改用「随正文 AI 判断」或升级酒馆助手');
+                    api('generateRaw', false) ? '可用' : '缺失——判断AI用不了，请改用手动推进或升级酒馆助手');
                 const localPresets = readJudgeApiPresets();
                 const selectedPreset = config.settings && config.settings.judgePreset || '';
                 push('本机API 预设', !selectedPreset || localPresets.some(item => item.name === selectedPreset),
@@ -3757,7 +3702,7 @@
     }
 
     // 支线走完：被依附的那条接着走，落在走进支线时记下的「下一段」。
-    // 手动「下一段」、随正文标记、判断AI推进都走这里，谁把支线推过最后一段都会回去。
+    // 手动「下一段」和判断AI推进都走这里，谁把支线推过最后一段都会回去。
     async function returnToHost(context, contexts, options) {
         const settings = options || {};
         const hostKey = context && context.state ? context.state.returnKey : '';
@@ -4604,7 +4549,7 @@
             }
         } else if ((!preset || preset.connection === 'main') && !api('generateRaw', false)) {
             // 自定义连接直连酒馆后端，不需要 generateRaw。
-            return { key: 'judge-no-engine', error: '判断AI需要酒馆助手的 generateRaw 接口，当前不可用；请改用「随正文 AI 判断」或升级酒馆助手。' };
+            return { key: 'judge-no-engine', error: '判断AI需要酒馆助手的 generateRaw 接口，当前不可用；请改用手动推进或升级酒馆助手。' };
         }
         return { preset };
     }
@@ -4985,55 +4930,22 @@
         if (!message || message.role !== 'assistant' || typeof message.message !== 'string') return;
         LogModule.debug('事件', `收到正文（第 ${messageId} 层）`);
 
-        const markers = Array.from(message.message.matchAll(COMPLETE_MARKER_RE));
+        COMPLETE_MARKER_RE.lastIndex = 0;
+        if (COMPLETE_MARKER_RE.test(message.message)) {
+            COMPLETE_MARKER_RE.lastIndex = 0;
+            const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
+            COMPLETE_MARKER_RE.lastIndex = 0;
+            const setChatMessages = api('setChatMessages', false);
+            if (setChatMessages && cleaned !== message.message) {
+                await Promise.resolve(setChatMessages([{ message_id: messageId, message: cleaned }], { refresh: 'affected' }));
+                message.message = cleaned;
+            }
+        }
         const config = await readConfig();
         const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge' && bindingOrderMode(binding) !== 'pick');
         const pickNeeded = (config.bindings || []).some(binding => bindingOrderMode(binding) === 'pick');
-        // 手动推进、随正文 AI 都不另开请求。随正文 AI 的标记写在回复里，这里检测到再推进。
-        // 只要有一条绑定自己开了判断 AI，就要进来，不必整页都是判断 AI。
-        if (markers.length === 0 && !judgeNeeded && !pickNeeded) return;
-        if (markers.length > 0) await withIoCache(() => applyCompletionMarkers(message, messageId, markers));
-        // 判断 AI 才另开请求：这一层到点的绑定合成一次，排队发，不并发（见 runFloorCheck）。
+        // 手动不另开请求。判断 AI 才另开请求：这一层到点的绑定合成一次，排队发，不并发。
         if (judgeNeeded || pickNeeded) await runFloorCheck(messageId);
-    }
-
-    // 随正文 AI 的完成标记：擦掉标记一次，再按各绑定的阶段 id 分别推进，推进完统一同步一次镜像。
-    async function applyCompletionMarkers(message, messageId, markers) {
-        const all = await loadContexts();
-        if (!all.configured) return;
-        const cleaned = message.message.replace(COMPLETE_MARKER_RE, '').trimEnd();
-        const setChatMessages = api('setChatMessages', false);
-        if (setChatMessages && cleaned !== message.message) {
-            await Promise.resolve(setChatMessages([{ message_id: messageId, message: cleaned }], { refresh: 'affected' }));
-        }
-        let moved = false;
-        // 一条消息可能同时完成好几条绑定的阶段：按各自的阶段 id 指纹分别推进。
-        for (const context of all.contexts) {
-            if (context.broken || !context.stage || context.stage.terminal) continue;
-            if (context.state && (context.state.lineCut === true || context.state.sideOut)) continue;
-            if (attachmentAsleep(context, all.contexts)) continue;
-            if (bindingOrderMode(context.binding) === 'pick') continue;
-            const fingerprint = `${messageId}:${context.stage.id}:${hashText(cleaned)}`;
-            if (context.state.lastCompletionFingerprint === fingerprint) continue;
-            const target = nextVisibleIndex(context.parsed, context.state, context.state.stageIndex);
-            const pending = branchPendingChoices(context.parsed, context.state, target);
-            if (pending && pending.length > 1) {
-                const hit = pending.find(candidate => markers.some(match => match[1] === candidate.id));
-                if (hit) {
-                    await moveToIndex(context, context.parsed.stages.indexOf(hit), { messageId, fingerprint, branchChoices: branchChoiceRecord(context.state, hit), sync: false });
-                    moved = true;
-                } else if (markers.some(match => match[1] === context.stage.id)) {
-                    // 旧标记只到「完成当前段」：落在第一个候选上并锁定，其余分支不再走。
-                    await moveToIndex(context, target, { messageId, fingerprint, branchChoices: branchChoiceRecord(context.state, pending[0]), sync: false });
-                    moved = true;
-                }
-                continue;
-            }
-            if (!markers.some(match => match[1] === context.stage.id)) continue;
-            await moveToIndex(context, target, { messageId, fingerprint, sync: false });
-            moved = true;
-        }
-        if (moved) await syncMirrors('normal');
     }
 
     // ---------------------------------------------------------------
@@ -5580,7 +5492,7 @@
             }, item.label)));
     }
 
-    // 支线插在它所挂的那一段后面，上下各一条线；阶段样式和原来一样。
+    // 每个阶段单独一行。支线直接插在它所挂的那一段后面，不再画横线。
     function roadmapNodeView(node) {
         const stages = node.stages || [];
         const grouped = new Map();
@@ -5592,11 +5504,7 @@
         });
         const flow = [];
         const pushInserted = after => {
-            const kids = grouped.get(after) || [];
-            if (!kids.length) return;
-            flow.push(el('span', { class: 'dga-roadmap-rule', 'aria-hidden': 'true', text: '——————' }));
-            kids.forEach(child => flow.push(roadmapNodeView(child)));
-            flow.push(el('span', { class: 'dga-roadmap-rule', 'aria-hidden': 'true', text: '——————' }));
+            (grouped.get(after) || []).forEach(child => flow.push(roadmapNodeView(child)));
         };
         if (!stages.length) pushInserted(1);
         stages.forEach((name, index) => {
@@ -6427,15 +6335,14 @@
         );
     }
 
-    // 「动态指导」页的「如何判断？」卡（v2.23 按手稿重排）：判断模式（手动/标记/判断AI）
-    // 放在最上面；只有切到「判断AI」档才会出现 API 预设、多久检查一次、参考几段
-    // 角色回复与判断AI提示词入口（v2.20 从仪表盘挪入）。
+    // 「动态指导」页的「如何判断？」卡：手动或判断AI。
+    // 只有切到「判断AI」才会出现 API 预设、多久检查一次、参考几段与提示词入口。
     function judgeSettingsCard() {
         const config = ui.snapshot ? ui.snapshot.config : null;
         const mode = autoAdvanceMode(config);
         const settings = config && config.settings ? config.settings : {};
         const presetList = readJudgeApiPresets();
-        const modeOptions = ['off', 'story', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
+        const modeOptions = ['off', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const children = [
             muted('这里是所有条目的默认。某一条想不一样，在它的小卡上改。'),
             field('判断模式', selectControl(modeOptions, mode, value => {
@@ -6444,10 +6351,6 @@
         ];
         if (mode === 'off') {
             children.push(muted('不调用 AI。要进入下一段，自己点小卡上的「下一段」。'));
-            return card('如何判断？', ...children);
-        }
-        if (mode === 'story') {
-            children.push(muted('写正文的 AI 如果已经完成这一段，会在同一条回复末尾带一个标记。脚本看到标记就进入下一段。标记说明单独放着，不改原文，镜像仍是原文切片。'));
             return card('如何判断？', ...children);
         }
         const presetOptions = [{ value: '', label: '酒馆主 API（不用预设）' }]
@@ -7008,11 +6911,10 @@
         const config = ui.snapshot && ui.snapshot.config;
         const binding = context.binding || {};
         const globalMode = autoAdvanceMode(config);
-        const ownMode = ['off', 'story', 'judge'].includes(binding.advanceMode) ? binding.advanceMode : '';
+        const ownMode = binding.advanceMode === 'judge' ? 'judge' : (binding.advanceMode === 'off' ? 'off' : '');
         const modeOptions = [
-            { value: '', label: `跟随全局（${{ off: '手动', story: '随正文', judge: '判断AI' }[globalMode] || '手动'}）` },
+            { value: '', label: `跟随全局（${globalMode === 'judge' ? '判断AI' : '手动'}）` },
             { value: 'off', label: '这条手动' },
-            { value: 'story', label: '这条随正文' },
             { value: 'judge', label: '这条判断AI' },
         ];
         const orderMode = bindingOrderMode(binding);
@@ -7080,7 +6982,7 @@
                 }, label)))) : null,
             binding.attachKey ? renderPassList(context, binding, (context.parsed && context.parsed.stages) || [], hostStages) : null,
             field('这条怎么判断', selectControl(modeOptions, ownMode, value => runAction('修改这条的判断', () => updateBinding(context.key, item => {
-                if (['off', 'story', 'judge'].includes(value)) item.advanceMode = value;
+                if (value === 'off' || value === 'judge') item.advanceMode = value;
                 else delete item.advanceMode;
             }), { success: '已记下这条的判断方式' }))),
         ];
@@ -8487,11 +8389,9 @@ ${P} .dga-roadmap-row { display: flex; flex-direction: column; gap: 4px; padding
 ${P} .dga-roadmap-row.is-live { border-left-color: var(--dga-accent); }
 ${P} .dga-roadmap-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 ${P} .dga-roadmap-head small, ${P} .dga-roadmap-how { color: var(--dga-text-3); font-size: 12px; }
-${P} .dga-roadmap-stages { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--dga-text-2); }
+${P} .dga-roadmap-stages { display: flex; flex-direction: column; align-items: stretch; gap: 2px; font-size: 12px; color: var(--dga-text-2); }
 ${P} .dga-roadmap-stages .is-done { color: var(--dga-text-3); text-decoration: line-through; }
 ${P} .dga-roadmap-stages .is-now { color: var(--dga-accent); font-weight: 700; }
-${P} .dga-roadmap-rule { flex: 1 0 100%; color: var(--dga-text-3); letter-spacing: 1px; }
-${P} .dga-roadmap-stages > .dga-roadmap-row { flex: 1 0 100%; }
 ${P} .dga-health-list { display: flex; flex-direction: column; gap: 10px; }
 ${P} .dga-health-item { display: grid; grid-template-columns: 30px minmax(0, 1fr) max-content; column-gap: 10px; row-gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--dga-border); border-radius: 4px; background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
 ${P} .dga-health-item.is-error { border-color: color-mix(in srgb, var(--dga-danger) 45%, transparent); }
