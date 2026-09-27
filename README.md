@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v3.0**（发布标签：`v3.0`）
+当前版本：**v3.0.1**（发布标签：`v3.0.1`）
 
 把完整剧情大纲写在角色世界书的条目里，用分段划成一幕一幕。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前这一幕。可以同时绑定好几条。没选依附的自己走。选了依附的，从某一段开始挂上去：分岔口是选了这条、原来那条就断；支线是可以走，走完回到原来那条接着往下。分岔口上还能再依附别的条目。
 
@@ -8,11 +8,11 @@
 
 ## 安装与开始使用
 
-在 [v2.99.4 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v2.99.4)下载导入文件：
+在 [v3.0.1 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v3.0.1)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.99.4/dynamic-guide-offline-v2.99.4.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.99.4/dynamic-guide-online-v2.99.4.json)：启动时加载固定版本的远程脚本。
-- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v2.99.4/dynamic-guide-regex-marker-hide-v2.99.4.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.0.1/dynamic-guide-offline-v3.0.1.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.0.1/dynamic-guide-online-v3.0.1.json)：启动时加载固定版本的远程脚本。
+- [标记隐藏 Regex](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.0.1/dynamic-guide-regex-marker-hide-v3.0.1.json)：可选配套——让 AI 回复末尾的完成标记完全不显示（只影响显示层，脚本仍会把它从存储里擦掉）。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -30,10 +30,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.99.4/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v3.0.1/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v2.99.4`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v3.0.1`。
 
 ## v2.0 文本格式
 
@@ -136,13 +136,25 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v2.99.4
 
 ## 路线图
 
-设了「依附」之后，「动态指导」页最上面会多一张「路线图」，按依附关系把所有条目排成缩进大纲：
+「动态指导」页最上面一直有一张「路线图」。每条绑定按分段列出来；走过的划掉，当前这段高亮。没有依附时也显示。
 
-- 顶格的是自己往下走的条目，缩进的是依附在它上面的分岔口或支线，写明从哪一条的第几段接上。
-- 每条下面列出它的分段，走过的划掉，当前这段高亮；还写着「现在第几段」「还没走到」「暂停：走进了分岔」「全部走完」等状态。
+有依附时，分岔口或支线插在它所挂的那一段后面，上下用一条线隔开，后面的段接着往下排：
+
+```text
+主线
+1. 内容1
+——————
+└ 支线
+1. 支线内容1
+2. 支线内容2
+——————
+2. 内容2
+```
+
+- 还写着「现在第几段」「还没走到」「暂停：走进了分岔」「全部走完」等状态。
 - 设了换边的，写出「这条第几段 ← / → / ↔ 那边第几段」。
 
-路线图只看不改，全从现有设置和进度推出来，不另存数据。要改依附或换边，去那一条小卡的「设置 ›」。只有一条、或没有任何依附时不显示。
+路线图只看不改，全从现有设置和进度推出来，不另存数据。要改依附或换边，去那一条小卡的「设置 ›」。被依附的那条不能再反过来依附这条，间接绕一圈也不行。
 
 ## 从 1.x 升级
 
@@ -187,6 +199,12 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 每个条目是一条线，按分段往下走；非直线的走法只有「依附」这一种：一条线可以从另一条的某一段接上，做成分岔口或支线，两条之间还可以设换边。自动推进依赖模型遵守完成标记或判断AI的结论，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v3.0.1（2026-09-27）
+
+- 路线图一直显示。没有依附时也列出每条自己的分段。
+- 支线或分岔口插在它所依附的那一段后面，上下用一条线隔开，后面的段接着排。卡片和阶段样式不变。
+- 被依附的条目不能再反过来依附这条，间接绕一圈也不行，避免两条互相挂住。
 
 ### v3.0（2026-09-27）
 

@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.0
+     * 动态指导助手 v3.0.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.0';
+    const VERSION = '3.0.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -3295,7 +3295,27 @@
         return host.state.forkInto !== context.key;
     }
 
-    // 路线图（v3.0）：按「依附」把所有绑定排成缩进大纲。只读，全从现有设置和进度推出来，不另存东西。
+    // 把 from 挂到 to 上会不会绕回 from。被依附的那条不能再挂回依附它的这条，间接绕一圈也不行。
+    function attachmentCycles(items, fromKey, toKey) {
+        if (!fromKey || !toKey) return false;
+        if (fromKey === toKey) return true;
+        const attachOf = new Map();
+        (items || []).forEach(item => {
+            if (!item || !item.key) return;
+            const attachKey = item.attachKey != null ? item.attachKey : (item.binding && item.binding.attachKey);
+            attachOf.set(item.key, attachKey || '');
+        });
+        const seen = new Set();
+        let key = toKey;
+        while (key && !seen.has(key)) {
+            if (key === fromKey) return true;
+            seen.add(key);
+            key = attachOf.get(key) || '';
+        }
+        return false;
+    }
+
+    // 路线图：每条自己的分段一直列出来。有依附时，那条插在所挂的那一段后面。只读，不另存东西。
     const PASS_MARKS = { back: '←', over: '→', both: '↔' };
 
     function roadmapOutline(contexts) {
@@ -3312,10 +3332,9 @@
             if (!kids.has(host.key)) kids.set(host.key, []);
             kids.get(host.key).push(item);
         });
-        const rows = [];
         const seen = new Set();
-        const walk = (item, depth) => {
-            if (seen.has(item.key)) return;
+        const nodeOf = (item, depth) => {
+            if (seen.has(item.key)) return null;
             seen.add(item.key);
             const binding = item.binding;
             const state = item.state || {};
@@ -3338,7 +3357,12 @@
             else if (!stages.length) now = '还没有分段';
             else if (here >= stages.length && !(item.parsed && item.parsed.loop)) now = '全部走完';
             else now = `现在第 ${Math.min(here, stages.length - 1) + 1} 段`;
-            rows.push({
+            const branches = (kids.get(item.key) || []).map(child => {
+                const node = nodeOf(child, depth + 1);
+                if (!node) return null;
+                return { after: Math.max(1, Math.floor(Number(child.binding.attachStage) || 1)), node };
+            }).filter(Boolean);
+            return {
                 key: item.key,
                 depth,
                 name: entryName(item.entry),
@@ -3348,12 +3372,19 @@
                 here: Math.min(here, stages.length),
                 stages: stages.map(stage => stage.name),
                 passes,
-            });
-            (kids.get(item.key) || []).forEach(child => walk(child, depth + 1));
+                branches,
+            };
         };
-        roots.forEach(item => walk(item, 0));
-        // 依附绕成圈时没有根，剩下的按顶层补上。
-        list.forEach(item => walk(item, 0));
+        const rows = [];
+        roots.forEach(item => {
+            const node = nodeOf(item, 0);
+            if (node) rows.push(node);
+        });
+        // 依附绕成圈时没有根，剩下的按顶层补上，避免漏掉、也避免死循环。
+        list.forEach(item => {
+            const node = nodeOf(item, 0);
+            if (node) rows.push(node);
+        });
         return rows;
     }
 
@@ -5549,10 +5580,43 @@
             }, item.label)));
     }
 
-    // 只有设了依附才显示：一条线自己往下走，没什么好画的。
+    // 支线插在它所挂的那一段后面，上下各一条线；阶段样式和原来一样。
+    function roadmapNodeView(node) {
+        const stages = node.stages || [];
+        const grouped = new Map();
+        (node.branches || []).forEach(branch => {
+            let after = Math.max(1, Math.floor(Number(branch.after) || 1));
+            if (stages.length) after = Math.min(after, stages.length);
+            if (!grouped.has(after)) grouped.set(after, []);
+            grouped.get(after).push(branch.node);
+        });
+        const flow = [];
+        const pushInserted = after => {
+            const kids = grouped.get(after) || [];
+            if (!kids.length) return;
+            flow.push(el('span', { class: 'dga-roadmap-rule', 'aria-hidden': 'true', text: '——————' }));
+            kids.forEach(child => flow.push(roadmapNodeView(child)));
+            flow.push(el('span', { class: 'dga-roadmap-rule', 'aria-hidden': 'true', text: '——————' }));
+        };
+        if (!stages.length) pushInserted(1);
+        stages.forEach((name, index) => {
+            flow.push(el('span', {
+                class: index === node.here && node.live ? 'is-now' : (index < node.here ? 'is-done' : ''),
+                text: `${index + 1}. ${name}`,
+            }));
+            pushInserted(index + 1);
+        });
+        return el('div', { class: `dga-roadmap-row${node.live ? ' is-live' : ''}` },
+            el('div', { class: 'dga-roadmap-head' },
+                el('b', { text: `${node.depth ? '└ ' : ''}${node.name}` }),
+                el('small', { text: node.now })),
+            node.how ? el('small', { class: 'dga-roadmap-how', text: node.how }) : null,
+            flow.length ? el('div', { class: 'dga-roadmap-stages' }, ...flow) : null,
+            ...(node.passes || []).map(text => el('small', { class: 'dga-roadmap-how', text })));
+    }
+
     function roadmapCard() {
         const contexts = ui.snapshot ? ui.snapshot.contexts : [];
-        if (!contexts.some(item => item && !item.broken && item.binding && item.binding.attachKey)) return null;
         const open = ui.roadmapOpen !== false;
         const rows = open ? roadmapOutline(contexts) : [];
         const card = el('section', { class: 'dga-card dga-span dga-roadmap-card' },
@@ -5562,20 +5626,10 @@
                 'aria-expanded': open ? 'true' : 'false',
                 onclick: () => { ui.roadmapOpen = !open; render(); },
             }, `${open ? '▾' : '▸'} 路线图`),
-            open ? muted('按每条的「依附」自动排出来，只看不改。要改，去那一条的「设置」。') : null,
-            open ? el('div', { class: 'dga-roadmap' }, ...rows.map(row => el('div', {
-                class: `dga-roadmap-row${row.live ? ' is-live' : ''}`,
-                style: { 'margin-left': `${row.depth * 20}px` },
-            },
-            el('div', { class: 'dga-roadmap-head' },
-                el('b', { text: `${row.depth ? '└ ' : ''}${row.name}` }),
-                el('small', { text: row.now })),
-            row.how ? el('small', { class: 'dga-roadmap-how', text: row.how }) : null,
-            row.stages.length ? el('div', { class: 'dga-roadmap-stages' }, ...row.stages.map((name, index) => el('span', {
-                class: index === row.here && row.live ? 'is-now' : (index < row.here ? 'is-done' : ''),
-                text: `${index + 1}. ${name}`,
-            }))) : null,
-            ...row.passes.map(text => el('small', { class: 'dga-roadmap-how', text }))))) : null);
+            open ? muted(rows.length
+                ? '按分段和依附排出来，只看不改。要改，去那一条的「设置」。'
+                : '绑定条目后，分段会列在这里。') : null,
+            open && rows.length ? el('div', { class: 'dga-roadmap' }, ...rows.map(roadmapNodeView)) : null);
         card.id = 'dga-card-roadmap';
         return card;
     }
@@ -6987,21 +7041,27 @@
                 }, label)))) : null,
             field('依附于', selectControl(
                 [{ value: '', label: '不依附，自己走' }].concat((ui.snapshot && ui.snapshot.contexts || [])
-                    .filter(item => item.key !== context.key && !item.broken)
+                    .filter(item => item.key !== context.key && !item.broken
+                        && !attachmentCycles(ui.snapshot.contexts, context.key, item.key))
                     .map(item => ({ value: item.key, label: entryName(item.entry) }))),
                 binding.attachKey || '',
-                value => runAction('保存依附', () => updateBinding(context.key, item => {
-                    if (value) {
-                        item.attachKey = value;
-                        if (!item.attachStage) item.attachStage = 1;
-                        if (item.attachKind !== 'side' && item.attachKind !== 'fork') item.attachKind = 'fork';
-                    } else {
-                        delete item.attachKey;
-                        delete item.attachStage;
-                        delete item.attachKind;
-                        delete item.passes;
+                value => runAction('保存依附', () => {
+                    if (value && attachmentCycles((ui.snapshot && ui.snapshot.contexts) || [], context.key, value)) {
+                        throw new Error('被依附的那条不能再挂回这条，不然两条会互相卡住。');
                     }
-                }), { success: value ? '这条会从指定那一段挂到所选条目上' : '这条自己单独走' }),
+                    return updateBinding(context.key, item => {
+                        if (value) {
+                            item.attachKey = value;
+                            if (!item.attachStage) item.attachStage = 1;
+                            if (item.attachKind !== 'side' && item.attachKind !== 'fork') item.attachKind = 'fork';
+                        } else {
+                            delete item.attachKey;
+                            delete item.attachStage;
+                            delete item.attachKind;
+                            delete item.passes;
+                        }
+                    });
+                }, { success: value ? '这条会从指定那一段挂到所选条目上' : '这条自己单独走' }),
             )),
             binding.attachKey ? field('从第几段开始', selectControl(
                 attachStageOptions,
@@ -8430,6 +8490,8 @@ ${P} .dga-roadmap-head small, ${P} .dga-roadmap-how { color: var(--dga-text-3); 
 ${P} .dga-roadmap-stages { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--dga-text-2); }
 ${P} .dga-roadmap-stages .is-done { color: var(--dga-text-3); text-decoration: line-through; }
 ${P} .dga-roadmap-stages .is-now { color: var(--dga-accent); font-weight: 700; }
+${P} .dga-roadmap-rule { flex: 1 0 100%; color: var(--dga-text-3); letter-spacing: 1px; }
+${P} .dga-roadmap-stages > .dga-roadmap-row { flex: 1 0 100%; }
 ${P} .dga-health-list { display: flex; flex-direction: column; gap: 10px; }
 ${P} .dga-health-item { display: grid; grid-template-columns: 30px minmax(0, 1fr) max-content; column-gap: 10px; row-gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--dga-border); border-radius: 4px; background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
 ${P} .dga-health-item.is-error { border-color: color-mix(in srgb, var(--dga-danger) 45%, transparent); }
@@ -8967,6 +9029,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         branchChoiceRecord,
         stepTargetVisible,
         roadmapOutline,
+        attachmentCycles,
         cleanStoryLinks,
         stageSendText,
         stageGuidePrompt,

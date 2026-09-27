@@ -3601,7 +3601,7 @@ test('小卡状态字多就缩略，点「展开」看全文、再点「收起�
     assert.deepEqual(errors, []);
 });
 
-test('路线图：按依附排成缩进大纲，标出接在哪、换边和各条进度', () => {
+test('路线图：没有依附也列出分段；支线插在所依附的那一段后面', () => {
     const stages = names => ({ stages: names.map(name => ({ name })) });
     const line = (key, name, parsed, state, binding) => ({
         key, configured: true, entry: { name }, parsed, state, binding: { worldbookName: '书', entryName: name, ...binding },
@@ -3612,19 +3612,95 @@ test('路线图：按依附排成缩进大纲，标出接在哪、换边和各�
         line('书#3', '番外', stages(['番一']), { stageIndex: 0 }, { attachKey: '书#1', attachStage: 3, attachKind: 'side' }),
         line('书#4', '独立', stages(['甲']), { stageIndex: 1 }, {}),
     ]);
-    assert.deepEqual(plain(rows.map(row => [row.name, row.depth])), [['主线', 0], ['岔路', 1], ['番外', 1], ['独立', 0]]);
+    assert.deepEqual(plain(rows.map(row => row.name)), ['主线', '独立']);
     assert.equal(rows[0].now, '现在第 2 段');
-    assert.equal(rows[1].how, '分岔口：从「主线」第 2 段「同居」接上');
-    assert.equal(rows[1].now, '现在第 1 段', '走进了分岔');
-    assert.deepEqual(plain(rows[1].passes), ['换边：这条第 2 段 ← 那边第 3 段']);
-    assert.equal(rows[2].how, '支线：从「主线」第 3 段「分别」接上');
-    assert.equal(rows[2].now, '还没走到');
-    assert.equal(rows[3].now, '全部走完');
+    assert.deepEqual(plain(rows[0].branches.map(item => [item.after, item.node.name])), [[2, '岔路'], [3, '番外']]);
+    assert.equal(rows[0].branches[0].node.how, '分岔口：从「主线」第 2 段「同居」接上');
+    assert.equal(rows[0].branches[0].node.now, '现在第 1 段', '走进了分岔');
+    assert.deepEqual(plain(rows[0].branches[0].node.passes), ['换边：这条第 2 段 ← 那边第 3 段']);
+    assert.equal(rows[0].branches[1].node.how, '支线：从「主线」第 3 段「分别」接上');
+    assert.equal(rows[0].branches[1].node.now, '还没走到');
+    assert.equal(rows[1].now, '全部走完');
+    const alone = core.roadmapOutline([
+        line('书#1', '主线', stages(['内容1', '内容2', '内容3', '内容4']), { stageIndex: 0 }, {}),
+    ]);
+    assert.equal(alone.length, 1);
+    assert.deepEqual(plain(alone[0].stages), ['内容1', '内容2', '内容3', '内容4']);
+    assert.equal(alone[0].branches.length, 0);
     const loop = core.roadmapOutline([
         line('a', '甲', stages(['一']), {}, { attachKey: 'b' }),
         line('b', '乙', stages(['一']), {}, { attachKey: 'a' }),
     ]);
-    assert.equal(loop.length, 2, '依附绕成圈也不丢条目、不死循环');
+    const names = [];
+    const walk = nodes => nodes.forEach(node => {
+        names.push(node.name);
+        (node.branches || []).forEach(item => walk([item.node]));
+    });
+    walk(loop);
+    assert.deepEqual(names, ['甲', '乙'], '依附绕成圈也不丢条目、不死循环');
+});
+
+test('依附不能绕回：被依附的那条不能再挂到依附它的这条上', () => {
+    const line = (key, name, attachKey) => ({
+        key, entry: { name }, binding: attachKey ? { attachKey } : {},
+    });
+    const contexts = [
+        line('a', '主线'),
+        line('b', '支线', 'a'),
+        line('c', '旁支', 'b'),
+    ];
+    assert.equal(core.attachmentCycles(contexts, 'a', 'b'), true, '主线不能挂回支线');
+    assert.equal(core.attachmentCycles(contexts, 'a', 'c'), true, '绕一圈也不行');
+    assert.equal(core.attachmentCycles(contexts, 'b', 'a'), false, '支线挂在主线上是原来的方向');
+    assert.equal(core.attachmentCycles(contexts, 'c', 'a'), false, '旁支也可以直接挂到主线');
+    assert.equal(core.attachmentCycles(contexts, 'a', 'a'), true);
+    assert.equal(core.attachmentCycles(contexts, 'a', ''), false);
+});
+
+test('被依附的条目不能再选回依附它的那条，支线插在那一段后面', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二', enabled: false });
+    state.entries.push({ uid: 2, name: '支线', content: '## 支线内容1\n乙\n\n## 支线内容2\n乙二', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '支线', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'side' },
+            ],
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    const text = roadmap.textContent;
+    const firstRule = text.indexOf('——————');
+    const secondRule = text.lastIndexOf('——————');
+    assert.ok(text.indexOf('1. 内容1') < firstRule, '支线接在内容1后面');
+    assert.ok(firstRule < text.indexOf('└ 支线') && text.indexOf('└ 支线') < text.indexOf('1. 支线内容1'));
+    assert.ok(text.indexOf('2. 支线内容2') < secondRule && secondRule < text.indexOf('2. 内容2'));
+    const buttons = [];
+    const walk = node => {
+        if (node.tagName === 'BUTTON' && node.textContent === '设置 ›') buttons.push(node);
+        (node.children || []).forEach(walk);
+    };
+    walk(panel());
+    buttons[0].listeners.click[0]();
+    const selects = [];
+    const walkSel = node => {
+        if (node.tagName === 'SELECT') selects.push(node);
+        (node.children || []).forEach(walkSel);
+    };
+    walkSel(panel());
+    const attach = selects.find(select => optionsOf(select).some(option => option.textContent === '不依附，自己走'));
+    assert.deepEqual(optionsOf(attach).map(option => option.textContent), ['不依附，自己走'], '主线不能再选支线');
+    assert.deepEqual(errors, []);
 });
 
 test('没有时间线；编辑仍是分段，设置里可以依附', async () => {
@@ -3642,7 +3718,10 @@ test('没有时间线；编辑仍是分段，设置里可以依附', async () =>
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
 
-    assert.equal(panel().querySelector('.dga-roadmap-card'), null, '没有依附时不显示路线图');
+    const roadmap = panel().querySelector('.dga-roadmap-card');
+    assert.ok(roadmap, '没有依附时也显示路线图');
+    assert.match(roadmap.textContent, /第一幕/);
+    assert.match(roadmap.textContent, /第二幕/);
     assert.equal(findButton(panel(), '时间线 ›'), null, '小卡上没有时间线');
     await findButton(panel(), '设置 ›').listeners.click[0]();
     assert.match(panel().textContent, /阶段怎么走/, '设置页能看到阶段怎么走');
