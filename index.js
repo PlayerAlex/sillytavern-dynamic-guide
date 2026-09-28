@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.1
+     * 动态指导助手 v3.2
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.1';
+    const VERSION = '3.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -55,29 +55,56 @@
     //
     // 零 DOM 依赖的内存环形缓冲：等级 debug / info / warn / error，全部写入
     // 缓冲（debug 默认不采集，运行日志页可开）。每条带时间戳、模块标签、消息；
-    // 订阅机制让日志页打开时实时刷新。只存内存（上限 500 条），不写变量、
+    // 订阅机制让日志页打开时实时刷新。只存内存（上限 2000 条，与数据库一致），不写变量、
     // 不上传；console 输出仍由各调用点自己负责，模块本身不产生副作用。
     // ---------------------------------------------------------------
 
     const LogModule = (() => {
-        const MAX_ENTRIES = 500;
+        const MAX_ENTRIES = 2000;
         let entries = [];
         let nextId = 1;
         let debugEnabled = false;
         const knownTags = new Set();
         const subscribers = new Set();
 
-        function stringify(value) {
-            if (value == null) return String(value);
+        // 参数序列化（照数据库 normalizeLogArg_ACU）：错误对象带 name / message / stack / cause，
+        // 普通对象先试 JSON，空对象或循环引用再按自身属性展开，都不行才给占位文字。
+        function stringify(value, depth) {
+            const level = depth || 0;
+            if (value === null) return 'null';
+            if (value === undefined) return 'undefined';
             if (typeof value === 'string') return value;
-            if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-            if (value instanceof Error || (value && typeof value.message === 'string')) {
-                return `${value.name || 'Error'}: ${value.message}`;
+            if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint' || typeof value === 'symbol') return String(value);
+            if (typeof value === 'function') return `[Function ${value.name || 'anonymous'}]`;
+            const name = typeof value.name === 'string' ? value.name : '';
+            const message = typeof value.message === 'string' ? value.message : '';
+            const stack = typeof value.stack === 'string' ? value.stack : '';
+            if (value instanceof Error || message || stack) {
+                const header = `${name || 'Error'}${message ? `: ${message}` : ''}`;
+                const parts = [header];
+                if (stack && stack !== header) {
+                    const rest = stack.startsWith(header) ? stack.slice(header.length).trim() : stack;
+                    if (rest) parts.push(rest);
+                }
+                if (value.cause !== undefined && level < 3) parts.push(`cause=${stringify(value.cause, level + 1)}`);
+                return parts.join(' | ');
             }
             try {
-                return JSON.stringify(value);
+                const json = JSON.stringify(value);
+                if (json && json !== '{}') return json;
             } catch (error) {
-                return String(value);
+                // 循环引用等：走下面的按属性展开。
+            }
+            try {
+                const typeName = value.constructor && value.constructor.name && value.constructor.name !== 'Object' ? value.constructor.name : 'Object';
+                const own = level < 3
+                    ? Object.getOwnPropertyNames(value).map(key => `${key}=${stringify(value[key], level + 1)}`).join(', ')
+                    : '';
+                if (own) return `${typeName}{${own}}`;
+                const text = String(value);
+                return text === '[object Object]' ? `${typeName}{}` : text;
+            } catch (error) {
+                return '[无法序列化的日志参数]';
             }
         }
 
@@ -88,7 +115,7 @@
                 time: Date.now(),
                 level,
                 tag: tag || '未分类',
-                message: args.map(stringify).join(' '),
+                message: args.map(arg => stringify(arg)).join(' '),
             };
             entries.push(entry);
             if (entries.length > MAX_ENTRIES) entries = entries.slice(entries.length - MAX_ENTRIES);
@@ -126,6 +153,95 @@
             },
         };
     })();
+
+    // ---------------------------------------------------------------
+    // 一、核心：报错处理建议（仿数据库 log-error-hints.ts）
+    //
+    // 把 error 级日志翻译成「大概是什么问题 + 可以怎么处理」。按顺序匹配：越靠前越具体
+    // （明确短语、HTTP 状态码），越靠后越宽泛（按功能兜底），最后一条通用兜底，
+    // 保证每条 error 都有建议。只做字符串匹配，不碰页面。文案换成本插件的页面和设置。
+    // ---------------------------------------------------------------
+
+    const LOG_HINT_RETRY = '稍等片刻再试一次，很多问题是服务商偶发抖动。';
+    const LOG_HINT_SEE_PREVIOUS = '查看紧邻的上一条日志，通常有更具体的原因（HTTP 状态码、返回内容等）。';
+    const LOG_HINT_EXPORT = '反复出现时，在运行日志页点「导出」，连同复现步骤一起反馈给作者。';
+
+    const LOG_ERROR_HINT_RULES = [
+        { id: 'aborted', test: /request aborted|aborterror|the user aborted|已中止|已取消|用户取消|signal is aborted/,
+            summary: '请求被中止（通常是停止了生成、切换了聊天或关闭了面板）。',
+            steps: ['如果是你主动停止的，可以忽略这条。', '没有手动停止却出现时，检查网络是否在请求途中断开，然后重试。'] },
+        { id: 'storage-quota', test: /quotaexceeded|exceeded the quota|storage.*full|out of storage|存储空间不足/,
+            summary: '浏览器本地存储满了，API 预设或本机设置写不进去。',
+            steps: ['清理浏览器里其他站点或扩展占用的存储。', '无痕模式下存储受限，换普通窗口再试。'] },
+        { id: 'preset-missing', test: /找不到本机 ?api ?预设|预设.*(不存在|未找到|找不到)|preset .* not found/,
+            summary: '选中的 API 预设已经不在本机（被删除、改名，或换了浏览器）。',
+            steps: ['到「API」页确认预设还在，或新建一个同名预设。', '在「如何判断？」卡里重新选一次 API 预设。', 'API 预设只存在当前浏览器，换设备后要重新建。'] },
+        { id: 'tavern-profile', test: /connectionmanagerrequestservice|连接管理器|未选择酒馆连接预设|连接预设.*(不存在|无效|失败)|connection profile/,
+            summary: '「酒馆预设」连接不可用：酒馆的连接管理器缺失，或所选连接预设被删除、没配 API。',
+            steps: ['打开酒馆「API 连接」→「连接配置」，确认该预设存在并绑好了 API。', '回到本插件「API」页重新选一次连接预设并保存。', '酒馆版本过旧时没有连接管理器，升级酒馆或改用「自定义」连接。'] },
+        { id: 'tavern-helper', test: /generateraw|tavernhelper|未检测到酒馆助手|js-slash-runner/,
+            summary: '缺少酒馆助手（JS-Slash-Runner）的 generateRaw 接口，用不了酒馆主 API。',
+            steps: ['在酒馆扩展里安装并启用最新版酒馆助手，然后刷新页面。', '临时办法：到「API」页新建「自定义」连接的预设，不依赖 generateRaw。'] },
+        { id: 'api-config', test: /缺少端点|缺少.*模型名|url或模型未配置|未配置 ?api|endpoint.*(为空|missing)|api.*(未配置|未填写)/,
+            summary: 'API 预设不完整：端点、API Key 或模型名有一项没填。',
+            steps: ['到「API」页补全该预设并保存。', '确认「如何判断？」卡选的就是这个预设。'] },
+        { id: 'http-401', test: /\b401\b|unauthorized|invalid[ _-]?api[ _-]?key|incorrect api key|invalid x-api-key|authentication[ _-]?error|no auth credentials|令牌无效|密钥无效|api key 无效/,
+            summary: 'API 拒绝了请求：密钥无效、填错或已过期（401）。',
+            steps: ['到「API」页检查当前预设的 API Key 是否完整、有没有多余空格。', '确认 Key 和端点属于同一家服务商。', '中转站请登录站点确认 Key 仍有效、余额充足。'] },
+        { id: 'http-403', test: /\b403\b|forbidden|permission[ _-]?denied|not allowed to|access denied|无权访问|权限不足/,
+            summary: '服务商拒绝访问（403）：Key 没有权限，或请求来源被限制。',
+            steps: ['确认 Key 有权使用所选模型。', '有的服务商拒绝浏览器直连：把预设改成「酒馆预设」连接，由酒馆后端转发。', '中转站请联系站方确认账号是否被限制。'] },
+        { id: 'http-404', test: /\b404\b|not[ _]found.*(model|endpoint|route)|model.*(not found|does not exist|not exist)|no such model|unknown model|invalid model|模型不存在|找不到模型/,
+            summary: '端点或模型名不存在（404）。',
+            steps: ['到「API」页检查端点是否完整，结尾要不要 /v1 按服务商文档填。', '点「加载模型」重新选模型，避免手写拼错。', '确认服务商仍提供该模型，旧模型可能已下线。'] },
+        { id: 'http-429', test: /\b429\b|rate[ _-]?limit|too many requests|quota|insufficient (balance|funds)|exceeded your current|resource[ _-]?exhausted|请求过于频繁|限流|额度不足|余额不足|欠费|配额/,
+            summary: '请求太频繁被限流，或账户额度 / 余额用完了（429）。',
+            steps: ['先等 1–2 分钟；自动检查出错后本来就会暂停一阵，短时间反复重试只会限流更久。', '到服务商后台确认余额和额度。', '把「多久检查一次」和「大检查」调稀一些，每层都查最费请求；公益站尤其要注意。'] },
+        { id: 'http-5xx', test: /\b(500|502|503|504|529)\b|bad gateway|service unavailable|gateway time-?out|internal server error|overloaded|server error|服务器错误|服务不可用|上游.*(错误|超时)/,
+            summary: '服务商服务器出错或过载（5xx），不是本地配置问题。',
+            steps: [LOG_HINT_RETRY, '持续出现时换模型或换渠道。', '中转站请看站方公告是否在维护。'] },
+        { id: 'context-length', test: /context[ _-]?length|maximum context|context window|too many tokens|tokens? (exceed|limit|too long)|prompt is too long|input is too long|超出.*(上下文|长度)|上下文.*(超限|过长)/,
+            summary: '发给判断AI的内容太长，超出了模型的上下文上限。',
+            steps: ['在「如何判断？」卡里把「参考几段回复」调小。', '精简阶段正文、完成条件或自定义提示词。', '换用上下文更大的模型。'] },
+        { id: 'http-400', test: /\b400\b|bad request|invalid_request_error|unsupported parameter|invalid parameter|unrecognized request argument|unknown parameter|参数错误|请求参数无效/,
+            summary: '服务商认为请求有问题（400）：通常是模型名或某个参数不被支持。',
+            steps: ['到「API」页确认模型名拼写正确，最好用「加载模型」选。', '改过附加主体参数、温度等高级参数的，先恢复默认再试。', '有的模型不支持 system 角色，换个模型试试。'] },
+        { id: 'network-cors', test: /\bcors\b|cross-origin|access-control-allow-origin|preflight/,
+            summary: '浏览器跨域被拦截（CORS）：该服务商不允许网页直接调用。',
+            steps: ['把预设改成「酒馆预设」或「自定义」连接，都由酒馆后端转发。'] },
+        { id: 'network', test: /failed to fetch|networkerror|network error|net::err|econnrefused|econnreset|enotfound|etimedout|getaddrinfo|socket hang up|fetch failed|timed? ?out|timeout|无法连接|连接被拒绝|网络错误|请求超时|超时/,
+            summary: '网络连不上目标服务，或者等响应超时了。',
+            steps: ['检查本机网络和代理；酒馆部署在远程服务器时，确认服务器能访问该 API 地址。', '超时多半是模型响应慢：稍后重试，或换更快的模型。'] },
+        { id: 'content-filter', test: /content[ _-]?filter|content_policy|safety (setting|filter|system)|blocked by|flagged|prohibited_content|recitation|内容审查|违规内容|敏感内容|安全策略/,
+            summary: '内容被服务商的安全审查拦截，模型拒绝或截断了输出。',
+            steps: ['换审查宽松的模型或渠道。', '调整触发审查的阶段正文或提示词。'] },
+        { id: 'empty-response', test: /未返回预期的文本响应|返回无效响应|unknown response format|failed to parse response|empty response|响应为空|返回为空|空响应|返回内容为空/,
+            summary: 'AI 返回了空内容或认不出的格式。',
+            steps: [LOG_HINT_RETRY, '可能被服务商静默审查了，换个模型再试。', '开了流式输出时，先在仪表盘「开关」里关掉再试。'] },
+        { id: 'json-import', test: haystack => /json|parse|解析|unexpected token|unexpected end/.test(haystack) && /导入|import/.test(haystack),
+            summary: '导入的文件不是合法 JSON，或结构和本插件要求的不一致。',
+            steps: ['确认导入的是本插件「导出」生成的文件，不是别的插件或手改过的文件。', '用记事本打开，检查是否被截断、首尾大括号是否完整。'] },
+        { id: 'worldbook', test: /world ?book|lorebook|世界书/,
+            summary: '世界书读取或写入失败。',
+            steps: ['确认角色绑定的世界书还在，没有被删除或改名。', '在酒馆自带的世界书面板里确认它能正常打开。', '回到「动态指导」页重新选一次条目。'] },
+        { id: 'judge', test: /判断ai|大检查|选段/,
+            summary: '判断AI请求或结论处理失败。',
+            steps: [LOG_HINT_SEE_PREVIOUS, '到仪表盘「运行概览」确认 API 状态；暂停中可在小卡「设置 ›」点「现在检查」手动试。', LOG_HINT_EXPORT] },
+        { id: 'generic', test: () => true,
+            summary: '插件内部操作失败。',
+            steps: ['先重试一次；和 API 有关的话稍等片刻再试。', '刷新页面后再做一次同样的操作。', LOG_HINT_EXPORT] },
+    ];
+
+    // 只对 error 级日志给建议；其他级别返回 null。在小写化后的「标签 + 消息」上匹配。
+    function resolveLogErrorHint(entry) {
+        if (!entry || entry.level !== 'error') return null;
+        const haystack = `${entry.tag || ''} ${entry.message || ''}`.toLowerCase();
+        for (const rule of LOG_ERROR_HINT_RULES) {
+            const matched = typeof rule.test === 'function' ? rule.test(haystack) : rule.test.test(haystack);
+            if (matched) return { id: rule.id, summary: rule.summary, steps: rule.steps.slice() };
+        }
+        return null;
+    }
 
     // ---------------------------------------------------------------
     // 一、核心：边界规则模块（复刻数据库 shujuku AcuRulePairList / utils.ts）
@@ -595,6 +711,9 @@
         if (Object.keys(branchChoices).length) next.branchChoices = branchChoices;
         if (old.lastJudgeYes === true || old.lastJudgeYes === false) next.lastJudgeYes = old.lastJudgeYes;
         if (typeof old.lastJudgeBasis === 'string' && old.lastJudgeBasis) next.lastJudgeBasis = old.lastJudgeBasis.slice(0, 500);
+        if (old.lastBigCheckId != null) next.lastBigCheckId = old.lastBigCheckId;
+        if (Number.isFinite(old.stageEnteredId)) next.stageEnteredId = old.stageEnteredId;
+        if (typeof old.lastBigCheckBasis === 'string' && old.lastBigCheckBasis) next.lastBigCheckBasis = old.lastBigCheckBasis.slice(0, 500);
         if (old.lineCut === true) next.lineCut = true;
         if (typeof old.forkInto === 'string' && old.forkInto) next.forkInto = old.forkInto;
         if (typeof old.sideOut === 'string' && old.sideOut) next.sideOut = old.sideOut;
@@ -1151,6 +1270,136 @@
     function findJudgeApiPreset(name) {
         const wanted = String(name || '').trim();
         return readJudgeApiPresets().find(item => item.name === wanted) || null;
+    }
+
+    // 按聊天 / 按线选判断AI的 API（v3.2，仿数据库 apiPresetBindingsByChat / plotTaskApiPresetOverridesById）。
+    // 只存本机 localStorage，不写角色变量，照旧不随角色卡导出。优先级：这条线 > 这个聊天 > 全局。
+    // 值为 '@main' 表示这里强制用酒馆主 API。
+    const PRESET_OVERRIDES_KEY = 'dynamic-guide-assistant:preset-overrides:v1';
+    const PRESET_MAIN = '@main';
+
+    function readPresetOverrides() {
+        const empty = { chats: {}, lines: {} };
+        const storage = presetStorage();
+        if (!storage) return empty;
+        try {
+            const raw = storage.getItem(PRESET_OVERRIDES_KEY);
+            const parsed = raw ? JSON.parse(raw) : {};
+            const clean = source => {
+                const out = {};
+                if (source && typeof source === 'object') {
+                    Object.keys(source).forEach(key => {
+                        if (typeof source[key] === 'string' && source[key].trim()) out[key] = source[key].trim();
+                    });
+                }
+                return out;
+            };
+            return { chats: clean(parsed && parsed.chats), lines: clean(parsed && parsed.lines) };
+        } catch (error) {
+            return empty;
+        }
+    }
+
+    function writePresetOverrides(overrides) {
+        const storage = presetStorage();
+        if (!storage) throw new Error('当前页面无法访问 localStorage，不能保存按聊天 / 按线的 API 选择。');
+        storage.setItem(PRESET_OVERRIDES_KEY, JSON.stringify({ chats: overrides.chats || {}, lines: overrides.lines || {} }));
+    }
+
+    // group = 'chats' | 'lines'；name 为空 = 改回跟随上一级。
+    function setPresetOverride(group, key, name) {
+        if (group !== 'chats' && group !== 'lines') throw new Error(`未知的覆盖类型：${group}`);
+        if (!key) throw new Error(group === 'chats' ? '拿不到当前聊天的 id，不能按聊天单独选 API。' : '这条绑定没有 key。');
+        const overrides = readPresetOverrides();
+        const value = String(name || '').trim();
+        if (value) overrides[group][key] = value;
+        else delete overrides[group][key];
+        writePresetOverrides(overrides);
+    }
+
+    function currentChatKey() {
+        try {
+            const context = sillyTavernContext();
+            if (context && context.chatId) return String(context.chatId);
+            if (context && typeof context.getCurrentChatId === 'function') {
+                const id = context.getCurrentChatId();
+                if (id) return String(id);
+            }
+        } catch (error) { /* 测试环境没有酒馆上下文 */ }
+        try {
+            const getCurrentChatId = api('getCurrentChatId', false);
+            const id = getCurrentChatId ? getCurrentChatId() : '';
+            return id ? String(id) : '';
+        } catch (error) {
+            return '';
+        }
+    }
+
+    function resolveJudgePresetName(settings, context) {
+        const overrides = readPresetOverrides();
+        const pick = (value, source) => ({ name: value === PRESET_MAIN ? '' : value, source });
+        const line = context && context.key ? overrides.lines[context.key] : '';
+        if (line) return pick(line, 'line');
+        const chat = currentChatKey();
+        if (chat && overrides.chats[chat]) return pick(overrides.chats[chat], 'chat');
+        return { name: settings && typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '', source: 'global' };
+    }
+
+    // 这条绑定这一次实际用的设置：只把 judgePreset 换成按线 / 按聊天解析出来的名字。
+    function settingsForContext(settings, context) {
+        const base = settings || {};
+        const resolved = resolveJudgePresetName(base, context);
+        return resolved.source === 'global' ? base : { ...base, judgePreset: resolved.name };
+    }
+
+    function presetOverrideOptions(presetList, followLabel, current) {
+        const options = [{ value: '', label: followLabel }, { value: PRESET_MAIN, label: '酒馆主 API（不用预设）' }]
+            .concat((presetList || []).map(item => ({ value: item.name, label: item.name })));
+        if (current && !options.some(item => item.value === current)) options.push({ value: current, label: `${current}（已不存在）` });
+        return options;
+    }
+
+    // 预设改名 / 删除时同步所有引用（仿数据库 renameApiPresetReferences / clearApiPresetReferences）：
+    // 全局 judgePreset / conditionPreset、各角色的本机预设名存档、按聊天和按线的覆盖。newName 为空 = 清掉。
+    async function updatePresetReferences(oldName, newName) {
+        const from = String(oldName || '').trim();
+        const to = String(newName || '').trim();
+        if (!from || from === to) return;
+        const overrides = readPresetOverrides();
+        let touched = false;
+        ['chats', 'lines'].forEach(group => Object.keys(overrides[group]).forEach(key => {
+            if (overrides[group][key] !== from) return;
+            if (to) overrides[group][key] = to;
+            else delete overrides[group][key];
+            touched = true;
+        }));
+        if (touched) writePresetOverrides(overrides);
+        const storage = presetStorage();
+        if (storage && typeof storage.key === 'function' && typeof storage.length === 'number') {
+            try {
+                for (let index = 0; index < storage.length; index += 1) {
+                    const key = storage.key(index);
+                    if (!key || !key.startsWith(LOCAL_PRESET_PREFIX)) continue;
+                    const parsed = JSON.parse(storage.getItem(key) || '{}');
+                    let changed = false;
+                    ['judgePreset', 'conditionPreset'].forEach(field => {
+                        if (parsed && parsed[field] === from) { parsed[field] = to; changed = true; }
+                    });
+                    if (changed) storage.setItem(key, JSON.stringify(parsed));
+                }
+            } catch (error) { /* 别的角色的存档读不了就跳过，当前角色下面照样更新 */ }
+        }
+        const fresh = await readConfig();
+        const settings = { ...(fresh.settings || {}) };
+        let changed = false;
+        ['judgePreset', 'conditionPreset'].forEach(field => {
+            if (settings[field] === from) { settings[field] = to; changed = true; }
+        });
+        if (changed) {
+            fresh.settings = settings;
+            await writeConfig(fresh);
+        }
+        LogModule.info('API', to ? `API 预设「${from}」改名为「${to}」，引用已同步` : `API 预设「${from}」已删除，引用已清掉`);
     }
 
     // 编辑器偏好（v2.29）：正文选择方式跟着人走，存本机 localStorage，不随角色卡导出。
@@ -1963,6 +2212,22 @@
             const n = Math.floor(Number(settings.judgeHistoryCount));
             settings.judgeHistoryCount = Number.isFinite(n) && n >= 1 ? n : 1;
         }
+        // 动态指导总开关（v3.2）：只认 false = 关闭；缺省即开启。
+        if (settings.guideEnabled != null) {
+            if (settings.guideEnabled === false) settings.guideEnabled = false;
+            else delete settings.guideEnabled;
+        }
+        // 大检查（v3.2）：每 N 层核对一次近段大纲与最近正文。缺省 / 0 / 非法值 = 关闭。
+        if (settings.bigCheckInterval != null) {
+            const n = Math.floor(Number(settings.bigCheckInterval));
+            if (Number.isFinite(n) && n >= 1) settings.bigCheckInterval = n;
+            else delete settings.bigCheckInterval;
+        }
+        ['bigCheckSystemPrompt', 'bigCheckUserPrompt'].forEach(field => {
+            if (settings[field] == null) return;
+            if (typeof settings[field] !== 'string') settings[field] = String(settings[field]);
+            if (!settings[field].trim()) delete settings[field];
+        });
         // 流式输出（v2.18，数据库 streamingEnabled 同款）：只认布尔，缺省 false。
         if (settings.streamingEnabled != null) settings.streamingEnabled = settings.streamingEnabled === true;
         if (settings.storageMode != null && settings.storageMode !== 'card' && settings.storageMode !== 'user') {
@@ -2384,7 +2649,17 @@
     }
 
     function isPickerExcludedEntry(entry) {
-        return isAssistantEntry(entry) || isDatabaseEntry(entry);
+        return isAssistantEntry(entry) || isDatabaseEntry(entry) || isMvuEntry(entry);
+    }
+
+    // MVU（MagVarUpdate）写进世界书的条目：[InitVar] 初始化变量、[mvu_xxx] 与变量更新规则 / 输出格式说明。
+    // 和数据库条目一样只从待选列表拿掉，不改、不删。
+    function isMvuEntry(entry) {
+        const name = entryName(entry).trim();
+        return /\[\s*init\s*var\s*\]/i.test(name)
+            || /\[\s*mvu[\w-]*\s*\]/i.test(name)
+            || /^mvu[_\s-]/i.test(name)
+            || /变量更新规则|变量输出格式/.test(name);
     }
 
     function sameUid(left, right) {
@@ -3532,6 +3807,46 @@
         return recovered.length;
     }
 
+    // 动态指导总开关（v3.2，仿数据库各功能在高级设置里的总开关）：关掉时世界书归回原样——
+    // 删掉所有镜像和标记条目、重新打开原条目；判断AI、大检查、选段都不再跑。绑定、划分和进度保留，
+    // 重新打开后下一次同步照常关掉原条目、重建镜像。
+    let guideOffRestored = null;
+
+    function guideDisabled(config) {
+        return Boolean(config && config.settings && config.settings.guideEnabled === false);
+    }
+
+    async function restoreWorldbooksForOff(config) {
+        const bindings = (config && config.bindings) || [];
+        const signature = bindings.map(item => bindingKey(item)).join('|');
+        if (guideOffRestored === signature) return;
+        for (const binding of bindings) {
+            let located = null;
+            try { located = await locateEntry(binding); } catch (error) { located = null; }
+            if (!located) {
+                await removeOrphanMirror(binding);
+                continue;
+            }
+            const sourceName = entryName(located.entry);
+            const mirrorName = mirrorNameFor(sourceName);
+            const cueName = cueNameFor(sourceName);
+            await updateWorldbook(located.worldbookName, worldbook => {
+                const target = findEntry(worldbook, binding.entryUid, binding.entryName);
+                if (target) {
+                    target.enabled = true;
+                    if ('disable' in target) target.disable = false;
+                }
+                worldbookEntries(worldbook).slice().forEach(item => {
+                    if (sameUid(item.uid, located.entry.uid)) return;
+                    if (entryName(item) === mirrorName || entryName(item) === cueName) removeEntryFromWorldbook(worldbook, item);
+                });
+                return worldbook;
+            });
+        }
+        guideOffRestored = signature;
+        LogModule.info('总开关', `动态指导已关闭：${bindings.length} 条绑定的原条目已重新打开，镜像已删除；绑定与进度保留`);
+    }
+
     async function removeOrphanMirror(binding) {
         const mirrorName = mirrorNameFor(binding.entryName || '');
         const bound = await boundWorldbookNames(await currentCharacter()).catch(() => []);
@@ -3561,6 +3876,11 @@
 
     async function syncMirrorsNow(generationType) {
         let all = await loadContexts();
+        if (guideDisabled(all.config)) {
+            await restoreWorldbooksForOff(all.config);
+            return;
+        }
+        guideOffRestored = null;
         // 支线已经走完、却还记着要回哪一条：v2.99.3 及以前自动推进走完支线不会回去，
         // 被依附的那条会一直停着、也没有镜像。碰到这种进度就补回去。
         const stuck = all.contexts.filter(sideLineFinished);
@@ -3747,8 +4067,14 @@
             lastJudgeCheckedId: context.state.lastJudgeCheckedId == null ? null : context.state.lastJudgeCheckedId,
             ...(context.state.lastJudgeYes === true || context.state.lastJudgeYes === false ? { lastJudgeYes: context.state.lastJudgeYes } : {}),
             ...(context.state.lastJudgeBasis ? { lastJudgeBasis: context.state.lastJudgeBasis } : {}),
+            ...(context.state.lastBigCheckId != null ? { lastBigCheckId: context.state.lastBigCheckId } : {}),
+            ...(context.state.lastBigCheckBasis ? { lastBigCheckBasis: context.state.lastBigCheckBasis } : {}),
             // 这条消息引起的推进才记下「从哪一段过来」。手动拨进度清掉，避免重新生成退错段。
             preAdvanceIndex: settings.messageId != null ? context.state.stageIndex : null,
+            // 进入这一段的楼层（v3.2）：给判断AI算「已在这段停了几层」。段没变就沿用。
+            ...(index !== context.state.stageIndex
+                ? { stageEnteredId: settings.messageId != null ? settings.messageId : currentMessageId() }
+                : (Number.isFinite(context.state.stageEnteredId) ? { stageEnteredId: context.state.stageEnteredId } : {})),
             ...(Object.keys(branchChoices).length ? { branchChoices } : {}),
             ...(context.state.lineCut === true ? { lineCut: true } : {}),
             ...(context.state.forkInto ? { forkInto: context.state.forkInto } : {}),
@@ -3894,7 +4220,8 @@
     // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
     //   酒馆主 API → 酒馆助手 generateRaw；酒馆预设 → ConnectionManagerRequestService；
     //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
-    // 判断AI结果一律只信一次，失败不重试。
+    // 判断AI结论只信一次；请求本身遇到临时性错误（5xx、超时、网络）原地重试一次（仿数据库
+    // isRetryableAiRequestError），401/400/404 等确定性错误和 429 限流不重试，直接进暂停。
 
     // 请求闸门（v2.99.4，仿数据库 shujuku 的串行队列）：发给模型的请求一律排队，一次只发一个，
     // 不会几条绑定同时请求。失败后暂停自动检查一阵：公益站对短时间反复请求会限流甚至封号，
@@ -3919,20 +4246,86 @@
         return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
     }
 
+    // 中止（v3.2，仿数据库 AbortSignal）：切换聊天时把在途和排队中的请求作废。能取消的通道
+    // （自定义 API 的 fetch）真的取消；generateRaw / 连接管理器取消不了，就把回来的结论丢掉。
+    // 中止不算失败、不暂停。
+    const modelAbort = { epoch: 0, controller: null };
+    const MODEL_RETRY_DELAY = 1500;
+
+    function modelAbortError() {
+        const error = new Error('请求已中止（切换了聊天）');
+        error.name = 'AbortError';
+        return error;
+    }
+
+    function isAbortError(error) {
+        return Boolean(error && typeof error === 'object' && error.name === 'AbortError');
+    }
+
+    function isRetryableModelError(error) {
+        if (!error || isAbortError(error)) return false;
+        const text = String(error && error.message ? error.message : error);
+        if (/\b(?:400|401|403|404)\b|unauthorized|forbidden|invalid[ _-]?api[ _-]?key/i.test(text)) return false;
+        if (/\b429\b|rate.?limit|too many|quota|限流|额度|余额|频繁/i.test(text)) return false;
+        if (/\b(?:500|502|503|504|529)\b|bad gateway|service unavailable|gateway time-?out|overloaded/i.test(text)) return true;
+        if (error && error.name === 'TypeError') return true;
+        return /timeout|timed out|network|connection reset|socket hang up|failed to fetch|econnreset|超时|网络错误/i.test(text);
+    }
+
+    function modelDelay(ms) {
+        const timer = hostWindow && typeof hostWindow.setTimeout === 'function'
+            ? hostWindow.setTimeout.bind(hostWindow)
+            : (typeof setTimeout === 'function' ? setTimeout : null);
+        return new Promise(resolve => (timer ? timer(resolve, ms) : resolve()));
+    }
+
+    function abortModelRequests(reason) {
+        modelAbort.epoch += 1;
+        const controller = modelAbort.controller;
+        modelAbort.controller = null;
+        if (controller) {
+            try { controller.abort(); } catch (error) { /* 已经结束的请求取消不了，忽略 */ }
+        }
+        LogModule.info('判断AI', `${reason || '中止'}：在途和排队中的判断请求作废`);
+    }
+
     function askModel(messages, preset, settings) {
+        const epoch = modelAbort.epoch;
         const run = async () => {
+            if (epoch !== modelAbort.epoch) throw modelAbortError();
+            const Controller = typeof AbortController === 'function' ? AbortController : (hostWindow && hostWindow.AbortController);
+            const controller = typeof Controller === 'function' ? new Controller() : null;
+            modelAbort.controller = controller;
+            const options = { ...(settings || {}), abortSignal: controller ? controller.signal : null };
+            const stale = error => isAbortError(error) || epoch !== modelAbort.epoch;
             try {
-                const text = await askJudge(messages, preset, settings);
+                let text;
+                try {
+                    text = await askJudge(messages, preset, options);
+                } catch (error) {
+                    if (stale(error) || !isRetryableModelError(error)) throw error;
+                    LogModule.warn('判断AI', `请求遇到临时性错误，${MODEL_RETRY_DELAY / 1000} 秒后原地重试一次：${error && error.message ? error.message : error}`);
+                    await modelDelay(MODEL_RETRY_DELAY);
+                    if (epoch !== modelAbort.epoch) throw modelAbortError();
+                    text = await askJudge(messages, preset, options);
+                }
+                if (epoch !== modelAbort.epoch) throw modelAbortError();
                 modelGate.failures = 0;
                 modelGate.pausedUntil = 0;
                 modelGate.lastError = '';
                 return text;
             } catch (error) {
+                if (stale(error)) {
+                    LogModule.info('判断AI', '请求已中止，不算失败，也不暂停');
+                    throw isAbortError(error) ? error : modelAbortError();
+                }
                 modelGate.failures += 1;
                 modelGate.lastError = error && error.message ? error.message : String(error);
                 modelGate.pausedUntil = Date.now() + modelPauseSeconds(error, modelGate.failures) * 1000;
                 LogModule.warn('判断AI', `请求失败（连续第 ${modelGate.failures} 次），自动检查暂停到 ${modelPauseClock()}`);
                 throw error;
+            } finally {
+                if (modelAbort.controller === controller) modelAbort.controller = null;
             }
         };
         const result = modelGate.tail.then(run, run);
@@ -3951,7 +4344,7 @@
     const DEFAULT_JUDGE_SYSTEM_PROMPT = [
         '你负责判断剧情该不该推进。每次只回答一个问题：这条剧情线现在该不该从当前阶段进入它的下一阶段。',
         '你不续写、不评价文笔、不改大纲，也不替角色做决定。',
-        '答案只按案卷末尾的作答表填写，标签外不写任何字。',
+        '可以先在标签外写几句简短分析；最后必须按案卷末尾的作答表填标签。系统只读标签，同一标签写了几次只认最后一次。',
     ].join('\n');
 
     const DEFAULT_JUDGE_RULES_PROMPT = [
@@ -3985,7 +4378,8 @@
         '- 阶段「暑假」，下一阶段「开学」。正文写暑假里又一天的日常 → NO；正文写到开学第一天上课 → YES。',
     ].join('\n');
 
-    const DEFAULT_JUDGE_CASE_PROMPT = [
+    // v3.0 / v3.1 的默认案卷原文：只用来比对用户存下的段，一字不差就换成新默认。
+    const LEGACY_JUDGE_CASE_PROMPT_V30 = [
         '# 本次案卷',
         '',
         '## 对照标准',
@@ -4017,11 +4411,46 @@
         '</road>',
     ].join('\n');
 
+    // v3.0 / v3.1 身份段原文（迁移比对用）。
+    const JUDGE_IDENTITY_V30 = DEFAULT_JUDGE_SYSTEM_PROMPT.split('\n').slice(0, 2)
+        .concat(['答案只按案卷末尾的作答表填写，标签外不写任何字。']).join('\n');
+
+    // v3.2：身份和判定手册合成一段静态 system（仿数据库 V19 单 system 前缀：有的兼容网关会把所有
+    // system 提到指令前缀，一段字节稳定的前缀也更容易命中服务商的提示词缓存）。
+    const DEFAULT_JUDGE_ROOT_PROMPT = [DEFAULT_JUDGE_SYSTEM_PROMPT, '', DEFAULT_JUDGE_RULES_PROMPT].join('\n');
+    // v3.2 案卷：多给上一阶段和已在这段停了几层（仿数据库注入阶段历史），状态型阶段更好判。
+    const DEFAULT_JUDGE_CASE_PROMPT = LEGACY_JUDGE_CASE_PROMPT_V30
+        .replace('【下一阶段】{{next}}', '【上一阶段】{{previous}}\n【已停多久】{{elapsed}}\n\n【下一阶段】{{next}}');
+
     const DEFAULT_JUDGE_SEGMENTS = [
-        { role: 'system', content: DEFAULT_JUDGE_SYSTEM_PROMPT },
-        { role: 'system', content: DEFAULT_JUDGE_RULES_PROMPT },
+        { role: 'system', content: DEFAULT_JUDGE_ROOT_PROMPT },
         { role: 'user', content: DEFAULT_JUDGE_CASE_PROMPT },
     ];
+
+    // 默认提示词迁移（v3.2，仿数据库 default-lineage）：用户存下的段里，和历史默认一字不差的换成
+    // 新默认（v3.0 的身份 + 手册两段合成一段），改过的段原样保留。只在读取时换，不改存档。
+    function migrateJudgeSegments(segments) {
+        if (!Array.isArray(segments)) return segments;
+        const same = (seg, role, content) => Boolean(seg && seg.role === role && String(seg.content || '').trim() === content.trim());
+        const out = [];
+        let changed = false;
+        for (let index = 0; index < segments.length; index += 1) {
+            const seg = segments[index];
+            if (same(seg, 'system', JUDGE_IDENTITY_V30) && same(segments[index + 1], 'system', DEFAULT_JUDGE_RULES_PROMPT)) {
+                out.push({ role: 'system', content: DEFAULT_JUDGE_ROOT_PROMPT });
+                index += 1;
+                changed = true;
+                continue;
+            }
+            if (same(seg, 'user', LEGACY_JUDGE_CASE_PROMPT_V30)) {
+                out.push({ role: 'user', content: DEFAULT_JUDGE_CASE_PROMPT });
+                changed = true;
+                continue;
+            }
+            out.push(seg);
+        }
+        return changed ? out : segments;
+    }
 
     const JUDGE_SEGMENT_ROLES = ['system', 'user', 'assistant'];
 
@@ -4048,9 +4477,9 @@
     // 解析分支判断的回答：<branch> 里写序号（从 1 起）或分支名。0、空、对不上都不选。
     function judgePickedBranch(text, candidates) {
         const list = Array.isArray(candidates) ? candidates : [];
-        const tag = String(text || '').match(/<branch>\s*([\s\S]*?)<\/branch>/i);
-        if (!tag) return null;
-        const inner = judgeFieldBody(tag[1]);
+        const tag = lastTagInner(text, 'branch');
+        if (tag == null) return null;
+        const inner = judgeFieldBody(tag);
         if (!inner || /^0+$/.test(inner)) return null;
         if (/^\d+$/.test(inner)) {
             const index = Number(inner) - 1;
@@ -4062,7 +4491,7 @@
     // AI 选段（v3.0）：两段——system 身份和规则 / user 本次案卷。
     const PICK_STAGE_SYSTEM_PROMPT = [
         '你是剧情定位员。每次只回答一个问题：按最近正文，剧情现在停在哪一段。',
-        '你不续写、不评价文笔、不改大纲。答案只按案卷末尾的作答表填写，标签外不写任何字。',
+        '你不续写、不评价文笔、不改大纲。可以先在标签外写几句简短分析；最后必须按作答表填标签，同一标签只认最后一次。',
         '',
         '# 定位规则',
         '- 只有【最近正文】里写出来的事算发生过。阶段说明只是对照标准。',
@@ -4093,6 +4522,126 @@
             '- 序号：第几段',
             '</stage>',
         ].join('\n');
+    }
+
+    // 大检查（v3.2）：每 N 层另问一次判断AI，核对近 5 段大纲（前 2 / 当前 / 后 2，贴边时往另一侧补）、
+    // 当前段的分岔口和最近 3 段正文：大纲是不是推早了（正文还没演到就进了下一段），或者正文已经跑过大纲。
+    // 查出偏差就改到正文对应的那一段；正文走进了分岔就进那条。
+    // 只对判断AI档生效：AI 选段档每次都在重新定位，手动档不另开请求。
+    const BIG_CHECK_OUTLINE_BEFORE = 2;
+    const BIG_CHECK_OUTLINE_AFTER = 2;
+    const BIG_CHECK_HISTORY_COUNT = 3;
+    const BIG_CHECK_DRIFT_LABELS = { ok: '正常', early: '推早了', ahead: '跑过头' };
+
+    const DEFAULT_BIG_CHECK_SYSTEM_PROMPT = [
+        '你是剧情进度校对员。每隔几层做一次大检查，只回答一个问题：大纲记的进度和最近正文对不对得上。',
+        '你不续写、不评价文笔、不改大纲。可以先在标签外写几句简短分析；最后必须按作答表填标签，同一标签只认最后一次。',
+        '',
+        '# 校对规则',
+        '- 只有【最近正文】里真正写出来的事算发生过。大纲各段只是对照标准。计划、预告、回忆、假设都不算发生。',
+        '- 先看正文现在最像【近段大纲】里的哪一段，再和【大纲现在停在】比：',
+        '  - 正常：正文就在当前这段，或者这段刚开头、还没演完。',
+        '  - 推早了：大纲已经进了当前这段，正文却还停在更早的一段，前面那段的事没演到。',
+        '  - 跑过头：正文已经演到当前段之后的某一段，大纲还停在后面。',
+        '- 多过了一天、多了一段日常，都不算换段。状态、总结、思维链不算剧情。拿不准就写正常。',
+        '- <stage> 写正文现在对应的那一段的序号，只能从【近段大纲】里选。',
+        '- 【分岔口】列出当前这段能走进的几条线。正文已经走进哪条，就在 <road> 写它的序号；没走进写 0。',
+        '',
+        '# 例子（照这个口径判，不要照抄内容）',
+        '- 大纲停在「开学」，最近正文还在写暑假里的一天日常 → 推早了，<stage> 写「暑假」那段的序号。',
+        '- 大纲停在「初遇」，正文里两人已经互报姓名、约好再见，还一起去了地下室 → 跑过头，<stage> 写「进入地下室」那段。',
+        '- 大纲停在「初遇」，正文刚写到两人在雨里碰面、还没说上话 → 正常，这段刚开头不算推早。',
+    ].join('\n');
+
+    const DEFAULT_BIG_CHECK_USER_PROMPT = [
+        '# 本次案卷',
+        '',
+        '【近段大纲】',
+        '{{outline}}',
+        '',
+        '【大纲现在停在】',
+        '{{current}}',
+        '{{elapsed}}',
+        '',
+        '【分岔口】',
+        '{{roads}}',
+        '',
+        '【最近正文】',
+        '{{history}}',
+        '',
+        '## 作答表',
+        '先写依据，再下结论。只填下面的标签。',
+        '<basis>',
+        '- 已发生：正文里对得上的事，以及对上的是哪一段',
+        '</basis>',
+        '<drift>',
+        '- 偏差：正常、推早了、跑过头，三选一',
+        '</drift>',
+        '<stage>',
+        '- 序号：正文现在对应的那一段',
+        '</stage>',
+        '<road>',
+        '- 路：0',
+        '</road>',
+    ].join('\n');
+
+    function bigCheckPromptPair(settings) {
+        const source = settings && typeof settings === 'object' ? settings : {};
+        const system = typeof source.bigCheckSystemPrompt === 'string' && source.bigCheckSystemPrompt.trim()
+            ? source.bigCheckSystemPrompt
+            : DEFAULT_BIG_CHECK_SYSTEM_PROMPT;
+        const user = typeof source.bigCheckUserPrompt === 'string' && source.bigCheckUserPrompt.trim()
+            ? source.bigCheckUserPrompt
+            : DEFAULT_BIG_CHECK_USER_PROMPT;
+        return { system, user };
+    }
+
+    // 用函数替换，正文里带 $ 也不会被当成替换模式。
+    function fillBigCheckPrompt(template, parts) {
+        return String(template || '')
+            .replace(/\{\{\s*outline\s*\}\}/g, () => parts.outline)
+            .replace(/\{\{\s*current\s*\}\}/g, () => parts.current)
+            .replace(/\{\{\s*roads\s*\}\}/g, () => parts.roads)
+            .replace(/\{\{\s*history\s*\}\}/g, () => parts.history)
+            .replace(/\{\{\s*elapsed\s*\}\}/g, () => parts.elapsed || '');
+    }
+
+    // 0 = 关闭。
+    function bigCheckInterval(settings) {
+        const n = Math.floor(Number(settings && settings.bigCheckInterval));
+        return Number.isFinite(n) && n >= 1 ? n : 0;
+    }
+
+    // 近段大纲的范围：当前段前 2 段、后 2 段；贴近开头或末尾时往另一侧补足。end 不含。
+    function bigCheckWindow(visible, currentOrder) {
+        const total = visible.length;
+        const size = Math.min(total, BIG_CHECK_OUTLINE_BEFORE + BIG_CHECK_OUTLINE_AFTER + 1);
+        const here = Math.max(0, Math.min(currentOrder, total - 1));
+        const start = Math.max(0, Math.min(here - BIG_CHECK_OUTLINE_BEFORE, total - size));
+        return { start, end: start + size };
+    }
+
+    function bigCheckOutlineText(visible, range, currentOrder, choices) {
+        return visible.slice(range.start, range.end).map((stage, offset) => {
+            const order = range.start + offset;
+            const body = String(stage.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+            const branchTag = stage.branch && !choices[stage.branch] ? `（分支·${stage.branch}）` : '';
+            const here = order === currentOrder ? '（大纲现在停在这里）' : '';
+            const condition = stage.completion ? `\n   完成条件：${stage.completion}` : '';
+            return `${order + 1}. ${stage.name}${branchTag}${here}${body ? `：${body}` : ''}${condition}`;
+        }).join('\n');
+    }
+
+    // <drift> 只认一个结论；把「正常、推早了、跑过头」原样抄回来算没作答。
+    function bigCheckDrift(text) {
+        const tag = lastTagInner(text, 'drift');
+        if (tag == null) return null;
+        const body = judgeFieldBody(tag);
+        const hits = [];
+        if (/正常|\bok\b/i.test(body)) hits.push('ok');
+        if (/推早|早了|\bearly\b/i.test(body)) hits.push('early');
+        if (/跑过|超过|\bahead\b/i.test(body)) hits.push('ahead');
+        return hits.length === 1 ? hits[0] : null;
     }
 
     // 一键生成「什么时候进入下一段」。写的是离开当前阶段、进入下一阶段的那一个结果。
@@ -4149,8 +4698,9 @@
         return null;
     }
 
-    function fillJudgePlaceholders(template, stage, condition, history, next, roads) {
+    function fillJudgePlaceholders(template, stage, condition, history, next, roads, extra) {
         const following = next || {};
+        const more = extra || {};
         return String(template || '')
             .replace(/\{\{\s*stage\s*\}\}/g, stage.name)
             .replace(/\{\{\s*prompt\s*\}\}/g, stage.prompt)
@@ -4158,7 +4708,9 @@
             .replace(/\{\{\s*history\s*\}\}/g, history)
             .replace(/\{\{\s*next\s*\}\}/g, following.name || '（没有下一阶段）')
             .replace(/\{\{\s*nextPrompt\s*\}\}/g, following.prompt || '（没有）')
-            .replace(/\{\{\s*roads\s*\}\}/g, roads || '这一段没有分岔。路写 0。');
+            .replace(/\{\{\s*roads\s*\}\}/g, roads || '这一段没有分岔。路写 0。')
+            .replace(/\{\{\s*previous\s*\}\}/g, more.previous || '（这是第一段）')
+            .replace(/\{\{\s*elapsed\s*\}\}/g, more.elapsed || '（没有记录进入这段的楼层，按正文判断）');
     }
 
     // 兼容旧版：settings.judgePrompt 单模板字符串仍然生效（相当于 system 段 + 单个 user 段）；
@@ -4169,14 +4721,14 @@
             return [{ role: 'system', content: DEFAULT_JUDGE_SYSTEM_PROMPT }, { role: 'user', content: settings.judgePrompt }];
         }
         return Array.isArray(settings && settings.judgeSegments) && settings.judgeSegments.length
-            ? settings.judgeSegments : DEFAULT_JUDGE_SEGMENTS;
+            ? migrateJudgeSegments(settings.judgeSegments) : DEFAULT_JUDGE_SEGMENTS;
     }
 
     // 组装判断AI消息：逐段替换占位符；空内容段丢弃。
-    function judgeMessagesFor(settings, stage, condition, history, next, roads) {
+    function judgeMessagesFor(settings, stage, condition, history, next, roads, extra) {
         const messages = judgeMessageSpecs(settings)
             .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role) && typeof seg.content === 'string' && seg.content.trim())
-            .map(seg => ({ role: seg.role, content: fillJudgePlaceholders(seg.content, stage, condition, history, next, roads) }));
+            .map(seg => ({ role: seg.role, content: fillJudgePlaceholders(seg.content, stage, condition, history, next, roads, extra) }));
         if (!messages.length) {
             messages.push({ role: 'user', content: fillJudgePlaceholders('当前阶段「{{stage}}」演完了吗？下一阶段是「{{next}}」。还停在当前这段就回答 NO，已经换成下一段才回答 YES。', stage, condition, history, next) });
         }
@@ -4207,20 +4759,32 @@
             .split('\n')
             .map(line => line
                 .replace(/^\s*[-–—•]+\s*/, '')
-                .replace(/^(已发生|依据|结论|序号|走向|路|basis|verdict|stage)\s*[:：]\s*/i, '')
+                .replace(/^(已发生|依据|结论|序号|走向|路|偏差|basis|verdict|stage|drift)\s*[:：]\s*/i, '')
                 .trim())
             .filter(Boolean)
             .join(' ')
             .trim();
     }
 
-    // 判定结论：优先读英文 <verdict>，再认旧的 <结论>。都没有时回退「开头就是 YES」。
+    // 同一标签写了几次只认最后一次（v3.2，仿数据库「标签外可写思路，只读标签」）：
+    // 思维链或草稿里先写过的标签会被后面的正式作答盖掉。
+    function lastTagInner(text, tag) {
+        const source = String(text || '');
+        const pattern = new RegExp('<' + tag + '>\\s*([\\s\\S]*?)</' + tag + '>', 'gi');
+        let found = null;
+        let match = pattern.exec(source);
+        while (match) {
+            found = match[1];
+            match = pattern.exec(source);
+        }
+        return found;
+    }
+
+    // 判定结论：优先读英文 <verdict>，再认旧的 <结论>，都取最后一处。都没有时回退「开头就是 YES」。
     function judgeVerdictInner(text) {
-        const raw = String(text || '');
-        const english = raw.match(/<verdict>\s*([\s\S]*?)<\/verdict>/i);
-        if (english) return english[1];
-        const chinese = raw.match(/<结论>\s*([\s\S]*?)<\/结论>/i);
-        return chinese ? chinese[1] : null;
+        const english = lastTagInner(text, 'verdict');
+        if (english != null) return english;
+        return lastTagInner(text, '结论');
     }
 
     function judgeSaysYes(text) {
@@ -4235,10 +4799,9 @@
 
     function judgeBasisText(text) {
         const raw = String(text || '');
-        const english = raw.match(/<basis>\s*([\s\S]*?)<\/basis>/i);
-        const chinese = raw.match(/<依据>\s*([\s\S]*?)<\/依据>/i);
-        const tag = english || chinese;
-        const basis = tag ? judgeFieldBody(tag[1]) : raw.replace(/\s+/g, ' ').trim();
+        const english = lastTagInner(raw, 'basis');
+        const tag = english != null ? english : lastTagInner(raw, '依据');
+        const basis = tag != null ? judgeFieldBody(tag) : raw.replace(/\s+/g, ' ').trim();
         return basis.slice(0, 500);
     }
 
@@ -4250,9 +4813,9 @@
     // AI 选段：<stage> 里是从 1 开始的序号，或阶段名。空表、对不上的序号都不换段。
     function judgePickedIndex(text, stages) {
         const list = Array.isArray(stages) ? stages : [];
-        const tag = String(text || '').match(/<stage>\s*([\s\S]*?)<\/stage>/i);
-        if (!tag) return null;
-        const inner = judgeFieldBody(tag[1]);
+        const tag = lastTagInner(text, 'stage');
+        if (tag == null) return null;
+        const inner = judgeFieldBody(tag);
         if (!inner || inner === '第几段') return null;
         if (/^\d+$/.test(inner)) {
             const index = Number(inner) - 1;
@@ -4323,6 +4886,9 @@
             .map(item => {
                 let text = String(item.message || '').replace(COMPLETE_MARKER_RE, '').trim();
                 if (text && settings) text = applyBoundaryRules(text, settings).trim();
+                // 每条最多 3000 字，只留尾部：最新发生的事在后面，整条照发容易撞上下文上限。
+                const cap = 3000;
+                if (text.length > cap) text = `（前面省略 ${text.length - cap} 字）${text.slice(-cap)}`;
                 return text ? `角色：${text}` : '';
             })
             .filter(Boolean)
@@ -4385,11 +4951,12 @@
         return text;
     }
 
-    async function askJudgeViaCustomApi(messages, preset, streaming) {
+    async function askJudgeViaCustomApi(messages, preset, streaming, signal) {
         const response = await hostFetch('/api/backends/chat-completions/generate', {
             method: 'POST',
             headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
             body: JSON.stringify(buildJudgeCustomRequestBody(messages, preset, streaming)),
+            ...(signal ? { signal } : {}),
         });
         if (!response.ok) {
             const detail = await response.text();
@@ -4426,7 +4993,7 @@
             if (!preset.apiurl || !preset.model) {
                 throw new Error(`API 预设「${preset.name}」缺少端点(基础URL)或模型名。`);
             }
-            return askJudgeViaCustomApi(messages, preset, streaming);
+            return askJudgeViaCustomApi(messages, preset, streaming, settings && settings.abortSignal);
         }
         // 酒馆主 API（或无预设）：走酒馆助手 generateRaw。
         // 段列表映射为 ordered_prompts 条目，最后一条 user 消息作为 user_input（最终注入）。
@@ -4448,7 +5015,8 @@
         if (settings && settings.judgeMaxTokens) {
             request.max_tokens = settings.judgeMaxTokens;
             request.max_length = settings.judgeMaxTokens;
-            request.temperature = 0.2;
+            // 酒馆主 API 通道：预设里填了温度就用预设的，和另外两条通道一致；没选预设时压到 0.2。
+            request.temperature = preset && Number.isFinite(Number(preset.temperature)) ? Number(preset.temperature) : 0.2;
         }
         const result = await generateRaw(request);
         return typeof result === 'string'
@@ -4489,9 +5057,9 @@
     }
 
     function judgePickedFork(text, forks) {
-        const tag = String(text || '').match(/<road>\s*([\s\S]*?)<\/road>/i);
-        if (!tag) return null;
-        const inner = judgeFieldBody(tag[1]);
+        const tag = lastTagInner(text, 'road');
+        if (tag == null) return null;
+        const inner = judgeFieldBody(tag);
         if (!inner || /^0+$/.test(inner)) return null;
         if (/^\d+$/.test(inner)) {
             const index = Number(inner) - 1;
@@ -4566,8 +5134,25 @@
         return preset ? { ...preset, maxTokens: Math.min(Math.floor(Number(preset.maxTokens)) || cap, cap) } : null;
     }
 
+    // 已在这段停了几层：进入这段的楼层没记下时，退到上次推进的楼层。
+    function stageElapsedText(context, messageId) {
+        const state = (context && context.state) || {};
+        const entered = Number.isFinite(state.stageEnteredId) ? state.stageEnteredId
+            : (Number.isFinite(state.lastCompletionMessageId) ? state.lastCompletionMessageId : null);
+        if (entered == null || messageId == null || !Number.isFinite(Number(messageId))) return '（没有记录进入这段的楼层，按正文判断）';
+        const floors = Math.max(0, Number(messageId) - entered);
+        return `已在这段停了约 ${floors} 层（第 ${entered} 层进入，现在第 ${messageId} 层）`;
+    }
+
+    function judgeFillFor(context, messageId) {
+        const stages = (context && context.parsed && context.parsed.stages) || [];
+        const index = Number(context && context.state && context.state.stageIndex) || 0;
+        const previous = index > 0 && stages[index - 1] ? stages[index - 1].name : '';
+        return { previous, elapsed: stageElapsedText(context, messageId) };
+    }
+
     // 一条绑定这一层交给判断AI的材料。extra 是「现在检查」时填的本次附加要求。
-    function judgeCaseFor(context, contexts, extra) {
+    function judgeCaseFor(context, contexts, extra, messageId) {
         const stage = context.stage;
         let condition = stage.completion ? stage.completion : JUDGE_EMPTY_CONDITION;
         const hint = String(extra || '').trim();
@@ -4584,6 +5169,7 @@
             roads: roadListText(context, forks),
             branches: pending && pending.length > 1 ? pending : null,
             startStageIndex: context.state.stageIndex,
+            fill: judgeFillFor(context, messageId),
         };
     }
 
@@ -4599,7 +5185,7 @@
 
     // 只有一条到点：照原来的段发。下一格是分支组时，把走向表接在最后一段后面。
     function singleJudgeMessages(settings, item, history) {
-        const messages = judgeMessagesFor(settings, item.stage, item.condition, history, item.next, item.roads);
+        const messages = judgeMessagesFor(settings, item.stage, item.condition, history, item.next, item.roads, item.fill);
         return item.branches ? appendToLastUser(messages, branchTableText(item.branches)) : messages;
     }
 
@@ -4618,7 +5204,7 @@
         const blocks = cases.map((item, index) => {
             const parts = [
                 `【剧情线】${entryName(item.context.entry)}`,
-                fillJudgePlaceholders(template, item.stage, item.condition, '（见上面的【最近正文】）', item.next, item.roads),
+                fillJudgePlaceholders(template, item.stage, item.condition, '（见上面的【最近正文】）', item.next, item.roads, item.fill),
             ];
             if (item.branches) parts.push(branchTableText(item.branches));
             return `<case n="${index + 1}">\n${parts.join('\n\n')}\n</case>`;
@@ -4626,7 +5212,7 @@
         const caseMessage = {
             role: 'user',
             content: [
-                `这一层要判断 ${cases.length} 条剧情线。各条互不相干，只按自己那条的阶段、条件和表判断。每条的表按序号放进 <answer n="序号"></answer>，${cases.length} 条都要写，标签外不要写字。`,
+                `这一层要判断 ${cases.length} 条剧情线。各条互不相干，只按自己那条的阶段、条件和表判断。每条的表按序号放进 <answer n="序号"></answer>，${cases.length} 条都要写。标签外可以写几句简短分析，同一序号只认最后一次。`,
                 '',
                 '【最近正文】',
                 history,
@@ -4636,7 +5222,7 @@
         };
         const messages = specs.map((seg, index) => (index === caseAt
             ? caseMessage
-            : { role: seg.role, content: fillJudgePlaceholders(seg.content, first.stage, first.condition, history, first.next, first.roads) }));
+            : { role: seg.role, content: fillJudgePlaceholders(seg.content, first.stage, first.condition, history, first.next, first.roads, first.fill) }));
         if (caseAt < 0) messages.push(caseMessage);
         return messages;
     }
@@ -4657,12 +5243,12 @@
     // 推进完统一同步一次镜像。force =「现在检查」：出错直接抛给界面。
     async function judgeBindings(list, messageId, all, options) {
         const flags = options || {};
-        const settings = all.config && all.config.settings ? all.config.settings : {};
+        const settings = settingsForContext(all.config && all.config.settings ? all.config.settings : {}, list[0]);
         const channel = usableChannel(settings, flags.force);
         if (!channel) return;
         const labels = list.map(context => `「${entryName(context.entry)}」`).join('、');
         try {
-            const cases = list.map(context => judgeCaseFor(context, all.contexts, flags.extra));
+            const cases = list.map(context => judgeCaseFor(context, all.contexts, flags.extra, messageId));
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
             // 到了分岔口只给当前这一层正文，不带上一层；合并请求里只要有一条在分岔口，就都只看这一层。
             const historyCount = cases.some(item => item.forks.length) ? 1 : judgeHistoryCount(settings);
@@ -4717,6 +5303,11 @@
             }
             if (moved) await syncMirrors('normal');
         } catch (error) {
+            if (isAbortError(error)) {
+                LogModule.info('判断AI', `${labels} 的请求已中止，这一层不推进`);
+                if (flags.force) throw error;
+                return;
+            }
             const reason = error && error.message ? error.message : String(error);
             LogModule.error('判断AI', `${labels} 调用失败：${reason}`);
             if (flags.force) throw error;
@@ -4772,7 +5363,7 @@
     // AI 选段：按正文现在像哪一段直接改到那一段（可以往回跳）。每条各问一次，排在判断后面，不并发。
     async function pickStageFor(context, messageId, all, options) {
         const flags = options || {};
-        const settings = all.config && all.config.settings ? all.config.settings : {};
+        const settings = settingsForContext(all.config && all.config.settings ? all.config.settings : {}, context);
         const channel = usableChannel(settings, flags.force);
         if (!channel) return;
         const stages = context.parsed && context.parsed.stages || [];
@@ -4786,7 +5377,9 @@
             const catalog = visible.map((stage, index) => {
                 const body = String(stage.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80);
                 const branchTag = stage.branch && !choices[stage.branch] ? `（分支·${stage.branch}）` : '';
-                return `${index + 1}. ${stage.name}${branchTag}${body ? `：${body}` : ''}`;
+                // v3.2：目录也带完成条件，和大检查的大纲窗口一致。
+                const condition = stage.completion ? `（完成条件：${String(stage.completion).replace(/\s+/g, ' ').trim().slice(0, 60)}）` : '';
+                return `${index + 1}. ${stage.name}${branchTag}${body ? `：${body}` : ''}${condition}`;
             }).join('\n');
             const currentStage = stages[startStageIndex];
             const currentOrder = visible.indexOf(currentStage);
@@ -4833,11 +5426,139 @@
             // 选中未决分支即锁定：同组其他分支这次聊天不再走。
             await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]) });
         } catch (error) {
+            if (isAbortError(error)) {
+                LogModule.info('判断AI', `「${bindingLabel}」选段请求已中止`);
+                if (flags.force) throw error;
+                return;
+            }
             const reason = error && error.message ? error.message : String(error);
             LogModule.error('判断AI', `「${bindingLabel}」选段失败：${reason}`);
             if (flags.force) throw error;
             reportOnce('judge-failed', `AI 选段失败：${reason}。自动检查会先暂停一会儿，免得反复请求；请检查当前 API 连接。`);
         }
+    }
+
+    // 大检查到点：判断AI档、醒着、没断、有下一段可比。同一层重新生成不再问；楼层倒退重新算。
+    // 首次检查立即执行。这一层已经被普通判断推进过的，留到下一层再查。
+    function bigCheckDueFor(context, messageId, settings, contexts) {
+        const interval = bigCheckInterval(settings);
+        if (!interval) return false;
+        if (!context || context.broken || !context.stage || context.stage.terminal) return false;
+        if (!context.parsed || context.parsed.stages.length < 2) return false;
+        if (context.state && (context.state.lineCut === true || context.state.sideOut)) return false;
+        if (attachmentAsleep(context, contexts)) return false;
+        if (bindingOrderMode(context.binding) === 'pick') return false;
+        if (context.autoAdvance !== 'judge') return false;
+        if (context.state.lastCompletionMessageId === messageId) return false;
+        const last = context.state.lastBigCheckId;
+        if (last == null) return true;
+        const since = Number(messageId) - Number(last);
+        return since < 0 || since >= interval;
+    }
+
+    // 一条绑定做一次大检查。改段前重新读进度，期间进度或楼层变了就放弃（与判断AI同一套守卫）。
+    async function bigCheckFor(context, messageId, all) {
+        const settings = settingsForContext(all.config && all.config.settings ? all.config.settings : {}, context);
+        const channel = usableChannel(settings, false);
+        if (!channel) return false;
+        const label = entryName(context.entry);
+        const stages = context.parsed.stages;
+        const startStageIndex = context.state.stageIndex;
+        try {
+            const choices = branchChoicesOf(context.state);
+            const visible = stages.filter(item => !stageBranchSkipped(item, choices));
+            const currentStage = stages[startStageIndex];
+            const currentOrder = visible.indexOf(currentStage);
+            if (currentOrder < 0) return false;
+            const range = bigCheckWindow(visible, currentOrder);
+            const forks = forksAtStage(context, all.contexts);
+            const history = (await recentHistoryText(messageId, BIG_CHECK_HISTORY_COUNT, settings)) || '（没有取到聊天记录）';
+            const pair = bigCheckPromptPair(settings);
+            const parts = {
+                outline: bigCheckOutlineText(visible, range, currentOrder, choices),
+                current: `${currentOrder + 1}. ${currentStage.name}`,
+                elapsed: stageElapsedText(context, messageId),
+                roads: roadListText(context, forks),
+                history,
+            };
+            const messages = [
+                { role: 'system', content: fillBigCheckPrompt(pair.system, parts) },
+                { role: 'user', content: fillBigCheckPrompt(pair.user, parts) },
+            ];
+            LogModule.info('大检查', `「${label}」第 ${messageId} 层：核对第 ${range.start + 1}–${range.end} 段大纲与最近 ${BIG_CHECK_HISTORY_COUNT} 段正文（现在第 ${currentOrder + 1} 段）`);
+            const text = await askModel(messages, cappedPreset(channel.preset, JUDGE_REPLY_CAP), { ...settings, judgeMaxTokens: JUDGE_REPLY_CAP });
+            const filtered = applyBoundaryRules(text, settings);
+            const drift = bigCheckDrift(filtered);
+            const pickedFork = forks.length ? judgePickedFork(filtered, forks) : null;
+            const picked = judgePickedIndex(filtered, visible);
+            const inWindow = picked != null && picked >= range.start && picked < range.end;
+            // 方向和序号必须一致：推早了只能往回改，跑过头只能往后改。
+            const agrees = inWindow && ((drift === 'early' && picked < currentOrder) || (drift === 'ahead' && picked > currentOrder));
+            const targetStage = agrees ? visible[picked] : null;
+            const verdict = pickedFork
+                ? `走进分岔「${entryName(pickedFork.entry)}」`
+                : (drift ? BIG_CHECK_DRIFT_LABELS[drift] : '没按表作答，不改段');
+            const basis = judgeBasisText(filtered);
+            await patchStateFor(context.key, {
+                lastBigCheckId: messageId,
+                lastBigCheckBasis: `${verdict}${basis ? `：${basis}` : ''}`.slice(0, 500),
+            });
+            judgeRuntime.lastRaw = String(text || '');
+            judgeRuntime.lastFiltered = filtered;
+            judgeRuntime.lastAt = Date.now();
+            judgeRuntime.lastYes = Boolean(pickedFork || targetStage);
+            if (!pickedFork && !targetStage) {
+                if (drift && drift !== 'ok') LogModule.info('大检查', `「${label}」判为${BIG_CHECK_DRIFT_LABELS[drift]}，但序号对不上方向或不在这几段里，不改段`);
+                else LogModule.info('大检查', `「${label}」${verdict}`);
+                return false;
+            }
+            const fresh = await loadContexts();
+            const latest = fresh.contexts.find(item => item.key === context.key);
+            const nowMessageId = currentMessageId();
+            if (!latest || latest.broken || !latest.state || latest.state.stageIndex !== startStageIndex
+                || (nowMessageId != null && nowMessageId !== messageId)
+                || latest.state.lastCompletionMessageId === messageId) {
+                LogModule.warn('大检查', `「${label}」要改段，但检查期间进度已变化，放弃本次过期改动`);
+                return false;
+            }
+            if (pickedFork) {
+                const fork = fresh.contexts.find(item => item.key === pickedFork.key && !item.broken) || pickedFork;
+                LogModule.info('大检查', `「${label}」正文已走进分岔「${entryName(fork.entry)}」，暂时关闭被依附的这条`);
+                await patchStatesFor({
+                    [latest.key]: { lineCut: true, sideOut: '', forkInto: fork.key, lastCompletionMessageId: messageId },
+                    [fork.key]: { ...stagePatch(fork.parsed, 0), lineCut: false, returnKey: '', returnIndex: null, sideOut: '' },
+                });
+                return true;
+            }
+            const realIndex = latest.parsed.stages.findIndex(item => item.id === targetStage.id);
+            if (realIndex < 0) return false;
+            LogModule.info('大检查', `「${label}」${BIG_CHECK_DRIFT_LABELS[drift]}，改到第 ${realIndex + 1} 段「${targetStage.name}」`);
+            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]), sync: false });
+            return true;
+        } catch (error) {
+            if (isAbortError(error)) {
+                LogModule.info('大检查', `「${label}」请求已中止`);
+                return false;
+            }
+            const reason = error && error.message ? error.message : String(error);
+            LogModule.error('大检查', `「${label}」检查失败：${reason}`);
+            reportOnce('big-check-failed', `大检查失败：${reason}。自动检查会先暂停一会儿，免得反复请求；请检查当前 API 连接。`);
+            return false;
+        }
+    }
+
+    // 普通判断和选段做完后重新读进度，再挑这一层到点的大检查，一条一条排队问。
+    async function runBigChecks(messageId) {
+        const all = await loadContexts();
+        if (!all.configured) return;
+        const settings = all.config.settings || {};
+        const due = all.contexts.filter(context => bigCheckDueFor(context, messageId, settings, all.contexts));
+        let moved = false;
+        for (const context of due) {
+            if (modelPauseLeft() > 0) break;
+            if (await bigCheckFor(context, messageId, all)) moved = true;
+        }
+        if (moved) await syncMirrors('normal');
     }
 
     // 一层回复只排一次检查（v2.99.4）：这一层到点的判断档绑定合成一次请求，AI 选段的各问一次，全部排队不并发。
@@ -4885,17 +5606,31 @@
         const settings = all.config.settings || {};
         const judges = all.contexts.filter(context => judgeDueFor(context, messageId, settings, all.contexts, false));
         const picks = all.contexts.filter(context => pickDueFor(context, messageId, settings, all.contexts, false));
-        if (!judges.length && !picks.length) return;
+        const bigs = all.contexts.filter(context => bigCheckDueFor(context, messageId, settings, all.contexts));
+        if (!judges.length && !picks.length && !bigs.length) return;
         if (modelPauseLeft() > 0) {
             LogModule.info('判断AI', `第 ${messageId} 层：上次请求出错，自动检查暂停到 ${modelPauseClock()}，这一层不问`);
             reportOnce(`model-paused:${modelGate.pausedUntil}`, `判断AI上次请求出错，自动检查先停到 ${modelPauseClock()}，免得反复请求被限流或封号。要马上试，点小卡「设置 ›」里的「现在检查」。`);
             return;
         }
-        if (judges.length) await judgeBindings(judges, messageId, all);
+        if (judges.length) {
+            // 按线 / 按聊天选了不同 API 的绑定分组，同一个 API 的仍合成一次请求。
+            const groups = new Map();
+            judges.forEach(context => {
+                const name = resolveJudgePresetName(settings, context).name;
+                if (!groups.has(name)) groups.set(name, []);
+                groups.get(name).push(context);
+            });
+            for (const group of groups.values()) {
+                if (modelPauseLeft() > 0) break;
+                await judgeBindings(group, messageId, all);
+            }
+        }
         for (const context of picks) {
             if (modelPauseLeft() > 0) break;
             await pickStageFor(context, messageId, all);
         }
+        if (bigs.length && modelPauseLeft() <= 0) await runBigChecks(messageId);
     }
 
     // 「现在检查」：只查这一条，不看档位、间隔和出错暂停（用户自己点的），排在自动检查后面，不并发。
@@ -4907,6 +5642,7 @@
             const messageId = currentMessageId();
             if (messageId == null) throw new Error('当前没有可检查的回复。');
             const settings = all.config.settings || {};
+            if (guideDisabled(all.config)) throw new Error('动态指导总开关已关闭，先到仪表盘「开关」→「高级设置」打开。');
             if (bindingOrderMode(context.binding) === 'pick') {
                 if (!pickDueFor(context, messageId, settings, all.contexts, true)) throw new Error('这条绑定现在不能检查。');
                 await pickStageFor(context, messageId, all, { force: true, extra });
@@ -4945,6 +5681,8 @@
         const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge' && bindingOrderMode(binding) !== 'pick');
         const pickNeeded = (config.bindings || []).some(binding => bindingOrderMode(binding) === 'pick');
         // 手动不另开请求。判断 AI 才另开请求：这一层到点的绑定合成一次，排队发，不并发。
+        // 总开关关着：只擦掉回复里的旧标记，不另开任何判断请求。
+        if (guideDisabled(config)) return;
         if (judgeNeeded || pickNeeded) await runFloorCheck(messageId);
     }
 
@@ -5724,11 +6462,7 @@
                 if (!hostWindow.confirm(`删除 API 预设「${current.name}」？`)) return;
                 runAction('删除 API 预设', async () => {
                     writeJudgeApiPresets(readJudgeApiPresets().filter(item => item.name !== current.name));
-                    const fresh = await readConfig();
-                    if (fresh.settings && fresh.settings.judgePreset === current.name) {
-                        fresh.settings = { ...fresh.settings, judgePreset: '' };
-                        await writeConfig(fresh);
-                    }
+                    await updatePresetReferences(current.name, '');
                     syncApiDraft();
                 }, { success: `API 预设「${current.name}」已删除` });
             },
@@ -5836,6 +6570,9 @@
             const remaining = readJudgeApiPresets()
                 .filter(item => item.name !== ui.apiDraftOriginalName && item.name !== preset.name);
             writeJudgeApiPresets(remaining.concat([preset]));
+            if (ui.apiDraftOriginalName && ui.apiDraftOriginalName !== preset.name) {
+                await updatePresetReferences(ui.apiDraftOriginalName, preset.name);
+            }
             // 保存后自动设为当前（对齐 shujuku：保存即绑定到当前聊天）
             const fresh = await readConfig();
             fresh.settings = { ...(fresh.settings || {}), judgePreset: preset.name };
@@ -6086,44 +6823,93 @@
     // ---------------------------------------------------------------
     // 三、界面：运行日志页（目录页，左上角可以打开导航）
     //
-    // 展示 LogModule 的内存日志：等级筛选 + 调试日志采集开关 + 复制/清空。
-    // 页面打开期间订阅日志模块，新日志实时刷新；日志只存内存（上限 500 条），
-    // 不写变量、不上传。
+    // 仿数据库 useLogViewer / log-viewer：等级 + 模块筛选、关键词搜索、暂停 / 恢复（暂停期间
+    // 新日志只计数，恢复时一次显示）、调试日志采集开关、复制 / 导出（文本或 JSON）/ 清空。
+    // 错误日志下面附「可能原因 + 怎么处理」（resolveLogErrorHint）。最新在最上面；
+    // 日志只存内存（上限 2000 条），不写变量、不上传。
     // ---------------------------------------------------------------
 
     const LOG_LEVEL_LABELS = { debug: '调试', info: '信息', warn: '警告', error: '错误' };
     let logPageSubscribed = false;
 
+    function logTimeText(timestamp) {
+        const date = new Date(timestamp);
+        const pad = value => String(value).padStart(2, '0');
+        return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(date.getMilliseconds()).padStart(3, '0')}`;
+    }
+
+    function logFileStamp() {
+        const stamp = new Date();
+        const pad = value => String(value).padStart(2, '0');
+        return `${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}`;
+    }
+
+    function downloadLogFile(filename, text, type) {
+        const win = hostWindow;
+        const blob = new win.Blob([text], { type });
+        const url = win.URL.createObjectURL(blob);
+        const link = el('a', { href: url, download: filename });
+        hostDocument().body.appendChild(link);
+        link.click();
+        link.remove();
+        win.setTimeout(() => win.URL.revokeObjectURL(url), 1000);
+    }
+
     function renderLogPage() {
         if (!logPageSubscribed) {
             logPageSubscribed = true;
             LogModule.subscribe(() => {
-                if (ui.view === 'logs' && !ui.busy) render();
+                if (ui.view !== 'logs' || ui.busy) return;
+                // 暂停时不重绘，免得正在看的那条被挤走；只记下攒了几条。
+                if (ui.logPaused) { ui.logPending = (ui.logPending || 0) + 1; return; }
+                render();
             });
         }
-        const all = LogModule.list();
+        const paused = Boolean(ui.logPaused);
+        const all = paused && ui.logSnapshot ? ui.logSnapshot : LogModule.list();
+        const tags = LogModule.tags();
+        // 选中的模块被清空后不在列表里了，回到全部（数据库同款）。
+        if (ui.logTagFilter && ui.logTagFilter !== 'all' && !tags.includes(ui.logTagFilter)) ui.logTagFilter = 'all';
         const filter = ui.logLevelFilter || 'all';
         const tagFilter = ui.logTagFilter || 'all';
+        const keyword = String(ui.logKeyword || '');
+        const needle = keyword.trim().toLowerCase();
         const filtered = all.filter(entry => (filter === 'all' || entry.level === filter)
-            && (tagFilter === 'all' || entry.tag === tagFilter));
+            && (tagFilter === 'all' || entry.tag === tagFilter)
+            && (!needle || String(entry.message || '').toLowerCase().includes(needle)));
         // 等级统计行（v2.14）
         const counts = { debug: 0, info: 0, warn: 0, error: 0 };
         all.forEach(entry => { counts[entry.level] = (counts[entry.level] || 0) + 1; });
-        const statsText = `共 ${all.length} 条 · 信息 ${counts.info} · 警告 ${counts.warn} · 错误 ${counts.error}${counts.debug ? ` · 调试 ${counts.debug}` : ''}`;
-        const formatTime = timestamp => {
-            const date = new Date(timestamp);
-            const pad = value => String(value).padStart(2, '0');
-            return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        const pending = paused ? (ui.logPending || 0) : 0;
+        const statsText = `共 ${all.length} 条${filtered.length !== all.length ? ` · 显示 ${filtered.length}` : ''} · 信息 ${counts.info} · 警告 ${counts.warn} · 错误 ${counts.error}${counts.debug ? ` · 调试 ${counts.debug}` : ''}`;
+        const liveText = paused ? (pending ? `已暂停，${pending} 条待显示` : '已暂停') : '实时更新中';
+        const formatLine = entry => `${logTimeText(entry.time)} [${LOG_LEVEL_LABELS[entry.level] || entry.level}] [${entry.tag}] ${entry.message}`;
+        const rows = filtered.slice().reverse().map(entry => {
+            const hint = resolveLogErrorHint(entry);
+            return el('div', { class: `dga-log-entry dga-log-${entry.level}` },
+                el('div', { class: 'dga-log-row' },
+                    el('span', { class: 'dga-log-time', text: logTimeText(entry.time) }),
+                    el('span', { class: `dga-log-level dga-log-level-${entry.level}`, text: LOG_LEVEL_LABELS[entry.level] || entry.level }),
+                    el('span', { class: 'dga-log-tag', text: `[${entry.tag}]` }),
+                    el('span', { class: 'dga-log-text', text: entry.message })),
+                hint ? el('div', { class: 'dga-log-hint', 'data-hint': hint.id },
+                    el('p', { class: 'dga-log-hint-summary', text: `可能原因：${hint.summary}` }),
+                    el('ol', { class: 'dga-log-hint-steps' }, ...hint.steps.map(step => el('li', { text: step })))) : null);
+        });
+        const resetPause = () => { ui.logPaused = false; ui.logSnapshot = null; ui.logPending = 0; };
+        const togglePause = () => {
+            if (paused) resetPause();
+            else { ui.logPaused = true; ui.logSnapshot = LogModule.list(); ui.logPending = 0; }
+            render();
         };
-        const formatLine = entry => `${formatTime(entry.time)} [${LOG_LEVEL_LABELS[entry.level] || entry.level}] [${entry.tag}] ${entry.message}`;
-        const rows = filtered.slice().reverse().map(entry => el('div', { class: `dga-log-row dga-log-${entry.level}` },
-            el('span', { class: 'dga-log-time', text: formatTime(entry.time) }),
-            el('span', { class: `dga-log-level dga-log-level-${entry.level}`, text: LOG_LEVEL_LABELS[entry.level] || entry.level }),
-            el('span', { class: 'dga-log-tag', text: `[${entry.tag}]` }),
-            el('span', { class: 'dga-log-text', text: entry.message })));
-        const back = () => { ui.view = 'manager'; render(); };
+        const search = el('input', {
+            class: 'dga-input dga-log-search', type: 'text', placeholder: '搜索日志…',
+            onchange: event => { ui.logKeyword = event.target.value; render(); },
+        });
+        search.value = keyword;
+        const back = () => { resetPause(); ui.view = 'manager'; render(); };
         return [
-            header('运行日志', `${statsText} · 上限 500 · 只存内存`, back, '返回', null, { subpage: true, nav: true }),
+            header('运行日志', `${statsText} · 上限 2000 · 只存内存`, back, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
                 el('div', { class: 'dga-log-toolbar' },
@@ -6135,40 +6921,51 @@
                         { value: 'debug', label: '调试' },
                     ], filter, value => { ui.logLevelFilter = value; render(); }),
                     selectControl(
-                        [{ value: 'all', label: '全部标签' }].concat(LogModule.tags().map(tag => ({ value: tag, label: tag }))),
+                        [{ value: 'all', label: '全部模块' }].concat(tags.map(tag => ({ value: tag, label: tag }))),
                         tagFilter,
                         value => { ui.logTagFilter = value; render(); },
                     ),
+                    search,
+                ),
+                el('div', { class: 'dga-log-toolbar' },
+                    btn(paused ? `恢复${pending ? `（${pending} 条待显示）` : ''}` : '暂停', togglePause, { ghost: true }),
                     el('label', { class: 'dga-log-debug-toggle' },
                         el('input', {
                             type: 'checkbox', checked: LogModule.isDebugEnabled(),
-                            onchange: event => { LogModule.setDebugEnabled(event.target.checked); render(); },
+                            onchange: event => {
+                                LogModule.setDebugEnabled(event.target.checked);
+                                setMessage(event.target.checked ? '已开始采集调试日志；排查完建议关掉。' : '已停止采集调试日志。', event.target.checked ? 'info' : 'success');
+                                render();
+                            },
                         }),
                         '采集调试日志'),
                     btn('复制', () => {
                         copyText(filtered.map(formatLine).join('\n'));
                     }, { ghost: true, disabled: filtered.length === 0 }),
                     btn('导出', () => {
-                        const win = hostWindow;
-                        const blob = new win.Blob([filtered.map(formatLine).join('\n')], { type: 'text/plain;charset=utf-8' });
-                        const url = win.URL.createObjectURL(blob);
-                        const stamp = new Date();
-                        const pad = value => String(value).padStart(2, '0');
-                        const link = el('a', {
-                            href: url,
-                            download: `动态指导助手-运行日志-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.txt`,
-                        });
-                        hostDocument().body.appendChild(link);
-                        link.click();
-                        link.remove();
-                        win.setTimeout(() => win.URL.revokeObjectURL(url), 1000);
+                        downloadLogFile(`动态指导助手-运行日志-${logFileStamp()}.txt`, filtered.map(formatLine).join('\n'), 'text/plain;charset=utf-8');
                         setMessage(`已导出 ${filtered.length} 条日志。`, 'success');
                     }, { ghost: true, disabled: filtered.length === 0 }),
-                    btn('清空', () => { LogModule.clear(); render(); }, { ghost: true, disabled: all.length === 0 }),
+                    btn('导出 JSON', () => {
+                        // 数据库同款结构：time（ISO）/ level / tag / message。
+                        const data = filtered.map(entry => ({ time: new Date(entry.time).toISOString(), level: entry.level, tag: entry.tag, message: entry.message }));
+                        downloadLogFile(`动态指导助手-运行日志-${logFileStamp()}.json`, JSON.stringify(data, null, 2), 'application/json');
+                        setMessage(`已导出 ${data.length} 条日志（JSON）。`, 'success');
+                    }, { ghost: true, disabled: filtered.length === 0 }),
+                    btn('清空', () => {
+                        LogModule.clear();
+                        ui.logSnapshot = paused ? [] : null;
+                        ui.logPending = 0;
+                        setMessage('日志已清空。', 'success');
+                        render();
+                    }, { ghost: true, disabled: all.length === 0 }),
+                    el('span', { class: 'dga-log-live', text: liveText }),
                 ),
                 rows.length
                     ? el('div', { class: 'dga-log-list' }, ...rows)
-                    : muted('暂无日志。判断AI检查、阶段推进、绑定变更都会记在这里；关面板不清空，刷新页面才清空。'),
+                    : muted(all.length
+                        ? '没有符合筛选的日志。'
+                        : '暂无日志。判断AI检查、阶段推进、绑定变更都会记在这里；关面板不清空，刷新页面才清空。'),
             ),
         ];
     }
@@ -6315,6 +7112,11 @@
                 checked => saveGuideSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
         ];
         const advancedChildren = [
+            toggleRow('动态指导总开关', '关掉后世界书归回原样：删掉所有「（动态指导）」镜像、重新打开原条目，判断AI和大检查都不再运行。绑定、划分和进度都保留，重新打开即可接着用。',
+                settings.guideEnabled !== false, checked => {
+                    if (!checked) abortModelRequests('关闭动态指导');
+                    saveGuideSettings({ guideEnabled: checked }, checked ? '动态指导已开启，镜像已重建' : '动态指导已关闭，世界书已归回原样');
+                }),
             // 开发者模式（v2.32）：打开后左侧导航多一页「开发者模式」，作者向设置都放那里。
             toggleRow('开发者模式', '打开后左侧导航会多出「开发者模式」页：配置存哪、以及后续的作者向设置都放在那里。',
                 devModeOn(), checked => { setDevMode(checked); render(); }),
@@ -6359,6 +7161,15 @@
             field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
                 saveGuideSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '判断AI改用酒馆主 API');
             })),
+            (() => {
+                const chatKey = currentChatKey();
+                if (!chatKey) return null;
+                const own = readPresetOverrides().chats[chatKey] || '';
+                return field('这个聊天用的 API', selectControl(presetOverrideOptions(presetList, '跟随上面的 API 预设', own), own, value => runAction('修改这个聊天的 API', async () => {
+                    setPresetOverride('chats', chatKey, value);
+                    return true;
+                }, { success: value ? '已记下这个聊天用的 API' : '这个聊天改回跟随上面的 API 预设' })), '只存本机，不随角色卡导出。每条线还能在小卡「设置 ›」里单独选。');
+            })(),
             (() => {
                 // 数据库填表同款频率制：每层 / 每 2 层 / 每 3 层 / 每 5 层 / 自定义。
                 const interval = judgeCheckInterval(settings);
@@ -6421,12 +7232,85 @@
                     selectValue === 'custom' ? countInput : null,
                 ), '只看 AI 正文，不含用户消息。');
             })(),
+            (() => {
+                // 大检查（v3.2）：每 N 层另问一次，核对近 5 段大纲、分岔口和最近 3 段正文；偏了就改到正文对应的那段。
+                const every = bigCheckInterval(settings);
+                const presets = [0, 5, 10, 20];
+                const selectValue = presets.includes(every) ? String(every) : 'custom';
+                const everyInput = el('input', {
+                    class: 'dga-input', type: 'number', min: 1, step: 1,
+                    onchange: event => {
+                        const n = Math.floor(Number(event.target.value));
+                        const safe = Number.isFinite(n) && n >= 1 ? n : 1;
+                        saveGuideSettings({ bigCheckInterval: safe }, `大检查改为每 ${safe} 层一次`);
+                    },
+                });
+                everyInput.value = String(every || 8);
+                return field('大检查', el('div', { class: 'dga-two-col' },
+                    selectControl([
+                        { value: '0', label: '关闭' },
+                        { value: '5', label: '每 5 层' },
+                        { value: '10', label: '每 10 层' },
+                        { value: '20', label: '每 20 层' },
+                        { value: 'custom', label: '自定义…' },
+                    ], selectValue, value => {
+                        if (value === 'custom') {
+                            saveGuideSettings({ bigCheckInterval: presets.includes(every) ? 8 : every }, '大检查频率：自定义');
+                        } else if (value === '0') {
+                            saveGuideSettings({ bigCheckInterval: 0 }, '大检查已关闭');
+                        } else {
+                            saveGuideSettings({ bigCheckInterval: Number(value) }, `大检查改为每 ${value} 层一次`);
+                        }
+                    }),
+                    selectValue === 'custom' ? everyInput : null,
+                ), '每 N 层核对一次近 5 段大纲、分岔口和最近 3 段正文。推早了或跑过头，就改到正文对应的那一段。');
+            })(),
             presetList.length === 0
                 ? muted('还没有预设：去「API」页新建，或直接用酒馆主 API。')
                 : null,
             btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
+            bigCheckInterval(settings)
+                ? btn(ui.bigCheckPromptOpen ? '收起大检查提示词' : '大检查提示词…', () => { ui.bigCheckPromptOpen = !ui.bigCheckPromptOpen; ui.bigCheckPromptDraft = null; render(); }, { ghost: true })
+                : null,
+            bigCheckInterval(settings) && ui.bigCheckPromptOpen ? bigCheckPromptEditor(settings) : null,
         );
         return card('如何判断？', ...children);
+    }
+
+    // 大检查提示词（v3.2）：就地编辑两段；和默认一字不差时不另存，以后默认更新能自动用上。
+    function bigCheckPromptEditor(settings) {
+        if (!ui.bigCheckPromptDraft) {
+            const pair = bigCheckPromptPair(settings);
+            ui.bigCheckPromptDraft = { system: pair.system, user: pair.user };
+        }
+        const draft = ui.bigCheckPromptDraft;
+        const area = (key, rows) => el('textarea', {
+            class: 'dga-input', rows,
+            text: draft[key],
+            onchange: event => { draft[key] = event.target.value; },
+        });
+        const save = () => saveGuideSettings({
+            bigCheckSystemPrompt: String(draft.system || '').trim() === DEFAULT_BIG_CHECK_SYSTEM_PROMPT.trim() ? '' : draft.system,
+            bigCheckUserPrompt: String(draft.user || '').trim() === DEFAULT_BIG_CHECK_USER_PROMPT.trim() ? '' : draft.user,
+        }, '大检查提示词已保存');
+        return el('div', { class: 'dga-bigcheck-prompt' },
+            muted('两段：system 规则 / user 案卷。占位符：{{outline}} 近段大纲、{{current}} 现在停在、{{roads}} 分岔口、{{history}} 最近正文。结论读 <drift>、<stage>、<road>。'),
+            field('SYSTEM', area('system', 8)),
+            field('USER', area('user', 10)),
+            el('div', { class: 'dga-api-actions' },
+                btn('恢复默认提示词', () => {
+                    ui.bigCheckPromptDraft = { system: DEFAULT_BIG_CHECK_SYSTEM_PROMPT, user: DEFAULT_BIG_CHECK_USER_PROMPT };
+                    setMessage('已载入大检查默认提示词；点「保存」后生效。', 'info');
+                    render();
+                }, { ghost: true }),
+                btn('保存', save, { primary: true }),
+            ));
+    }
+
+    function bigCheckWaitText(context) {
+        if (!context || !context.state || !context.state.lastBigCheckBasis) return '';
+        if (bindingOrderMode(context.binding) === 'pick' || context.autoAdvance !== 'judge') return '';
+        return `上次大检查：${context.state.lastBigCheckBasis}`;
     }
 
     // 「动态指导」页的「提取 / 排除规则 + 规则测试」卡（v2.23 从提示词二级页搬入）：
@@ -7000,8 +7884,15 @@
                 if (Number.isFinite(n) && n >= 1) item.judgeInterval = n;
                 else delete item.judgeInterval;
             }), { success: '已记下这条的检查间隔' }))));
+            const ownPreset = readPresetOverrides().lines[context.key] || '';
+            children.push(field('这条用的 API', selectControl(presetOverrideOptions(readJudgeApiPresets(), '跟随聊天 / 全局', ownPreset), ownPreset, value => runAction('修改这条的 API', async () => {
+                setPresetOverride('lines', context.key, value);
+                return true;
+            }, { success: value ? '已记下这条用的 API' : '这条改回跟随聊天 / 全局' }))));
             const statusNode = judgeStatusLine(context, judgeWaitText(context));
             if (statusNode) children.push(statusNode);
+            const bigNode = judgeStatusLine({ key: `${context.key}#big` }, bigCheckWaitText(context));
+            if (bigNode) children.push(bigNode);
             const canCheck = orderMode === 'pick'
                 ? context.parsed.stages.length > 0
                 : Boolean(context.stage && !context.stage.terminal);
@@ -8677,7 +9568,15 @@ ${P} .dga-log-debug-toggle { display: flex; align-items: center; gap: 6px; font-
 ${P} .dga-log-debug-toggle input { width: 16px; height: 16px; margin: 0; }
 ${P} .dga-log-list { display: flex; flex-direction: column; gap: 2px; font-family: var(--dga-font-mono); font-size: 12px; }
 ${P} .dga-log-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 8px; border-radius: 4px; }
-${P} .dga-log-row:nth-child(odd) { background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
+${P} .dga-log-entry { border-radius: 4px; }
+${P} .dga-log-entry:nth-child(odd) { background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); }
+${P} .dga-log-entry.dga-log-error { background: color-mix(in srgb, var(--dga-danger) 8%, transparent); }
+${P} .dga-log-entry.dga-log-warn { background: color-mix(in srgb, var(--dga-warning) 5%, transparent); }
+${P} .dga-log-hint { margin: 0 8px 6px; padding: 6px 10px; border-left: 2px solid var(--dga-danger); color: var(--dga-text-2); white-space: normal; }
+${P} .dga-log-hint-summary { margin: 0; color: var(--dga-text-1); }
+${P} .dga-log-hint-steps { margin: 4px 0 0; padding-left: 18px; }
+${P} .dga-log-toolbar .dga-log-search { flex: 1 1 160px; min-width: 120px; min-height: 38px; }
+${P} .dga-log-live { margin-left: auto; font-size: 12px; color: var(--dga-text-3); }
 ${P} .dga-log-time { flex-shrink: 0; color: var(--dga-text-3); }
 ${P} .dga-log-level { flex-shrink: 0; min-width: 30px; font-weight: 700; }
 ${P} .dga-log-level-info { color: #7cc4ff; }
@@ -8940,6 +9839,16 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         getJudgeRuntime: () => ({ ...judgeRuntime }),
         normalizeRulePairs: RuleModule.normalize,
         log: LogModule,
+        resolveLogErrorHint,
+        isMvuEntry,
+        migrateJudgeSegments,
+        judgeDefaults: { legacyIdentity: JUDGE_IDENTITY_V30, rules: DEFAULT_JUDGE_RULES_PROMPT, legacyCase: LEGACY_JUDGE_CASE_PROMPT_V30, segments: DEFAULT_JUDGE_SEGMENTS },
+        isPickerExcludedEntry,
+        isRetryableModelError,
+        abortModelRequests,
+        setPresetOverride,
+        resolveJudgePresetName,
+        updatePresetReferences,
         rebasePickText,
         pickAssign,
         pickRemove,
@@ -9001,6 +9910,7 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
     }
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
+            abortModelRequests('切换聊天');
             // 换聊天后进度不同：镜像内容按新聊天的进度重新对齐（镜像在世界书里，不按聊天隔离）。
             LogModule.info('事件', '切换聊天，按当前角色卡重新对齐绑定和镜像');
             resetIoCache();

@@ -2256,12 +2256,14 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.equal(verdicts[0].should_silence, true, '判断AI请求必须静默');
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'system', 'user_input'], '默认三段：身份 / 判定手册 / 本次案卷（案卷即 user_input）');
+        ['system', 'user_input'], 'v3.2 默认两段：身份和判定手册合成一段 system / 本次案卷（案卷即 user_input）');
     assert.match(ordered[0].content, /你负责判断剧情该不该推进/, '第一段只交代身份');
     assert.doesNotMatch(ordered[0].content, /格式示例|<basis>|<verdict>/, '身份段不解释标签');
-    assert.match(ordered[1].content, /# 判定手册/, '第二段是判定手册（与案卷数据分开）');
-    assert.match(ordered[1].content, /状态型[\s\S]*事件型/, '手册要先分清两种阶段');
-    assert.match(ordered[1].content, /## 五、例子/, '手册要带正反例子');
+    assert.match(ordered[0].content, /# 判定手册/, '判定手册在同一段 system 里（与案卷数据分开）');
+    assert.match(ordered[0].content, /状态型[\s\S]*事件型/, '手册要先分清两种阶段');
+    assert.match(ordered[0].content, /## 五、例子/, '手册要带正反例子');
+    assert.match(String(verdicts[0].user_input), /【上一阶段】（这是第一段）/, '案卷带上一阶段');
+    assert.match(String(verdicts[0].user_input), /【已停多久】/, '案卷带已停几层');
     assert.match(String(verdicts[0].user_input), /【当前阶段】甲一/, '案卷要带阶段名');
     assert.match(String(verdicts[0].user_input), /甲一正文/, '案卷要带阶段正文');
     assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案卷要带最近正文');
@@ -2752,12 +2754,11 @@ test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
     assert.equal(cmCalls[0].profileId, '酒馆代理A');
     assert.equal(cmCalls[0].maxTokens, 16);
     assert.equal(cmCalls[0].messages[0].role, 'system');
-    assert.equal(cmCalls[0].messages[1].role, 'system', '第二段是判定手册');
-    assert.match(cmCalls[0].messages[1].content, /# 判定手册/);
-    assert.equal(cmCalls[0].messages[2].role, 'user');
-    assert.match(cmCalls[0].messages[2].content, /这一轮的回复/);
-    assert.match(cmCalls[0].messages[2].content, /<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, '案卷的 verdict 是条目');
-    assert.equal(cmCalls[0].messages.length, 3, '不再有独立的最终注入消息');
+    assert.match(cmCalls[0].messages[0].content, /# 判定手册/, '身份和手册合成一段 system');
+    assert.equal(cmCalls[0].messages[1].role, 'user');
+    assert.match(cmCalls[0].messages[1].content, /这一轮的回复/);
+    assert.match(cmCalls[0].messages[1].content, /<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, '案卷的 verdict 是条目');
+    assert.equal(cmCalls[0].messages.length, 2, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
     assert.deepEqual(run.errors, []);
 });
@@ -2804,10 +2805,10 @@ test('判断AI档：自定义 API 预设直连酒馆后端 generate 端点', asy
     assert.equal(body.custom_prompt_post_processing, 'strict');
     assert.equal(body.stream, false);
     assert.equal(body.messages[0].role, 'system');
-    assert.equal(body.messages[1].role, 'system', '第二段是判定手册');
-    assert.equal(body.messages[2].role, 'user', '第三段是本次案卷');
-    assert.match(body.messages[2].content, /这一轮的回复/);
-    assert.equal(body.messages.length, 3, '不再有独立的最终注入消息');
+    assert.match(body.messages[0].content, /# 判定手册/, '身份和手册合成一段 system');
+    assert.equal(body.messages[1].role, 'user', '第二段是本次案卷');
+    assert.match(body.messages[1].content, /这一轮的回复/);
+    assert.equal(body.messages.length, 2, '不再有独立的最终注入消息');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 0, 'NO 不推进');
     assert.deepEqual(run.errors, []);
 });
@@ -3078,7 +3079,9 @@ test('判断AI档：提取规则取最后一处 <结论>，盖过草稿里的旧
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    assert.equal(core.judgeSaysYes('<结论>NO</结论>\n（上面是草稿，作废）\n<结论>YES</结论>'), false, '不过滤时只读第一个标签，会误判 NO');
+    assert.equal(core.judgeSaysYes('<结论>NO</结论>\n（上面是草稿，作废）\n<结论>YES</结论>'), true, 'v3.2 起不配规则也只认最后一处标签');
+    assert.equal(core.judgeSaysYes('<think>先写个 <verdict>NO</verdict> 试试</think>\n<verdict>\n- 结论：YES\n</verdict>'), true, '思维链里的草稿标签被最后的正式作答盖掉');
+    assert.equal(core.judgeBasisText('<basis>草稿</basis>\n<basis>- 已发生：两人见面</basis>'), '两人见面', '依据也取最后一处');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, '提取规则生效后必须推进');
     const judgeLogs = run.core.log.list().filter(entry => entry.tag === '判断AI');
     assert.ok(judgeLogs.some(entry => /YES/.test(entry.message)), '运行日志里要有判断AI的结论记录');
@@ -3121,13 +3124,74 @@ test('运行日志：debug 默认不采集，开启后采集；订阅实时通�
     assert.equal(seen.length, 2, '退订后不再通知');
 });
 
-test('运行日志：环形缓冲超过 500 条丢最旧', () => {
+test('运行日志：环形缓冲超过 2000 条丢最旧', () => {
     const run = load();
     const log = run.core.log;
     log._resetForTesting();
-    for (let index = 0; index < 510; index += 1) log.info('测试', `第 ${index} 条`);
-    assert.equal(log.count(), 500);
+    for (let index = 0; index < 2010; index += 1) log.info('测试', `第 ${index} 条`);
+    assert.equal(log.count(), 2000);
     assert.equal(log.list()[0].message, '第 10 条', '最旧的 10 条必须被丢弃');
+});
+
+test('运行日志：错误对象带 stack 与 cause，循环引用对象不报错', () => {
+    const run = load();
+    const log = run.core.log;
+    log._resetForTesting();
+    const inner = new Error('底层超时');
+    const outer = new Error('调用失败');
+    outer.cause = inner;
+    const loop = { a: 1 };
+    loop.self = loop;
+    log.error('API', outer, loop, undefined, null);
+    const message = log.list()[0].message;
+    assert.match(message, /^Error: 调用失败/);
+    assert.match(message, /cause=Error: 底层超时/);
+    assert.match(message, /Object\{a=1/);
+    assert.match(message, /undefined null$/);
+});
+
+test('运行日志：错误处理建议按规则匹配，只给 error 级', () => {
+    const run = load();
+    const hint = run.core.resolveLogErrorHint;
+    assert.equal(hint({ level: 'warn', tag: '判断AI', message: 'HTTP 429' }), null);
+    assert.equal(hint({ level: 'error', tag: '判断AI', message: '调用失败：HTTP 429 Too Many Requests' }).id, 'http-429');
+    assert.equal(hint({ level: 'error', tag: '判断AI', message: '401 Unauthorized' }).id, 'http-401');
+    assert.equal(hint({ level: 'error', tag: '判断AI', message: 'Failed to fetch' }).id, 'network');
+    assert.equal(hint({ level: 'error', tag: '判断AI', message: '找不到本机 API 预设「甲」' }).id, 'preset-missing');
+    assert.equal(hint({ level: 'error', tag: '判断AI', message: '判断AI需要酒馆助手的 generateRaw 接口' }).id, 'tavern-helper');
+    assert.equal(hint({ level: 'error', tag: '绑定', message: '世界书写入失败' }).id, 'worldbook');
+    assert.equal(hint({ level: 'error', tag: '其他', message: '不明原因' }).id, 'generic', '通用兜底');
+});
+
+test('运行日志页：关键词搜索、暂停攒条数、错误下面附处理建议', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文', enabled: false });
+    const booted = loadWithDocument(documentRef, helper);
+    const log = booted.sandbox.DynamicGuideAssistantCore.log;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    log.error('判断AI', '调用失败：HTTP 429 Too Many Requests');
+    log.info('推进', '甲一 → 甲二');
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '运行日志').listeners.click[0]();
+    const hintNode = panel().querySelector('.dga-log-hint');
+    assert.ok(hintNode, '错误日志下面要有处理建议');
+    assert.match(hintNode.textContent, /限流/);
+    const search = panel().querySelector('.dga-log-search');
+    assert.ok(search, '有关键词搜索框');
+    search.listeners.change[0]({ target: { value: '甲一' } });
+    assert.ok(!panel().querySelector('.dga-log-hint'), '搜索后只剩匹配的那条');
+    assert.match(panel().textContent, /甲一 → 甲二/);
+    findButton(panel(), '暂停').listeners.click[0]();
+    log.info('推进', '暂停期间来的');
+    assert.ok(findButton(panel(), '恢复'), '暂停后按钮变成恢复');
+    assert.doesNotMatch(panel().textContent, /暂停期间来的/, '暂停时不显示新日志');
+    findButton(panel(), '恢复').listeners.click[0]();
+    search.listeners.change[0]({ target: { value: '' } });
+    const fresh = panel().querySelector('.dga-log-search');
+    fresh.listeners.change[0]({ target: { value: '' } });
+    assert.match(panel().textContent, /暂停期间来的/, '恢复后一次显示出来');
+    assert.deepEqual(booted.errors, []);
 });
 
 
@@ -4038,7 +4102,7 @@ test('同一层好几条判断AI绑定合成一次请求，按 <answer n> 各自
     assert.match(asked, /<case n="3">\n【剧情线】丙线/);
     assert.match(asked, /<answer n="序号"><\/answer>/);
     assert.deepEqual(plain(calls[0].ordered_prompts.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'system', 'user_input'], '身份、手册只发一份');
+        ['system', 'user_input'], '身份和手册合成一段，只发一份');
     assert.ok(calls[0].max_tokens > 1024 && calls[0].max_tokens <= 4096, '合并后回复长度按条数放宽，但有上限');
     const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
     assert.equal(saved[keyOf('书A', 1)].stageIndex, 1, '第 1 条 YES 推进');
@@ -4109,4 +4173,316 @@ test('「导出」用的是宿主窗口，不再把窗口当函数调用', async
     assert.equal(downloads.length, 1, '点「导出」要真的下载一份日志');
     assert.match(downloads[0], /^动态指导助手-运行日志-\d{8}-\d{4}\.txt$/);
     assert.deepEqual(booted.errors, []);
+});
+
+
+// 大检查（v3.2）：每 N 层核对近 5 段大纲、分岔口和最近 3 段正文，偏了就改到正文对应的那段。
+function bigCheckWorld(options) {
+    const opts = options || {};
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文\n\n## 甲三\n甲三正文\n\n## 甲四\n甲四正文\n\n## 甲五\n甲五正文\n\n## 甲六\n甲六正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }].concat(opts.extraEntries || []) };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }].concat(opts.extraBindings || []),
+        settings: { autoAdvance: 'judge', bigCheckInterval: 5, ...(opts.settings || {}) },
+    };
+    const bindings = { [keyOf('书A', 1)]: { stageIndex: 2, stageName: '甲三', ...(opts.hostState || {}) } };
+    const ids = opts.messageIds || [5];
+    const messages = ids.map(id => ({ message_id: id, role: 'assistant', message: `第 ${id} 层正文。` }));
+    const world = multiWorld(books, { config, messages, lastMessageId: ids[ids.length - 1], chatState: { version: 2, bindings } });
+    const calls = { judge: [], big: [] };
+    world.helper.generateRaw = async request => {
+        if (JSON.stringify(request).includes('剧情进度校对员')) {
+            calls.big.push(request);
+            return opts.bigAnswer || '<basis>对上了</basis>\n<drift>正常</drift>\n<stage>3</stage>\n<road>0</road>';
+        }
+        calls.judge.push(request);
+        return '<basis>还没演完</basis>\n<verdict>NO</verdict>';
+    };
+    const hostState = () => world.state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)];
+    return { ...world, calls, hostState };
+}
+
+test('大检查：首次立即检查，只带前 2 / 当前 / 后 2 段大纲，推早了就往回改', async () => {
+    const world = bigCheckWorld({ bigAnswer: '<basis>正文还在甲二</basis>\n<drift>推早了</drift>\n<stage>2</stage>\n<road>0</road>' });
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(world.calls.judge.length, 1, '普通判断照常问一次');
+    assert.equal(world.calls.big.length, 1, '大检查另问一次');
+    const input = String(world.calls.big[0].user_input);
+    assert.match(input, /1\. 甲一[\s\S]*2\. 甲二[\s\S]*3\. 甲三（大纲现在停在这里）[\s\S]*4\. 甲四[\s\S]*5\. 甲五/);
+    assert.doesNotMatch(input, /甲六/, '只带 5 段');
+    assert.match(input, /【分岔口】[\s\S]*这一段没有分岔/);
+    assert.match(input, /第 5 层正文/);
+    assert.doesNotMatch(input, /\{\{/, '占位符都要替换');
+    assert.equal(world.hostState().stageIndex, 1, '推早了改回甲二');
+    assert.equal(world.hostState().lastBigCheckId, 5);
+    assert.match(world.hostState().lastBigCheckBasis, /^推早了：正文还在甲二/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('大检查：跑过头就往后改；正常不动', async () => {
+    const ahead = bigCheckWorld({ bigAnswer: '<drift>跑过头</drift>\n<stage>4</stage>' });
+    load(ahead.helper);
+    await new Promise(setImmediate);
+    await ahead.state.events.get('message_received')(5);
+    assert.equal(ahead.hostState().stageIndex, 3, '跑过头改到甲四');
+
+    const ok = bigCheckWorld();
+    load(ok.helper);
+    await new Promise(setImmediate);
+    await ok.state.events.get('message_received')(5);
+    assert.equal(ok.calls.big.length, 1);
+    assert.equal(ok.hostState().stageIndex, 2, '正常不改段');
+    assert.match(ok.hostState().lastBigCheckBasis, /^正常/);
+});
+
+test('大检查：方向和序号对不上、原样抄模板都不改段', async () => {
+    const wrong = bigCheckWorld({ bigAnswer: '<drift>推早了</drift>\n<stage>4</stage>' });
+    load(wrong.helper);
+    await new Promise(setImmediate);
+    await wrong.state.events.get('message_received')(5);
+    assert.equal(wrong.hostState().stageIndex, 2, '推早了却写了后面的序号，不改');
+
+    const copied = bigCheckWorld({ bigAnswer: '<drift>\n- 偏差：正常、推早了、跑过头，三选一\n</drift>\n<stage>1</stage>' });
+    load(copied.helper);
+    await new Promise(setImmediate);
+    await copied.state.events.get('message_received')(5);
+    assert.equal(copied.hostState().stageIndex, 2, '三个都写等于没作答');
+    assert.match(copied.hostState().lastBigCheckBasis, /没按表作答/);
+});
+
+test('大检查：按间隔触发，没到层数不问', async () => {
+    const world = bigCheckWorld({ settings: { bigCheckInterval: 10 }, hostState: { lastBigCheckId: 5 }, messageIds: [8, 15] });
+    load(world.helper);
+    await new Promise(setImmediate);
+    world.state.lastMessageId = 8;
+    await world.state.events.get('message_received')(8);
+    assert.equal(world.calls.big.length, 0, '距上次 3 层，不到 10 层');
+    world.state.lastMessageId = 15;
+    await world.state.events.get('message_received')(15);
+    assert.equal(world.calls.big.length, 1, '距上次 10 层，到点');
+    assert.equal(world.hostState().lastBigCheckId, 15);
+});
+
+test('大检查：手动推进档不跑，关闭时也不跑', async () => {
+    const manual = bigCheckWorld({ settings: { autoAdvance: 'off' } });
+    load(manual.helper);
+    await new Promise(setImmediate);
+    await manual.state.events.get('message_received')(5);
+    assert.equal(manual.calls.big.length + manual.calls.judge.length, 0, '手动档不另开请求');
+
+    const off = bigCheckWorld({ settings: { bigCheckInterval: 0 } });
+    load(off.helper);
+    await new Promise(setImmediate);
+    await off.state.events.get('message_received')(5);
+    assert.equal(off.calls.big.length, 0, '频率关闭');
+    assert.equal(off.calls.judge.length, 1, '普通判断不受影响');
+    assert.equal(core.normalizeConfig({ version: 2, bindings: [], settings: { bigCheckInterval: 0 } }).settings.bigCheckInterval, undefined);
+});
+
+test('大检查：正文已走进分岔就进那条，并关掉被依附的这条', async () => {
+    const world = bigCheckWorld({
+        extraEntries: [{ uid: 2, name: '岔路', content: '## 岔一\n岔一正文\n\n## 岔二\n岔二正文', enabled: false }],
+        extraBindings: [{ worldbookName: '书A', entryUid: 2, entryName: '岔路', boundAt: null, attachKey: keyOf('书A', 1), attachStage: 3, attachKind: 'fork' }],
+        bigAnswer: '<basis>人已经走进岔路</basis>\n<drift>正常</drift>\n<stage>3</stage>\n<road>1</road>',
+    });
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.ok(world.calls.big.length >= 1);
+    assert.match(String(world.calls.big[0].user_input), /1\. 依附 · 岔路/, '分岔口要列出能走进的线');
+    assert.equal(world.hostState().lineCut, true, '被依附的这条暂时关闭');
+    assert.equal(world.hostState().forkInto, keyOf('书A', 2));
+    const fork = world.state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 2)];
+    assert.equal(fork.stageIndex, 0, '分岔从第一段开始');
+    assert.deepEqual(run.errors, []);
+});
+
+
+test('大检查：「如何判断？」卡有频率选项，开了才出现提示词入口，点开能就地编辑', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: { version: 2, bindings: [{ worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' }], settings: { autoAdvance: 'judge', bigCheckInterval: 10 } },
+    };
+    const { errors } = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    assert.match(panel().textContent, /大检查/, '判断AI卡里有大检查频率');
+    const open = findButton(panel(), '大检查提示词');
+    assert.ok(open, '开了大检查才有提示词入口');
+    open.listeners.click[0]();
+    assert.match(panel().textContent, /剧情进度校对员/, '展开后是默认 system 段');
+    assert.match(panel().textContent, /\{\{outline\}\}/, '展开后是默认 user 案卷');
+    assert.ok(panel().querySelector('.dga-bigcheck-prompt'), '编辑区挂在卡里');
+    assert.deepEqual(errors, []);
+});
+
+// v3.2 对照数据库：临时错误重试、切换聊天中止、预设引用同步、按聊天 / 按线选 API
+function judgeWorld(extra) {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = { version: 2, bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }], settings: { autoAdvance: 'judge', ...(extra || {}) } };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const world = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const stageOf = () => {
+        const root = world.state.variables.chat.$dynamicGuideAssistant;
+        const item = root && root.state && root.state.bindings && root.state.bindings[keyOf('书A', 1)];
+        return item ? item.stageIndex : 0;
+    };
+    return { ...world, stageOf };
+}
+
+test('判断AI：临时性错误原地重试一次，确定性错误和限流不重试', async () => {
+    const flaky = judgeWorld();
+    let calls = 0;
+    flaky.helper.generateRaw = async () => { calls += 1; if (calls === 1) throw new Error('502 Bad Gateway'); return 'YES'; };
+    const run = load(flaky.helper);
+    await new Promise(setImmediate);
+    await flaky.state.events.get('message_received')(5);
+    assert.equal(calls, 2, '502 要原地重试一次');
+    assert.equal(flaky.stageOf(), 1, '重试成功照常推进');
+    const retryable = run.core.isRetryableModelError;
+    assert.equal(retryable(new Error('401 Unauthorized')), false);
+    assert.equal(retryable(new Error('HTTP 429 Too Many Requests')), false, '限流不原地重试');
+    assert.equal(retryable(new Error('request timed out')), true);
+    const aborted = new Error('x'); aborted.name = 'AbortError';
+    assert.equal(retryable(aborted), false);
+
+    const auth = judgeWorld();
+    let authCalls = 0;
+    auth.helper.generateRaw = async () => { authCalls += 1; throw new Error('401 Unauthorized'); };
+    load(auth.helper);
+    await new Promise(setImmediate);
+    await auth.state.events.get('message_received')(5);
+    assert.equal(authCalls, 1, '401 不重试');
+});
+
+test('中止在途判断请求：结论作废、不算失败，下一层照常检查', async () => {
+    const world = judgeWorld();
+    let calls = 0;
+    let release = null;
+    world.helper.generateRaw = () => {
+        calls += 1;
+        if (calls === 1) return new Promise(resolve => { release = resolve; });
+        return Promise.resolve('YES');
+    };
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    const pending = world.state.events.get('message_received')(5);
+    for (let index = 0; index < 10 && !release; index += 1) await new Promise(setImmediate);
+    assert.ok(release, '第一次请求已经发出');
+    run.core.abortModelRequests('测试切换聊天');
+    release('YES');
+    await pending;
+    assert.equal(world.stageOf(), 0, '中止后回来的 YES 不能推进');
+    world.state.messages.push({ message_id: 6, role: 'assistant', message: '下一层。' });
+    world.state.lastMessageId = 6;
+    await world.state.events.get('message_received')(6);
+    assert.equal(calls, 2, '中止不进暂停，下一层照常问');
+    assert.equal(world.stageOf(), 1);
+    assert.deepEqual(run.errors, []);
+});
+
+test('按线 > 按聊天 > 全局选 API；预设改名、删除时引用跟着同步', async () => {
+    const world = judgeWorld({ judgePreset: '甲' });
+    world.helper.getCurrentChatId = () => '聊天一';
+    const storage = memoryStorage();
+    const run = load(world.helper, { localStorage: storage });
+    await new Promise(setImmediate);
+    const resolve = key => run.core.resolveJudgePresetName({ judgePreset: '甲' }, { key }).name;
+    assert.equal(resolve('线1'), '甲', '没覆盖时跟全局');
+    run.core.setPresetOverride('chats', '聊天一', '乙');
+    assert.equal(resolve('线1'), '乙', '按聊天覆盖');
+    run.core.setPresetOverride('lines', '线1', '丙');
+    assert.equal(resolve('线1'), '丙', '按线优先');
+    assert.equal(resolve('线2'), '乙');
+    run.core.setPresetOverride('lines', '线3', '@main');
+    assert.equal(resolve('线3'), '', '@main 表示酒馆主 API');
+    await run.core.updatePresetReferences('丙', '丁');
+    assert.equal(resolve('线1'), '丁', '改名同步到按线覆盖');
+    await run.core.updatePresetReferences('乙', '');
+    assert.equal(resolve('线2'), '甲', '删除后按聊天覆盖清掉，回到全局');
+    await run.core.updatePresetReferences('甲', '戊');
+    const config = world.state.variables.character.$dynamicGuideAssistant.config;
+    assert.notEqual(config.settings && config.settings.judgePreset, '甲', '全局引用也跟着改');
+    assert.ok(!JSON.stringify(config).includes('戊'), 'API 预设名照旧不写进角色变量');
+});
+
+test('待选列表排除 MVU 条目，普通条目照常可选', () => {
+    const run = load();
+    const excluded = run.core.isPickerExcludedEntry;
+    assert.equal(excluded({ uid: 1, name: '[InitVar]初始变量' }), true);
+    assert.equal(excluded({ uid: 2, name: '[initvar]' }), true);
+    assert.equal(excluded({ uid: 3, name: '[mvu_update]变量更新' }), true);
+    assert.equal(excluded({ uid: 4, name: '变量更新规则' }), true);
+    assert.equal(excluded({ uid: 5, name: '剧情大纲' }), false);
+    assert.equal(excluded({ uid: 6, name: '初始化剧情' }), false, '只是名字里有「初始」不算 MVU');
+});
+
+test('总开关关闭：世界书归回原样、不另开判断请求，重新打开后重建镜像', async () => {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [
+        { uid: 1, name: '大纲A', content, enabled: false },
+        { uid: 2, name: '大纲A（动态指导）', content: '甲一正文', enabled: true },
+    ] };
+    const config = { version: 2, bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }], settings: { autoAdvance: 'judge', guideEnabled: false } };
+    const message = { message_id: 5, role: 'assistant', message: '回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    let calls = 0;
+    helper.generateRaw = async () => { calls += 1; return 'YES'; };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('generate')('normal');
+    const source = state.books.书A.find(item => item.uid === 1);
+    assert.equal(source.enabled, true, '原条目重新打开');
+    assert.equal(state.books.书A.some(item => item.name === '大纲A（动态指导）'), false, '镜像删掉');
+    await state.events.get('message_received')(5);
+    assert.equal(calls, 0, '关闭时不问判断AI');
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.bindings.length, 1, '绑定保留');
+
+    state.variables.character.$dynamicGuideAssistant.config.settings.guideEnabled = true;
+    await state.events.get('generate')('normal');
+    assert.equal(state.books.书A.find(item => item.uid === 1).enabled, false, '重新打开后原条目再关掉');
+    assert.ok(state.books.书A.some(item => item.name === '大纲A（动态指导）'), '镜像重建');
+    assert.deepEqual(run.errors, []);
+});
+
+test('默认提示词迁移：和 v3.0 默认一字不差的段换成新默认，改过的段保留', () => {
+    const run = load();
+    const d = run.core.judgeDefaults;
+    const old = [
+        { role: 'system', content: d.legacyIdentity },
+        { role: 'system', content: d.rules },
+        { role: 'user', content: d.legacyCase },
+    ];
+    const migrated = plain(run.core.migrateJudgeSegments(old));
+    assert.deepEqual(migrated, plain(d.segments), '全是旧默认时整组换成新默认');
+    const custom = [
+        { role: 'system', content: '我自己写的身份' },
+        { role: 'system', content: d.rules },
+        { role: 'user', content: d.legacyCase },
+    ];
+    const kept = plain(run.core.migrateJudgeSegments(custom));
+    assert.equal(kept.length, 3, '身份改过就不合并');
+    assert.equal(kept[0].content, '我自己写的身份');
+    assert.match(kept[2].content, /\{\{elapsed\}\}/, '没改过的案卷段换成新默认');
+});
+
+test('已停几层：推进时记下进入楼层，下一次判断的案卷写出停了几层', async () => {
+    const world = judgeWorld();
+    world.state.variables.chat = { $dynamicGuideAssistant: { state: { version: 2, bindings: { [keyOf('书A', 1)]: { stageIndex: 1, stageName: '甲二', stageEnteredId: 2 } } } } };
+    const sent = [];
+    world.helper.generateRaw = async request => { sent.push(request); return 'NO'; };
+    load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(sent.length, 1);
+    assert.match(String(sent[0].user_input), /已在这段停了约 3 层（第 2 层进入，现在第 5 层）/);
+    assert.match(String(sent[0].user_input), /【上一阶段】甲一/);
 });
