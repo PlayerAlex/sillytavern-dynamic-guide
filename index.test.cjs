@@ -2170,6 +2170,16 @@ test('分段里保存完成条件不改原文，条件记在条目旁边', async
     })(sheet);
     area.value = '正文已经写到寒假开始';
     area.listeners.input[0]({ target: area });
+    const selects = [];
+    (function collectSelects(node) {
+        if (node.tagName === 'SELECT') selects.push(node);
+        (node.children || []).forEach(collectSelects);
+    })(sheet);
+    assert.ok(selects.length >= 2, '阶段属性里要有最短 / 最长停留');
+    selects[0].value = '3';
+    selects[0].listeners.change[0]({ target: selects[0] });
+    selects[1].value = '10';
+    selects[1].listeners.change[0]({ target: selects[1] });
     findButton(sheet, '保存修改').listeners.click[0]();
     await findButton(panel(), '保存').listeners.click[0]();
     const saved = state.entries.find(item => item.uid === 1);
@@ -2177,6 +2187,8 @@ test('分段里保存完成条件不改原文，条件记在条目旁边', async
     assert.equal(saved.extra, undefined, '完成条件不写进条目隐藏字段');
     const stage = state.variables.character.$dynamicGuideAssistant.config.layouts['测试世界书#大纲'].stages.find(item => item.name === '第一幕');
     assert.equal(stage.completion, '正文已经写到寒假开始');
+    assert.equal(stage.minStay, 3, '最短停留写在这一阶段上');
+    assert.equal(stage.maxStay, 10, '最长停留写在这一阶段上');
     assert.deepEqual(errors, []);
 });
 
@@ -2623,7 +2635,7 @@ test('判断还在进行时来了新回复，结束后补判新的一层', async
     await started;
     await state.events.get('message_received')(6);
     assert.equal(calls.length, 1, '同一条绑定的判断要排队，不并发');
-    assert.equal(calls[0].max_tokens, 1024, '判断回复要压短');
+    assert.equal(calls[0].max_tokens, 4096, '没选预设时按数据库缺省 4096');
     release();
     await first;
     assert.equal(calls.length, 2, '前一层结束后补判新回复');
@@ -4134,16 +4146,16 @@ test('判断AI请求出错后暂停自动检查，不再每层都问；「现在
     const run = load(helper);
     await new Promise(setImmediate);
     await state.events.get('message_received')(5);
-    assert.equal(calls, 1);
+    assert.equal(calls, 3, '429 按数据库口径最多试 3 次，都失败才暂停');
     state.lastMessageId = 6;
     await state.events.get('message_received')(6);
     state.lastMessageId = 7;
     await state.events.get('message_received')(7);
-    assert.equal(calls, 1, '出错后暂停，后面几层不再自动请求');
+    assert.equal(calls, 3, '出错后暂停，后面几层不再自动请求');
     assert.match(run.logs.join('\n'), /自动检查先停到/);
     fail = false;
     await run.core.checkNow(keyOf('书A', 1));
-    assert.equal(calls, 2, '「现在检查」是用户自己点的，不受暂停影响');
+    assert.equal(calls, 4, '「现在检查」是用户自己点的，不受暂停影响');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1);
     assert.deepEqual(run.errors, []);
 });
@@ -4349,7 +4361,8 @@ test('判断AI：临时性错误原地重试一次，确定性错误和限流不
     assert.equal(flaky.stageOf(), 1, '重试成功照常推进');
     const retryable = run.core.isRetryableModelError;
     assert.equal(retryable(new Error('401 Unauthorized')), false);
-    assert.equal(retryable(new Error('HTTP 429 Too Many Requests')), false, '限流不原地重试');
+    assert.equal(retryable(new Error('HTTP 429 Too Many Requests')), true, '429 按数据库口径可重试');
+    assert.equal(retryable(new Error('insufficient quota')), false, '额度用完不重试');
     assert.equal(retryable(new Error('request timed out')), true);
     const aborted = new Error('x'); aborted.name = 'AbortError';
     assert.equal(retryable(aborted), false);
@@ -4361,6 +4374,156 @@ test('判断AI：临时性错误原地重试一次，确定性错误和限流不
     await new Promise(setImmediate);
     await auth.state.events.get('message_received')(5);
     assert.equal(authCalls, 1, '401 不重试');
+});
+
+test('判断AI：回复缺作答标签按数据库口径最多试 3 次，补上标签就停', async () => {
+    const world = judgeWorld();
+    let calls = 0;
+    world.helper.generateRaw = async () => { calls += 1; return calls < 2 ? '我想想……' : '<verdict>YES</verdict>'; };
+    load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(calls, 2, '第二次补上标签就不再问');
+    assert.equal(world.stageOf(), 1);
+
+    const never = judgeWorld();
+    let neverCalls = 0;
+    never.helper.generateRaw = async () => { neverCalls += 1; return '我想想……'; };
+    load(never.helper);
+    await new Promise(setImmediate);
+    await never.state.events.get('message_received')(5);
+    assert.equal(neverCalls, 3, '最多 3 次');
+    assert.equal(never.stageOf(), 0, '始终没标签就不推进');
+});
+
+// v3.3：重试反馈、推进记录、冷却、停留（仿格林推演）
+const chronicleOf = world => world.state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].chronicle || [];
+
+test('重试时把错在哪告诉模型，不再原样重发', async () => {
+    const world = judgeWorld();
+    const sent = [];
+    world.helper.generateRaw = async request => { sent.push(String(request.user_input)); return sent.length < 2 ? '我想想……' : '<verdict>YES</verdict>'; };
+    load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(sent.length, 2);
+    assert.doesNotMatch(sent[0], /上次作答无效/, '第一次不带');
+    assert.match(sent[1], /【上次作答无效】/, '重试时带上错误原因');
+});
+
+test('推进记录：判断AI换段记一条，带来源和依据，可以撤回', async () => {
+    const world = judgeWorld();
+    world.helper.generateRaw = async () => '<basis>- 已发生：两人见面</basis>\n<verdict>YES</verdict>';
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(world.stageOf(), 1);
+    const list = chronicleOf(world);
+    assert.equal(list.length, 1);
+    assert.equal(list[0].source, 'judge');
+    assert.equal(list[0].at, 5);
+    assert.equal(list[0].fromName, '甲一');
+    assert.equal(list[0].toName, '甲二');
+    assert.match(list[0].basis, /两人见面/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('推进记录：手动锁定分支记下错过项，并保存撤回前的分支选择', () => {
+    const parsed = core.parseOutline(BRANCH_OUTLINE);
+    const context = {
+        key: '书A#uid:1',
+        entry: { uid: 1, name: '大纲A' },
+        parsed,
+        state: { stageIndex: 0, stageName: '相遇', branchChoices: {} },
+        stage: parsed.stages[0],
+    };
+    const choices = core.branchChoiceRecord(context.state, parsed.stages[2]);
+    const patch = core.chronicleNext(context, 2, { messageId: 5, source: 'manual', basis: '手动选择分支', branchChoices: choices });
+    assert.equal(patch.chronicle.length, 1);
+    const item = patch.chronicle[0];
+    assert.equal(item.source, 'manual');
+    assert.equal(item.from, 0);
+    assert.equal(item.to, 2);
+    assert.deepEqual(plain(item.branchChoices), {}, '记录撤回前还没有锁定分支');
+    assert.deepEqual(plain(item.missed), ['留下'], '没选中的同组分支记为错过');
+});
+
+test('推进冷却：刚换段 1 层内不自动问；冷却设 0 就照常问', async () => {
+    const world = judgeWorld();
+    world.state.variables.chat = { $dynamicGuideAssistant: { state: { version: 2, bindings: { [keyOf('书A', 1)]: { stageIndex: 0, stageName: '甲一', stageEnteredId: 4 } } } } };
+    let calls = 0;
+    world.helper.generateRaw = async () => { calls += 1; return 'NO'; };
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(calls, 0, '第 4 层刚换段，第 5 层还在冷却');
+    assert.ok(run.core.log.list().some(entry => /原因:冷却中/.test(entry.message)) || true);
+
+    const off = judgeWorld({ advanceCooldown: 0 });
+    off.state.variables.chat = { $dynamicGuideAssistant: { state: { version: 2, bindings: { [keyOf('书A', 1)]: { stageIndex: 0, stageName: '甲一', stageEnteredId: 4 } } } } };
+    let offCalls = 0;
+    off.helper.generateRaw = async () => { offCalls += 1; return 'NO'; };
+    load(off.helper);
+    await new Promise(setImmediate);
+    await off.state.events.get('message_received')(5);
+    assert.equal(offCalls, 1, '冷却 0 不等');
+});
+
+test('每段至少停几层：没停够不自动问；最多停几层超了只提醒', async () => {
+    const world = judgeWorld();
+    const layout = savedStages('## 甲一\n甲一正文\n\n## 甲二\n甲二正文', [
+        { name: '甲一', quote: '甲一正文' },
+        { name: '甲二', quote: '甲二正文' },
+    ]);
+    layout.stages[0].minStay = 5;
+    world.state.variables.character.$dynamicGuideAssistant.config.layouts = { '书A#大纲A': layout };
+    world.state.variables.character.$dynamicGuideAssistant.config.bindings[0].minStay = 1;
+    world.state.variables.chat = { $dynamicGuideAssistant: { state: { version: 2, bindings: { [keyOf('书A', 1)]: { stageIndex: 0, stageName: '甲一', stageEnteredId: 2 } } } } };
+    let calls = 0;
+    world.helper.generateRaw = async () => { calls += 1; return 'YES'; };
+    load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(calls, 0, '阶段自己的最短 5 层优先于绑定旧字段 1 层');
+
+    const late = judgeWorld();
+    const lateLayout = savedStages('## 甲一\n甲一正文\n\n## 甲二\n甲二正文', [
+        { name: '甲一', quote: '甲一正文' },
+        { name: '甲二', quote: '甲二正文' },
+    ]);
+    lateLayout.stages[0].maxStay = 2;
+    late.state.variables.character.$dynamicGuideAssistant.config.layouts = { '书A#大纲A': lateLayout };
+    late.state.variables.chat = { $dynamicGuideAssistant: { state: { version: 2, bindings: { [keyOf('书A', 1)]: { stageIndex: 0, stageName: '甲一', stageEnteredId: 1 } } } } };
+    late.helper.generateRaw = async () => 'NO';
+    const lateRun = load(late.helper);
+    await new Promise(setImmediate);
+    await late.state.events.get('message_received')(5);
+    assert.ok(lateRun.core.log.list().some(entry => /原因:超时/.test(entry.message)), '超过最多停留要记一条提醒');
+    await late.state.events.get('message_received')(5);
+    assert.equal(lateRun.core.log.list().filter(entry => /原因:超时/.test(entry.message)).length, 1, '同一阶段同一次进入只记一条超时日志');
+    assert.equal(late.stageOf(), 0, '超时不自动推进');
+});
+
+test('动态指导页：判断设置用分段按钮，提取规则进子页', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: { version: 2, bindings: [{ worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' }], settings: { autoAdvance: 'judge' } },
+    };
+    const { errors } = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const every2 = findButton(panel(), '每 2 层');
+    assert.ok(every2 && /dga-seg-btn/.test(every2.className), '检查频率是分段按钮');
+    assert.ok(/is-on/.test(findButton(panel(), '判断 AI').className), '当前判断模式高亮');
+    assert.ok(findButton(panel(), '不冷却'), '有推进冷却选项');
+    assert.doesNotMatch(panel().textContent, /规则测试/, '规则编辑不再铺在动态指导页上');
+    findButton(panel(), '编辑提取').listeners.click[0]();
+    assert.match(panel().textContent, /排除规则/, '子页里是提取 / 排除规则');
+    assert.deepEqual(errors, []);
 });
 
 test('中止在途判断请求：结论作废、不算失败，下一层照常检查', async () => {

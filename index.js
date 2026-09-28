@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.2
+     * 动态指导助手 v3.3
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.2';
+    const VERSION = '3.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -713,6 +713,7 @@
         if (typeof old.lastJudgeBasis === 'string' && old.lastJudgeBasis) next.lastJudgeBasis = old.lastJudgeBasis.slice(0, 500);
         if (old.lastBigCheckId != null) next.lastBigCheckId = old.lastBigCheckId;
         if (Number.isFinite(old.stageEnteredId)) next.stageEnteredId = old.stageEnteredId;
+        if (Array.isArray(old.chronicle)) next.chronicle = old.chronicle.filter(item => item && typeof item === 'object').slice(-CHRONICLE_LIMIT);
         if (typeof old.lastBigCheckBasis === 'string' && old.lastBigCheckBasis) next.lastBigCheckBasis = old.lastBigCheckBasis.slice(0, 500);
         if (old.lineCut === true) next.lineCut = true;
         if (typeof old.forkInto === 'string' && old.forkInto) next.forkInto = old.forkInto;
@@ -2161,6 +2162,12 @@
             if (ownMode === 'off' || ownMode === 'judge') binding.advanceMode = ownMode;
             const ownInterval = Math.floor(Number(item.judgeInterval));
             if (Number.isFinite(ownInterval) && ownInterval >= 1) binding.judgeInterval = ownInterval;
+            // v3.3 草稿曾把停留限制写在整条绑定上；保留读取仅作旧数据回退。
+            // 新数据写在 layout.stages[]，由阶段属性弹层单独设置。
+            ['minStay', 'maxStay'].forEach(field => {
+                const n = Math.floor(Number(item[field]));
+                if (Number.isFinite(n) && n >= 1) binding[field] = n;
+            });
             const layout = cleanLayout(item.layout);
             if (layout) binding.layout = layout;
             const key = bindingKey(binding);
@@ -2216,6 +2223,12 @@
         if (settings.guideEnabled != null) {
             if (settings.guideEnabled === false) settings.guideEnabled = false;
             else delete settings.guideEnabled;
+        }
+        // 推进冷却（v3.3，仿格林推演圈层冷却）：刚换段后 N 层内不自动推进。缺省 1；0 = 不冷却。
+        if (settings.advanceCooldown != null) {
+            const n = Math.floor(Number(settings.advanceCooldown));
+            if (Number.isFinite(n) && n >= 0) settings.advanceCooldown = n;
+            else delete settings.advanceCooldown;
         }
         // 大检查（v3.2）：每 N 层核对一次近段大纲与最近正文。缺省 / 0 / 非法值 = 关闭。
         if (settings.bigCheckInterval != null) {
@@ -2752,6 +2765,8 @@
             completion: stage.completion || '',
             terminal: Boolean(stage.terminal),
             branch: String(stage.branch || '').trim(),
+            ...(Number.isFinite(Number(stage.minStay)) && Number(stage.minStay) >= 1 ? { minStay: Math.floor(Number(stage.minStay)) } : {}),
+            ...(Number.isFinite(Number(stage.maxStay)) && Number(stage.maxStay) >= 1 ? { maxStay: Math.floor(Number(stage.maxStay)) } : {}),
             loopTo: String(stage.loopTo || '').trim(),
             side: Boolean(stage.side),
             lineTo: cleanLineTo(stage.lineTo),
@@ -2929,6 +2944,8 @@
                     completion: stage.completion || '',
                     terminal: Boolean(stage.terminal),
                     branch: String(stage.branch || '').trim(),
+                    ...(Number.isFinite(Number(stage.minStay)) && Number(stage.minStay) >= 1 ? { minStay: Math.floor(Number(stage.minStay)) } : {}),
+                    ...(Number.isFinite(Number(stage.maxStay)) && Number(stage.maxStay) >= 1 ? { maxStay: Math.floor(Number(stage.maxStay)) } : {}),
                     loopTo: String(stage.loopTo || '').trim(),
                     side: Boolean(stage.side),
                     lineTo: cleanLineTo(stage.lineTo),
@@ -2968,6 +2985,8 @@
                 autoComplete,
                 terminal: Boolean(stage.terminal),
                 branch: String(stage.branch || '').trim(),
+                ...(Number.isFinite(Number(stage.minStay)) && Number(stage.minStay) >= 1 ? { minStay: Math.floor(Number(stage.minStay)) } : {}),
+                ...(Number.isFinite(Number(stage.maxStay)) && Number(stage.maxStay) >= 1 ? { maxStay: Math.floor(Number(stage.maxStay)) } : {}),
                 loopTo: String(stage.loopTo || '').trim(),
                 stageIndex: index,
             };
@@ -3145,7 +3164,9 @@
             const hasFlag = flag && typeof flag === 'object' && Object.prototype.hasOwnProperty.call(flag, 'loop');
             let located = null;
             try { located = await locateEntry(binding); } catch (error) { located = null; }
-            const savedLayout = cleanLayout(binding.layout) || savedLayoutFromFlag(flag) || (located && readLayout(located.entry));
+            // 与 loadContexts 使用同一权威顺序：绑定布局 → config.layouts → 旧状态/条目。
+            // 否则启动恢复会从原文重建 binding.layout，遮住 config.layouts 里的阶段属性。
+            const savedLayout = layoutOnBinding(binding, config) || savedLayoutFromFlag(flag) || (located && readLayout(located.entry));
             let layout = savedLayout;
             if (!layout && located) {
                 const migrated = layoutFromPick(pickFromSource(String(located.entry.content || '')));
@@ -4075,6 +4096,8 @@
             ...(index !== context.state.stageIndex
                 ? { stageEnteredId: settings.messageId != null ? settings.messageId : currentMessageId() }
                 : (Number.isFinite(context.state.stageEnteredId) ? { stageEnteredId: context.state.stageEnteredId } : {})),
+            // 推进记录（v3.3，仿格林推演 chronicle）：换段就记一条，段没变就原样带上。
+            ...chronicleNext(context, index, settings),
             ...(Object.keys(branchChoices).length ? { branchChoices } : {}),
             ...(context.state.lineCut === true ? { lineCut: true } : {}),
             ...(context.state.forkInto ? { forkInto: context.state.forkInto } : {}),
@@ -4202,6 +4225,145 @@
         return true;
     }
 
+    // ---------------------------------------------------------------
+    // 推进记录、冷却、停留与原因码（v3.3，仿格林推演 chronicle / 圈层冷却 / 到期清扫 / 规则编号）
+    // ---------------------------------------------------------------
+    const CHRONICLE_LIMIT = 20;
+    const CHRONICLE_SOURCES = { judge: '判断AI', bigcheck: '大检查', pick: 'AI 选段', manual: '手动', fork: '进分岔', side: '进支线', undo: '撤回' };
+    const MODEL_RETRY_FEEDBACK = '【上次作答无效】上一次回复没有按作答表填标签，系统读不到结论。这次请按案卷末尾的作答表把标签完整填好。';
+    const autoSkipNotes = new Map();
+    const maxStayLogged = new Set();
+
+    function appendChronicle(state, entry) {
+        const list = Array.isArray(state && state.chronicle) ? state.chronicle.slice() : [];
+        list.push({ ...entry, time: Date.now() });
+        return list.slice(-CHRONICLE_LIMIT);
+    }
+
+    // 分支组这次锁定后，同组没选的那几段记为「错过」。
+    function missedBranchNames(context, choices) {
+        if (!choices) return [];
+        const before = branchChoicesOf(context.state);
+        const after = branchChoicesOf({ branchChoices: choices });
+        const names = [];
+        Object.keys(after).forEach(group => {
+            if (before[group]) return;
+            (context.parsed.stages || []).forEach(stage => {
+                if (stage.branch === group && stage.id !== after[group]) names.push(stage.name);
+            });
+        });
+        return names;
+    }
+
+    function chronicleNext(context, index, options) {
+        const state = context.state || {};
+        if (index === state.stageIndex) return Array.isArray(state.chronicle) && state.chronicle.length ? { chronicle: state.chronicle } : {};
+        const opts = options || {};
+        const stages = (context.parsed && context.parsed.stages) || [];
+        const missed = missedBranchNames(context, opts.branchChoices);
+        const source = opts.source || (opts.messageId != null ? 'judge' : 'manual');
+        if (missed.length) LogModule.info('推进', `「${entryName(context.entry)}」[原因:错过] 分支没走：${missed.join('、')}`);
+        return {
+            chronicle: appendChronicle(state, {
+                at: opts.messageId != null ? opts.messageId : currentMessageId(),
+                from: state.stageIndex,
+                to: index,
+                fromName: stages[state.stageIndex] ? stages[state.stageIndex].name : '',
+                toName: stages[index] ? stages[index].name : '（全部完成）',
+                source,
+                basis: String(opts.basis || '').slice(0, 200),
+                missed,
+                branchChoices: branchChoicesOf(state),
+            }),
+        };
+    }
+
+    function forkChronicle(context, fork, messageId, via) {
+        const side = fork && fork.binding && fork.binding.attachKind === 'side';
+        const basis = via === 'bigcheck'
+            ? '大检查发现正文已走进分岔'
+            : (via === 'judge' ? '判断AI写了路' : `手动进入${side ? '支线' : '分岔'}`);
+        return appendChronicle(context.state, {
+            at: messageId, from: context.state.stageIndex, to: context.state.stageIndex,
+            fromName: context.stage ? context.stage.name : '', toName: `${side ? '支线' : '分岔'}「${entryName(fork.entry)}」`,
+            source: side ? 'side' : 'fork', basis, missed: [], branchChoices: branchChoicesOf(context.state),
+        });
+    }
+
+    function advanceCooldown(settings) {
+        const n = Math.floor(Number(settings && settings.advanceCooldown));
+        return Number.isFinite(n) && n >= 0 ? n : 1;
+    }
+
+    function bindingStay(binding, field) {
+        const n = Math.floor(Number(binding && binding[field]));
+        return Number.isFinite(n) && n >= 1 ? n : 0;
+    }
+
+    // 阶段自己的停留限制优先；绑定字段仅兼容 v3.3 发布前草稿。
+    function stageStay(context, field) {
+        const n = Math.floor(Number(context && context.stage && context.stage[field]));
+        return Number.isFinite(n) && n >= 1 ? n : bindingStay(context && context.binding, field);
+    }
+
+    // 自动推进要不要先等：冷却中 / 未到最短停留。返回原因（写进日志和小卡），空串 = 不用等。
+    function autoWaitReason(context, messageId, settings) {
+        const state = (context && context.state) || {};
+        const entered = state.stageEnteredId;
+        const key = context && context.key;
+        if (!Number.isFinite(entered) || messageId == null || Number(messageId) < entered) {
+            autoSkipNotes.delete(key);
+            return '';
+        }
+        const since = Number(messageId) - entered;
+        const cooldown = advanceCooldown(settings);
+        const minStay = stageStay(context, 'minStay');
+        let reason = '';
+        if (since <= cooldown && cooldown > 0) reason = `冷却中：刚换段 ${since} 层（冷却 ${cooldown} 层）`;
+        else if (minStay && since < minStay) reason = `未到最短停留：已停 ${since}/${minStay} 层`;
+        if (reason) {
+            autoSkipNotes.set(key, reason);
+            LogModule.debug('判断AI', `「${entryName(context.entry)}」第 ${messageId} 层 [原因:${reason.split('：')[0]}] ${reason}`);
+        } else {
+            autoSkipNotes.delete(key);
+        }
+        return reason;
+    }
+
+    function warnMaxStay(context, messageId) {
+        if (!context || context.broken || !context.stage || messageId == null) return;
+        const max = stageStay(context, 'maxStay');
+        const entered = context.state && context.state.stageEnteredId;
+        if (!max || !Number.isFinite(entered)) return;
+        const since = Number(messageId) - entered;
+        if (since < max) return;
+        const onceKey = `max-stay:${context.key}:${context.state.stageIndex}:${entered}`;
+        if (maxStayLogged.has(onceKey)) return;
+        maxStayLogged.add(onceKey);
+        const text = `「${entryName(context.entry)}」这一段「${context.stage.name}」已停 ${since} 层（上限 ${max}），看看是否该手动推进。`;
+        LogModule.warn('推进', `[原因:超时] ${text}`);
+        notify(text, 'warning');
+    }
+
+    function chronicleField(context) {
+        const list = context && context.state && Array.isArray(context.state.chronicle) ? context.state.chronicle.slice(-5).reverse() : [];
+        if (!list.length) return null;
+        return field('最近推进', el('div', { class: 'dga-chronicle' }, ...list.map(item => el('div', { class: 'dga-chronicle-row' },
+            el('span', {
+                class: 'dga-chronicle-text',
+                title: item.basis || '',
+                text: `第 ${item.at == null ? '?' : item.at} 层 · ${CHRONICLE_SOURCES[item.source] || item.source}：${item.fromName || '—'} → ${item.toName || '—'}${item.missed && item.missed.length ? `（错过：${item.missed.join('、')}）` : ''}`,
+            }),
+            item.source === 'fork' ? null : btn('撤回到这一步', () => runAction('撤回推进', async () => {
+                const all = await loadContexts();
+                const now = all.contexts.find(entry => entry.key === context.key);
+                if (!now || now.broken) throw new Error('这条绑定现在不能撤回。');
+                await moveToIndex(now, item.from, { source: 'undo', resetBranches: false, branchChoices: item.branchChoices || {} });
+                return true;
+            }, { success: `已撤回到「${item.fromName || `第 ${Number(item.from) + 1} 段`}」` }), { ghost: true })))),
+            '只存在当前聊天，每条线留最近 20 条。');
+    }
+
     function messageIdFromArgs(args) {
         for (const value of args) {
             if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -4211,10 +4373,13 @@
     }
 
     // 判断AI（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
-    // 回复只要结论，压到 1024，避免预设里的 60000 让模型空转。
-    const JUDGE_REPLY_CAP = 1024;
-    // 好几条合进一次请求时，每条各留一份结论的长度，但总长不超过这个数。
-    const JUDGE_MERGED_REPLY_CAP = 4096;
+    // 回复长度（v3.2.1，对齐数据库 resolveRequestMaxTokens_ACU）：用 API 预设里的最大回复长度；
+    // 没选预设（酒馆主 API）时缺省 4096。不再单独压到 1024，免得标签外的分析或推理把作答表截掉。
+    const JUDGE_REPLY_CAP = 4096;
+    function judgeReplyTokens(preset) {
+        const n = Math.floor(Number(preset && preset.maxTokens));
+        return Number.isFinite(n) && n >= 1 ? n : JUDGE_REPLY_CAP;
+    }
     // 提示词在二级页面按「段」自定义（每段可选 system/user/assistant 角色，
     // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符，可导入导出/恢复默认）；
     // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
@@ -4250,7 +4415,11 @@
     // （自定义 API 的 fetch）真的取消；generateRaw / 连接管理器取消不了，就把回来的结论丢掉。
     // 中止不算失败、不暂停。
     const modelAbort = { epoch: 0, controller: null };
-    const MODEL_RETRY_DELAY = 1500;
+    // 重试（v3.2.1，对齐数据库填表 / 剧情推进）：一次请求最多试 3 次（tableMaxRetries / loopSettings.maxRetries 缺省 3），
+    // 每次失败等 5 秒。两类情况重试：请求的临时性错误（isRetryableAiRequestError_ACU 口径：429、5xx、超时、网络），
+    // 以及模型回了但缺作答标签（填表缺 <tableEdit>、剧情推进缺标签同款）。密钥 / 参数 / 额度类错误不重试。
+    const MODEL_RETRY_DELAY = 5000;
+    const MODEL_MAX_ATTEMPTS = 3;
 
     function modelAbortError() {
         const error = new Error('请求已中止（切换了聊天）');
@@ -4266,7 +4435,8 @@
         if (!error || isAbortError(error)) return false;
         const text = String(error && error.message ? error.message : error);
         if (/\b(?:400|401|403|404)\b|unauthorized|forbidden|invalid[ _-]?api[ _-]?key/i.test(text)) return false;
-        if (/\b429\b|rate.?limit|too many|quota|限流|额度|余额|频繁/i.test(text)) return false;
+        if (/quota|insufficient|额度|余额|欠费/i.test(text)) return false;
+        if (/\b429\b|rate.?limit|too many requests|限流|频繁/i.test(text)) return true;
         if (/\b(?:500|502|503|504|529)\b|bad gateway|service unavailable|gateway time-?out|overloaded/i.test(text)) return true;
         if (error && error.name === 'TypeError') return true;
         return /timeout|timed out|network|connection reset|socket hang up|failed to fetch|econnreset|超时|网络错误/i.test(text);
@@ -4289,7 +4459,8 @@
         LogModule.info('判断AI', `${reason || '中止'}：在途和排队中的判断请求作废`);
     }
 
-    function askModel(messages, preset, settings) {
+    // validate(text) 为 false 表示缺作答标签，按数据库口径重试；最后一次仍缺就原样交回，调用方照常「不推进」。
+    function askModel(messages, preset, settings, validate) {
         const epoch = modelAbort.epoch;
         const run = async () => {
             if (epoch !== modelAbort.epoch) throw modelAbortError();
@@ -4300,14 +4471,24 @@
             const stale = error => isAbortError(error) || epoch !== modelAbort.epoch;
             try {
                 let text;
-                try {
-                    text = await askJudge(messages, preset, options);
-                } catch (error) {
-                    if (stale(error) || !isRetryableModelError(error)) throw error;
-                    LogModule.warn('判断AI', `请求遇到临时性错误，${MODEL_RETRY_DELAY / 1000} 秒后原地重试一次：${error && error.message ? error.message : error}`);
+                let sending = messages;
+                for (let attempt = 1; attempt <= MODEL_MAX_ATTEMPTS; attempt += 1) {
+                    try {
+                        text = await askJudge(sending, preset, options);
+                    } catch (error) {
+                        if (stale(error) || !isRetryableModelError(error) || attempt === MODEL_MAX_ATTEMPTS) throw error;
+                        LogModule.warn('判断AI', `第 ${attempt}/${MODEL_MAX_ATTEMPTS} 次请求失败，${MODEL_RETRY_DELAY / 1000} 秒后重试：${error && error.message ? error.message : error}`);
+                        await modelDelay(MODEL_RETRY_DELAY);
+                        if (epoch !== modelAbort.epoch) throw modelAbortError();
+                        continue;
+                    }
+                    if (epoch !== modelAbort.epoch) throw modelAbortError();
+                    if (typeof validate !== 'function' || validate(text) || attempt === MODEL_MAX_ATTEMPTS) break;
+                    LogModule.warn('判断AI', `第 ${attempt}/${MODEL_MAX_ATTEMPTS} 次回复缺作答标签，${MODEL_RETRY_DELAY / 1000} 秒后重试`);
+                    // 仿数据库填表 SQL_ERROR_MARKER：重试时把错在哪告诉模型，不再原样重发。
+                    sending = appendToLastUser(messages.map(item => ({ ...item })), MODEL_RETRY_FEEDBACK);
                     await modelDelay(MODEL_RETRY_DELAY);
                     if (epoch !== modelAbort.epoch) throw modelAbortError();
-                    text = await askJudge(messages, preset, options);
                 }
                 if (epoch !== modelAbort.epoch) throw modelAbortError();
                 modelGate.failures = 0;
@@ -5091,10 +5272,13 @@
         if (!force && context.autoAdvance !== 'judge') return false;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到判断AI跳过。
         if (context.state.lastCompletionMessageId === messageId) return false;
+        // 推进冷却 / 最短停留（v3.3）：只拦自动检查，「现在检查」照常问。
+        if (!force && autoWaitReason(context, messageId, settings)) return false;
         return Boolean(force) || checkIntervalReached(context, messageId, settings);
     }
 
     function pickDueFor(context, messageId, settings, contexts, force) {
+        if (!force && autoWaitReason(context, messageId, settings)) return false;
         if (!context || context.broken || bindingOrderMode(context.binding) !== 'pick') return false;
         if (!context.parsed || !context.parsed.stages.length) return false;
         if (context.state && (context.state.lineCut === true || context.state.sideOut)) return false;
@@ -5255,11 +5439,20 @@
             const history = (await recentHistoryText(messageId, historyCount, settings)) || '（没有取到聊天记录）';
             const merged = cases.length > 1;
             const messages = merged ? mergedJudgeMessages(settings, cases, history) : singleJudgeMessages(settings, cases[0], history);
-            const cap = merged ? Math.min(JUDGE_REPLY_CAP * cases.length, JUDGE_MERGED_REPLY_CAP) : JUDGE_REPLY_CAP;
+            const cap = judgeReplyTokens(channel.preset);
             const preset = channel.preset;
             LogModule.info('判断AI', `${labels} 第 ${messageId} 层：开始检查${merged ? `（${cases.length} 条合成一次请求）` : `阶段「${cases[0].stage.name}」`}（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
-            const text = await askModel(messages, cappedPreset(preset, cap), { ...settings, judgeMaxTokens: cap });
+            const answered = raw => {
+                const clean = applyBoundaryRules(raw, settings);
+                if (merged) {
+                    // 整份回复一条都没按序号作答才重试；漏答某一条照原设计「这条不推进」，不整组重问。
+                    return splitJudgeAnswers(raw, cases.length).some(item => item != null)
+                        || splitJudgeAnswers(clean, cases.length).some(item => item != null);
+                }
+                return judgeHasVerdictTag(clean) || /^\s*(YES|NO)\b/i.test(String(clean || ''));
+            };
+            const text = await askModel(messages, preset, { ...settings, judgeMaxTokens: cap }, answered);
             // 先过提取/排除规则（数据库填表同款），削掉思维链等噪声后再解析结论。
             const filtered = applyBoundaryRules(text, settings);
             // 合并请求先从原文按 <answer n> 拆开，再各自过规则：提取规则若只留 <verdict>，
@@ -5336,7 +5529,7 @@
             const fork = guard.contexts.find(context => context.key === pickedFork.key && !context.broken) || pickedFork;
             LogModule.info('判断AI', `「${label}」进入分叉「${entryName(fork.entry)}」，暂时关闭被依附的这条`);
             await patchStatesFor({
-                [now.key]: { lineCut: true, sideOut: '', forkInto: fork.key, lastCompletionMessageId: messageId },
+                [now.key]: { lineCut: true, sideOut: '', forkInto: fork.key, lastCompletionMessageId: messageId, chronicle: forkChronicle(now, fork, messageId, 'judge') },
                 [fork.key]: { ...stagePatch(fork.parsed, 0), lineCut: false, returnKey: '', returnIndex: null, sideOut: '' },
             });
             return true;
@@ -5353,10 +5546,10 @@
                 return false;
             }
             LogModule.info('判断AI', `「${label}」进入分支「${stage.name}」`);
-            await moveToIndex(now, now.parsed.stages.indexOf(stage), { messageId, branchChoices: branchChoiceRecord(now.state, stage), sync: false });
+            await moveToIndex(now, now.parsed.stages.indexOf(stage), { messageId, branchChoices: branchChoiceRecord(now.state, stage), sync: false, source: 'judge', basis: judgeBasisText(item.answer) });
             return true;
         }
-        await moveToIndex(now, targetIndex, { messageId, sync: false });
+        await moveToIndex(now, targetIndex, { messageId, sync: false, source: 'judge', basis: judgeBasisText(item.answer) });
         return true;
     }
 
@@ -5392,7 +5585,8 @@
                 { role: 'user', content: caseText },
             ];
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：按正文选段（现在第 ${Math.min(startStageIndex, stages.length - 1) + 1} 段）`);
-            const text = await askModel(messages, cappedPreset(channel.preset, JUDGE_REPLY_CAP), { ...settings, judgeMaxTokens: JUDGE_REPLY_CAP });
+            const text = await askModel(messages, channel.preset, { ...settings, judgeMaxTokens: judgeReplyTokens(channel.preset) },
+                raw => lastTagInner(applyBoundaryRules(raw, settings), 'stage') != null);
             // 和判断一样先过提取/排除规则，思维链里抄出来的 <stage> 不算。
             const filtered = applyBoundaryRules(text, settings);
             const picked = judgePickedIndex(filtered, visible);
@@ -5424,7 +5618,7 @@
             if (realIndex < 0) return;
             LogModule.info('判断AI', `「${bindingLabel}」改到第 ${realIndex + 1} 段「${pickedStage.name}」`);
             // 选中未决分支即锁定：同组其他分支这次聊天不再走。
-            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]) });
+            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]), source: 'pick', basis: judgeBasisText(filtered) });
         } catch (error) {
             if (isAbortError(error)) {
                 LogModule.info('判断AI', `「${bindingLabel}」选段请求已中止`);
@@ -5450,6 +5644,7 @@
         if (bindingOrderMode(context.binding) === 'pick') return false;
         if (context.autoAdvance !== 'judge') return false;
         if (context.state.lastCompletionMessageId === messageId) return false;
+        if (autoWaitReason(context, messageId, settings)) return false;
         const last = context.state.lastBigCheckId;
         if (last == null) return true;
         const since = Number(messageId) - Number(last);
@@ -5486,7 +5681,8 @@
                 { role: 'user', content: fillBigCheckPrompt(pair.user, parts) },
             ];
             LogModule.info('大检查', `「${label}」第 ${messageId} 层：核对第 ${range.start + 1}–${range.end} 段大纲与最近 ${BIG_CHECK_HISTORY_COUNT} 段正文（现在第 ${currentOrder + 1} 段）`);
-            const text = await askModel(messages, cappedPreset(channel.preset, JUDGE_REPLY_CAP), { ...settings, judgeMaxTokens: JUDGE_REPLY_CAP });
+            const text = await askModel(messages, channel.preset, { ...settings, judgeMaxTokens: judgeReplyTokens(channel.preset) },
+                raw => lastTagInner(applyBoundaryRules(raw, settings), 'drift') != null);
             const filtered = applyBoundaryRules(text, settings);
             const drift = bigCheckDrift(filtered);
             const pickedFork = forks.length ? judgePickedFork(filtered, forks) : null;
@@ -5525,7 +5721,7 @@
                 const fork = fresh.contexts.find(item => item.key === pickedFork.key && !item.broken) || pickedFork;
                 LogModule.info('大检查', `「${label}」正文已走进分岔「${entryName(fork.entry)}」，暂时关闭被依附的这条`);
                 await patchStatesFor({
-                    [latest.key]: { lineCut: true, sideOut: '', forkInto: fork.key, lastCompletionMessageId: messageId },
+                    [latest.key]: { lineCut: true, sideOut: '', forkInto: fork.key, lastCompletionMessageId: messageId, chronicle: forkChronicle(latest, fork, messageId, 'bigcheck') },
                     [fork.key]: { ...stagePatch(fork.parsed, 0), lineCut: false, returnKey: '', returnIndex: null, sideOut: '' },
                 });
                 return true;
@@ -5533,7 +5729,7 @@
             const realIndex = latest.parsed.stages.findIndex(item => item.id === targetStage.id);
             if (realIndex < 0) return false;
             LogModule.info('大检查', `「${label}」${BIG_CHECK_DRIFT_LABELS[drift]}，改到第 ${realIndex + 1} 段「${targetStage.name}」`);
-            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]), sync: false });
+            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]), sync: false, source: 'bigcheck', basis: basis });
             return true;
         } catch (error) {
             if (isAbortError(error)) {
@@ -5605,6 +5801,7 @@
         if (!all.configured) return;
         const settings = all.config.settings || {};
         const judges = all.contexts.filter(context => judgeDueFor(context, messageId, settings, all.contexts, false));
+        all.contexts.forEach(context => warnMaxStay(context, messageId));
         const picks = all.contexts.filter(context => pickDueFor(context, messageId, settings, all.contexts, false));
         const bigs = all.contexts.filter(context => bigCheckDueFor(context, messageId, settings, all.contexts));
         if (!judges.length && !picks.length && !bigs.length) return;
@@ -5825,6 +6022,18 @@
         return select;
     }
 
+    // 分段按钮（v3.3，仿数据库 AcuSegmentedControl）：选项少的设置不用下拉，一排按钮点选，选中高亮。
+    function segControl(options, value, onchange, label) {
+        return el('div', { class: 'dga-seg dga-seg-fill', role: 'radiogroup', 'aria-label': label || '', style: `--dga-seg-count: ${Math.max(1, options.length)}` },
+            ...options.map(option => el('button', {
+                type: 'button', role: 'radio',
+                'aria-checked': option.value === value ? 'true' : 'false',
+                class: `dga-seg-btn${option.value === value ? ' is-on' : ''}`,
+                disabled: Boolean(ui.busy),
+                onclick: () => { if (option.value !== value) onchange(option.value); },
+            }, option.label)));
+    }
+
     function messageBar(message) {
         const item = message || ui.message;
         return item ? el('div', { class: 'dga-msg', 'data-type': item.type || 'info', text: item.text }) : null;
@@ -5911,7 +6120,7 @@
                         : (ui.view === 'judgePrompt' ? renderJudgePromptPage()
                             : (ui.view === 'logs' ? renderLogPage()
                                 : (ui.view === 'dev' ? renderDevPage()
-                                    : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
+                                    : (ui.view === 'guide' ? renderGuidePage() : (ui.view === 'rules' ? renderRulesPage() : renderManager())))))));
         // 电脑端和数据库一样：目录页左侧常驻导航，右侧是当前页。编辑、时间线、设置、判断AI提示词仍是二级页，不放这列。
         const showRail = ui.view !== 'editor' && ui.view !== 'pace' && ui.view !== 'judgePrompt';
         const main = el('div', { class: 'dga-main' }, ...page);
@@ -6286,9 +6495,16 @@
         bindCard.id = 'dga-card-bind';
         const judgeCard = judgeSettingsCard();
         judgeCard.id = 'dga-card-judge';
-        const rules = guideRulesCard();
+        // 提取 / 排除规则（v3.3）：挪进子页，这里只留摘要和入口（仿数据库「该去子页的去子页」）。
+        const guideSettings = ui.snapshot && ui.snapshot.config && ui.snapshot.config.settings ? ui.snapshot.config.settings : {};
+        const extractCount = RuleModule.normalize(guideSettings.extractRules).length;
+        const excludeCount = RuleModule.normalize(guideSettings.excludeRules).length;
+        const rules = card('提取规则',
+            muted(extractCount || excludeCount
+                ? `提取 ${extractCount} 条 · 排除 ${excludeCount} 条，发送前和解析结论前都会过滤。`
+                : '还没有规则：正文和判断AI的输出原样使用。'),
+            btn('编辑提取 / 排除规则…', () => { ui.view = 'rules'; ui.guideRuleRows = null; ui.navOpen = false; render(); }, { ghost: true }));
         rules.id = 'dga-card-rules';
-        rules.classList.add('dga-span');
         const body = el('div', { class: 'dga-body dga-split' },
             ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
@@ -6306,6 +6522,14 @@
                 { id: 'dga-card-rules', label: '提取规则' },
             ].filter(Boolean)),
             body,
+        ];
+    }
+
+    function renderRulesPage() {
+        const back = () => { ui.view = 'guide'; enterGuidePage(); render(); };
+        return [
+            header('提取 / 排除规则', '动态指导 · 输出过滤', back, '返回', null, { subpage: true }),
+            el('div', { class: 'dga-body' }, messageBar(), guideRulesCard()),
         ];
     }
 
@@ -7088,6 +7312,7 @@
 
     function judgeWaitText(context) {
         if (!context) return '';
+        const wait = autoSkipNotes.get(context.key) || '';
         if (bindingOrderMode(context.binding) === 'pick') {
             if (context.state.lastJudgeCheckedId == null && !context.state.lastJudgeBasis) return '';
             const basis = context.state.lastJudgeBasis ? `：${context.state.lastJudgeBasis}` : '';
@@ -7097,9 +7322,9 @@
         const verdict = context.state.lastJudgeYes === true
             ? '上次 YES'
             : (context.state.lastJudgeYes === false ? '上次 NO' : '');
-        if (!verdict) return '';
+        if (!verdict) return wait;
         const basis = context.state.lastJudgeBasis ? `：${context.state.lastJudgeBasis}` : '';
-        return `${verdict}${basis}`;
+        return `${verdict}${basis}${wait ? `（${wait}）` : ''}`;
     }
 
     // 仪表盘「开关」卡（v2.24 起只放流式输出：判断模式三档挪到「动态指导」页的
@@ -7147,9 +7372,9 @@
         const modeOptions = ['off', 'judge'].map(value => ({ value, label: AUTO_ADVANCE_LABELS[value] }));
         const children = [
             muted('这里是所有条目的默认。某一条想不一样，在它的小卡上改。'),
-            field('判断模式', selectControl(modeOptions, mode, value => {
+            field('判断模式', segControl(modeOptions, mode, value => {
                 saveGuideSettings({ autoAdvance: value }, `判断模式已切换为：${AUTO_ADVANCE_LABELS[value] || value}`);
-            })),
+            }, '判断模式')),
         ];
         if (mode === 'off') {
             children.push(muted('不调用 AI。要进入下一段，自己点小卡上的「下一段」。'));
@@ -7184,8 +7409,8 @@
                     },
                 });
                 intervalInput.value = String(interval);
-                return field('多久检查一次', el('div', { class: 'dga-two-col' },
-                    selectControl([
+                return field('多久检查一次', el('div', { class: 'dga-seg-stack' },
+                    segControl([
                         { value: '1', label: '每层' },
                         { value: '2', label: '每 2 层' },
                         { value: '3', label: '每 3 层' },
@@ -7215,8 +7440,8 @@
                     },
                 });
                 countInput.value = String(count);
-                return field('参考几段回复', el('div', { class: 'dga-two-col' },
-                    selectControl([
+                return field('参考几段回复', el('div', { class: 'dga-seg-stack' },
+                    segControl([
                         { value: '1', label: '最新 1 段' },
                         { value: '2', label: '最近 2 段' },
                         { value: '3', label: '最近 3 段' },
@@ -7246,8 +7471,8 @@
                     },
                 });
                 everyInput.value = String(every || 8);
-                return field('大检查', el('div', { class: 'dga-two-col' },
-                    selectControl([
+                return field('大检查', el('div', { class: 'dga-seg-stack' },
+                    segControl([
                         { value: '0', label: '关闭' },
                         { value: '5', label: '每 5 层' },
                         { value: '10', label: '每 10 层' },
@@ -7264,6 +7489,15 @@
                     }),
                     selectValue === 'custom' ? everyInput : null,
                 ), '每 N 层核对一次近 5 段大纲、分岔口和最近 3 段正文。推早了或跑过头，就改到正文对应的那一段。');
+            })(),
+            (() => {
+                // 推进冷却（v3.3，仿格林推演圈层冷却）：刚换段后 N 层内不自动推进，免得连跳两段。
+                const cooldown = String(advanceCooldown(settings));
+                const options = [0, 1, 2, 3].map(n => ({ value: String(n), label: n === 0 ? '不冷却' : `${n} 层` }));
+                if (!options.some(item => item.value === cooldown)) options.push({ value: cooldown, label: `${cooldown} 层` });
+                return field('推进冷却', segControl(options, cooldown, value => {
+                    saveGuideSettings({ advanceCooldown: Number(value) }, value === '0' ? '推进冷却已关闭' : `换段后 ${value} 层内不自动推进`);
+                }, '推进冷却'), '刚换段后这几层不自动问判断AI；手动「下一段」和「现在检查」不受限。');
             })(),
             presetList.length === 0
                 ? muted('还没有预设：去「API」页新建，或直接用酒馆主 API。')
@@ -7452,14 +7686,14 @@
                         const chosen = here[pick - 1];
                         if (chosen.binding.attachKind === 'side') {
                             await patchStatesFor({
-                                [fresh.key]: { sideOut: chosen.key },
+                                [fresh.key]: { sideOut: chosen.key, chronicle: forkChronicle(fresh, chosen, currentMessageId(), 'manual') },
                                 [chosen.key]: {
                                     ...stagePatch(chosen.parsed, 0), lineCut: false, returnKey: fresh.key, returnIndex: fresh.state.stageIndex + 1,
                                 },
                             });
                         } else {
                             await patchStatesFor({
-                                [fresh.key]: { lineCut: true, sideOut: '', forkInto: chosen.key },
+                                [fresh.key]: { lineCut: true, sideOut: '', forkInto: chosen.key, chronicle: forkChronicle(fresh, chosen, currentMessageId(), 'manual') },
                                 [chosen.key]: { ...stagePatch(chosen.parsed, 0), lineCut: false, returnKey: '', returnIndex: null },
                             });
                         }
@@ -7760,7 +7994,7 @@
             const stage = fresh.parsed.stages.find(item => item.id === candidate.id);
             if (!stage) throw new Error('这个分支已经不在了。');
             ui.branchPick = '';
-            await moveToIndex(fresh, fresh.parsed.stages.indexOf(stage), { branchChoices: branchChoiceRecord(fresh.state, stage) });
+            await moveToIndex(fresh, fresh.parsed.stages.indexOf(stage), { branchChoices: branchChoiceRecord(fresh.state, stage), source: 'manual', basis: '手动选择分支' });
             return true;
         }, { success: `进入分支「${candidate.name}」，其余分支这次聊天不再走` });
         const backdrop = el('div', {
@@ -7869,6 +8103,7 @@
                 if (value === 'off' || value === 'judge') item.advanceMode = value;
                 else delete item.advanceMode;
             }), { success: '已记下这条的判断方式' }))),
+            chronicleField(context),
         ];
         if (orderMode === 'pick' || context.autoAdvance === 'judge') {
             const settings = config && config.settings ? config.settings : {};
@@ -8444,6 +8679,8 @@
             name: owner.name,
             kind: owner.kind === 'addon' ? 'addon' : 'stage',
             completion: owner.kind === 'stage' ? (owner.completion || '') : '',
+            minStay: owner.kind === 'stage' && Number.isFinite(Number(owner.minStay)) ? Math.floor(Number(owner.minStay)) : 0,
+            maxStay: owner.kind === 'stage' && Number.isFinite(Number(owner.maxStay)) ? Math.floor(Number(owner.maxStay)) : 0,
             terminal: owner.kind === 'stage' ? Boolean(owner.terminal) : false,
             loopTo: owner.kind === 'stage' ? String(owner.loopTo || '') : '',
             branch: owner.kind === 'stage' ? String(owner.branch || '') : '',
@@ -8682,12 +8919,15 @@
             completion.value = sheet.completion;
             const stages = stageSequence(editor.pick);
             const others = stages.filter(stage => stage !== owner);
+            const stayOptions = [{ value: '0', label: '不限' }].concat([1, 2, 3, 5, 10, 20].map(n => ({ value: String(n), label: `${n} 层` })));
             box.append(sheetSection('离开这一段',
                 field('什么时候进入下一段', completion),
                 el('div', { class: 'dga-inline-action' },
                     btn('AI 生成', () => runAction('生成完成条件', () => generateCondition(sheet, completion), {
                         success: '已生成，确认后点「保存修改」。',
-                    }), { ghost: true }))));
+                    }), { ghost: true })),
+                field('至少停几层', selectControl(stayOptions, String(sheet.minStay || 0), value => { sheet.minStay = Math.max(0, Math.floor(Number(value) || 0)); }), '没停够时不自动推进；手动「下一段」不受限。'),
+                field('最多停几层', selectControl(stayOptions, String(sheet.maxStay || 0), value => { sheet.maxStay = Math.max(0, Math.floor(Number(value) || 0)); }), '超过后提醒一次，不会自动推进。')));
             if (others.length && !sheet.creating) {
                 box.append(sheetSection('整理',
                     others.length ? field('再分配', selectControl(
@@ -8757,6 +8997,8 @@
         owner.name = name;
         if (owner.kind === 'stage') {
             owner.completion = String(sheet.completion || '').trim();
+            if (sheet.minStay >= 1) owner.minStay = Math.floor(sheet.minStay); else delete owner.minStay;
+            if (sheet.maxStay >= 1) owner.maxStay = Math.floor(sheet.maxStay); else delete owner.maxStay;
             owner.terminal = Boolean(sheet.terminal);
             const loopId = String(sheet.loopTo || '').trim();
             owner.loopTo = owner.terminal || !editor.pick.stages.some(stage => stage !== owner && stage.id === loopId) ? '' : loopId;
@@ -9370,6 +9612,14 @@ ${P} .dga-seg-btn { min-height: 40px; border-radius: 4px; border: 1px solid var(
 ${P} .dga-seg-btn:hover { background: var(--dga-hover); }
 ${P} .dga-seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-seg-btn.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); font-weight: 700; }
+${P} .dga-seg.dga-seg-fill { grid-template-columns: repeat(var(--dga-seg-count, 2), minmax(0, 1fr)); gap: 4px; padding: 3px; border-radius: 6px; background: var(--dga-bg-2); }
+${P} .dga-seg.dga-seg-fill .dga-seg-btn { min-height: 34px; padding: 0 6px; border-color: transparent; background: transparent; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+${P} .dga-seg.dga-seg-fill .dga-seg-btn:hover:not(.is-on) { background: var(--dga-hover); }
+${P} .dga-seg.dga-seg-fill .dga-seg-btn.is-on { background: var(--dga-accent); color: var(--dga-on-accent); }
+${P} .dga-seg-stack { display: grid; gap: 6px; }
+${P} .dga-chronicle { display: grid; gap: 4px; }
+${P} .dga-chronicle-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; font-size: 12px; }
+${P} .dga-chronicle-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--dga-text-2); }
 ${P} .dga-work-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 ${P} .dga-pass { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-pass-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -9843,6 +10093,8 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         isMvuEntry,
         migrateJudgeSegments,
         judgeDefaults: { legacyIdentity: JUDGE_IDENTITY_V30, rules: DEFAULT_JUDGE_RULES_PROMPT, legacyCase: LEGACY_JUDGE_CASE_PROMPT_V30, segments: DEFAULT_JUDGE_SEGMENTS },
+        chronicleNext,
+        forkChronicle,
         isPickerExcludedEntry,
         isRetryableModelError,
         abortModelRequests,
@@ -9911,6 +10163,8 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
             abortModelRequests('切换聊天');
+            autoSkipNotes.clear();
+            maxStayLogged.clear();
             // 换聊天后进度不同：镜像内容按新聊天的进度重新对齐（镜像在世界书里，不按聊天隔离）。
             LogModule.info('事件', '切换聊天，按当前角色卡重新对齐绑定和镜像');
             resetIoCache();

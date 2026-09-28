@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v3.2**（发布标签：`v3.2`）
+当前版本：**v3.3**（发布标签：`v3.3`）
 
 把完整剧情大纲写在角色世界书的条目里，用分段划成一幕一幕。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前这一幕。可以同时绑定好几条。没选依附的自己走。选了依附的，从某一段开始挂上去：分岔口是选了这条、原来那条就断；支线是可以走，走完回到原来那条接着往下。分岔口上还能再依附别的条目。
 
@@ -8,10 +8,10 @@
 
 ## 安装与开始使用
 
-在 [v3.2 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v3.2)下载导入文件：
+在 [v3.3 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v3.3)下载导入文件：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.2/dynamic-guide-offline-v3.2.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.2/dynamic-guide-online-v3.2.json)：启动时加载固定版本的远程脚本。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.3/dynamic-guide-offline-v3.3.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.3/dynamic-guide-online-v3.3.json)：启动时加载固定版本的远程脚本。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -29,10 +29,10 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v3.2/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v3.3/index.js';
 ```
 
-推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v3.2`。
+推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。当前项目版本、Git 标签及在线加载地址均使用 `v3.3`。
 
 ## v2.0 文本格式
 
@@ -197,6 +197,21 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 每个条目是一条线，按分段往下走；非直线的走法只有「依附」这一种：一条线可以从另一条的某一段接上，做成分岔口或支线，两条之间还可以设换边。自动推进依赖判断AI的结论，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v3.3（2026-09-29）
+
+- 推进记录（仿数据库格林推演的编年记录）：每次换段记下第几层、从哪段到哪段、谁推的（判断AI / 大检查 / AI 选段 / 手动 / 进分岔 / 撤回）和判断依据。小卡「设置 ›」里列出最近 5 条，可以「撤回到这一步」。只存当前聊天，每条线留最近 20 条。
+- 推进冷却：刚换段后 N 层内不自动问判断AI（默认 1 层，可设 0–3 层），免得连跳两段。手动「下一段」和「现在检查」不受限。
+- 每段至少 / 最多停几层：在「编辑」里点阶段标题条，打开阶段属性弹层设置。每一段可以不同；没停够不自动推进，停超过上限只提醒一次，不会自动推进。分支组锁定后，同组没走的分支记为「错过」。
+- 跳过原因写进运行日志（「冷却中」「未到最短停留」「超时」「错过」），小卡的上次结论后面也会带上。
+- 判断AI回复缺作答标签重试时，会告诉模型「上次没按作答表填」，不再原样重发（仿数据库填表）。
+- 「动态指导」页改版：判断模式、检查频率、参考段数、大检查、推进冷却改成分段按钮；提取 / 排除规则挪进子页，页面上只留摘要和「编辑提取 / 排除规则…」入口。
+- 包含 v3.2.1 的改动（该版未单独发布）。
+
+### v3.2.1（2026-09-29）
+
+- 判断AI、AI 选段、大检查的重试对齐数据库填表 / 剧情推进：一次请求最多试 3 次，每次隔 5 秒。429、5xx、超时、网络断开会重试；模型回了但缺作答标签也会重试。密钥错误、400/404、额度用完不重试。3 次都失败才暂停自动检查。
+- 判断回复长度对齐数据库：用 API 预设里的最大回复长度；没选预设时 4096。不再单独压到 1024，避免标签外的分析或推理把作答表截掉。
 
 ### v3.2（2026-09-28）
 
