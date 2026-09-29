@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.4';
+    const VERSION = '3.5';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1346,11 +1346,23 @@
         return { name: settings && typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '', source: 'global' };
     }
 
-    // 这条绑定这一次实际用的设置：只把 judgePreset 换成按线 / 按聊天解析出来的名字。
+    // 提示词和规则只取当前绑定；旧全局提示词保留存档，但不参与卡片判断。
     function settingsForContext(settings, context) {
         const base = settings || {};
         const resolved = resolveJudgePresetName(base, context);
-        return resolved.source === 'global' ? base : { ...base, judgePreset: resolved.name };
+        const binding = context && context.binding ? context.binding : {};
+        return {
+            ...base,
+            ...(resolved.source === 'global' ? {} : { judgePreset: resolved.name }),
+            judgePrompt: '',
+            judgeSegments: bindingPromptSpecs(binding, 'judge'),
+            pickStageSegments: bindingPromptSpecs(binding, 'pick'),
+            bigCheckSegments: bindingPromptSpecs(binding, 'bigCheck'),
+            bigCheckSystemPrompt: undefined,
+            bigCheckUserPrompt: undefined,
+            extractRules: binding.extractRules || [],
+            excludeRules: binding.excludeRules || [],
+        };
     }
 
     function presetOverrideOptions(presetList, followLabel, current) {
@@ -2192,6 +2204,14 @@
         };
     }
 
+    function normalizePromptSegments(segments) {
+        if (!Array.isArray(segments)) return [];
+        return segments.filter(seg => seg && typeof seg === 'object').map(seg => ({
+            role: ['system', 'user', 'assistant'].includes(seg.role) ? seg.role : 'user',
+            content: seg.content == null ? '' : String(seg.content),
+        }));
+    }
+
     function normalizeConfig(raw) {
         const empty = { version: 2, bindings: [], settings: {} };
         if (!raw || typeof raw !== 'object') return empty;
@@ -2236,6 +2256,14 @@
             if (ownMode === 'off' || ownMode === 'judge') binding.advanceMode = ownMode;
             const ownInterval = Math.floor(Number(item.judgeInterval));
             if (Number.isFinite(ownInterval) && ownInterval >= 1) binding.judgeInterval = ownInterval;
+            ['extractRules', 'excludeRules'].forEach(field => {
+                const rules = RuleModule.normalize(item[field]);
+                if (rules.length) binding[field] = rules;
+            });
+            ['judgeSegments', 'pickStageSegments', 'bigCheckSegments'].forEach(field => {
+                const segments = normalizePromptSegments(item[field]);
+                if (segments.length) binding[field] = segments;
+            });
             // v3.3 草稿曾把停留限制写在整条绑定上；保留读取仅作旧数据回退。
             // 新数据写在 layout.stages[]，由阶段属性弹层单独设置。
             ['minStay', 'maxStay'].forEach(field => {
@@ -4596,7 +4624,7 @@
     // 判断AI提示词（v3.0）：三段——system 身份 / system 判定手册 / user 本次案卷。
     // 不再用 assistant 预确认段：有的接口会把它当成模型已经说过的话接着编，也多花一段字数。
     // 手册里没有占位符，合并请求时原样只发一份；每条要填的东西都在最后一段案卷里。
-    // 案卷必须留在最后一段 user：generateRaw 只把最后一段当 user_input。
+    // 案卷留在最后一段 user，合并判断时将其替换为各绑定的案卷；完整消息顺序交给调用通道。
     // 口径：已发生只认正文；先分清状态型 / 事件型阶段；达成 / 部分达成 / 偏离三档，只有达成写 YES。
     const DEFAULT_JUDGE_SYSTEM_PROMPT = [
         '你负责判断剧情该不该推进。每次只回答一个问题：这条剧情线现在该不该从当前阶段进入它的下一阶段。',
@@ -4847,15 +4875,37 @@
         '</road>',
     ].join('\n');
 
-    function bigCheckPromptPair(settings) {
-        const source = settings && typeof settings === 'object' ? settings : {};
-        const system = typeof source.bigCheckSystemPrompt === 'string' && source.bigCheckSystemPrompt.trim()
-            ? source.bigCheckSystemPrompt
-            : DEFAULT_BIG_CHECK_SYSTEM_PROMPT;
-        const user = typeof source.bigCheckUserPrompt === 'string' && source.bigCheckUserPrompt.trim()
-            ? source.bigCheckUserPrompt
-            : DEFAULT_BIG_CHECK_USER_PROMPT;
-        return { system, user };
+    const BINDING_PROMPT_TYPES = {
+        judge: {
+            field: 'judgeSegments', label: '常规判断', defaults: DEFAULT_JUDGE_SEGMENTS,
+            hint: '占位符：{{stage}} {{prompt}} {{condition}} {{history}} {{previous}} {{elapsed}} {{next}} {{nextPrompt}} {{roads}}。结论读 <verdict>，也兼容 <结论> 和开头的 YES / NO。',
+        },
+        pick: {
+            field: 'pickStageSegments', label: 'AI选段',
+            defaults: [
+                { role: 'system', content: PICK_STAGE_SYSTEM_PROMPT },
+                { role: 'user', content: pickStageCase('{{catalog}}', '{{current}}', '{{history}}') },
+            ],
+            hint: '占位符：{{catalog}} 可选阶段、{{current}} 现在停在、{{history}} 最近正文。结论读 <stage>，依据读 <basis>。',
+        },
+        bigCheck: {
+            field: 'bigCheckSegments', label: '大检查',
+            defaults: [
+                { role: 'system', content: DEFAULT_BIG_CHECK_SYSTEM_PROMPT },
+                { role: 'user', content: DEFAULT_BIG_CHECK_USER_PROMPT },
+            ],
+            hint: '占位符：{{outline}} 近段大纲、{{current}} 现在停在、{{roads}} 分岔口、{{history}} 最近正文、{{elapsed}} 已停多久。结论读 <drift>、<stage>、<road>。',
+        },
+    };
+
+    function bindingPromptSpecs(binding, kind) {
+        const type = BINDING_PROMPT_TYPES[kind];
+        const segments = normalizePromptSegments(binding && binding[type.field]);
+        return segments.some(seg => seg.content.trim()) ? segments : type.defaults.map(seg => ({ ...seg }));
+    }
+
+    function fillPickStagePrompt(template, parts) {
+        return String(template || '').replace(/\{\{\s*(catalog|current|history)\s*\}\}/g, (match, key) => parts[key] || '');
     }
 
     // 用函数替换，正文里带 $ 也不会被当成替换模式。
@@ -4964,15 +5014,15 @@
         const following = next || {};
         const more = extra || {};
         return String(template || '')
-            .replace(/\{\{\s*stage\s*\}\}/g, stage.name)
-            .replace(/\{\{\s*prompt\s*\}\}/g, stage.prompt)
-            .replace(/\{\{\s*condition\s*\}\}/g, condition)
-            .replace(/\{\{\s*history\s*\}\}/g, history)
-            .replace(/\{\{\s*next\s*\}\}/g, following.name || '（没有下一阶段）')
-            .replace(/\{\{\s*nextPrompt\s*\}\}/g, following.prompt || '（没有）')
-            .replace(/\{\{\s*roads\s*\}\}/g, roads || '这一段没有分岔。路写 0。')
-            .replace(/\{\{\s*previous\s*\}\}/g, more.previous || '（这是第一段）')
-            .replace(/\{\{\s*elapsed\s*\}\}/g, more.elapsed || '（没有记录进入这段的楼层，按正文判断）');
+            .replace(/\{\{\s*stage\s*\}\}/g, () => stage.name)
+            .replace(/\{\{\s*prompt\s*\}\}/g, () => stage.prompt)
+            .replace(/\{\{\s*condition\s*\}\}/g, () => condition)
+            .replace(/\{\{\s*history\s*\}\}/g, () => history)
+            .replace(/\{\{\s*next\s*\}\}/g, () => following.name || '（没有下一阶段）')
+            .replace(/\{\{\s*nextPrompt\s*\}\}/g, () => following.prompt || '（没有）')
+            .replace(/\{\{\s*roads\s*\}\}/g, () => roads || '这一段没有分岔。路写 0。')
+            .replace(/\{\{\s*previous\s*\}\}/g, () => more.previous || '（这是第一段）')
+            .replace(/\{\{\s*elapsed\s*\}\}/g, () => more.elapsed || '（没有记录进入这段的楼层，按正文判断）');
     }
 
     // 兼容旧版：settings.judgePrompt 单模板字符串仍然生效（相当于 system 段 + 单个 user 段）；
@@ -5177,6 +5227,33 @@
         return '';
     }
 
+    // 酒馆预设会改变宿主当前连接：请求前切到目标，结束后恢复原连接。
+    async function runWithTavernProfile(profileId, action) {
+        const context = sillyTavernContext();
+        const manager = context && context.extensionSettings && context.extensionSettings.connectionManager;
+        const profiles = manager && Array.isArray(manager.profiles) ? manager.profiles : [];
+        const profile = profiles.find(item => item && item.id === profileId);
+        if (!profile) throw new Error(`无法找到 ID 为「${profileId}」的酒馆连接预设。`);
+        if (!profile.api) throw new Error(`酒馆连接预设「${profile.name || profile.id}」没有配置 API。`);
+        const slash = api('triggerSlash', false);
+        const original = slash ? String(await slash('/profile') || '') : '';
+        const target = String(profile.name || profile.id);
+        const needSwitch = Boolean(original && original !== target);
+        try {
+            if (needSwitch) await slash(`/profile await=true "${target.replace(/"/g, '\\"')}"`);
+            return await action(profile);
+        } finally {
+            if (needSwitch) {
+                try {
+                    const current = String(await slash('/profile') || '');
+                    if (current !== original) await slash(`/profile await=true "${original.replace(/"/g, '\\"')}"`);
+                } catch (error) {
+                    LogModule.warn('判断AI', `恢复原酒馆连接预设失败：${error.message || error}`);
+                }
+            }
+        }
+    }
+
     // 直发生成端点（v3.4，照数据库 30b304da / a2e394c6）：酒馆主 API 和「酒馆预设」是 Chat Completion 时，
     // 按酒馆自己的字段拼好请求体，用原生 fetch 直接发到 /api/backends/chat-completions/generate。
     // generateRaw 和连接管理器都经过酒馆的全局 fetch，会被别的脚本改写；generateRaw 还会触发酒馆的生成事件，
@@ -5305,8 +5382,8 @@
         return null;
     }
 
-    // 「酒馆预设」直发：字段照酒馆 ConnectionManagerRequestService.sendRequest → ChatCompletionService.processRequest，
-    // 带上 secret_id，后端按这个预设自己的密钥发，不用像数据库那样先切换用户当前的连接。
+    // 「酒馆预设」直发：字段照酒馆 ConnectionManagerRequestService.sendRequest → ChatCompletionService.processRequest。
+    // 调用方先切到目标连接预设，再在结束后恢复原连接。
     // 不是 Chat Completion、读不到代理、旧版酒馆缺接口时返回 null，调用方退回连接管理器。
     async function askJudgeViaProfileDirect(messages, preset, signal) {
         const context = sillyTavernContext();
@@ -5326,7 +5403,6 @@
             max_tokens: preset.maxTokens != null ? preset.maxTokens : 60000,
             model: profile.model,
             chat_completion_source: entry.source,
-            secret_id: profile['secret-id'],
             custom_url: apiUrl,
             vertexai_region: apiUrl,
             zai_endpoint: apiUrl,
@@ -5423,9 +5499,11 @@
             if (!preset.tavernProfile) {
                 throw new Error(`API 预设「${preset.name}」没有选择酒馆预设。`);
             }
-            const direct = await askJudgeViaProfileDirect(messages, preset, settings && settings.abortSignal);
-            if (direct != null) return direct;
-            return askJudgeViaConnectionProfile(messages, preset);
+            return runWithTavernProfile(preset.tavernProfile, async () => {
+                const direct = await askJudgeViaProfileDirect(messages, preset, settings && settings.abortSignal);
+                if (direct != null) return direct;
+                return askJudgeViaConnectionProfile(messages, preset);
+            });
         }
         if (preset && preset.connection === 'custom') {
             if (!preset.apiurl || !preset.model) {
@@ -5436,21 +5514,15 @@
         // 酒馆主 API（或无预设）：Chat Completion 时直发生成端点（v3.4）；文本补全照旧走酒馆助手 generateRaw。
         const direct = await askJudgeViaMainApiDirect(messages, preset, settings);
         if (direct != null) return direct;
-        // generateRaw：段列表映射为 ordered_prompts 条目，最后一条 user 消息作为 user_input（最终注入）。
-        // 最近剧情已通过 {{history}} 占位符写进段内容，不再叠加 chat_history，避免弱模型被重复内容干扰。
+        // generateRaw 回退：和数据库填表一样，完整段列表直接交给 ordered_prompts。
+        // 最近剧情已通过 {{history}} 占位符写进段内容，不再叠加聊天历史。
         const generateRaw = api('generateRaw', false);
         if (!generateRaw) return null;
-        const lastUserIndex = messages.map((item, index) => (item.role === 'user' ? index : -1)).filter(index => index >= 0).pop();
-        const userInput = lastUserIndex != null ? messages[lastUserIndex].content : '';
-        const ordered = messages.filter((item, index) => index !== lastUserIndex)
-            .map(item => ({ role: item.role, content: item.content }));
-        ordered.push('user_input');
         const request = {
-            user_input: userInput,
             should_silence: true,
             should_stream: streaming,
             max_chat_history: 0,
-            ordered_prompts: ordered,
+            ordered_prompts: messages,
         };
         if (settings && settings.judgeMaxTokens) {
             request.max_tokens = settings.judgeMaxTokens;
@@ -5546,7 +5618,7 @@
         return Boolean(force) || checkIntervalReached(context, messageId, settings);
     }
 
-    // 判断走哪条通道：本机 API 预设（酒馆预设 / 自定义），没选预设就是酒馆主 API（generateRaw）。
+    // 判断走哪条通道：本机 API 预设（酒馆预设 / 自定义），没选预设就用酒馆主 API（直发或 generateRaw 回退）。
     // 全部走酒馆的接口。用不了时返回 { error }，自动检查只提醒一次，「现在检查」直接报出来。
     function judgeChannel(settings) {
         const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
@@ -5554,11 +5626,8 @@
         if (presetName && !preset) {
             return { key: `judge-preset-missing:${presetName}`, error: `找不到本机 API 预设「${presetName}」，本次不检查；请重新选择或保存同名预设。` };
         }
-        if (preset && preset.connection === 'tavern') {
-            if (!connectionManagerService()) {
-                return { key: 'judge-no-cm', error: '「酒馆预设」连接需要酒馆的连接管理器（ConnectionManagerRequestService），当前不可用；请升级酒馆版本或改用其他连接方式。' };
-            }
-        } else if ((!preset || preset.connection === 'main') && !api('generateRaw', false)) {
+        if ((!preset || preset.connection === 'main') && !api('generateRaw', false)
+            && !mainApiIsChatCompletion(sillyTavernContext())) {
             // 自定义连接直连酒馆后端，不需要 generateRaw。
             return { key: 'judge-no-engine', error: '判断AI需要酒馆助手的 generateRaw 接口，当前不可用；请改用手动推进或升级酒馆助手。' };
         }
@@ -5633,9 +5702,9 @@
     }
 
     // 好几条同一层到点：合成一次请求（仿数据库把同一频率的表合进一次填表）。
-    // 系统段、手册段照常只发一份；案卷那段每条各填一份，包进 <case n="序号">，最近正文只放一次。
-    // 回答按序号写进 <answer n="序号">。前几段自定义里写了占位符的，按第一条填。
-    function mergedJudgeMessages(settings, cases, history) {
+    // 系统段、手册段照常只发一份；每条案卷各带自己的最近正文，包进 <case n="序号">。
+    // 回答按序号写进 <answer n="序号">。只有共用静态前后段且案卷模板相同的绑定才合并。
+    function mergedJudgeMessages(settings, cases) {
         const specs = judgeMessageSpecs(settings)
             .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role) && typeof seg.content === 'string' && seg.content.trim());
         let caseAt = -1;
@@ -5647,8 +5716,9 @@
         const blocks = cases.map((item, index) => {
             const parts = [
                 `【剧情线】${entryName(item.context.entry)}`,
-                fillJudgePlaceholders(template, item.stage, item.condition, '（见上面的【最近正文】）', item.next, item.roads, item.fill),
+                fillJudgePlaceholders(template, item.stage, item.condition, item.history, item.next, item.roads, item.fill),
             ];
+            if (!/\{\{\s*history\s*\}\}/.test(template)) parts.push(`【最近正文】\n${item.history}`);
             if (item.branches) parts.push(branchTableText(item.branches));
             return `<case n="${index + 1}">\n${parts.join('\n\n')}\n</case>`;
         });
@@ -5657,15 +5727,12 @@
             content: [
                 `这一层要判断 ${cases.length} 条剧情线。各条互不相干，只按自己那条的阶段、条件和表判断。每条的表按序号放进 <answer n="序号"></answer>，${cases.length} 条都要写。标签外可以写几句简短分析，同一序号只认最后一次。`,
                 '',
-                '【最近正文】',
-                history,
-                '',
                 ...blocks,
             ].join('\n'),
         };
         const messages = specs.map((seg, index) => (index === caseAt
             ? caseMessage
-            : { role: seg.role, content: fillJudgePlaceholders(seg.content, first.stage, first.condition, history, first.next, first.roads, first.fill) }));
+            : { role: seg.role, content: fillJudgePlaceholders(seg.content, first.stage, first.condition, '（见各条剧情线的【最近正文】）', first.next, first.roads, first.fill) }));
         if (caseAt < 0) messages.push(caseMessage);
         return messages;
     }
@@ -5686,40 +5753,43 @@
     // 推进完统一同步一次镜像。force =「现在检查」：出错直接抛给界面。
     async function judgeBindings(list, messageId, all, options) {
         const flags = options || {};
-        const settings = settingsForContext(all.config && all.config.settings ? all.config.settings : {}, list[0]);
+        const baseSettings = all.config && all.config.settings ? all.config.settings : {};
+        const settings = settingsForContext(baseSettings, list[0]);
         const channel = usableChannel(settings, flags.force);
         if (!channel) return;
         const labels = list.map(context => `「${entryName(context.entry)}」`).join('、');
         try {
-            const cases = list.map(context => judgeCaseFor(context, all.contexts, flags.extra, messageId));
+            const cases = list.map(context => ({
+                ...judgeCaseFor(context, all.contexts, flags.extra, messageId),
+                settings: settingsForContext(baseSettings, context),
+            }));
             // 只看 AI 最新正文（v2.15）：用户消息不发送；参考段数可在设置里调。
             // 到了分岔口只给当前这一层正文，不带上一层；合并请求里只要有一条在分岔口，就都只看这一层。
             const historyCount = cases.some(item => item.forks.length) ? 1 : judgeHistoryCount(settings);
-            const history = (await recentHistoryText(messageId, historyCount, settings)) || '（没有取到聊天记录）';
+            await Promise.all(cases.map(async item => {
+                item.history = (await recentHistoryText(messageId, historyCount, item.settings)) || '（没有取到聊天记录）';
+            }));
             const merged = cases.length > 1;
-            const messages = merged ? mergedJudgeMessages(settings, cases, history) : singleJudgeMessages(settings, cases[0], history);
+            const messages = merged ? mergedJudgeMessages(settings, cases) : singleJudgeMessages(settings, cases[0], cases[0].history);
             const cap = judgeReplyTokens(channel.preset);
             const preset = channel.preset;
             LogModule.info('判断AI', `${labels} 第 ${messageId} 层：开始检查${merged ? `（${cases.length} 条合成一次请求）` : `阶段「${cases[0].stage.name}」`}（${preset ? `API 预设「${preset.name}」` : '酒馆主 API'}）`);
             const startedAt = Date.now();
             const answered = raw => {
-                const clean = applyBoundaryRules(raw, settings);
                 if (merged) {
                     // 整份回复一条都没按序号作答才重试；漏答某一条照原设计「这条不推进」，不整组重问。
-                    return splitJudgeAnswers(raw, cases.length).some(item => item != null)
-                        || splitJudgeAnswers(clean, cases.length).some(item => item != null);
+                    return splitJudgeAnswers(raw, cases.length).some(item => item != null);
                 }
+                const clean = applyBoundaryRules(raw, settings);
                 return judgeHasVerdictTag(clean) || /^\s*(YES|NO)\b/i.test(String(clean || ''));
             };
             const text = await askModel(messages, preset, { ...settings, judgeMaxTokens: cap }, answered);
-            // 先过提取/排除规则（数据库填表同款），削掉思维链等噪声后再解析结论。
-            const filtered = applyBoundaryRules(text, settings);
             // 合并请求先从原文按 <answer n> 拆开，再各自过规则：提取规则若只留 <verdict>，
             // 先过规则会把序号标签一起削掉，几条就都没作答了。同一序号取最后一次，思维链里抄的那份会被盖掉。
-            const fallback = merged ? splitJudgeAnswers(filtered, cases.length) : null;
             const answers = merged
-                ? splitJudgeAnswers(text, cases.length).map((item, index) => (item == null ? fallback[index] : applyBoundaryRules(item, settings)))
-                : [filtered];
+                ? splitJudgeAnswers(text, cases.length).map((item, index) => (item == null ? null : applyBoundaryRules(item, cases[index].settings)))
+                : [applyBoundaryRules(text, settings)];
+            const filtered = merged ? answers.filter(item => item != null).join('\n\n') : answers[0];
             const outcomes = cases.map((item, index) => ({
                 ...item,
                 answer: answers[index],
@@ -5837,12 +5907,10 @@
             const currentOrder = visible.indexOf(currentStage);
             const current = currentStage && currentOrder >= 0 ? `${currentOrder + 1}. ${currentStage.name}` : '（还没有停在某一段）';
             const extra = String(flags.extra || '').trim();
-            let caseText = pickStageCase(catalog, current, history || '（没有取到聊天记录）');
-            if (extra) caseText += `\n本次只看这一次的附加要求：${extra}`;
-            const messages = [
-                { role: 'system', content: PICK_STAGE_SYSTEM_PROMPT },
-                { role: 'user', content: caseText },
-            ];
+            const parts = { catalog, current, history: history || '（没有取到聊天记录）' };
+            const messages = settings.pickStageSegments.filter(seg => seg.content.trim())
+                .map(seg => ({ role: seg.role, content: fillPickStagePrompt(seg.content, parts) }));
+            if (extra) appendToLastUser(messages, `本次只看这一次的附加要求：${extra}`);
             LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：按正文选段（现在第 ${Math.min(startStageIndex, stages.length - 1) + 1} 段）`);
             const text = await askModel(messages, channel.preset, { ...settings, judgeMaxTokens: judgeReplyTokens(channel.preset) },
                 raw => lastTagInner(applyBoundaryRules(raw, settings), 'stage') != null);
@@ -5927,7 +5995,6 @@
             const range = bigCheckWindow(visible, currentOrder);
             const forks = forksAtStage(context, all.contexts);
             const history = (await recentHistoryText(messageId, BIG_CHECK_HISTORY_COUNT, settings)) || '（没有取到聊天记录）';
-            const pair = bigCheckPromptPair(settings);
             const parts = {
                 outline: bigCheckOutlineText(visible, range, currentOrder, choices),
                 current: `${currentOrder + 1}. ${currentStage.name}`,
@@ -5935,10 +6002,8 @@
                 roads: roadListText(context, forks),
                 history,
             };
-            const messages = [
-                { role: 'system', content: fillBigCheckPrompt(pair.system, parts) },
-                { role: 'user', content: fillBigCheckPrompt(pair.user, parts) },
-            ];
+            const messages = settings.bigCheckSegments.filter(seg => seg.content.trim())
+                .map(seg => ({ role: seg.role, content: fillBigCheckPrompt(seg.content, parts) }));
             LogModule.info('大检查', `「${label}」第 ${messageId} 层：核对第 ${range.start + 1}–${range.end} 段大纲与最近 ${BIG_CHECK_HISTORY_COUNT} 段正文（现在第 ${currentOrder + 1} 段）`);
             const text = await askModel(messages, channel.preset, { ...settings, judgeMaxTokens: judgeReplyTokens(channel.preset) },
                 raw => lastTagInner(applyBoundaryRules(raw, settings), 'drift') != null);
@@ -6072,12 +6137,18 @@
             return;
         }
         if (judges.length) {
-            // 按线 / 按聊天选了不同 API 的绑定分组，同一个 API 的仍合成一次请求。
+            // API 和提示词相同才合并；非案卷段引用卡片数据时各自发送，避免取用第一条的内容。
             const groups = new Map();
             judges.forEach(context => {
                 const name = resolveJudgePresetName(settings, context).name;
-                if (!groups.has(name)) groups.set(name, []);
-                groups.get(name).push(context);
+                const specs = bindingPromptSpecs(context.binding, 'judge').filter(seg => seg.content.trim());
+                let caseAt = -1;
+                specs.forEach((seg, index) => { if (seg.role === 'user') caseAt = index; });
+                const ownPrefix = specs.some((seg, index) => index !== caseAt
+                    && /\{\{\s*(stage|prompt|condition|history|next|nextPrompt|roads|previous|elapsed)\s*\}\}/.test(seg.content));
+                const key = JSON.stringify([name, specs, ownPrefix ? context.key : '']);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(context);
             });
             for (const group of groups.values()) {
                 if (modelPauseLeft() > 0) break;
@@ -6187,13 +6258,12 @@
         // 判断AI提示词二级页草稿态（draft/snapshot 脏检查，对齐 shujuku 提示词抽屉）
         judgePromptDraft: null,
         judgePromptDraftSnapshot: '',
+        promptKey: '',
+        promptKind: 'judge',
         // 动态指导页「提取/排除规则」分组的展开态（默认折叠，对齐 AcuRulePairList）
-        guideRulesOpen: { extract: false, exclude: false },
+        guideRulesOpen: new Map(),
         // 动态指导页规则行本地态（null = 还没从设置读取；半填的行只存在这里）
-        guideRuleRows: null,
-        // 规则测试器（v2.14）：样例文本与最近一次试跑结果
-        judgeRuleTestText: '',
-        judgeRuleTestResult: null,
+        guideRuleRows: new Map(),
         // 条目搜索，以及每条小卡「本次附加要求」（只对下一次现在检查生效）
         entryQuery: '',
         entryQueryFocus: false,
@@ -6381,7 +6451,7 @@
                         : (ui.view === 'judgePrompt' ? renderJudgePromptPage()
                             : (ui.view === 'logs' ? renderLogPage()
                                 : (ui.view === 'dev' ? renderDevPage()
-                                    : (ui.view === 'guide' ? renderGuidePage() : (ui.view === 'rules' ? renderRulesPage() : renderManager())))))));
+                                    : (ui.view === 'guide' ? renderGuidePage() : renderManager()))))));
         // 电脑端和数据库一样：目录页左侧常驻导航，右侧是当前页。编辑、时间线、设置、判断AI提示词仍是二级页，不放这列。
         const showRail = ui.view !== 'editor' && ui.view !== 'pace' && ui.view !== 'judgePrompt';
         const main = el('div', { class: 'dga-main' }, ...page);
@@ -6418,10 +6488,18 @@
     function closePanel() {
         if (ui.view === 'editor' && editorUnsaved(ui.editor)
             && !hostWindow.confirm('还有没保存的修改，确定关闭？')) return;
+        if (!confirmDraftExit()) return;
         const panel = ensurePanel();
         if (panel) panel.hidden = true;
         discardEditor();
         ui.view = 'manager';
+    }
+
+    function confirmDraftExit() {
+        const dirty = ui.view === 'judgePrompt'
+            ? ui.judgePromptDraft && JSON.stringify(ui.judgePromptDraft) !== ui.judgePromptDraftSnapshot
+            : (ui.view === 'api' && ui.apiDraft && JSON.stringify(ui.apiDraft) !== ui.apiDraftSnapshot);
+        return !dirty || hostWindow.confirm('还有没保存的修改，确定放弃？');
     }
 
     // 所有按钮动作都从这里走：置忙、执行、失败时把原因显示在页面上。
@@ -6756,23 +6834,12 @@
         bindCard.id = 'dga-card-bind';
         const judgeCard = judgeSettingsCard();
         judgeCard.id = 'dga-card-judge';
-        // 提取 / 排除规则（v3.3）：挪进子页，这里只留摘要和入口（仿数据库「该去子页的去子页」）。
-        const guideSettings = ui.snapshot && ui.snapshot.config && ui.snapshot.config.settings ? ui.snapshot.config.settings : {};
-        const extractCount = RuleModule.normalize(guideSettings.extractRules).length;
-        const excludeCount = RuleModule.normalize(guideSettings.excludeRules).length;
-        const rules = card('提取规则',
-            muted(extractCount || excludeCount
-                ? `提取 ${extractCount} 条 · 排除 ${excludeCount} 条，发送前和解析结论前都会过滤。`
-                : '还没有规则：正文和判断AI的输出原样使用。'),
-            btn('编辑提取 / 排除规则…', () => { ui.view = 'rules'; ui.guideRuleRows = null; ui.navOpen = false; render(); }, { ghost: true }));
-        rules.id = 'dga-card-rules';
-        const body = el('div', { class: 'dga-body dga-split' },
+        const body = el('div', { class: 'dga-body' },
             ui.message && ui.message.type === 'error' ? messageBar() : null,
             ui.contextError ? messageBar({ type: 'error', text: ui.contextError }) : null,
             roadmap,
             bindCard,
             judgeCard,
-            rules,
         );
         return [
             header('动态指导', '指导条目与进度', () => { ui.view = 'manager'; render(); }, '返回', null, { subpage: true, nav: true }),
@@ -6780,23 +6847,15 @@
                 roadmap ? { id: 'dga-card-roadmap', label: '路线图' } : null,
                 { id: 'dga-card-bind', label: '绑定' },
                 { id: 'dga-card-judge', label: '如何判断' },
-                { id: 'dga-card-rules', label: '提取规则' },
             ].filter(Boolean)),
             body,
-        ];
-    }
-
-    function renderRulesPage() {
-        const back = () => { ui.view = 'guide'; enterGuidePage(); render(); };
-        return [
-            header('提取 / 排除规则', '动态指导 · 输出过滤', back, '返回', null, { subpage: true }),
-            el('div', { class: 'dga-body' }, messageBar(), guideRulesCard()),
         ];
     }
 
     // 离开划分阶段时若还有未保存的修改，先问一声。从侧栏跳走也要丢掉编辑器，并刷新小卡。
     function openView(view) {
         if (view === 'editor' && !ui.editor) return;
+        if (view !== ui.view && !confirmDraftExit()) return;
         const leavingEditor = ui.view === 'editor' && view !== 'editor';
         if (leavingEditor && editorUnsaved(ui.editor) && !hostWindow.confirm('还有没保存的修改，确定放弃？')) return;
         if (leavingEditor) discardEditor();
@@ -6904,10 +6963,10 @@
         syncApiDraft();
     }
 
-    // 进入动态指导页前的状态复位：规则行重新从设置读取
-    // （提示词页的导入会直接改写规则设置，本地行态不能接着用）。
+    // 进入动态指导页前，让各绑定卡片的规则行重新从配置读取。
     function enterGuidePage() {
-        ui.guideRuleRows = null;
+        ui.guideRuleRows = new Map();
+        ui.guideRulesOpen = new Map();
     }
 
     function renderApiPage() {
@@ -7112,14 +7171,12 @@
             formChildren.push(
                 field('酒馆预设', tavernSelect, '来自酒馆连接管理器的 profiles。'),
                 el('div', { class: 'dga-inline-action' }, refreshProfilesBtn),
-                el('div', { class: 'dga-two-col' },
-                    field('最大回复长度', maxTokensInput),
-                    field('温度', temperatureInput)),
             );
         }
 
         return [
             header('API', 'API 预设管理', () => {
+                if (!confirmDraftExit()) return;
                 const back = ui.apiReturnView || 'manager';
                 ui.apiReturnView = '';
                 ui.view = back;
@@ -7143,31 +7200,48 @@
         ];
     }
 
-    // 判断AI提示词二级页（从动态指导页「判断AI提示词…」进入）：仿数据库剧情推进页的
-    // 提示词段编辑 + 提示词抽屉的草稿/保存语义——编辑只改草稿，点「保存」才写入设置；
-    // 支持一键导入/导出 JSON、放弃修改与恢复默认。旧版 judgePrompt 单模板仍生效，
-    // 在本页保存一次即自动转成段结构。
-    // （v2.23 起提取/排除规则挪到动态指导页直接生效，不再进这份草稿。）
+    // 从绑定卡片进入，三种提示词各自保存；沿用数据库分段编辑和抽屉的草稿/保存语义。
+    function promptBinding() {
+        const config = ui.snapshot && ui.snapshot.config;
+        return config && config.bindings.find(binding => bindingKey(binding) === ui.promptKey);
+    }
+
+    function openBindingPrompts(context) {
+        ui.promptKey = context.key;
+        ui.promptKind = bindingOrderMode(context.binding) === 'pick' ? 'pick' : 'judge';
+        ui.judgePromptDraft = null;
+        ui.navOpen = false;
+        ui.view = 'judgePrompt';
+        render();
+    }
+
     function syncJudgePromptDraft() {
-        const config = ui.snapshot ? ui.snapshot.config : null;
-        const settings = config && config.settings ? config.settings : {};
-        const segments = judgeMessageSpecs(settings).map(seg => ({ role: seg.role, content: seg.content }));
+        const segments = bindingPromptSpecs(promptBinding(), ui.promptKind);
         ui.judgePromptDraft = { segments };
         ui.judgePromptDraftSnapshot = JSON.stringify(ui.judgePromptDraft);
     }
 
     function renderJudgePromptPage() {
+        const binding = promptBinding();
+        const back = () => {
+            if (!confirmDraftExit()) return;
+            ui.view = 'guide'; ui.judgePromptDraft = null; enterGuidePage(); render();
+        };
+        if (!binding) return [header('提示词', '这条绑定已不可用', back, '返回', null, { subpage: true })];
         if (!ui.judgePromptDraft) syncJudgePromptDraft();
-        const config = ui.snapshot ? ui.snapshot.config : null;
-        const settings = config && config.settings ? config.settings : {};
-        const useLegacy = Boolean(typeof settings.judgePrompt === 'string' && settings.judgePrompt.trim())
-            && !Array.isArray(settings.judgeSegments);
+        const type = BINDING_PROMPT_TYPES[ui.promptKind];
         const draft = ui.judgePromptDraft;
         const segments = draft.segments;
         const dirty = JSON.stringify(draft) !== ui.judgePromptDraftSnapshot;
         const roleOptions = JUDGE_SEGMENT_ROLES.map(role => ({ value: role, label: role.toUpperCase() }));
         const touch = () => render();
         const patchAt = (index, patch) => { segments[index] = { ...segments[index], ...patch }; };
+        const editContent = (index, event) => {
+            patchAt(index, { content: event.target.value });
+            const changed = JSON.stringify(draft) !== ui.judgePromptDraftSnapshot;
+            saveButton.disabled = Boolean(ui.busy || !changed);
+            discardButton.disabled = Boolean(ui.busy || !changed);
+        };
         const moveAt = (index, delta) => {
             const target = index + delta;
             if (target < 0 || target >= segments.length) return;
@@ -7196,23 +7270,19 @@
                     iconBtn('↓', index === segments.length - 1 ? '已经是最后一段' : '下移该段', () => moveAt(index, 1), { disabled: index === segments.length - 1 }),
                     iconBtn('✕', '删除该段', () => { segments.splice(index, 1); touch(); }, { danger: true }))),
             el('textarea', {
-                class: 'dga-input', rows: 4, placeholder: '提示词内容…支持 {{stage}} {{prompt}} {{condition}} {{history}} 占位符',
+                class: 'dga-input', rows: 6, placeholder: '提示词内容…',
                 text: seg.content,
-                onchange: event => { patchAt(index, { content: event.target.value }); touch(); },
+                oninput: event => editContent(index, event),
+                onchange: event => editContent(index, event),
             })));
 
-        const saveDraft = () => runAction('保存判断AI提示词', async () => {
-            const fresh = await readConfig();
-            fresh.settings = { ...(fresh.settings || {}) };
-            fresh.settings.judgeSegments = draft.segments
-                .filter(seg => seg && JUDGE_SEGMENT_ROLES.includes(seg.role))
-                .map(seg => ({ role: seg.role, content: String(seg.content || '') }));
-            fresh.settings.judgePrompt = '';
-            delete fresh.settings.judgeFinalPrompt;
-            await writeConfig(fresh);
+        const saveDraft = () => runAction(`保存${type.label}提示词`, async () => {
+            await updateBinding(ui.promptKey, item => {
+                item[type.field] = normalizePromptSegments(draft.segments);
+            });
             ui.judgePromptDraftSnapshot = JSON.stringify(ui.judgePromptDraft);
             return true;
-        }, { success: '判断AI提示词已保存' });
+        }, { success: `这条世界书的${type.label}提示词已保存` });
 
         const importInput = el('input', {
             type: 'file', accept: '.json,application/json', style: 'display:none',
@@ -7233,27 +7303,10 @@
                         }));
                     if (!cleaned.length) throw new Error('文件里没有可用的提示词段。');
                     draft.segments = cleaned;
-                    // 规则现在挂在动态指导页、改了立即生效，所以导入时直接写入设置，
-                    // 不进提示词草稿。旧导出文件没有规则字段时不动现有规则。
-                    let ruleNote = '';
-                    if (!Array.isArray(parsed) && parsed && typeof parsed === 'object'
-                        && (parsed.extractRules != null || parsed.excludeRules != null)) {
-                        const extractRules = RuleModule.normalize(parsed.extractRules);
-                        const excludeRules = RuleModule.normalize(parsed.excludeRules);
-                        const fresh = await readConfig();
-                        fresh.settings = { ...(fresh.settings || {}) };
-                        if (extractRules.length) fresh.settings.extractRules = extractRules;
-                        else delete fresh.settings.extractRules;
-                        if (excludeRules.length) fresh.settings.excludeRules = excludeRules;
-                        else delete fresh.settings.excludeRules;
-                        await writeConfig(fresh);
-                        ui.guideRuleRows = null;
-                        ruleNote = `，${extractRules.length + excludeRules.length} 条输出规则已直接生效`;
-                    }
-                    setMessage(`已导入 ${cleaned.length} 个提示词段${ruleNote}；提示词段点「保存」后生效。`, 'success');
+                    setMessage(`已导入 ${cleaned.length} 个提示词段；点「保存」后生效。`, 'success');
                     render();
                 } catch (error) {
-                    setMessage(`导入判断AI提示词失败：${error.message || error}`, 'error');
+                    setMessage(`导入提示词失败：${error.message || error}`, 'error');
                     render();
                 }
             },
@@ -7261,28 +7314,33 @@
         const exportBtn = btn('导出', () => {
             const win = hostWindow;
             const payload = {
-                type: 'dynamic-guide-judge-prompt', version: 1,
+                type: 'dynamic-guide-binding-prompt', version: 1, kind: ui.promptKind,
                 segments: draft.segments,
-                extractRules: RuleModule.normalize(settings.extractRules),
-                excludeRules: RuleModule.normalize(settings.excludeRules),
             };
             const blob = new win.Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
             const url = win.URL.createObjectURL(blob);
-            const link = el('a', { href: url, download: '动态指导助手-判断AI提示词.json' });
+            const link = el('a', { href: url, download: `动态指导助手-${type.label}提示词.json` });
             hostDocument().body.appendChild(link);
             link.click();
             link.remove();
             win.setTimeout(() => win.URL.revokeObjectURL(url), 1000);
             setMessage('已导出当前草稿的提示词段。', 'success');
         }, { ghost: true });
+        const discardButton = btn('放弃修改', () => { syncJudgePromptDraft(); render(); }, { ghost: true, disabled: !dirty });
+        const saveButton = btn('保存', saveDraft, { primary: true, disabled: !dirty });
 
-        const back = () => { ui.view = 'guide'; ui.judgePromptDraft = null; enterGuidePage(); render(); };
         return [
-            header('判断AI提示词', '判断AI · 提示词段', back, '返回', null, { subpage: true }),
+            header(`${type.label}提示词`, `${binding.entryName || '未命名条目'} · ${binding.worldbookName}`, back, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
-                muted('每段选角色、按顺序发送。占位符：{{stage}} {{prompt}} {{condition}} {{history}}；结论优先读 <verdict>，也认旧的 <结论>。没标签看开头是不是 YES。'),
-                useLegacy ? el('div', { class: 'dga-msg', 'data-type': 'info' }, '正在用旧版自定义提问。点「保存」会转成提示词段，旧模板已放进 user 段。') : null,
+                segControl(Object.entries(BINDING_PROMPT_TYPES).map(([value, item]) => ({ value, label: item.label })), ui.promptKind, value => {
+                    if (value === ui.promptKind || !confirmDraftExit()) return;
+                    ui.promptKind = value;
+                    ui.judgePromptDraft = null;
+                    ui.message = null;
+                    render();
+                }, '这条世界书的提示词类型'),
+                muted(`仅用于这条世界书。每段选角色、按顺序发送。${type.hint}`),
                 card('提示词段',
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最上方插入', () => insertAt('top'), { ghost: true })),
                     ...items,
@@ -7293,12 +7351,12 @@
                     btn('导入', () => importInput.click(), { ghost: true }),
                     exportBtn,
                     btn('恢复默认提示词', () => {
-                        draft.segments = DEFAULT_JUDGE_SEGMENTS.map(seg => ({ ...seg }));
+                        draft.segments = type.defaults.map(seg => ({ ...seg }));
                         setMessage('已载入内置默认提示词；点「保存」后生效。', 'info');
                         render();
                     }, { ghost: true }),
-                    btn('放弃修改', () => { syncJudgePromptDraft(); render(); }, { ghost: true, disabled: !dirty }),
-                    btn('保存', saveDraft, { primary: true, disabled: !dirty }),
+                    discardButton,
+                    saveButton,
                 ),
                 importInput,
             ),
@@ -7763,43 +7821,8 @@
             presetList.length === 0
                 ? muted('还没有预设：去「API」页新建，或直接用酒馆主 API。')
                 : null,
-            btn('判断AI提示词…', () => { ui.view = 'judgePrompt'; ui.judgePromptDraft = null; ui.navOpen = false; render(); }, { ghost: true }),
-            bigCheckInterval(settings)
-                ? btn(ui.bigCheckPromptOpen ? '收起大检查提示词' : '大检查提示词…', () => { ui.bigCheckPromptOpen = !ui.bigCheckPromptOpen; ui.bigCheckPromptDraft = null; render(); }, { ghost: true })
-                : null,
-            bigCheckInterval(settings) && ui.bigCheckPromptOpen ? bigCheckPromptEditor(settings) : null,
         );
         return card('如何判断？', ...children);
-    }
-
-    // 大检查提示词（v3.2）：就地编辑两段；和默认一字不差时不另存，以后默认更新能自动用上。
-    function bigCheckPromptEditor(settings) {
-        if (!ui.bigCheckPromptDraft) {
-            const pair = bigCheckPromptPair(settings);
-            ui.bigCheckPromptDraft = { system: pair.system, user: pair.user };
-        }
-        const draft = ui.bigCheckPromptDraft;
-        const area = (key, rows) => el('textarea', {
-            class: 'dga-input', rows,
-            text: draft[key],
-            onchange: event => { draft[key] = event.target.value; },
-        });
-        const save = () => saveGuideSettings({
-            bigCheckSystemPrompt: String(draft.system || '').trim() === DEFAULT_BIG_CHECK_SYSTEM_PROMPT.trim() ? '' : draft.system,
-            bigCheckUserPrompt: String(draft.user || '').trim() === DEFAULT_BIG_CHECK_USER_PROMPT.trim() ? '' : draft.user,
-        }, '大检查提示词已保存');
-        return el('div', { class: 'dga-bigcheck-prompt' },
-            muted('两段：system 规则 / user 案卷。占位符：{{outline}} 近段大纲、{{current}} 现在停在、{{roads}} 分岔口、{{history}} 最近正文。结论读 <drift>、<stage>、<road>。'),
-            field('SYSTEM', area('system', 8)),
-            field('USER', area('user', 10)),
-            el('div', { class: 'dga-api-actions' },
-                btn('恢复默认提示词', () => {
-                    ui.bigCheckPromptDraft = { system: DEFAULT_BIG_CHECK_SYSTEM_PROMPT, user: DEFAULT_BIG_CHECK_USER_PROMPT };
-                    setMessage('已载入大检查默认提示词；点「保存」后生效。', 'info');
-                    render();
-                }, { ghost: true }),
-                btn('保存', save, { primary: true }),
-            ));
     }
 
     function bigCheckWaitText(context) {
@@ -7808,28 +7831,25 @@
         return `上次大检查：${context.state.lastBigCheckBasis}`;
     }
 
-    // 「动态指导」页的「提取 / 排除规则 + 规则测试」卡（v2.23 从提示词二级页搬入）：
-    // 规则开始/结束都填上就立刻写入设置生效，不再走提示词草稿；只填了一半的行
-    // 留在内存里，重新进页面时再从设置读取。测试器用当前规则试跑，可一键填入
-    // 最近一次判断AI的真实输出。
-    function guideRulesCard() {
-        const config = ui.snapshot ? ui.snapshot.config : null;
-        const settings = config && config.settings ? config.settings : {};
-        const rowsState = ui.guideRuleRows || (ui.guideRuleRows = { extract: null, exclude: null });
-        const openState = ui.guideRulesOpen || (ui.guideRulesOpen = { extract: false, exclude: false });
+    // 各绑定卡片的规则行独立保存；半填的行只留在这张卡片的本地草稿中。
+    function guideRulesCard(context) {
+        const binding = context.binding || {};
+        const bindingKeyValue = context.key;
+        if (!ui.guideRuleRows.has(bindingKeyValue)) ui.guideRuleRows.set(bindingKeyValue, { extract: null, exclude: null });
+        if (!ui.guideRulesOpen.has(bindingKeyValue)) ui.guideRulesOpen.set(bindingKeyValue, { extract: false, exclude: false });
+        const rowsState = ui.guideRuleRows.get(bindingKeyValue);
+        const openState = ui.guideRulesOpen.get(bindingKeyValue);
         const fieldFor = key => (key === 'extract' ? 'extractRules' : 'excludeRules');
         const currentRows = key => {
-            if (!rowsState[key]) rowsState[key] = RuleModule.normalize(settings[fieldFor(key)]).map(rule => ({ ...rule }));
+            if (!rowsState[key]) rowsState[key] = RuleModule.normalize(binding[fieldFor(key)]).map(rule => ({ ...rule }));
             return rowsState[key];
         };
         const persist = key => runAction('保存输出规则', async () => {
-            const fresh = await readConfig();
-            fresh.settings = { ...(fresh.settings || {}) };
             const normalized = RuleModule.normalize(rowsState[key]);
-            if (normalized.length) fresh.settings[fieldFor(key)] = normalized;
-            else delete fresh.settings[fieldFor(key)];
-            await writeConfig(fresh);
-            return true;
+            return updateBinding(bindingKeyValue, item => {
+                if (normalized.length) item[fieldFor(key)] = normalized;
+                else delete item[fieldFor(key)];
+            });
         }, { success: '输出规则已保存' });
         const iconBtn = (label, title, onclick) => el('button', {
             type: 'button', class: 'dga-icon-btn dga-icon-danger', title, 'aria-label': title,
@@ -7867,45 +7887,12 @@
                     el('span', { class: 'dga-rule-count', text: rules.length ? `${rules.length} 条` : '暂无' })),
                 open ? el('div', { class: 'dga-rule-body' },
                     ...rows,
-                    rules.length === 0 ? el('div', { class: 'dga-rule-empty', text: '暂无规则。' }) : null,
+                    rules.length === 0 ? el('div', { class: 'dga-rule-empty', text: '暂无规则，点击下方按钮添加。' }) : null,
                     el('div', { class: 'dga-rule-add' }, btn(`＋ ${addLabel}`, () => { rules.push({ start: '', end: '' }); render(); }, { ghost: true }))) : null);
         };
-        const result = ui.judgeRuleTestResult;
-        return card('提取 / 排除规则',
-            muted('提取 = 只留区间内（取最后命中）；排除 = 删掉区间。留空不过滤，两栏都填会自动保存。'),
-            ruleGroup('extract', '提取规则', '开始边界', '结束边界', '添加'),
-            ruleGroup('exclude', '排除规则', '开始边界', '结束边界', '添加'),
-            el('div', { class: 'dga-rule-tester' },
-                el('div', { class: 'dga-rule-tester-title', text: '规则测试' }),
-                el('textarea', {
-                    class: 'dga-input', rows: 3,
-                    placeholder: '粘贴一段文字试跑…',
-                    text: ui.judgeRuleTestText || '',
-                    onchange: event => { ui.judgeRuleTestText = event.target.value; },
-                }),
-                el('div', { class: 'dga-rule-tester-actions' },
-                    btn('填入最近输出', () => {
-                        ui.judgeRuleTestText = judgeRuntime.lastRaw;
-                        render();
-                    }, { ghost: true, disabled: !judgeRuntime.lastRaw }),
-                    btn('测试', () => {
-                        ui.judgeRuleTestResult = previewJudgeOutput(ui.judgeRuleTestText, {
-                            extractRules: currentRows('extract'),
-                            excludeRules: currentRows('exclude'),
-                        });
-                        render();
-                    }, { ghost: true, disabled: !(ui.judgeRuleTestText || '').trim() }),
-                ),
-                result ? el('div', { class: 'dga-rule-tester-result' },
-                    el('div', { class: 'dga-rule-tester-verdict' },
-                        el('span', {
-                            class: `dga-verdict ${result.yes ? 'is-yes' : 'is-no'}`,
-                            text: result.yes ? '结论：YES（会推进）' : '结论：NO（不推进）',
-                        }),
-                        el('span', { class: 'dga-muted', text: `${result.hasTag ? '命中结论标签' : '无结论标签，按开头判断'}${result.changed ? ' · 输出已改' : ' · 输出未变'}` }),
-                    ),
-                    el('pre', { class: 'dga-rule-tester-filtered', text: result.filtered.length > 2000 ? `${result.filtered.slice(0, 2000)}\n…（共 ${result.filtered.length} 字，已截断）` : result.filtered }),
-                ) : null),
+        return el('div', { class: 'dga-bind-rules' },
+            ruleGroup('extract', '提取规则', '提取开始边界', '提取结束边界', '添加提取规则'),
+            ruleGroup('exclude', '排除规则', '排除开始边界', '排除结束边界', '添加排除规则'),
         );
     }
 
@@ -8088,7 +8075,13 @@
                         ui.view = 'pace';
                         render();
                     },
+                }),
+                el('button', {
+                    type: 'button', class: 'dga-pace-open', text: '提示词 ›',
+                    'aria-label': `${entryName(context.entry)}的提示词`,
+                    onclick: () => openBindingPrompts(context),
                 })),
+            guideRulesCard(context),
             judgeStatusLine(context, judgeWaitText(context)),
         );
     }
@@ -10001,9 +9994,9 @@ ${P} .dga-dev-line input.dga-dev-num { text-align: center; }
     ${P} .dga-dev-line { grid-template-columns: 1fr 1fr; grid-template-areas: "name name" "stage stage" "stepcap ordercap" "step order"; }
 }
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; gap: 4px; }
+${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; }
 ${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
-${P} .dga-set-open { margin-left: 14px; }
+${P} .dga-bind-actions .dga-pace-open { padding: 4px 8px; min-height: 32px; font-size: 13px; }
 ${P} .dga-pace-open:hover, ${P} .dga-pace-open:focus-visible { color: var(--dga-accent); outline: none; }
 ${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; text-align: center; }
 ${P} .dga-judge-toggle { margin-left: 6px; padding: 0 4px; border: 0; background: transparent; color: var(--dga-accent); font: inherit; font-size: 12px; line-height: 1.45; cursor: pointer; min-height: 0; }
@@ -10048,6 +10041,7 @@ ${P} .dga-pseg-actions { margin-left: auto; display: flex; align-items: center; 
 ${P} .dga-pseg-actions .dga-icon-btn { width: 36px; min-width: 36px; min-height: 36px; font-size: 15px; }
 ${P} .dga-pseg-add { display: flex; justify-content: center; }
 ${P} .dga-pseg-add .dga-btn { min-height: 36px; padding: 6px 12px; font-size: 13px; }
+${P} .dga-bind-rules { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--dga-border); }
 ${P} .dga-rule-group { border: 1px solid var(--dga-border); border-radius: 4px; overflow: hidden; }
 ${P} .dga-rule-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 8px 12px; border: 0; background: color-mix(in srgb, var(--dga-text-1) 4%, transparent); color: inherit; font: inherit; font-size: 13px; font-weight: 600; text-align: left; cursor: pointer; transition: background 0.15s ease; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-rule-head:hover { background: var(--dga-hover); }
@@ -10063,16 +10057,6 @@ ${P} .dga-rule-sep { flex-shrink: 0; font-size: 12px; color: var(--dga-text-3); 
 ${P} .dga-rule-empty { padding: 8px; text-align: center; font-size: 12px; color: var(--dga-text-3); }
 ${P} .dga-rule-add { display: flex; }
 ${P} .dga-rule-add .dga-btn { min-height: 36px; padding: 6px 12px; font-size: 13px; }
-${P} .dga-rule-tester { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-rule-tester-title { font-size: 13px; font-weight: 600; color: var(--dga-text-2); }
-${P} .dga-rule-tester-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-${P} .dga-rule-tester-actions .dga-btn { min-height: 34px; padding: 5px 12px; font-size: 13px; }
-${P} .dga-rule-tester-result { display: flex; flex-direction: column; gap: 6px; }
-${P} .dga-rule-tester-verdict { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-${P} .dga-verdict { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-${P} .dga-verdict.is-yes { background: color-mix(in srgb, var(--dga-success) 20%, transparent); color: var(--dga-success); }
-${P} .dga-verdict.is-no { background: color-mix(in srgb, var(--dga-danger) 18%, transparent); color: var(--dga-danger); }
-${P} .dga-rule-tester-filtered { margin: 0; padding: 8px 10px; border-radius: 4px; background: var(--dga-bg-2); font-family: var(--dga-font-mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; }
 ${P} .dga-log-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 ${P} .dga-log-toolbar select { flex: 0 1 140px; min-height: 38px; }
 ${P} .dga-log-debug-toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dga-text-2); cursor: pointer; }

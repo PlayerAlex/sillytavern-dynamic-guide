@@ -24,6 +24,15 @@ function load(helper, extra) {
 const { core } = load();
 const plain = value => JSON.parse(JSON.stringify(value));
 const range = (text, quote) => ({ start: text.indexOf(quote), end: text.indexOf(quote) + quote.length, quote });
+const lastUserText = request => {
+    const segments = (request.ordered_prompts || []).filter(item => item && item.role === 'user');
+    return segments.length ? String(segments[segments.length - 1].content) : '';
+};
+
+const promptTestNodes = (root, predicate) => [
+    ...(predicate(root) ? [root] : []),
+    ...(root.children || []).flatMap(child => promptTestNodes(child, predicate)),
+];
 
 function savedStages(content, stages) {
     return {
@@ -1866,7 +1875,8 @@ async function bootGuidePage() {
     assert.ok(panel().querySelector('.dga-nav-toggle'), '动态指导在目录里，左上角要有导航');
     assert.ok(panel().querySelector('.dga-rail'), '电脑上目录页左侧常驻导航');
     assert.ok(panel().querySelector('.dga-main'), '右侧是当前页');
-    assert.match(panel().querySelector('.dga-split').className, /dga-body/, '宽屏时卡片分成两列');
+    assert.ok(panel().querySelector('.dga-body'), '动态指导卡片按单栏排列');
+    assert.equal(panel().querySelector('.dga-split'), null, '动态指导页不再强制双栏');
     assert.equal(panel().querySelector('.dga-close').textContent, '×', '右上角仍是简化的 ×');
     const nav = panel().querySelector('.dga-panel-nav');
     const body = panel().querySelector('.dga-body');
@@ -1875,7 +1885,7 @@ async function bootGuidePage() {
     assert.ok(nav.parentNode.children.indexOf(nav) < nav.parentNode.children.indexOf(body), '标签排在卡片滚动区前面');
     assert.match(nav.textContent, /绑定/);
     assert.match(nav.textContent, /如何判断/);
-    assert.match(nav.textContent, /提取规则/);
+    assert.doesNotMatch(nav.textContent, /提取规则/, '全局规则入口已移除');
     return { documentRef, state, helper, errors: booted.errors, panel };
 }
 
@@ -2268,19 +2278,20 @@ test('判断AI档：YES 推进、NO 不推进、同一消息不重复推进', as
     assert.equal(verdicts[0].should_silence, true, '判断AI请求必须静默');
     const ordered = verdicts[0].ordered_prompts;
     assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'user_input'], 'v3.2 默认两段：身份和判定手册合成一段 system / 本次案卷（案卷即 user_input）');
+        ['system', 'user'], '和数据库填表一样，完整消息段按顺序交给 ordered_prompts');
+    assert.equal('user_input' in verdicts[0], false, '不再拆出最后一个 user 段');
     assert.match(ordered[0].content, /你负责判断剧情该不该推进/, '第一段只交代身份');
     assert.doesNotMatch(ordered[0].content, /格式示例|<basis>|<verdict>/, '身份段不解释标签');
     assert.match(ordered[0].content, /# 判定手册/, '判定手册在同一段 system 里（与案卷数据分开）');
     assert.match(ordered[0].content, /状态型[\s\S]*事件型/, '手册要先分清两种阶段');
     assert.match(ordered[0].content, /## 五、例子/, '手册要带正反例子');
-    assert.match(String(verdicts[0].user_input), /【上一阶段】（这是第一段）/, '案卷带上一阶段');
-    assert.match(String(verdicts[0].user_input), /【已停多久】/, '案卷带已停几层');
-    assert.match(String(verdicts[0].user_input), /【当前阶段】甲一/, '案卷要带阶段名');
-    assert.match(String(verdicts[0].user_input), /甲一正文/, '案卷要带阶段正文');
-    assert.match(String(verdicts[0].user_input), /这一轮的回复/, '案卷要带最近正文');
-    assert.match(String(verdicts[0].user_input), /<basis>\n- 已发生：[^\n]*\n<\/basis>\n<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, 'basis 和 verdict 是标签里的条目');
-    assert.doesNotMatch(String(verdicts[0].user_input), /\{\{/, '默认段里的占位符都要被替换');
+    assert.match(lastUserText(verdicts[0]), /【上一阶段】（这是第一段）/, '案卷带上一阶段');
+    assert.match(lastUserText(verdicts[0]), /【已停多久】/, '案卷带已停几层');
+    assert.match(lastUserText(verdicts[0]), /【当前阶段】甲一/, '案卷要带阶段名');
+    assert.match(lastUserText(verdicts[0]), /甲一正文/, '案卷要带阶段正文');
+    assert.match(lastUserText(verdicts[0]), /这一轮的回复/, '案卷要带最近正文');
+    assert.match(lastUserText(verdicts[0]), /<basis>\n- 已发生：[^\n]*\n<\/basis>\n<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, 'basis 和 verdict 是标签里的条目');
+    assert.doesNotMatch(lastUserText(verdicts[0]), /\{\{/, '默认段里的占位符都要被替换');
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
 
     await state.events.get('message_received')(5);
@@ -2333,7 +2344,7 @@ test('判断AI档：分岔口写了路就进入那条，并关掉被依附的这
     assert.equal(state.books.书A.find(item => item.name === '岔路（动态指导）'), undefined, '还没走进时分叉不发给 AI');
 
     await state.events.get('message_received')(5);
-    const askedText = String(asked[0].user_input);
+    const askedText = lastUserText(asked[0]);
     assert.match(askedText, /人已经走进岔路，当前这一层要完整留下/);
     assert.doesNotMatch(askedText, /上一层不该出现的句子/);
     assert.match(askedText, /0\. 被依附的这条\n第 1 段 · 甲一\n甲一正文/);
@@ -2375,10 +2386,10 @@ test('AI 选段：可以从第 3 段跳回第 1 段', async () => {
     await new Promise(setImmediate);
     await state.events.get('message_received')(8);
     assert.equal(sent.length, 1, '选段模式即使全局是手动也要问');
-    assert.match(String(sent[0].user_input), /1\. 甲/);
-    assert.match(String(sent[0].user_input), /3\. 丙/);
-    assert.match(String(sent[0].user_input), /可以比现在更小/);
-    assert.doesNotMatch(String(sent[0].user_input), /暑假|不要翻译/);
+    assert.match(lastUserText(sent[0]), /1\. 甲/);
+    assert.match(lastUserText(sent[0]), /3\. 丙/);
+    assert.match(lastUserText(sent[0]), /可以比现在更小/);
+    assert.doesNotMatch(lastUserText(sent[0]), /暑假|不要翻译/);
     assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[key].stageIndex, 0, '第 3 段可以跳回第 1 段');
     assert.deepEqual(run.errors, []);
 });
@@ -2458,15 +2469,14 @@ test('判断AI档：自定义提示词段按序组装并替换占位符', async 
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: {
-            autoAdvance: 'judge',
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null,
             judgeSegments: [
                 { role: 'system', content: '规则：只判断 {{stage}}' },
                 { role: 'assistant', content: '明白，只看 {{history}}' },
                 { role: 'user', content: '阶段={{stage}} 条件={{condition}}' },
             ],
-        },
+        }],
+        settings: { autoAdvance: 'judge' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
@@ -2478,11 +2488,11 @@ test('判断AI档：自定义提示词段按序组装并替换占位符', async 
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1);
     const ordered = verdicts[0].ordered_prompts;
-    assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))), ['system', 'assistant', 'user_input']);
+    assert.deepEqual(plain(ordered.map(item => (typeof item === 'string' ? item : item.role))), ['system', 'assistant', 'user']);
     assert.match(ordered[0].content, /^规则：只判断 甲一$/, 'system 段里占位符要替换');
     assert.match(ordered[1].content, /这一轮的回复/, 'assistant 段里的 {{history}} 也要替换');
-    assert.match(verdicts[0].user_input, /条件=（没写。/);
-    assert.match(verdicts[0].user_input, /不能因为符合这段就写 YES/);
+    assert.match(lastUserText(verdicts[0]), /条件=（没写。/);
+    assert.match(lastUserText(verdicts[0]), /不能因为符合这段就写 YES/);
     assert.deepEqual(run.errors, []);
 });
 
@@ -2701,13 +2711,15 @@ test('手动推进档不调用判断AI', async () => {
 });
 
 
-test('判断AI档：自定义提问模板替换占位符后发出', async () => {
+test('判断AI档：卡片自定义提问模板替换占位符后发出', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgePrompt: '阶段={{stage}}\n条件={{condition}}\n正文={{prompt}}\n历史={{history}}\n走没走？' },
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null,
+            judgeSegments: [{ role: 'user', content: '阶段={{stage}}\n条件={{condition}}\n正文={{prompt}}\n历史={{history}}\n走没走？' }],
+        }],
+        settings: { autoAdvance: 'judge' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
@@ -2718,7 +2730,7 @@ test('判断AI档：自定义提问模板替换占位符后发出', async () => 
 
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1);
-    const sent = String(verdicts[0].user_input);
+    const sent = lastUserText(verdicts[0]);
     assert.match(sent, /^阶段=甲一/, '模板要按自定义文案组装');
     assert.match(sent, /条件=（没写。/);
     assert.match(sent, /正文=甲一正文/);
@@ -2748,7 +2760,7 @@ test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
                     return { result: { choices: [{ message: { content: 'YES' } }] } };
                 },
             },
-            extensionSettings: { connectionManager: { profiles: [{ id: '酒馆代理A', name: '酒馆代理A' }] } },
+            extensionSettings: { connectionManager: { profiles: [{ id: '酒馆代理A', name: '酒馆代理A', api: 'koboldcpp' }] } },
         }),
     };
     const localStorage = memoryStorage({
@@ -2847,7 +2859,7 @@ function directSendWorld(settings, stContext, extra) {
     const SillyTavern = { getContext: () => stContext };
     const run = load(helper, { SillyTavern, fetch: fetchMock, ...(extra || {}) });
     const stageIndex = () => state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex;
-    return { state, run, rawCalls, fetches, stageIndex };
+    return { state, helper, run, rawCalls, fetches, stageIndex };
 }
 
 function fakeChatCompletionService(log) {
@@ -2896,6 +2908,21 @@ test('判断AI档：酒馆主 API 是 Chat Completion 时直发生成端点，�
     assert.deepEqual(world.run.errors, []);
 });
 
+test('主 API 可直发 Chat Completion 时不依赖 generateRaw', async () => {
+    const stContext = {
+        mainApi: 'openai', chatCompletionSettings: { chat_completion_source: 'openrouter' },
+        getChatCompletionModel: () => 'main-model',
+        ChatCompletionService: fakeChatCompletionService([]),
+    };
+    const world = directSendWorld({}, stContext);
+    delete world.helper.generateRaw;
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(world.fetches.length, 1);
+    assert.equal(world.stageIndex(), 1);
+    assert.deepEqual(world.run.errors, []);
+});
+
 test('判断AI档：旧版酒馆没有 presetToGeneratePayload 时按当前设置手拼请求体；文本补全照旧走 generateRaw', async () => {
     const service = fakeChatCompletionService([]);
     delete service.presetToGeneratePayload;
@@ -2923,7 +2950,7 @@ test('判断AI档：旧版酒馆没有 presetToGeneratePayload 时按当前设�
     assert.equal(text.rawCalls.length, 1, '照旧走 generateRaw');
 });
 
-test('判断AI档：Chat Completion 酒馆预设直发生成端点，带上 secret_id 和补全预设，不切换当前连接', async () => {
+test('判断AI档：Chat Completion 酒馆预设先切换连接，直发后恢复原连接', async () => {
     const presetCalls = [];
     const cmCalls = [];
     const profile = {
@@ -2942,7 +2969,16 @@ test('判断AI档：Chat Completion 酒馆预设直发生成端点，带上 secr
     const localStorage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1', maxTokens: 300 }]),
     });
-    const world = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage });
+    let activeProfile = '原连接';
+    const slashCalls = [];
+    const triggerSlash = async command => {
+        slashCalls.push(command);
+        if (command === '/profile') return activeProfile;
+        if (command === '/profile await=true "小模型"') activeProfile = '小模型';
+        if (command === '/profile await=true "原连接"') activeProfile = '原连接';
+        return activeProfile;
+    };
+    const world = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage, triggerSlash });
     await new Promise(setImmediate);
     await world.state.events.get('message_received')(5);
     assert.equal(cmCalls.length, 0, '不走连接管理器');
@@ -2951,14 +2987,53 @@ test('判断AI档：Chat Completion 酒馆预设直发生成端点，带上 secr
     const body = JSON.parse(world.fetches[0].options.body);
     assert.equal(body.chat_completion_source, 'openrouter');
     assert.equal(body.model, 'judge-mini');
-    assert.equal(body.secret_id, 'sec-9', '用这个预设自己的密钥');
+    assert.equal('secret_id' in body, false, '目标连接已激活，不再靠手填 secret_id 选择密钥');
     assert.equal(body.max_tokens, 300);
     assert.equal(body.custom_prompt_post_processing, 'strict');
     assert.equal(body.temperature, 0.3, '补全预设的参数要等 async 的 presetToGeneratePayload 生成完');
     assert.equal(body.stream, false);
     assert.equal(presetCalls.length, 1);
+    assert.deepEqual(slashCalls, ['/profile', '/profile await=true "小模型"', '/profile', '/profile await=true "原连接"']);
+    assert.equal(activeProfile, '原连接');
     assert.equal(world.stageIndex(), 1);
     assert.deepEqual(world.run.errors, []);
+});
+
+test('酒馆预设直发失败也恢复原连接，目标已激活时不重复切换', async () => {
+    const profile = { id: 'p1', name: '小模型', api: 'openrouter', model: 'judge-mini', proxy: 'None' };
+    const stContext = {
+        CONNECT_API_MAP: { openrouter: { selected: 'openai', source: 'openrouter' } },
+        extensionSettings: { connectionManager: { profiles: [profile] } },
+        ChatCompletionService: fakeChatCompletionService([]),
+    };
+    const localStorage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1' }]),
+    });
+    let activeProfile = '原连接';
+    const slashCalls = [];
+    const triggerSlash = async command => {
+        slashCalls.push(command);
+        if (command === '/profile') return activeProfile;
+        activeProfile = command.includes('小模型') ? '小模型' : '原连接';
+        return activeProfile;
+    };
+    const failed = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, {
+        localStorage, triggerSlash,
+        fetch: async () => { throw new Error('HTTP 400 配置错误'); },
+    });
+    await new Promise(setImmediate);
+    await failed.state.events.get('message_received')(5);
+    assert.deepEqual(slashCalls, ['/profile', '/profile await=true "小模型"', '/profile', '/profile await=true "原连接"']);
+    assert.equal(activeProfile, '原连接', '请求失败仍恢复');
+    assert.equal(failed.stageIndex(), 0);
+
+    activeProfile = '小模型';
+    slashCalls.length = 0;
+    const active = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage, triggerSlash });
+    await new Promise(setImmediate);
+    await active.state.events.get('message_received')(5);
+    assert.deepEqual(slashCalls, ['/profile'], '已是目标连接时不用切换和恢复');
+    assert.equal(active.stageIndex(), 1);
 });
 
 test('判断AI档：酒馆预设读不到反向代理或不是 Chat Completion 时退回连接管理器', async () => {
@@ -3225,17 +3300,22 @@ test('先提取后排除：与数据库（shujuku）顺序一致', () => {
     assert.equal(out, '<a>保留就好</a>');
 });
 
-test('normalizeConfig 清洗提取/排除规则：合法保留、整列无效删字段', () => {
+test('normalizeConfig 清洗绑定规则，旧全局规则保留但不继承', () => {
     const normalized = core.normalizeConfig({
         version: 2,
-        bindings: [],
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, extractRules: [{ start: ' <结论> ', end: ' </结论> ' }, { start: '', end: 'x' }] },
+            { worldbookName: '书A', entryUid: 2 },
+        ],
         settings: {
             autoAdvance: 'judge',
-            extractRules: [{ start: ' <结论> ', end: ' </结论> ' }, { start: '', end: 'x' }, 'bad'],
+            extractRules: [{ start: '<旧>', end: '</旧>' }],
             excludeRules: [],
         },
     });
-    assert.deepEqual(plain(normalized.settings.extractRules), [{ start: '<结论>', end: '</结论>' }]);
+    assert.deepEqual(plain(normalized.bindings[0].extractRules), [{ start: '<结论>', end: '</结论>' }]);
+    assert.equal('extractRules' in normalized.bindings[1], false, '别的绑定从空白开始');
+    assert.deepEqual(plain(normalized.settings.extractRules), [{ start: '<旧>', end: '</旧>' }], '旧配置只保留，不迁移');
     assert.equal('excludeRules' in normalized.settings, false, '整列无效就删字段（不过滤）');
     const absent = core.normalizeConfig({ version: 2, bindings: [], settings: { autoAdvance: 'judge' } });
     assert.equal('extractRules' in absent.settings, false, '没配过规则不能凭空加字段');
@@ -3246,8 +3326,8 @@ test('判断AI档：排除规则削掉思维链后读到真正的 YES', async ()
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<think>', end: '</think>' }] },
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null, excludeRules: [{ start: '<think>', end: '</think>' }] }],
+        settings: { autoAdvance: 'judge' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
@@ -3267,8 +3347,8 @@ test('判断AI档：提取规则取最后一处 <结论>，盖过草稿里的旧
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', extractRules: [{ start: '<结论>', end: '</结论>' }] },
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null, extractRules: [{ start: '<结论>', end: '</结论>' }] }],
+        settings: { autoAdvance: 'judge' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
@@ -3403,8 +3483,8 @@ test('判断AI档：提取规则发送前过滤角色回复，用户消息不发
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgeHistoryCount: 2, extractRules: [{ start: '<content>', end: '</content>' }] },
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null, extractRules: [{ start: '<content>', end: '</content>' }] }],
+        settings: { autoAdvance: 'judge', judgeHistoryCount: 2 },
     };
     const messages = [
         { message_id: 3, role: 'user', message: '用户的话不带任何标签' },
@@ -3419,7 +3499,7 @@ test('判断AI档：提取规则发送前过滤角色回复，用户消息不发
 
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1);
-    const sent = String(verdicts[0].user_input);
+    const sent = lastUserText(verdicts[0]);
     assert.match(sent, /雨夜的正文/, '参考 2 段时较早的角色回复正文也要发出去');
     assert.match(sent, /最新正文/);
     assert.doesNotMatch(sent, /状态栏|HP 100/, '角色消息 <content> 外的部分不能发出去');
@@ -3450,7 +3530,7 @@ test('判断AI档：默认只看 AI 最新 1 段正文，更早的角色回复�
 
     await state.events.get('message_received')(5);
     assert.equal(verdicts.length, 1);
-    const sent = String(verdicts[0].user_input);
+    const sent = lastUserText(verdicts[0]);
     assert.match(sent, /本轮最新正文/, '最新一段角色正文必须发送');
     assert.doesNotMatch(sent, /上一轮的旧正文/, '默认只发最新 1 段，旧的角色回复不发送');
     assert.doesNotMatch(sent, /用户：|用户输入/, '用户消息一律不发给判断AI');
@@ -3462,8 +3542,8 @@ test('判断AI档：排除规则在发送前削掉角色消息里的思维链', 
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<think>', end: '</think>' }] },
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null, excludeRules: [{ start: '<think>', end: '</think>' }] }],
+        settings: { autoAdvance: 'judge' },
     };
     const messages = [
         { message_id: 5, role: 'assistant', message: '<think>内心嘀咕一堆</think>看得见的正文' },
@@ -3475,7 +3555,7 @@ test('判断AI档：排除规则在发送前削掉角色消息里的思维链', 
     await new Promise(setImmediate);
 
     await state.events.get('message_received')(5);
-    const sent = String(verdicts[0].user_input);
+    const sent = lastUserText(verdicts[0]);
     assert.match(sent, /看得见的正文/);
     assert.doesNotMatch(sent, /内心嘀咕/, '角色消息里的 <think> 段发送前就要被削掉');
     assert.deepEqual(run.errors, []);
@@ -3486,8 +3566,8 @@ test('判断AI留痕：最近一次原始输出、过滤结果与结论都可在
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
     const config = {
         version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<think>', end: '</think>' }] },
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null, excludeRules: [{ start: '<think>', end: '</think>' }] }],
+        settings: { autoAdvance: 'judge' },
     };
     const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
     const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
@@ -3700,7 +3780,7 @@ test('判断AI档：下一格是分支组时，走向和结论在同一次请求
     await new Promise(setImmediate);
     await state.events.get('message_received')(5);
     assert.equal(calls.length, 1, '走向和结论一次问完，不再补问第二次');
-    const asked = String(calls[0].user_input);
+    const asked = lastUserText(calls[0]);
     assert.match(asked, /【分支】/);
     assert.match(asked, /1\. 留下/);
     assert.match(asked, /2\. 离开/);
@@ -3761,7 +3841,7 @@ test('AI 选段：已被否决的分支不进目录，目录序号映射回真�
     await new Promise(setImmediate);
     await state.events.get('message_received')(8);
     assert.equal(sent.length, 1);
-    const catalog = String(sent[0].user_input);
+    const catalog = lastUserText(sent[0]);
     assert.match(catalog, /1\. 相遇/);
     assert.match(catalog, /2\. 离开/);
     assert.match(catalog, /3\. 尾声/);
@@ -4249,8 +4329,8 @@ test('AI 选段也先过排除规则：思维链里抄出来的 <stage> 不算',
     const { state, helper } = multiWorld(books, {
         config: {
             version: 2,
-            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', orderMode: 'pick' }],
-            settings: { autoAdvance: 'off', excludeRules: [{ start: '<think>', end: '</think>' }] },
+            bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', orderMode: 'pick', excludeRules: [{ start: '<think>', end: '</think>' }] }],
+            settings: { autoAdvance: 'off' },
         },
         chatState: { version: 2, bindings: { [key]: { stageIndex: 0, stageName: '甲' } } },
         messages: [{ message_id: 8, role: 'assistant', message: '还在开头。' }],
@@ -4294,14 +4374,14 @@ test('同一层好几条判断AI绑定合成一次请求，按 <answer n> 各自
     await new Promise(setImmediate);
     await state.events.get('message_received')(5);
     assert.equal(calls.length, 1, '三条同一层到点，只发一次请求');
-    const asked = String(calls[0].user_input);
-    assert.equal(asked.split('这一层只出现一次的正文').length - 1, 1, '最近剧情只放一次');
+    const asked = lastUserText(calls[0]);
+    assert.equal(asked.split('这一层只出现一次的正文').length - 1, 3, '每条案卷分别带上自己的最近正文');
     assert.match(asked, /<case n="1">\n【剧情线】甲线/);
     assert.match(asked, /<case n="2">\n【剧情线】乙线/);
     assert.match(asked, /<case n="3">\n【剧情线】丙线/);
     assert.match(asked, /<answer n="序号"><\/answer>/);
     assert.deepEqual(plain(calls[0].ordered_prompts.map(item => (typeof item === 'string' ? item : item.role))),
-        ['system', 'user_input'], '身份和手册合成一段，只发一份');
+        ['system', 'user'], '身份和手册合成一段，只发一份');
     assert.ok(calls[0].max_tokens > 1024 && calls[0].max_tokens <= 4096, '合并后回复长度按条数放宽，但有上限');
     const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
     assert.equal(saved[keyOf('书A', 1)].stageIndex, 1, '第 1 条 YES 推进');
@@ -4310,6 +4390,46 @@ test('同一层好几条判断AI绑定合成一次请求，按 <answer n> 各自
     assert.match(saved[keyOf('书A', 3)].lastJudgeBasis, /没有按序号写这一条/);
     [1, 2, 3].forEach(uid => assert.equal(saved[keyOf('书A', uid)].lastJudgeCheckedId, 5, '三条都记为这一层查过'));
     assert.match(state.books.书A.find(item => item.name === '甲线（动态指导）').content, /甲二正文/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('合并判断仍按各绑定规则分别过滤正文和对应回答，不继承旧全局规则', async () => {
+    const books = { 书A: [
+        { uid: 1, name: '甲线', content: '## 甲一\n正文\n\n## 甲二\n正文', enabled: false },
+        { uid: 2, name: '乙线', content: '## 乙一\n正文\n\n## 乙二\n正文', enabled: false },
+    ] };
+    const config = {
+        version: 2,
+        settings: { autoAdvance: 'judge', excludeRules: [{ start: '<legacy>', end: '</legacy>' }] },
+        bindings: [
+            { worldbookName: '书A', entryUid: 1, entryName: '甲线', excludeRules: [{ start: '<a>', end: '</a>' }] },
+            { worldbookName: '书A', entryUid: 2, entryName: '乙线', excludeRules: [{ start: '<b>', end: '</b>' }] },
+        ],
+    };
+    const message = { message_id: 5, role: 'assistant', message: '正文<a>甲应过滤</a><b>乙应过滤</b><legacy>旧规则应保留</legacy>' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const calls = [];
+    helper.generateRaw = async options => {
+        calls.push(options);
+        return '<answer n="1"><verdict>YES</verdict><a><verdict>NO</verdict></a></answer>\n'
+            + '<answer n="2"><verdict>NO</verdict><b><verdict>YES</verdict></b></answer>';
+    };
+    const run = load(helper);
+    await new Promise(setImmediate);
+    await state.events.get('message_received')(5);
+    assert.equal(calls.length, 1, '两条绑定仍合并为一次模型请求');
+    const asked = lastUserText(calls[0]);
+    const cases = [...asked.matchAll(/<case n="\d+">([\s\S]*?)<\/case>/g)].map(match => match[1]);
+    assert.equal(cases.length, 2);
+    assert.doesNotMatch(cases[0], /甲应过滤/);
+    assert.match(cases[0], /乙应过滤|旧规则应保留/);
+    assert.doesNotMatch(cases[1], /乙应过滤/);
+    assert.match(cases[1], /甲应过滤|旧规则应保留/);
+    assert.match(cases[0], /旧规则应保留/, '旧全局规则不再参与运行');
+    assert.match(cases[1], /旧规则应保留/);
+    const saved = state.variables.chat.$dynamicGuideAssistant.state.bindings;
+    assert.equal(saved[keyOf('书A', 1)].stageIndex, 1, '甲线按自己的规则剔除假 NO 后推进');
+    assert.equal(saved[keyOf('书A', 2)].stageIndex, 0, '乙线按自己的规则剔除假 YES 后不推进');
     assert.deepEqual(run.errors, []);
 });
 
@@ -4409,7 +4529,7 @@ test('大检查：首次立即检查，只带前 1 / 当前 / 后 1 段大纲，
     await world.state.events.get('message_received')(5);
     assert.equal(world.calls.judge.length, 1, '普通判断照常问一次');
     assert.equal(world.calls.big.length, 1, '大检查另问一次');
-    const input = String(world.calls.big[0].user_input);
+    const input = lastUserText(world.calls.big[0]);
     assert.match(input, /2\. 甲二[\s\S]*3\. 甲三（大纲现在停在这里）[\s\S]*4\. 甲四/);
     assert.doesNotMatch(input, /甲一|甲五|甲六/, '只带前后各 1 段');
     const bigSystem = String(world.calls.big[0].ordered_prompts[0].content);
@@ -4502,7 +4622,7 @@ test('大检查：正文已走进分岔就进那条，并关掉被依附的这�
     await new Promise(setImmediate);
     await world.state.events.get('message_received')(5);
     assert.ok(world.calls.big.length >= 1);
-    assert.match(String(world.calls.big[0].user_input), /1\. 依附 · 岔路/, '分岔口要列出能走进的线');
+    assert.match(lastUserText(world.calls.big[0]), /1\. 依附 · 岔路/, '分岔口要列出能走进的线');
     assert.equal(world.hostState().lineCut, true, '被依附的这条暂时关闭');
     assert.equal(world.hostState().forkInto, keyOf('书A', 2));
     const fork = world.state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 2)];
@@ -4511,25 +4631,42 @@ test('大检查：正文已走进分岔就进那条，并关掉被依附的这�
 });
 
 
-test('大检查：「如何判断？」卡有频率选项，开了才出现提示词入口，点开能就地编辑', async () => {
+test('大检查：从世界书卡片进入二级提示词页，未保存离开可取消', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
     helper.getWorldbookNames = () => ['测试世界书'];
     state.variables.character.$dynamicGuideAssistant = {
         config: { version: 2, bindings: [{ worldbookName: '测试世界书', entryUid: 1, entryName: '大纲' }], settings: { autoAdvance: 'judge', bigCheckInterval: 10 } },
     };
-    const { errors } = loadWithDocument(documentRef, helper);
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
     await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
     const panel = () => documentRef.getElementById(PANEL_ID);
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
     assert.match(panel().textContent, /大检查/, '判断AI卡里有大检查频率');
-    const open = findButton(panel(), '大检查提示词');
-    assert.ok(open, '开了大检查才有提示词入口');
+    const open = findButton(panel().querySelector('.dga-bind-item'), '提示词 ›');
+    assert.ok(open, '提示词入口属于当前绑定');
+    assert.ok(!panel().querySelector('.dga-pseg'), '一级页不放提示词编辑区');
     open.listeners.click[0]();
-    assert.match(panel().textContent, /剧情进度校对员/, '展开后是默认 system 段');
-    assert.match(panel().textContent, /\{\{outline\}\}/, '展开后是默认 user 案卷');
-    assert.ok(panel().querySelector('.dga-bigcheck-prompt'), '编辑区挂在卡里');
+    findButton(panel(), '大检查').listeners.click[0]();
+    assert.match(panel().textContent, /剧情进度校对员/, '二级页显示默认 system 段');
+    assert.match(panel().textContent, /\{\{outline\}\}/, '二级页显示默认 user 案卷');
+    assert.ok(panel().querySelector('.dga-pseg'), '编辑区在二级页');
+    assert.ok(!panel().querySelector('.dga-rail'), '二级页不显示一级导航栏');
+    const firstTextarea = node => node.tagName === 'TEXTAREA' ? node
+        : (node.children || []).map(firstTextarea).find(Boolean);
+    const edited = firstTextarea(panel().querySelector('.dga-pseg'));
+    edited.value = '改过但没保存的规则';
+    edited.listeners.input[0]({ target: edited });
+    assert.equal(findButton(panel(), '保存').disabled, false, '输入时立即可以保存');
+    sandbox.confirm = () => false;
+    panel().querySelector('.dga-close').listeners.click[0]();
+    assert.ok(panel().querySelector('.dga-pseg'), '未保存的提示词取消离开后仍在二级页');
+    findButton(panel(), 'AI选段').listeners.click[0]();
+    assert.equal(firstTextarea(panel().querySelector('.dga-pseg')).value, '改过但没保存的规则', '取消类型切换后仍保留草稿');
+    sandbox.confirm = () => true;
+    panel().querySelector('.dga-close').listeners.click[0]();
+    assert.ok(!panel().querySelector('.dga-pseg'), '确认放弃后返回动态指导页');
     assert.deepEqual(errors, []);
 });
 
@@ -4600,7 +4737,7 @@ const chronicleOf = world => world.state.variables.chat.$dynamicGuideAssistant.s
 test('重试时把错在哪告诉模型，不再原样重发', async () => {
     const world = judgeWorld();
     const sent = [];
-    world.helper.generateRaw = async request => { sent.push(String(request.user_input)); return sent.length < 2 ? '我想想……' : '<verdict>YES</verdict>'; };
+    world.helper.generateRaw = async request => { sent.push(lastUserText(request)); return sent.length < 2 ? '我想想……' : '<verdict>YES</verdict>'; };
     load(world.helper);
     await new Promise(setImmediate);
     await world.state.events.get('message_received')(5);
@@ -4702,7 +4839,7 @@ test('每段至少停几层：没停够不自动问；最多停几层超了只�
     assert.equal(late.stageOf(), 0, '超时不自动推进');
 });
 
-test('动态指导页：判断设置用分段按钮，提取规则进子页', async () => {
+test('动态指导页：判断设置用分段按钮，规则位于绑定卡片内', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const { state, helper } = helperFor({ uid: 1, name: '大纲', content: '## 第一幕\n正文一\n\n## 第二幕\n正文二', enabled: false });
     helper.getWorldbookNames = () => ['测试世界书'];
@@ -4718,9 +4855,234 @@ test('动态指导页：判断设置用分段按钮，提取规则进子页', as
     assert.ok(every2 && /dga-seg-btn/.test(every2.className), '检查频率是分段按钮');
     assert.ok(/is-on/.test(findButton(panel(), '判断 AI').className), '当前判断模式高亮');
     assert.ok(findButton(panel(), '不冷却'), '有推进冷却选项');
-    assert.doesNotMatch(panel().textContent, /规则测试/, '规则编辑不再铺在动态指导页上');
-    findButton(panel(), '编辑提取').listeners.click[0]();
-    assert.match(panel().textContent, /排除规则/, '子页里是提取 / 排除规则');
+    const bindingCard = panel().querySelector('.dga-bind-item');
+    assert.ok(bindingCard, '有已绑定的世界书卡片');
+    assert.match(bindingCard.textContent, /提取规则|排除规则/, '规则位于绑定卡片内');
+    assert.equal(bindingCard.querySelector('.dga-rule-tester'), null, '卡片只保留数据库式折叠规则组');
+    assert.ok(!findButton(panel(), '编辑提取'), '没有全局规则子页入口');
+    assert.deepEqual(errors, []);
+});
+
+test('两张已绑定卡片分别编辑规则，只保存到当前绑定', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const books = { 书A: [
+        { uid: 1, name: '甲线', content: '## 甲一\n正文', enabled: false },
+        { uid: 2, name: '乙线', content: '## 乙一\n正文', enabled: false },
+    ] };
+    const config = { version: 2, settings: { autoAdvance: 'judge' }, bindings: [
+        { worldbookName: '书A', entryUid: 1, entryName: '甲线' },
+        { worldbookName: '书A', entryUid: 2, entryName: '乙线' },
+    ] };
+    const { state, helper } = multiWorld(books, { config });
+    const { errors } = loadWithDocument(documentRef, helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const allCards = () => {
+        const found = [];
+        const walk = node => {
+            if (nodeClassNames(node).includes('dga-bind-item')) found.push(node);
+            (node.children || []).forEach(walk);
+        };
+        walk(panel());
+        return found;
+    };
+    assert.equal(allCards().length, 2);
+    findButton(allCards()[0], '提取规则').listeners.click[0]();
+    findButton(allCards()[0], '＋ 添加').listeners.click[0]();
+    let row = allCards()[0].querySelector('.dga-rule-row');
+    row.children[0].listeners.change[0]({ target: { value: '<a>' } });
+    row = allCards()[0].querySelector('.dga-rule-row');
+    row.children[2].listeners.change[0]({ target: { value: '</a>' } });
+    await new Promise(setImmediate);
+    const bindings = state.variables.character.$dynamicGuideAssistant.config.bindings;
+    assert.deepEqual(plain(bindings[0].extractRules), [{ start: '<a>', end: '</a>' }]);
+    assert.equal('extractRules' in bindings[1], false);
+    assert.equal('extractRules' in state.variables.character.$dynamicGuideAssistant.config.settings, false);
+    assert.deepEqual(errors, []);
+});
+
+for (const [kind, field, template] of [
+    ['judge', 'judgeSegments', '{{stage}}|{{history}}'],
+    ['pick', 'pickStageSegments', '{{catalog}}|{{current}}|{{history}}'],
+    ['bigCheck', 'bigCheckSegments', '{{outline}}|{{current}}|{{roads}}|{{elapsed}}|{{history}}'],
+]) {
+    test(`卡片提示词：${kind} 按各自配置发送，旧全局提示词不混入`, async () => {
+        const books = { 书A: ['甲', '乙'].map((name, index) => ({
+            uid: index + 1, name: `${name}线`, content: `## ${name}一\n${name}正文\n\n## ${name}二\n后续`, enabled: false,
+        })) };
+        const config = {
+            version: 2,
+            settings: {
+                autoAdvance: 'judge', advanceCooldown: 0, bigCheckInterval: kind === 'bigCheck' ? 1 : 0,
+                judgePrompt: '旧全局单模板', judgeSegments: [{ role: 'system', content: '旧全局判断' }],
+                pickStageSegments: [{ role: 'system', content: '旧全局选段' }],
+                bigCheckSystemPrompt: '旧全局大检查', bigCheckUserPrompt: '旧全局案卷',
+                bigCheckSegments: [{ role: 'user', content: '旧全局分段' }],
+            },
+            bindings: books.书A.map(entry => ({
+                worldbookName: '书A', entryUid: entry.uid, entryName: entry.name,
+                ...(kind === 'pick' ? { orderMode: 'pick' } : {}),
+                [field]: [{ role: 'system', content: `${kind}-${entry.name}` }, { role: 'user', content: template }],
+            })),
+        };
+        const world = multiWorld(books, { config, messages: [{ message_id: 5, role: 'assistant', message: '带 $& 的正文' }], lastMessageId: 5 });
+        const requests = [];
+        world.helper.generateRaw = async request => {
+            requests.push(plain(request));
+            if (request.ordered_prompts[0].content.startsWith('pick-')) return '<stage>2</stage>';
+            if (request.ordered_prompts[0].content.startsWith('bigCheck-')) return '<drift>正常</drift><stage>1</stage>';
+            return '<answer n="1"><verdict>NO</verdict></answer><answer n="2"><verdict>NO</verdict></answer>';
+        };
+        const run = load(world.helper);
+        await new Promise(setImmediate);
+        await world.state.events.get('message_received')(5);
+        const own = requests.filter(request => request.ordered_prompts[0].content.startsWith(`${kind}-`));
+        assert.equal(own.length, 2, '两条不同模板分别发送');
+        own.forEach((request, index) => {
+            const name = ['甲', '乙'][index];
+            assert.equal(request.ordered_prompts[0].content, `${kind}-${name}线`);
+            assert.match(lastUserText(request), new RegExp(`${name}一`));
+            assert.doesNotMatch(lastUserText(request), new RegExp(`${['乙', '甲'][index]}一`));
+            assert.match(lastUserText(request), /带 \$& 的正文/, '正文中的替换字符按字面传递');
+            assert.doesNotMatch(JSON.stringify(request), /旧全局|\{\{/);
+        });
+        if (kind === 'pick') [1, 2].forEach(uid => {
+            assert.equal(world.state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', uid)].stageIndex, 1);
+        });
+        assert.deepEqual(run.errors, []);
+    });
+}
+
+test('卡片未设置提示词时三种调用都用内置默认，不复制旧全局', async () => {
+    const world = bigCheckWorld({ settings: {
+        judgePrompt: '旧全局', judgeSegments: [{ role: 'user', content: '旧全局' }],
+        bigCheckSystemPrompt: '旧全局', bigCheckUserPrompt: '旧全局',
+    } });
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(world.calls.judge.length, 1);
+    assert.equal(world.calls.big.length, 1);
+    assert.match(world.calls.judge[0].ordered_prompts[0].content, /你负责判断剧情该不该推进/);
+    assert.match(world.calls.big[0].ordered_prompts[0].content, /剧情进度校对员/);
+    assert.doesNotMatch(JSON.stringify(world.calls), /旧全局/);
+    const binding = world.state.variables.character.$dynamicGuideAssistant.config.bindings[0];
+    ['judgeSegments', 'pickStageSegments', 'bigCheckSegments'].forEach(field => assert.equal(field in binding, false));
+    binding.orderMode = 'pick';
+    world.state.variables.character.$dynamicGuideAssistant.config.settings.pickStageSegments = [{ role: 'user', content: '旧全局选段' }];
+    let pickRequest;
+    world.helper.generateRaw = async request => { pickRequest = request; return '<stage>3</stage>'; };
+    await run.core.checkNow(keyOf('书A', 1));
+    assert.match(pickRequest.ordered_prompts[0].content, /剧情定位员/);
+    assert.doesNotMatch(JSON.stringify(pickRequest), /旧全局/);
+    assert.deepEqual(run.errors, []);
+});
+
+test('相同卡片模板可合并，非案卷段带卡片占位符时各自完整发送', async () => {
+    for (const dynamicPrefix of [false, true]) {
+        const books = { 书A: ['甲', '乙'].map((name, index) => ({ uid: index + 1, name: `${name}线`, content: `## ${name}一\n正文\n\n## ${name}二\n后续`, enabled: false })) };
+        const config = { version: 2, settings: { autoAdvance: 'judge' }, bindings: books.书A.map(entry => ({
+            worldbookName: '书A', entryUid: entry.uid, entryName: entry.name,
+            judgeSegments: [
+                { role: 'system', content: dynamicPrefix ? '只检查 {{stage}}' : '共用规则' },
+                { role: 'user', content: '{{stage}} {{history}}' },
+            ],
+        })) };
+        const world = multiWorld(books, { config, messages: [{ message_id: 5, role: 'assistant', message: '正文' }], lastMessageId: 5 });
+        const requests = [];
+        world.helper.generateRaw = async request => {
+            requests.push(request);
+            return '<answer n="1"><verdict>NO</verdict></answer><answer n="2"><verdict>NO</verdict></answer>';
+        };
+        const run = load(world.helper);
+        await new Promise(setImmediate);
+        await world.state.events.get('message_received')(5);
+        assert.equal(requests.length, dynamicPrefix ? 2 : 1);
+        if (dynamicPrefix) {
+            assert.equal(requests[0].ordered_prompts[0].content, '只检查 甲一');
+            assert.equal(requests[1].ordered_prompts[0].content, '只检查 乙一');
+        } else {
+            assert.match(lastUserText(requests[0]), /<case n="1">[\s\S]*甲一[\s\S]*<case n="2">[\s\S]*乙一/);
+        }
+        assert.deepEqual(run.errors, []);
+    }
+});
+
+test('卡片提示词编辑：三类分别保存、重开可读，恢复默认不影响别卡或别类', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const books = { 书A: ['甲', '乙'].map((name, index) => ({ uid: index + 1, name: `${name}线`, content: `## ${name}一\n正文`, enabled: false })) };
+    const config = { version: 2, settings: { judgeSegments: [{ role: 'user', content: '旧全局保留' }] }, bindings: books.书A.map(entry => ({ worldbookName: '书A', entryUid: entry.uid, entryName: entry.name })) };
+    const { state, helper } = multiWorld(books, { config });
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const cards = () => promptTestNodes(panel(), node => nodeClassNames(node).includes('dga-bind-item'));
+    const areas = () => promptTestNodes(panel(), node => node.tagName === 'TEXTAREA');
+    const readBindings = () => state.variables.character.$dynamicGuideAssistant.config.bindings;
+    findButton(cards()[0], '提示词 ›').listeners.click[0]();
+    assert.match(panel().textContent, /甲线/);
+    assert.doesNotMatch(panel().textContent, /旧全局保留/);
+    for (const [label, field] of [['常规判断', 'judgeSegments'], ['AI选段', 'pickStageSegments'], ['大检查', 'bigCheckSegments']]) {
+        findButton(panel(), label).listeners.click[0]();
+        areas()[0].listeners.change[0]({ target: { value: `甲-${label}` } });
+        findButton(panel(), '保存').listeners.click[0]();
+        await new Promise(setImmediate);
+        assert.equal(readBindings()[0][field][0].content, `甲-${label}`);
+        assert.equal(field in readBindings()[1], false);
+    }
+    panel().querySelector('.dga-close').listeners.click[0]();
+    findButton(cards()[1], '提示词 ›').listeners.click[0]();
+    assert.match(panel().textContent, /乙线/);
+    assert.doesNotMatch(panel().textContent, /甲-常规判断/);
+    areas()[0].listeners.change[0]({ target: { value: '乙独有判断' } });
+    findButton(panel(), '保存').listeners.click[0]();
+    await new Promise(setImmediate);
+    panel().querySelector('.dga-close').listeners.click[0]();
+    findButton(cards()[0], '提示词 ›').listeners.click[0]();
+    assert.match(panel().textContent, /甲-常规判断/, '重新进入会读取已保存内容');
+    findButton(panel(), '大检查').listeners.click[0]();
+    assert.match(panel().textContent, /甲-大检查/);
+    findButton(panel(), '恢复默认提示词').listeners.click[0]();
+    assert.equal(readBindings()[0].bigCheckSegments[0].content, '甲-大检查', '恢复默认先改草稿');
+    findButton(panel(), '保存').listeners.click[0]();
+    await new Promise(setImmediate);
+    assert.match(readBindings()[0].bigCheckSegments[0].content, /剧情进度校对员/);
+    assert.equal(readBindings()[0].judgeSegments[0].content, '甲-常规判断');
+    assert.equal(readBindings()[0].pickStageSegments[0].content, '甲-AI选段');
+    assert.equal(readBindings()[1].judgeSegments[0].content, '乙独有判断');
+    assert.equal(state.variables.character.$dynamicGuideAssistant.config.settings.judgeSegments[0].content, '旧全局保留');
+    const imported = [{ role: 'system', content: '导入的大检查规则' }, { role: 'user', content: '{{outline}}' }];
+    const input = promptTestNodes(panel(), node => node.tagName === 'INPUT' && node.getAttribute('type') === 'file')[0];
+    await input.listeners.change[0]({ target: { files: [{ text: async () => JSON.stringify({ segments: imported }) }], value: 'prompt.json' } });
+    assert.match(panel().textContent, /导入的大检查规则/);
+    assert.match(readBindings()[0].bigCheckSegments[0].content, /剧情进度校对员/, '导入先改草稿');
+    findButton(panel(), '保存').listeners.click[0]();
+    await new Promise(setImmediate);
+    assert.deepEqual(plain(readBindings()[0].bigCheckSegments), imported);
+    assert.equal(readBindings()[0].judgeSegments[0].content, '甲-常规判断');
+    assert.equal('bigCheckSegments' in readBindings()[1], false);
+    let exported;
+    sandbox.Blob = function Blob(parts) { this.parts = parts; };
+    sandbox.URL = { createObjectURL: blob => { exported = JSON.parse(blob.parts[0]); return 'blob:prompt'; }, revokeObjectURL: () => {} };
+    const createElement = documentRef.createElement;
+    documentRef.createElement = tag => {
+        const node = createElement(tag);
+        if (String(tag).toLowerCase() === 'a') {
+            node.click = () => {};
+            node.remove = () => {};
+        }
+        return node;
+    };
+    findButton(panel(), '导出').listeners.click[0]();
+    assert.deepEqual(exported.segments, imported, '只导出当前卡的当前类型');
+    assert.equal(exported.kind, 'bigCheck');
+    const restored = await sandbox.DynamicGuideAssistantCore.getCurrentSnapshot();
+    assert.equal(restored.config.bindings[0].pickStageSegments[0].content, '甲-AI选段', '持久化后重新读取不丢字段');
     assert.deepEqual(errors, []);
 });
 
@@ -4844,6 +5206,6 @@ test('已停几层：推进时记下进入楼层，下一次判断的案卷写�
     await new Promise(setImmediate);
     await world.state.events.get('message_received')(5);
     assert.equal(sent.length, 1);
-    assert.match(String(sent[0].user_input), /已在这段停了约 3 层（第 2 层进入，现在第 5 层）/);
-    assert.match(String(sent[0].user_input), /【上一阶段】甲一/);
+    assert.match(lastUserText(sent[0]), /已在这段停了约 3 层（第 2 层进入，现在第 5 层）/);
+    assert.match(lastUserText(sent[0]), /【上一阶段】甲一/);
 });
