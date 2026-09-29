@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.3
+     * 动态指导助手 v3.3.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.3';
+    const VERSION = '3.4';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1640,6 +1640,80 @@
             || (currentWindow && currentWindow.fetch);
         if (!fetchFn) throw new Error('当前环境没有 fetch，无法通过酒馆后端请求。');
         return fetchFn(...args);
+    }
+
+    // 原生 fetch（v3.4，照数据库 pristine-fetch）：有的酒馆脚本（例如 Kemini 伴生面板）会包装 fetch，
+    // 命中 /api/backends/*/generate 就改写请求体和响应。判断请求打同一个端点，被改写后结论会被污染。
+    // 先按已知标记剥掉包装；剥完仍不是原生的，改用专用隐藏 iframe 里的原生 fetch（第三方脚本碰不到新建的窗口）；
+    // 都拿不到就退回 hostFetch 并告警一次。每次都重新解析：脚本可能比本插件晚装上。
+    const FETCH_PATCH_MARKERS = ['__keminiAntiTruncation__', '__keminiFetchInterceptor__'];
+    const PRISTINE_FRAME_ID = 'dga-pristine-fetch-frame';
+    let pristineFallbackWarned = false;
+
+    // bind 出来的叫「bound fetch」，JS 包装函数的源码不是 native code，两种都不算原生。
+    function isNativeFetch(candidate) {
+        if (typeof candidate !== 'function') return false;
+        try {
+            return candidate.name === 'fetch' && /\{\s*\[native code\]\s*\}\s*$/.test(Function.prototype.toString.call(candidate));
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function unwrapFetchPatches(start) {
+        let current = start;
+        for (let depth = 0; depth < 16; depth += 1) {
+            let original = null;
+            for (const marker of FETCH_PATCH_MARKERS) {
+                const slot = typeof current === 'function' ? current[marker] : null;
+                if (slot && typeof slot === 'object' && typeof slot.original === 'function') {
+                    original = slot.original;
+                    break;
+                }
+            }
+            if (!original || original === current) break;
+            current = original;
+        }
+        return current;
+    }
+
+    // iframe 常驻复用：请求进行中移除浏览上下文会中断请求。
+    function pristineFrameFetch() {
+        const doc = currentWindow.document;
+        if (!doc || typeof doc.createElement !== 'function') return null;
+        try {
+            let frame = doc.getElementById(PRISTINE_FRAME_ID);
+            if (!frame || !frame.isConnected || !frame.contentWindow) {
+                if (frame && typeof frame.remove === 'function') frame.remove();
+                frame = doc.createElement('iframe');
+                frame.id = PRISTINE_FRAME_ID;
+                frame.setAttribute('aria-hidden', 'true');
+                frame.tabIndex = -1;
+                frame.style.cssText = 'display:none !important;width:0;height:0;border:0;position:absolute;';
+                (doc.body || doc.documentElement).appendChild(frame);
+            }
+            const frameWindow = frame.contentWindow;
+            const frameFetch = frameWindow && frameWindow.fetch;
+            if (!isNativeFetch(frameFetch)) return null;
+            // 隐藏 iframe 的基址不一定和页面一致，相对地址先按页面解析成绝对地址。
+            const base = doc.baseURI || (currentWindow.location && currentWindow.location.href) || '';
+            return (input, init) => frameFetch.call(frameWindow, typeof input === 'string' && base ? new URL(input, base).href : input, init);
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function pristineFetch(input, init) {
+        const current = (typeof fetch === 'function' && fetch) || (hostWindow && hostWindow.fetch) || (currentWindow && currentWindow.fetch);
+        const unwrapped = unwrapFetchPatches(current);
+        if (isNativeFetch(unwrapped)) return unwrapped.call(undefined, input, init);
+        const frameFetch = pristineFrameFetch();
+        if (frameFetch) return frameFetch(input, init);
+        if (!pristineFallbackWarned) {
+            pristineFallbackWarned = true;
+            LogModule.warn('判断AI', '拿不到原生 fetch，判断请求可能仍会被别的脚本改写');
+        }
+        return hostFetch(input, init);
     }
 
     // 酒馆连接管理器（ConnectionManagerRequestService），「酒馆预设」连接的判断AI调用走这里。
@@ -4383,8 +4457,10 @@
     // 提示词在二级页面按「段」自定义（每段可选 system/user/assistant 角色，
     // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符，可导入导出/恢复默认）；
     // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
-    //   酒馆主 API → 酒馆助手 generateRaw；酒馆预设 → ConnectionManagerRequestService；
+    //   酒馆主 API → Chat Completion 时直发生成端点，文本补全走酒馆助手 generateRaw；
+    //   酒馆预设 → Chat Completion 预设直发生成端点，其余走 ConnectionManagerRequestService；
     //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
+    //   发生成端点一律用原生 fetch（pristineFetch，v3.4）。
     // 判断AI结论只信一次；请求本身遇到临时性错误（5xx、超时、网络）原地重试一次（仿数据库
     // isRetryableAiRequestError），401/400/404 等确定性错误和 429 限流不重试，直接进暂停。
 
@@ -4412,7 +4488,7 @@
     }
 
     // 中止（v3.2，仿数据库 AbortSignal）：切换聊天时把在途和排队中的请求作废。能取消的通道
-    // （自定义 API 的 fetch）真的取消；generateRaw / 连接管理器取消不了，就把回来的结论丢掉。
+    // （自定义 API 和直发生成端点的 fetch）真的取消；generateRaw / 连接管理器取消不了，就把回来的结论丢掉。
     // 中止不算失败、不暂停。
     const modelAbort = { epoch: 0, controller: null };
     // 重试（v3.2.1，对齐数据库填表 / 剧情推进）：一次请求最多试 3 次（tableMaxRetries / loopSettings.maxRetries 缺省 3），
@@ -4705,12 +4781,14 @@
         ].join('\n');
     }
 
-    // 大检查（v3.2）：每 N 层另问一次判断AI，核对近 5 段大纲（前 2 / 当前 / 后 2，贴边时往另一侧补）、
+    // 大检查（v3.3.1 起收窄）：每 N 层另问一次判断AI，核对近 3 段大纲（前 1 / 当前 / 后 1，贴边时往另一侧补）、
     // 当前段的分岔口和最近 3 段正文：大纲是不是推早了（正文还没演到就进了下一段），或者正文已经跑过大纲。
     // 查出偏差就改到正文对应的那一段；正文走进了分岔就进那条。
     // 只对判断AI档生效：AI 选段档每次都在重新定位，手动档不另开请求。
-    const BIG_CHECK_OUTLINE_BEFORE = 2;
-    const BIG_CHECK_OUTLINE_AFTER = 2;
+    // v3.3.1：前后各 2 段时，日常片段常被误认成更早的阶段，一次退回两段。收窄到前后各 1 段，
+    // 并且改段只允许相邻一格（见 bigCheckFor 的 adjacent 判定）。
+    const BIG_CHECK_OUTLINE_BEFORE = 1;
+    const BIG_CHECK_OUTLINE_AFTER = 1;
     const BIG_CHECK_HISTORY_COUNT = 3;
     const BIG_CHECK_DRIFT_LABELS = { ok: '正常', early: '推早了', ahead: '跑过头' };
 
@@ -4725,12 +4803,15 @@
         '  - 推早了：大纲已经进了当前这段，正文却还停在更早的一段，前面那段的事没演到。',
         '  - 跑过头：正文已经演到当前段之后的某一段，大纲还停在后面。',
         '- 多过了一天、多了一段日常，都不算换段。状态、总结、思维链不算剧情。拿不准就写正常。',
+        '- 推早了要很确定才写：正文必须明确还在演上一段独有的事，而且当前这段的事一件都没开始。日常、闲聊、吃饭、回忆、气氛相似，都不是推早的证据，写正常。',
+        '- 只能和相邻的一段比：推早了只能是前一段，跑过头只能是后一段。',
         '- <stage> 写正文现在对应的那一段的序号，只能从【近段大纲】里选。',
         '- 【分岔口】列出当前这段能走进的几条线。正文已经走进哪条，就在 <road> 写它的序号；没走进写 0。',
         '',
         '# 例子（照这个口径判，不要照抄内容）',
-        '- 大纲停在「开学」，最近正文还在写暑假里的一天日常 → 推早了，<stage> 写「暑假」那段的序号。',
-        '- 大纲停在「初遇」，正文里两人已经互报姓名、约好再见，还一起去了地下室 → 跑过头，<stage> 写「进入地下室」那段。',
+        '- 大纲停在「进入地下室」，最近正文两人还在雨里、刚互报姓名，地下室一个字没提 → 推早了，<stage> 写前一段「初遇」的序号。',
+        '- 大纲停在「进入地下室」，最近正文写两人在客厅吃饭、闲聊、回忆那晚的雨 → 正常：日常和回忆不是推早的证据。',
+        '- 大纲停在「初遇」，正文里两人已经互报姓名、约好再见，还一起下了地下室 → 跑过头，<stage> 写后一段「进入地下室」的序号。',
         '- 大纲停在「初遇」，正文刚写到两人在雨里碰面、还没说上话 → 正常，这段刚开头不算推早。',
     ].join('\n');
 
@@ -4793,7 +4874,7 @@
         return Number.isFinite(n) && n >= 1 ? n : 0;
     }
 
-    // 近段大纲的范围：当前段前 2 段、后 2 段；贴近开头或末尾时往另一侧补足。end 不含。
+    // 近段大纲的范围：当前段前 1 段、后 1 段；贴近开头或末尾时往另一侧补足。end 不含。
     function bigCheckWindow(visible, currentOrder) {
         const total = visible.length;
         const size = Math.min(total, BIG_CHECK_OUTLINE_BEFORE + BIG_CHECK_OUTLINE_AFTER + 1);
@@ -5096,6 +5177,180 @@
         return '';
     }
 
+    // 直发生成端点（v3.4，照数据库 30b304da / a2e394c6）：酒馆主 API 和「酒馆预设」是 Chat Completion 时，
+    // 按酒馆自己的字段拼好请求体，用原生 fetch 直接发到 /api/backends/chat-completions/generate。
+    // generateRaw 和连接管理器都经过酒馆的全局 fetch，会被别的脚本改写；generateRaw 还会触发酒馆的生成事件，
+    // 本插件的镜像同步和数据库等插件都会把一次判断当成正文生成。直发两样都没有，而且能中止。
+    // 判断回复短，照酒馆 quiet 生成一律不流式。
+    const CHAT_COMPLETION_GENERATE_URL = '/api/backends/chat-completions/generate';
+
+    async function postChatCompletionDirect(payload, signal) {
+        const context = sillyTavernContext();
+        const service = context && context.ChatCompletionService;
+        const data = service && typeof service.createRequestData === 'function'
+            ? service.createRequestData.call(service, payload)
+            : { ...payload };
+        const response = await pristineFetch(CHAT_COMPLETION_GENERATE_URL, {
+            method: 'POST',
+            headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
+            cache: 'no-cache',
+            body: JSON.stringify({ ...data, stream: false }),
+            ...(signal ? { signal } : {}),
+        });
+        const raw = await response.text();
+        let json = null;
+        try {
+            json = raw ? JSON.parse(raw) : null;
+        } catch (error) {
+            throw new Error(`生成端点返回了无法解析的响应（HTTP ${response.status}）。`);
+        }
+        if (!response.ok || (json && json.error)) {
+            const detail = (json && json.error && json.error.message)
+                || (json && typeof json.error === 'string' ? json.error : '')
+                || raw.slice(0, 300);
+            throw new Error(`API 请求失败：HTTP ${response.status}${detail ? ` ${detail}` : ''}`);
+        }
+        // 优先用酒馆自己的 extractMessageFromData（Claude、Gemini 原样返回的格式也认得），拿不到再用通用取法。
+        let text = '';
+        try {
+            if (context && typeof context.extractMessageFromData === 'function') text = context.extractMessageFromData(json, 'openai');
+        } catch (error) {
+            text = '';
+        }
+        if (typeof text !== 'string' || !text) text = judgeTextFromJson(json);
+        if (!text) throw new Error('生成端点返回无效响应（没有正文）。');
+        return text;
+    }
+
+    function mainApiIsChatCompletion(context) {
+        return Boolean(context && context.mainApi === 'openai'
+            && context.chatCompletionSettings && typeof context.chatCompletionSettings === 'object');
+    }
+
+    function finiteOrUndefined(value) {
+        const n = Number(value);
+        return value !== '' && value != null && Number.isFinite(n) ? n : undefined;
+    }
+
+    // 酒馆主 API 的请求体：优先让酒馆按当前 Chat Completion 设置自己生成（presetToGeneratePayload 传空预设 =
+    // 原样用当前设置，和酒馆 quiet 生成同一套 createGenerationParameters，各家来源的特殊字段都带上）；
+    // 旧版酒馆没有这个接口时，照数据库 sendMainApiChatCompletionRequest_ACU 的字段手拼。
+    async function mainApiDirectPayload(context, messages, maxTokens, temperature) {
+        const oai = context.chatCompletionSettings;
+        const model = typeof context.getChatCompletionModel === 'function' ? context.getChatCompletionModel() : undefined;
+        const service = context.ChatCompletionService;
+        const overrides = { messages, model, max_tokens: maxTokens, temperature, stream: false, tools: undefined, tool_choice: undefined };
+        // 没给长度就沿用酒馆设置里的，不要用 undefined 把它盖掉。
+        if (maxTokens == null) delete overrides.max_tokens;
+        if (service && typeof service.presetToGeneratePayload === 'function') {
+            return await service.presetToGeneratePayload.call(service, {}, {}, overrides);
+        }
+        const source = String(oai.chat_completion_source || '');
+        const payload = {
+            max_tokens: finiteOrUndefined(oai.openai_max_tokens),
+            ...overrides,
+            chat_completion_source: source,
+            top_p: finiteOrUndefined(oai.top_p_openai),
+            custom_prompt_post_processing: oai.custom_prompt_post_processing,
+        };
+        if (oai.reverse_proxy && ['claude', 'openai', 'mistralai', 'makersuite', 'vertexai', 'deepseek', 'xai', 'zai', 'moonshot'].includes(source)) {
+            payload.reverse_proxy = oai.reverse_proxy;
+            payload.proxy_password = oai.proxy_password;
+        }
+        if (source === 'custom') {
+            payload.custom_url = oai.custom_url;
+            payload.custom_include_body = oai.custom_include_body;
+            payload.custom_exclude_body = oai.custom_exclude_body;
+            payload.custom_include_headers = oai.custom_include_headers;
+        }
+        if (source === 'claude') payload.claude_use_sysprompt = oai.claude_use_sysprompt;
+        if (source === 'makersuite' || source === 'vertexai') payload.use_makersuite_sysprompt = oai.use_makersuite_sysprompt;
+        if (source === 'vertexai') {
+            payload.vertexai_auth_mode = oai.vertexai_auth_mode;
+            payload.vertexai_region = oai.vertexai_region;
+            payload.vertexai_express_project_id = oai.vertexai_express_project_id;
+        }
+        if (source === 'azure_openai') {
+            payload.azure_base_url = oai.azure_base_url;
+            payload.azure_deployment_name = oai.azure_deployment_name;
+            payload.azure_api_version = oai.azure_api_version;
+        }
+        return payload;
+    }
+
+    // 主 API 不是 Chat Completion（文本补全）时返回 null，调用方照旧走 generateRaw。
+    async function askJudgeViaMainApiDirect(messages, preset, settings) {
+        const context = sillyTavernContext();
+        if (!mainApiIsChatCompletion(context)) return null;
+        const maxTokens = settings && settings.judgeMaxTokens ? settings.judgeMaxTokens : undefined;
+        // 和 generateRaw 通道一致：预设里填了温度就用预设的，没选预设时压到 0.2。
+        const temperature = preset && Number.isFinite(Number(preset.temperature)) ? Number(preset.temperature) : 0.2;
+        const payload = await mainApiDirectPayload(context, messages, maxTokens, temperature);
+        LogModule.debug('判断AI', '酒馆主 API：直发生成端点');
+        return postChatCompletionDirect(payload, settings && settings.abortSignal);
+    }
+
+    // 连接预设的反向代理：酒馆的代理列表没暴露到 context。读不到就返回 null，调用方退回连接管理器（它读得到）。
+    function profileProxy(context, profile) {
+        const name = String(profile && profile.proxy || '');
+        if (!name || name === 'None') return {};
+        const oai = context.chatCompletionSettings || {};
+        const list = Array.isArray(oai.proxies) ? oai.proxies : [];
+        const hit = list.find(item => item && item.name === name);
+        if (hit) return { url: hit.url || undefined, password: hit.password || undefined };
+        const manager = context.extensionSettings && context.extensionSettings.connectionManager;
+        if (manager && manager.selectedProfile === profile.id) {
+            return { url: oai.reverse_proxy || undefined, password: oai.proxy_password || undefined };
+        }
+        return null;
+    }
+
+    // 「酒馆预设」直发：字段照酒馆 ConnectionManagerRequestService.sendRequest → ChatCompletionService.processRequest，
+    // 带上 secret_id，后端按这个预设自己的密钥发，不用像数据库那样先切换用户当前的连接。
+    // 不是 Chat Completion、读不到代理、旧版酒馆缺接口时返回 null，调用方退回连接管理器。
+    async function askJudgeViaProfileDirect(messages, preset, signal) {
+        const context = sillyTavernContext();
+        const service = context && context.ChatCompletionService;
+        if (!context || !service || typeof service.createRequestData !== 'function') return null;
+        const manager = context.extensionSettings && context.extensionSettings.connectionManager;
+        const profiles = manager && Array.isArray(manager.profiles) ? manager.profiles : [];
+        const profile = profiles.find(item => item && item.id === preset.tavernProfile);
+        const entry = profile && profile.api && context.CONNECT_API_MAP ? context.CONNECT_API_MAP[profile.api] : null;
+        if (!entry || entry.selected !== 'openai' || !entry.source) return null;
+        const proxy = profileProxy(context, profile);
+        if (!proxy) return null;
+        const apiUrl = profile['api-url'];
+        let data = service.createRequestData.call(service, {
+            stream: false,
+            messages,
+            max_tokens: preset.maxTokens != null ? preset.maxTokens : 60000,
+            model: profile.model,
+            chat_completion_source: entry.source,
+            secret_id: profile['secret-id'],
+            custom_url: apiUrl,
+            vertexai_region: apiUrl,
+            zai_endpoint: apiUrl,
+            siliconflow_endpoint: apiUrl,
+            minimax_endpoint: apiUrl,
+            reverse_proxy: proxy.url,
+            proxy_password: proxy.password,
+            custom_prompt_post_processing: profile['prompt-post-processing'],
+        });
+        if (profile.preset) {
+            const presetManager = typeof context.getPresetManager === 'function' ? context.getPresetManager('openai') : null;
+            const completionPreset = presetManager && typeof presetManager.getCompletionPresetByName === 'function'
+                ? presetManager.getCompletionPresetByName(profile.preset)
+                : null;
+            if (completionPreset) {
+                if (typeof service.presetToGeneratePayload !== 'function') return null;
+                // 酒馆里这是 async（数据库没 await，预设参数会丢），这里要等它。
+                data = await service.presetToGeneratePayload.call(service, completionPreset, {}, data);
+            }
+        }
+        LogModule.debug('判断AI', `酒馆预设「${profile.name || profile.id}」：直发生成端点`);
+        return postChatCompletionDirect(data, signal);
+    }
+
     // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
     // （复刻 shujuku 的自定义 API 调用，附加主体/排除参数/请求标头/提示词后处理全部生效）。
     // messages 为完整段列表（含最终注入）。
@@ -5133,7 +5388,7 @@
     }
 
     async function askJudgeViaCustomApi(messages, preset, streaming, signal) {
-        const response = await hostFetch('/api/backends/chat-completions/generate', {
+        const response = await pristineFetch(CHAT_COMPLETION_GENERATE_URL, {
             method: 'POST',
             headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
             body: JSON.stringify(buildJudgeCustomRequestBody(messages, preset, streaming)),
@@ -5168,6 +5423,8 @@
             if (!preset.tavernProfile) {
                 throw new Error(`API 预设「${preset.name}」没有选择酒馆预设。`);
             }
+            const direct = await askJudgeViaProfileDirect(messages, preset, settings && settings.abortSignal);
+            if (direct != null) return direct;
             return askJudgeViaConnectionProfile(messages, preset);
         }
         if (preset && preset.connection === 'custom') {
@@ -5176,8 +5433,10 @@
             }
             return askJudgeViaCustomApi(messages, preset, streaming, settings && settings.abortSignal);
         }
-        // 酒馆主 API（或无预设）：走酒馆助手 generateRaw。
-        // 段列表映射为 ordered_prompts 条目，最后一条 user 消息作为 user_input（最终注入）。
+        // 酒馆主 API（或无预设）：Chat Completion 时直发生成端点（v3.4）；文本补全照旧走酒馆助手 generateRaw。
+        const direct = await askJudgeViaMainApiDirect(messages, preset, settings);
+        if (direct != null) return direct;
+        // generateRaw：段列表映射为 ordered_prompts 条目，最后一条 user 消息作为 user_input（最终注入）。
         // 最近剧情已通过 {{history}} 占位符写进段内容，不再叠加 chat_history，避免弱模型被重复内容干扰。
         const generateRaw = api('generateRaw', false);
         if (!generateRaw) return null;
@@ -5688,8 +5947,10 @@
             const pickedFork = forks.length ? judgePickedFork(filtered, forks) : null;
             const picked = judgePickedIndex(filtered, visible);
             const inWindow = picked != null && picked >= range.start && picked < range.end;
-            // 方向和序号必须一致：推早了只能往回改，跑过头只能往后改。
-            const agrees = inWindow && ((drift === 'early' && picked < currentOrder) || (drift === 'ahead' && picked > currentOrder));
+            // 方向和序号必须一致：推早了只能往回改，跑过头只能往后改；而且只许相邻一格
+            // （贴边时窗口会往另一侧补，补出来的第二格不许跳）。
+            const adjacent = picked != null && Math.abs(picked - currentOrder) === 1;
+            const agrees = inWindow && adjacent && ((drift === 'early' && picked < currentOrder) || (drift === 'ahead' && picked > currentOrder));
             const targetStage = agrees ? visible[picked] : null;
             const verdict = pickedFork
                 ? `走进分岔「${entryName(pickedFork.entry)}」`
@@ -7458,7 +7719,7 @@
                 ), '只看 AI 正文，不含用户消息。');
             })(),
             (() => {
-                // 大检查（v3.2）：每 N 层另问一次，核对近 5 段大纲、分岔口和最近 3 段正文；偏了就改到正文对应的那段。
+                // 大检查：每 N 层另问一次，核对前后各 1 段大纲、分岔口和最近 3 段正文；偏了只改相邻一格。
                 const every = bigCheckInterval(settings);
                 const presets = [0, 5, 10, 20];
                 const selectValue = presets.includes(every) ? String(every) : 'custom';
@@ -7488,7 +7749,7 @@
                         }
                     }),
                     selectValue === 'custom' ? everyInput : null,
-                ), '每 N 层核对一次近 5 段大纲、分岔口和最近 3 段正文。推早了或跑过头，就改到正文对应的那一段。');
+                ), '每 N 层核对一次前后各 1 段大纲、分岔口和最近 3 段正文。推早了或跑过头，只改到相邻那一段；日常片段不算推早。');
             })(),
             (() => {
                 // 推进冷却（v3.3，仿格林推演圈层冷却）：刚换段后 N 层内不自动推进，免得连跳两段。

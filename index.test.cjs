@@ -2825,6 +2825,193 @@ test('判断AI档：自定义 API 预设直连酒馆后端 generate 端点', asy
     assert.deepEqual(run.errors, []);
 });
 
+// v3.4 直发生成端点：一条绑定、判断AI档，SillyTavern.getContext() 由调用方给。
+function directSendWorld(settings, stContext, extra) {
+    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
+    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
+    const config = {
+        version: 2,
+        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
+        settings: { autoAdvance: 'judge', ...settings },
+    };
+    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
+    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
+    const rawCalls = [];
+    helper.generateRaw = async options => { rawCalls.push(options); return '<verdict>NO</verdict>'; };
+    const fetches = [];
+    const fetchMock = async (url, options) => {
+        fetches.push({ url, options });
+        const body = JSON.stringify({ choices: [{ message: { content: '<basis>- 已发生：甲二开始</basis>\n<verdict>- 结论：YES</verdict>' } }] });
+        return { ok: true, status: 200, text: async () => body, json: async () => JSON.parse(body) };
+    };
+    const SillyTavern = { getContext: () => stContext };
+    const run = load(helper, { SillyTavern, fetch: fetchMock, ...(extra || {}) });
+    const stageIndex = () => state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex;
+    return { state, run, rawCalls, fetches, stageIndex };
+}
+
+function fakeChatCompletionService(log) {
+    return {
+        createRequestData(payload) {
+            const data = { use_sysprompt: true, ...payload };
+            Object.keys(data).forEach(key => { if (data[key] === undefined) delete data[key]; });
+            return data;
+        },
+        async presetToGeneratePayload(preset, overridePreset, overridePayload) {
+            log.push({ preset, overridePayload: { ...overridePayload } });
+            return this.createRequestData({ type: 'quiet', top_p: 0.9, temperature: preset.temperature != null ? preset.temperature : 1, ...overridePayload });
+        },
+    };
+}
+
+test('判断AI档：酒馆主 API 是 Chat Completion 时直发生成端点，不走 generateRaw', async () => {
+    const presetCalls = [];
+    const stContext = {
+        mainApi: 'openai',
+        chatCompletionSettings: { chat_completion_source: 'openrouter' },
+        getChatCompletionModel: () => 'main-model',
+        getRequestHeaders: () => ({ 'X-CSRF-Token': 't' }),
+        ChatCompletionService: fakeChatCompletionService(presetCalls),
+        extractMessageFromData: json => json.choices[0].message.content,
+    };
+    const world = directSendWorld({}, stContext);
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(world.rawCalls.length, 0, '不走 generateRaw，也就不触发酒馆生成事件');
+    assert.equal(world.fetches.length, 1);
+    assert.equal(world.fetches[0].url, '/api/backends/chat-completions/generate');
+    assert.equal(world.fetches[0].options.headers['X-CSRF-Token'], 't');
+    const body = JSON.parse(world.fetches[0].options.body);
+    assert.equal(body.stream, false);
+    assert.equal(body.model, 'main-model');
+    assert.equal(body.max_tokens, 4096, '没选预设时回复长度 4096');
+    assert.equal(body.temperature, 0.2, '没选预设时温度压到 0.2');
+    assert.equal(body.top_p, 0.9, '其余参数由酒馆按当前设置生成');
+    assert.equal('tools' in body, false, '不带酒馆的函数工具');
+    assert.equal(body.messages[0].role, 'system');
+    assert.match(body.messages[1].content, /这一轮的回复/);
+    assert.equal(presetCalls.length, 1, '用空预设让酒馆按当前设置生成请求体');
+    assert.deepEqual(plain(presetCalls[0].preset), {});
+    assert.equal(world.stageIndex(), 1, 'YES 要推进');
+    assert.deepEqual(world.run.errors, []);
+});
+
+test('判断AI档：旧版酒馆没有 presetToGeneratePayload 时按当前设置手拼请求体；文本补全照旧走 generateRaw', async () => {
+    const service = fakeChatCompletionService([]);
+    delete service.presetToGeneratePayload;
+    const manual = directSendWorld({}, {
+        mainApi: 'openai',
+        chatCompletionSettings: { chat_completion_source: 'custom', custom_url: 'https://relay.example/v1', custom_include_headers: 'X-A: 1', reverse_proxy: 'https://proxy.example', top_p_openai: 0.8 },
+        getChatCompletionModel: () => 'relay-model',
+        ChatCompletionService: service,
+    });
+    await new Promise(setImmediate);
+    await manual.state.events.get('message_received')(5);
+    assert.equal(manual.rawCalls.length, 0);
+    const body = JSON.parse(manual.fetches[0].options.body);
+    assert.equal(body.chat_completion_source, 'custom');
+    assert.equal(body.custom_url, 'https://relay.example/v1');
+    assert.equal(body.custom_include_headers, 'X-A: 1');
+    assert.equal(body.top_p, 0.8);
+    assert.equal('reverse_proxy' in body, false, 'custom 来源不带反向代理');
+    assert.equal(manual.stageIndex(), 1);
+
+    const text = directSendWorld({}, { mainApi: 'textgenerationwebui', chatCompletionSettings: {}, ChatCompletionService: fakeChatCompletionService([]) });
+    await new Promise(setImmediate);
+    await text.state.events.get('message_received')(5);
+    assert.equal(text.fetches.length, 0, '文本补全不直发');
+    assert.equal(text.rawCalls.length, 1, '照旧走 generateRaw');
+});
+
+test('判断AI档：Chat Completion 酒馆预设直发生成端点，带上 secret_id 和补全预设，不切换当前连接', async () => {
+    const presetCalls = [];
+    const cmCalls = [];
+    const profile = {
+        id: 'p1', name: '小模型', api: 'openrouter', model: 'judge-mini', 'secret-id': 'sec-9',
+        'api-url': '', proxy: 'None', preset: '判断用补全预设', 'prompt-post-processing': 'strict',
+    };
+    const stContext = {
+        mainApi: 'openai',
+        chatCompletionSettings: {},
+        CONNECT_API_MAP: { openrouter: { selected: 'openai', source: 'openrouter' } },
+        extensionSettings: { connectionManager: { selectedProfile: 'other', profiles: [profile] } },
+        getPresetManager: api => (api === 'openai' ? { getCompletionPresetByName: name => (name === '判断用补全预设' ? { temperature: 0.3 } : null) } : null),
+        ChatCompletionService: fakeChatCompletionService(presetCalls),
+        ConnectionManagerRequestService: { sendRequest: async (...args) => { cmCalls.push(args); return { content: 'NO' }; } },
+    };
+    const localStorage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1', maxTokens: 300 }]),
+    });
+    const world = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage });
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(cmCalls.length, 0, '不走连接管理器');
+    assert.equal(world.rawCalls.length, 0);
+    assert.equal(world.fetches.length, 1);
+    const body = JSON.parse(world.fetches[0].options.body);
+    assert.equal(body.chat_completion_source, 'openrouter');
+    assert.equal(body.model, 'judge-mini');
+    assert.equal(body.secret_id, 'sec-9', '用这个预设自己的密钥');
+    assert.equal(body.max_tokens, 300);
+    assert.equal(body.custom_prompt_post_processing, 'strict');
+    assert.equal(body.temperature, 0.3, '补全预设的参数要等 async 的 presetToGeneratePayload 生成完');
+    assert.equal(body.stream, false);
+    assert.equal(presetCalls.length, 1);
+    assert.equal(world.stageIndex(), 1);
+    assert.deepEqual(world.run.errors, []);
+});
+
+test('判断AI档：酒馆预设读不到反向代理或不是 Chat Completion 时退回连接管理器', async () => {
+    for (const profile of [
+        { id: 'p1', name: '走代理', api: 'openai', model: 'm', proxy: '我的代理' },
+        { id: 'p1', name: '文本补全', api: 'koboldcpp', model: 'm' },
+    ]) {
+        const cmCalls = [];
+        const stContext = {
+            chatCompletionSettings: {},
+            CONNECT_API_MAP: { openai: { selected: 'openai', source: 'openai' }, koboldcpp: { selected: 'textgenerationwebui', type: 'koboldcpp' } },
+            extensionSettings: { connectionManager: { selectedProfile: 'other', profiles: [profile] } },
+            ChatCompletionService: fakeChatCompletionService([]),
+            ConnectionManagerRequestService: { sendRequest: async (...args) => { cmCalls.push(args); return { content: '<verdict>YES</verdict>' }; } },
+        };
+        const localStorage = memoryStorage({
+            'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1' }]),
+        });
+        const world = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage });
+        await new Promise(setImmediate);
+        await world.state.events.get('message_received')(5);
+        assert.equal(world.fetches.length, 0, `${profile.name}：不直发`);
+        assert.equal(cmCalls.length, 1, `${profile.name}：走连接管理器`);
+        assert.equal(world.stageIndex(), 1);
+    }
+});
+
+test('原生 fetch：别的脚本包装了 fetch 时，按标记剥回原函数再发', async () => {
+    const nativeCalls = [];
+    const wrappedCalls = [];
+    // Proxy 包一个名叫 fetch 的函数，toString 出来是 [native code]，冒充浏览器原生 fetch。
+    const nativeFetch = new Proxy(async function fetch(url, options) {
+        nativeCalls.push({ url, options });
+        const body = JSON.stringify({ choices: [{ message: { content: '<verdict>YES</verdict>' } }] });
+        return { ok: true, status: 200, text: async () => body, json: async () => JSON.parse(body) };
+    }, {});
+    const wrapper = async (url, options) => { wrappedCalls.push(url); return nativeFetch(url, options); };
+    wrapper.__keminiFetchInterceptor__ = { original: nativeFetch };
+    const stContext = {
+        mainApi: 'openai',
+        chatCompletionSettings: { chat_completion_source: 'openai' },
+        getChatCompletionModel: () => 'gpt',
+        ChatCompletionService: fakeChatCompletionService([]),
+    };
+    const world = directSendWorld({}, stContext, { fetch: wrapper });
+    await new Promise(setImmediate);
+    await world.state.events.get('message_received')(5);
+    assert.equal(wrappedCalls.length, 0, '不经过包装');
+    assert.equal(nativeCalls.length, 1);
+    assert.equal(world.stageIndex(), 1);
+    assert.deepEqual(world.run.errors, []);
+});
+
 test('判断AI档：选择不存在的本机预设时不调用 generateRaw', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
@@ -4215,7 +4402,7 @@ function bigCheckWorld(options) {
     return { ...world, calls, hostState };
 }
 
-test('大检查：首次立即检查，只带前 2 / 当前 / 后 2 段大纲，推早了就往回改', async () => {
+test('大检查：首次立即检查，只带前 1 / 当前 / 后 1 段大纲，推早了就往回改', async () => {
     const world = bigCheckWorld({ bigAnswer: '<basis>正文还在甲二</basis>\n<drift>推早了</drift>\n<stage>2</stage>\n<road>0</road>' });
     const run = load(world.helper);
     await new Promise(setImmediate);
@@ -4223,8 +4410,13 @@ test('大检查：首次立即检查，只带前 2 / 当前 / 后 2 段大纲，
     assert.equal(world.calls.judge.length, 1, '普通判断照常问一次');
     assert.equal(world.calls.big.length, 1, '大检查另问一次');
     const input = String(world.calls.big[0].user_input);
-    assert.match(input, /1\. 甲一[\s\S]*2\. 甲二[\s\S]*3\. 甲三（大纲现在停在这里）[\s\S]*4\. 甲四[\s\S]*5\. 甲五/);
-    assert.doesNotMatch(input, /甲六/, '只带 5 段');
+    assert.match(input, /2\. 甲二[\s\S]*3\. 甲三（大纲现在停在这里）[\s\S]*4\. 甲四/);
+    assert.doesNotMatch(input, /甲一|甲五|甲六/, '只带前后各 1 段');
+    const bigSystem = String(world.calls.big[0].ordered_prompts[0].content);
+    assert.match(bigSystem, /日常、闲聊/, '提示词写明日常片段不算推早');
+    assert.match(bigSystem, /只能和相邻的一段比/, '提示词写明只和相邻一段比');
+    assert.match(bigSystem, /吃饭、闲聊[^\n]*→ 正常/, '例子里有日常片段判正常的反例');
+    assert.doesNotMatch(bigSystem, /日常[^\n]*→ 推早了/, '例子不能把日常判成推早了');
     assert.match(input, /【分岔口】[\s\S]*这一段没有分岔/);
     assert.match(input, /第 5 层正文/);
     assert.doesNotMatch(input, /\{\{/, '占位符都要替换');
@@ -4256,6 +4448,12 @@ test('大检查：方向和序号对不上、原样抄模板都不改段', async
     await new Promise(setImmediate);
     await wrong.state.events.get('message_received')(5);
     assert.equal(wrong.hostState().stageIndex, 2, '推早了却写了后面的序号，不改');
+
+    const far = bigCheckWorld({ bigAnswer: '<drift>推早了</drift>\n<stage>1</stage>' });
+    load(far.helper);
+    await new Promise(setImmediate);
+    await far.state.events.get('message_received')(5);
+    assert.equal(far.hostState().stageIndex, 2, '跳回两段之前不执行，只许相邻一格');
 
     const copied = bigCheckWorld({ bigAnswer: '<drift>\n- 偏差：正常、推早了、跑过头，三选一\n</drift>\n<stage>1</stage>' });
     load(copied.helper);
