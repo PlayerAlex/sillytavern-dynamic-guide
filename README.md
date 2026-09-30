@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v3.5**
+当前版本：**v3.6**
 
 把完整剧情大纲写在角色世界书的条目里，用分段划成一幕一幕。动态指导助手会关闭来源条目，并在同一本世界书里维护一个「（动态指导）」镜像条目：位置、顺序、关键词等设置全部跟随原条目，内容只有当前这一幕。可以同时绑定好几条。没选依附的自己走。选了依附的，从某一段开始挂上去：分岔口是选了这条、原来那条就断；支线是可以走，走完回到原来那条接着往下。分岔口上还能再依附别的条目。
 
@@ -8,10 +8,10 @@
 
 ## 安装与开始使用
 
-导入文件位于本项目 `latest/` 目录，也可在 [v3.5 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v3.5)下载：
+导入文件位于本项目 `latest/` 目录，也可在 [v3.6 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v3.6)下载：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.5/dynamic-guide-offline-v3.5.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.5/dynamic-guide-online-v3.5.json)：启动时加载固定版本的远程脚本。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.6/dynamic-guide-offline-v3.6.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v3.6/dynamic-guide-online-v3.6.json)：启动时加载固定版本的远程脚本。
 
 1. 在酒馆助手中导入并启用“动态指导助手”脚本，或导入发布仓库的在线版 JSON。
 2. 给角色绑定一个世界书，在其中新建“大纲”条目。可以直接使用下面的文本模板，也可以先写普通大纲，用空行分开段落。
@@ -29,7 +29,7 @@
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v3.5/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v3.6/index.js';
 ```
 
 推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。
@@ -198,6 +198,13 @@ v1.3 系列的选区划分保存在条目扩展数据或正文末尾的 `DGA_LAY
 每个条目是一条线，按分段往下走；非直线的走法只有「依附」这一种：一条线可以从另一条的某一段接上，做成分岔口或支线，两条之间还可以设换边。自动推进依赖判断AI的结论，复杂条件可能需要手动调整。“只显示当前内容”仅控制镜像条目本次发送的指导，不会删除聊天历史中已经出现的信息。
 
 ## 更新日志
+
+### v3.6（2026-09-30）
+
+- UI 质感全面升级：参考数据库精致规整的层级与卡片质感，去除杂乱的多重半透明与毛玻璃叠加。
+- 原创曜石暮蓝主题：采用暮紫曜蓝（`#6E85F7`）主色与深炭曜石分层底色（`#0E131F` / `#161C2A` / `#1E2638` / `#283348`），主色、底色与正文色固定，不受酒馆主题颜色覆盖。
+- 实色分层与规整投影：外层与一级卡片使用 `var(--dga-bg-1)`，绑定条目/规则组/健康度/路线图等嵌套容器使用 `var(--dga-bg-2)`，统一 `1px solid` 细腻微边框与浅投影。
+- 控件与排版规范化：统一输入框/下拉框/按钮尺寸规范（主操作 34~36px，小工具 30px），优化开关（36×20px）与分段器胶囊化样式，提高信息密度与排版美观度。
 
 ### v3.5（2026-09-30）
 
