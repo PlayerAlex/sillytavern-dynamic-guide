@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.7
+     * 动态指导助手 v3.8
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.7';
+    const VERSION = '3.8';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -190,7 +190,7 @@
             steps: ['到「API」页检查当前预设的 API Key 是否完整、有没有多余空格。', '确认 Key 和端点属于同一家服务商。', '中转站请登录站点确认 Key 仍有效、余额充足。'] },
         { id: 'http-403', test: /\b403\b|forbidden|permission[ _-]?denied|not allowed to|access denied|无权访问|权限不足/,
             summary: '服务商拒绝访问（403）：Key 没有权限，或请求来源被限制。',
-            steps: ['确认 Key 有权使用所选模型。', '有的服务商拒绝浏览器直连：把预设改成「酒馆预设」连接，由酒馆后端转发。', '中转站请联系站方确认账号是否被限制。'] },
+            steps: ['确认 Key 有权使用所选模型。', '有的服务商拒绝浏览器直连：改用「自定义」连接，由酒馆后端转发。', '中转站请联系站方确认账号是否被限制。'] },
         { id: 'http-404', test: /\b404\b|not[ _]found.*(model|endpoint|route)|model.*(not found|does not exist|not exist)|no such model|unknown model|invalid model|模型不存在|找不到模型/,
             summary: '端点或模型名不存在（404）。',
             steps: ['到「API」页检查端点是否完整，结尾要不要 /v1 按服务商文档填。', '点「加载模型」重新选模型，避免手写拼错。', '确认服务商仍提供该模型，旧模型可能已下线。'] },
@@ -208,7 +208,7 @@
             steps: ['到「API」页确认模型名拼写正确，最好用「加载模型」选。', '改过附加主体参数、温度等高级参数的，先恢复默认再试。', '有的模型不支持 system 角色，换个模型试试。'] },
         { id: 'network-cors', test: /\bcors\b|cross-origin|access-control-allow-origin|preflight/,
             summary: '浏览器跨域被拦截（CORS）：该服务商不允许网页直接调用。',
-            steps: ['把预设改成「酒馆预设」或「自定义」连接，都由酒馆后端转发。'] },
+            steps: ['把预设改成「自定义」连接，由酒馆后端转发。'] },
         { id: 'network', test: /failed to fetch|networkerror|network error|net::err|econnrefused|econnreset|enotfound|etimedout|getaddrinfo|socket hang up|fetch failed|timed? ?out|timeout|无法连接|连接被拒绝|网络错误|请求超时|超时/,
             summary: '网络连不上目标服务，或者等响应超时了。',
             steps: ['检查本机网络和代理；酒馆部署在远程服务器时，确认服务器能访问该 API 地址。', '超时多半是模型响应慢：稍后重试，或换更快的模型。'] },
@@ -1196,13 +1196,10 @@
             const num = Number(value);
             return Number.isFinite(num) ? num : fallback;
         };
-        // v1（2.9）的 type 迁移：current→main、proxy→tavern、custom→custom。
-        let connection = ['main', 'custom', 'tavern'].includes(item.connection) ? item.connection : '';
-        if (!connection) {
-            if (item.type === 'proxy') connection = 'tavern';
-            else if (item.type === 'custom') connection = 'custom';
-            else connection = 'main';
-        }
+        // v1（2.9）的 type 迁移：current→main、custom→custom。
+        // v3.8 起不再提供「酒馆预设」连接：旧的 tavern / proxy 预设统一改走酒馆主 API。
+        let connection = ['main', 'custom'].includes(item.connection) ? item.connection : '';
+        if (!connection) connection = item.type === 'custom' ? 'custom' : 'main';
         return {
             name,
             connection,
@@ -1219,9 +1216,6 @@
             excludeBodyParams: connection === 'custom' ? String(item.excludeBodyParams || '') : '',
             requestHeaders: connection === 'custom' ? String(item.requestHeaders || '') : '',
             promptPostProcessing: connection === 'custom' ? normalizePromptPostProcessing(item.promptPostProcessing) : '',
-            tavernProfile: connection === 'tavern'
-                ? String(item.tavernProfile || item.proxyPreset || '').trim()
-                : '',
         };
     }
 
@@ -1274,7 +1268,8 @@
     }
 
     // 按聊天 / 按线选判断AI的 API（v3.2，仿数据库 apiPresetBindingsByChat / plotTaskApiPresetOverridesById）。
-    // 只存本机 localStorage，不写角色变量，照旧不随角色卡导出。优先级：这条线 > 这个聊天 > 全局。
+    // 只存本机 localStorage，不写角色变量，照旧不随角色卡导出。优先级：这条线 > 全局。
+    // v3.8 起按聊天的选择不再生效（入口已删），chats 字段仅为兼容旧存档保留。
     // 值为 '@main' 表示这里强制用酒馆主 API。
     const PRESET_OVERRIDES_KEY = 'dynamic-guide-assistant:preset-overrides:v1';
     const PRESET_MAIN = '@main';
@@ -1341,8 +1336,7 @@
         const pick = (value, source) => ({ name: value === PRESET_MAIN ? '' : value, source });
         const line = context && context.key ? overrides.lines[context.key] : '';
         if (line) return pick(line, 'line');
-        const chat = currentChatKey();
-        if (chat && overrides.chats[chat]) return pick(overrides.chats[chat], 'chat');
+        // v3.8 起不再按聊天单独选 API（入口已删）；旧的按聊天记录留在本机但不再生效。
         return { name: settings && typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '', source: 'global' };
     }
 
@@ -1458,15 +1452,15 @@
         { token: '--dga-on-accent', label: '强调色上的文字' },
         { token: '--dga-danger', label: '危险色' },
     ];
-    // 默认深色：中性灰底色，灰绿强调色只用于选中状态与主要操作。
+    // 默认深色：黑灰底色，黄色强调色只用于选中状态与主要操作。
     const APPEARANCE_DEFAULTS = {
-        '--dga-bg-0': '#1F2325',
-        '--dga-bg-1': '#272C2F',
-        '--dga-bg-2': '#32383C',
-        '--dga-text-1': '#F0F2EE',
-        '--dga-accent': '#B1B99A',
-        '--dga-on-accent': '#20251D',
-        '--dga-danger': '#D07A74',
+        '--dga-bg-0': '#161719',
+        '--dga-bg-1': '#1F2023',
+        '--dga-bg-2': '#2A2C30',
+        '--dga-text-1': '#EEEDE8',
+        '--dga-accent': '#E8C15A',
+        '--dga-on-accent': '#1B1A16',
+        '--dga-danger': '#E0716A',
     };
     const APPEARANCE_PRESETS = [
         { id: 'default-dark', name: '默认深色', tokens: { ...APPEARANCE_DEFAULTS } },
@@ -1775,32 +1769,6 @@
             LogModule.warn('判断AI', '拿不到原生 fetch，判断请求可能仍会被别的脚本改写');
         }
         return hostFetch(input, init);
-    }
-
-    // 酒馆连接管理器（ConnectionManagerRequestService），「酒馆预设」连接的判断AI调用走这里。
-    function connectionManagerService() {
-        try {
-            const context = sillyTavernContext();
-            const service = context && context.ConnectionManagerRequestService;
-            if (service && typeof service.sendRequest === 'function') return service;
-        } catch (error) {
-            // 同上：跨域候选不是运行接口来源。
-        }
-        return null;
-    }
-
-    // 酒馆连接预设列表（连接管理器里的 profiles），对应 API 页「酒馆预设」下拉。
-    function readTavernConnectionProfiles() {
-        try {
-            const context = sillyTavernContext();
-            const manager = context && context.extensionSettings && context.extensionSettings.connectionManager;
-            const profiles = manager && manager.profiles;
-            return (Array.isArray(profiles) ? profiles : [])
-                .filter(profile => profile && profile.id)
-                .map(profile => ({ id: String(profile.id), name: String(profile.name || profile.id) }));
-        } catch (error) {
-            return [];
-        }
     }
 
     // 复刻 shujuku fetchAvailableModels_ACU：把拉模型请求发给酒馆后端
@@ -3744,7 +3712,7 @@
             kids.get(host.key).push(item);
         });
         const seen = new Set();
-        const nodeOf = (item, depth) => {
+        const nodeOf = (item, depth, parentPath) => {
             if (seen.has(item.key)) return null;
             seen.add(item.key);
             const binding = item.binding;
@@ -3752,6 +3720,8 @@
             const stages = (item.parsed && item.parsed.stages) || [];
             const here = Math.max(0, Math.floor(Number(state.stageIndex) || 0));
             const host = binding.attachKey ? byKey.get(binding.attachKey) : null;
+            const name = entryName(item.entry);
+            const path = parentPath ? `${parentPath} › ${name}` : name;
             let how = '';
             let passes = [];
             if (host && depth > 0) {
@@ -3769,14 +3739,27 @@
             else if (here >= stages.length && !(item.parsed && item.parsed.loop)) now = '全部走完';
             else now = `现在第 ${Math.min(here, stages.length - 1) + 1} 段`;
             const branches = (kids.get(item.key) || []).map(child => {
-                const node = nodeOf(child, depth + 1);
+                const node = nodeOf(child, depth + 1, path);
                 if (!node) return null;
                 return { after: Math.max(1, Math.floor(Number(child.binding.attachStage) || 1)), node };
             }).filter(Boolean);
+            // 依附关系（v3.8 路线图用）：kind 决定标签，entered 表示这条正是走进去的那条，
+            // abandoned 表示同一接点上别的分岔被选中、这条已经放弃，asleep 表示还没轮到它。
+            const kind = host && depth > 0 ? (binding.attachKind === 'side' ? 'side' : 'fork') : '';
+            const hostState = (host && host.state) || {};
+            const entered = Boolean(kind) && (kind === 'side' ? hostState.sideOut === item.key : hostState.forkInto === item.key);
+            const abandoned = kind === 'fork' && !entered
+                && typeof hostState.forkInto === 'string' && Boolean(hostState.forkInto) && hostState.forkInto !== item.key;
             return {
                 key: item.key,
                 depth,
-                name: entryName(item.entry),
+                name,
+                path,
+                deep: depth >= 2,
+                kind,
+                entered,
+                abandoned,
+                asleep: Boolean(host) && attachmentAsleep(item, list),
                 how,
                 now,
                 live: /^现在/.test(now),
@@ -5197,54 +5180,7 @@
             .join('\n\n');
     }
 
-    // 「酒馆预设」连接：走酒馆连接管理器（对齐 shujuku sendConnectionManagerRequest_ACU），
-    // 不再走 generateRaw 的 proxy_preset。messages 为完整段列表（含最终注入）。
-    async function askJudgeViaConnectionProfile(messages, preset) {
-        const service = connectionManagerService();
-        if (!service) {
-            throw new Error('酒馆连接管理器不可用（找不到 ConnectionManagerRequestService）：请升级酒馆版本，或把这个 API 预设改成「酒馆主 API / 自定义」连接。');
-        }
-        const maxTokens = preset.maxTokens != null ? preset.maxTokens : 60000;
-        const result = await service.sendRequest(preset.tavernProfile, messages, maxTokens);
-        // 对齐 shujuku：优先 result.result.choices[0].message.content，再退 result.content / 字符串。
-        if (result && result.result && Array.isArray(result.result.choices)
-            && result.result.choices[0] && result.result.choices[0].message
-            && typeof result.result.choices[0].message.content === 'string') {
-            return result.result.choices[0].message.content;
-        }
-        if (result && typeof result.content === 'string') return result.content;
-        if (typeof result === 'string') return result;
-        return '';
-    }
-
-    // 酒馆预设会改变宿主当前连接：请求前切到目标，结束后恢复原连接。
-    async function runWithTavernProfile(profileId, action) {
-        const context = sillyTavernContext();
-        const manager = context && context.extensionSettings && context.extensionSettings.connectionManager;
-        const profiles = manager && Array.isArray(manager.profiles) ? manager.profiles : [];
-        const profile = profiles.find(item => item && item.id === profileId);
-        if (!profile) throw new Error(`无法找到 ID 为「${profileId}」的酒馆连接预设。`);
-        if (!profile.api) throw new Error(`酒馆连接预设「${profile.name || profile.id}」没有配置 API。`);
-        const slash = api('triggerSlash', false);
-        const original = slash ? String(await slash('/profile') || '') : '';
-        const target = String(profile.name || profile.id);
-        const needSwitch = Boolean(original && original !== target);
-        try {
-            if (needSwitch) await slash(`/profile await=true "${target.replace(/"/g, '\\"')}"`);
-            return await action(profile);
-        } finally {
-            if (needSwitch) {
-                try {
-                    const current = String(await slash('/profile') || '');
-                    if (current !== original) await slash(`/profile await=true "${original.replace(/"/g, '\\"')}"`);
-                } catch (error) {
-                    LogModule.warn('判断AI', `恢复原酒馆连接预设失败：${error.message || error}`);
-                }
-            }
-        }
-    }
-
-    // 直发生成端点（v3.4，照数据库 30b304da / a2e394c6）：酒馆主 API 和「酒馆预设」是 Chat Completion 时，
+    // 直发生成端点（v3.4，照数据库 30b304da / a2e394c6）：酒馆主 API 是 Chat Completion 时，
     // 按酒馆自己的字段拼好请求体，用原生 fetch 直接发到 /api/backends/chat-completions/generate。
     // generateRaw 和连接管理器都经过酒馆的全局 fetch，会被别的脚本改写；generateRaw 还会触发酒馆的生成事件，
     // 本插件的镜像同步和数据库等插件都会把一次判断当成正文生成。直发两样都没有，而且能中止。
@@ -5357,66 +5293,6 @@
         return postChatCompletionDirect(payload, settings && settings.abortSignal);
     }
 
-    // 连接预设的反向代理：酒馆的代理列表没暴露到 context。读不到就返回 null，调用方退回连接管理器（它读得到）。
-    function profileProxy(context, profile) {
-        const name = String(profile && profile.proxy || '');
-        if (!name || name === 'None') return {};
-        const oai = context.chatCompletionSettings || {};
-        const list = Array.isArray(oai.proxies) ? oai.proxies : [];
-        const hit = list.find(item => item && item.name === name);
-        if (hit) return { url: hit.url || undefined, password: hit.password || undefined };
-        const manager = context.extensionSettings && context.extensionSettings.connectionManager;
-        if (manager && manager.selectedProfile === profile.id) {
-            return { url: oai.reverse_proxy || undefined, password: oai.proxy_password || undefined };
-        }
-        return null;
-    }
-
-    // 「酒馆预设」直发：字段照酒馆 ConnectionManagerRequestService.sendRequest → ChatCompletionService.processRequest。
-    // 调用方先切到目标连接预设，再在结束后恢复原连接。
-    // 不是 Chat Completion、读不到代理、旧版酒馆缺接口时返回 null，调用方退回连接管理器。
-    async function askJudgeViaProfileDirect(messages, preset, signal) {
-        const context = sillyTavernContext();
-        const service = context && context.ChatCompletionService;
-        if (!context || !service || typeof service.createRequestData !== 'function') return null;
-        const manager = context.extensionSettings && context.extensionSettings.connectionManager;
-        const profiles = manager && Array.isArray(manager.profiles) ? manager.profiles : [];
-        const profile = profiles.find(item => item && item.id === preset.tavernProfile);
-        const entry = profile && profile.api && context.CONNECT_API_MAP ? context.CONNECT_API_MAP[profile.api] : null;
-        if (!entry || entry.selected !== 'openai' || !entry.source) return null;
-        const proxy = profileProxy(context, profile);
-        if (!proxy) return null;
-        const apiUrl = profile['api-url'];
-        let data = service.createRequestData.call(service, {
-            stream: false,
-            messages,
-            max_tokens: preset.maxTokens != null ? preset.maxTokens : 60000,
-            model: profile.model,
-            chat_completion_source: entry.source,
-            custom_url: apiUrl,
-            vertexai_region: apiUrl,
-            zai_endpoint: apiUrl,
-            siliconflow_endpoint: apiUrl,
-            minimax_endpoint: apiUrl,
-            reverse_proxy: proxy.url,
-            proxy_password: proxy.password,
-            custom_prompt_post_processing: profile['prompt-post-processing'],
-        });
-        if (profile.preset) {
-            const presetManager = typeof context.getPresetManager === 'function' ? context.getPresetManager('openai') : null;
-            const completionPreset = presetManager && typeof presetManager.getCompletionPresetByName === 'function'
-                ? presetManager.getCompletionPresetByName(profile.preset)
-                : null;
-            if (completionPreset) {
-                if (typeof service.presetToGeneratePayload !== 'function') return null;
-                // 酒馆里这是 async（数据库没 await，预设参数会丢），这里要等它。
-                data = await service.presetToGeneratePayload.call(service, completionPreset, {}, data);
-            }
-        }
-        LogModule.debug('判断AI', `酒馆预设「${profile.name || profile.id}」：直发生成端点`);
-        return postChatCompletionDirect(data, signal);
-    }
-
     // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
     // （复刻 shujuku 的自定义 API 调用，附加主体/排除参数/请求标头/提示词后处理全部生效）。
     // messages 为完整段列表（含最终注入）。
@@ -5485,16 +5361,6 @@
 
     async function askJudge(messages, preset, settings) {
         const streaming = Boolean(settings && settings.streamingEnabled);
-        if (preset && preset.connection === 'tavern') {
-            if (!preset.tavernProfile) {
-                throw new Error(`API 预设「${preset.name}」没有选择酒馆预设。`);
-            }
-            return runWithTavernProfile(preset.tavernProfile, async () => {
-                const direct = await askJudgeViaProfileDirect(messages, preset, settings && settings.abortSignal);
-                if (direct != null) return direct;
-                return askJudgeViaConnectionProfile(messages, preset);
-            });
-        }
         if (preset && preset.connection === 'custom') {
             if (!preset.apiurl || !preset.model) {
                 throw new Error(`API 预设「${preset.name}」缺少端点(基础URL)或模型名。`);
@@ -6144,7 +6010,6 @@
         apiModelOptions: [],
         apiModelStatus: 'idle',
         apiModelError: '',
-        apiTavernProfiles: [],
         // 判断AI提示词二级页草稿态（draft/snapshot 脏检查，对齐 shujuku 提示词抽屉）
         judgePromptDraft: null,
         judgePromptDraftSnapshot: '',
@@ -6667,52 +6532,121 @@
             }, item.label)));
     }
 
-    // 每个阶段单独一行。支线直接插在它所挂的那一段后面，不再画横线。
+    // 一条线按分段画成线路图。走进分岔口后当场换轨：分岔的分段接着编号往下排，
+    // 原线接点之后的段只划掉留痕；分岔再分岔也照样递归接下去（v3.8）。
     function roadmapNodeView(node) {
-        const stages = node.stages || [];
-        const grouped = new Map();
-        (node.branches || []).forEach(branch => {
-            let after = Math.max(1, Math.floor(Number(branch.after) || 1));
-            if (stages.length) after = Math.min(after, stages.length);
-            if (!grouped.has(after)) grouped.set(after, []);
-            grouped.get(after).push(branch.node);
-        });
         const flow = [];
-        const pushInserted = after => {
-            (grouped.get(after) || []).forEach(child => flow.push(roadmapNodeView(child)));
+        // 换轨后不再走的段：从线路里移出来单独写一行，免得看起来还在这条线上（v3.8）。
+        const dropped = [];
+        // 当前正在走的是哪条线、处在合并编号后的第几段；换轨后会落进分岔里，不能只看 node 自己。
+        let head = { number: null, names: [] };
+
+        const pushLine = (line, base, names) => {
+            const lineStages = line.stages || [];
+            const entry = (line.branches || []).find(branch => branch.node.kind === 'fork' && branch.node.entered) || null;
+            const cutAt = entry
+                ? Math.min(Math.max(1, Math.floor(Number(entry.after) || 1)), Math.max(1, lineStages.length))
+                : 0;
+            // 接点之后的段一确定就知道是哪些：先记下来，顺序自然是外层在前。
+            const cutNames = entry ? lineStages.slice(cutAt) : [];
+            if (cutNames.length) dropped.push({ line: line.name, names: cutNames });
+            // 接点之前挂着的其它依附照旧当分支块画；接点之后的不再走，也就不画。
+            const grouped = new Map();
+            (line.branches || []).forEach(branch => {
+                if (branch.node.abandoned) return;
+                if (entry && branch.node === entry.node) return;
+                const after = Math.max(1, Math.floor(Number(branch.after) || 1));
+                if (entry && after > cutAt) return;
+                const slot = lineStages.length ? Math.min(after, lineStages.length) : 1;
+                if (!grouped.has(slot)) grouped.set(slot, []);
+                grouped.get(slot).push(branch.node);
+            });
+            const insertAt = slot => (grouped.get(slot) || []).forEach(child => {
+                const view = roadmapNodeView(child);
+                if (view) flow.push(view);
+            });
+            let next = base;
+            let spliced = false;
+            if (!lineStages.length) insertAt(1);
+            lineStages.forEach((name, index) => {
+                const number = index + 1;
+                if (entry && number > cutAt) {
+                    if (!spliced) {
+                        spliced = true;
+                        insertAt(cutAt);
+                        next = pushLine(entry.node, next, names.concat(entry.node.name));
+                    }
+                    // 接点之后这条线不再走：不铺成站点，统一放到下面的「不再走」一行。
+                    return;
+                }
+                const live = index === line.here && line.live;
+                if (live) head = { number: next + 1, names };
+                flow.push(el('span', {
+                    class: live ? 'is-now' : (index < line.here ? 'is-done' : ''),
+                    text: `${next + 1}. ${name}`,
+                }));
+                next += 1;
+                insertAt(number);
+            });
+            if (entry && !spliced) {
+                insertAt(cutAt);
+                next = pushLine(entry.node, next, names.concat(entry.node.name));
+            }
+            return next;
         };
-        if (!stages.length) pushInserted(1);
-        stages.forEach((name, index) => {
-            flow.push(el('span', {
-                class: index === node.here && node.live ? 'is-now' : (index < node.here ? 'is-done' : ''),
-                text: `${index + 1}. ${name}`,
-            }));
-            pushInserted(index + 1);
-        });
-        return el('div', { class: `dga-roadmap-row${node.live ? ' is-live' : ''}` },
+
+        pushLine(node, 0, []);
+
+        const branchKind = node.kind === 'fork' ? 'fork' : (node.kind === 'side' ? 'side' : '');
+        // 走进依附之后，这一行的标题仍是根线名，光看它分不清现在走的是哪条；
+        // 所以把当前正在走的那条线单独标出来（走进去的分岔可以不止一层）。
+        const currentName = head.names.length ? head.names[head.names.length - 1] : (head.number != null ? node.name : '');
+        const walkText = currentName && currentName !== node.name
+            ? `现在在走：${head.names.length > 1 ? head.names.join(' › ') : currentName}`
+            : '';
+        const headNow = walkText
+            ? (head.number != null ? `现在第 ${head.number} 段` : '')
+            : node.now;
+        const children = [
             el('div', { class: 'dga-roadmap-head' },
-                el('b', { text: `${node.depth ? '└ ' : ''}${node.name}` }),
-                el('small', { text: node.now })),
-            node.how ? el('small', { class: 'dga-roadmap-how', text: node.how }) : null,
-            flow.length ? el('div', { class: 'dga-roadmap-stages' }, ...flow) : null,
-            ...(node.passes || []).map(text => el('small', { class: 'dga-roadmap-how', text })));
+                branchKind ? el('span', { class: 'dga-roadmap-tag', text: branchKind === 'side' ? '支线' : '分岔口' }) : null,
+                el('b', { text: node.name }),
+                walkText ? el('span', { class: 'dga-roadmap-walk', text: walkText }) : null,
+                headNow ? el('small', { text: headNow }) : null),
+        ];
+        // 依附块接在哪一段由位置本身表达，完整说明留在 title；不再多占一行。
+        // 嵌套超过 2 层不再靠缩进区分层级，改在标题下写来源路径（v3.8）。
+        if (node.deep) children.push(el('small', { class: 'dga-roadmap-how dga-roadmap-path', text: `来自：${node.path}` }));
+        // 分岔口和支线统一成同一种画法：都把分段铺成站点。
+        // 以前分岔口收成一行「共 N 段：…」，和支线不一致，多起来很难读（v3.8）。
+        if (flow.length) {
+            children.push(el('div', { class: 'dga-roadmap-stages' }, ...flow));
+        } else if (branchKind) {
+            children.push(el('small', { class: 'dga-roadmap-how', text: '还没有分段' }));
+        }
+        if (dropped.length) {
+            const text = dropped
+                .map(item => (item.line === node.name ? '' : `「${item.line}」`) + item.names.join('・'))
+                .join('；');
+            children.push(el('small', { class: 'dga-roadmap-how dga-roadmap-dropped', text: `不再走：${text}` }));
+        }
+        children.push(...(node.passes || []).map(text => el('small', { class: 'dga-roadmap-how', text })));
+        return el('div', {
+            class: `dga-roadmap-row${head.number != null ? ' is-live' : ''}${branchKind ? ` is-branch is-${branchKind}` : ''}`,
+            title: node.how || null,
+        }, ...children);
     }
 
     function roadmapCard() {
         const contexts = ui.snapshot ? ui.snapshot.contexts : [];
-        const open = ui.roadmapOpen !== false;
-        const rows = open ? roadmapOutline(contexts) : [];
+        // v3.8 起路线图常驻展开，不再提供收起按钮。
+        const rows = roadmapOutline(contexts);
         const card = el('section', { class: 'dga-card dga-span dga-roadmap-card' },
-            el('button', {
-                type: 'button',
-                class: 'dga-roadmap-toggle',
-                'aria-expanded': open ? 'true' : 'false',
-                onclick: () => { ui.roadmapOpen = !open; render(); },
-            }, `${open ? '▾' : '▸'} 路线图`),
-            open ? muted(rows.length
+            el('h3', { text: '路线图' }),
+            muted(rows.length
                 ? '按分段和依附排出来，只看不改。要改，去那一条的「设置」。'
-                : '绑定条目后，分段会列在这里。') : null,
-            open && rows.length ? el('div', { class: 'dga-roadmap' }, ...rows.map(roadmapNodeView)) : null);
+                : '绑定条目后，分段会列在这里。'),
+            rows.length ? el('div', { class: 'dga-roadmap' }, ...rows.map(roadmapNodeView)) : null);
         card.id = 'dga-card-roadmap';
         return card;
     }
@@ -6818,7 +6752,7 @@
             // 默认值与数据库（shujuku）一致：最大回复长度 60000、温度 1，不留空。
             apiurl: '', key: '', model: '', maxTokens: 60000, temperature: 1,
             bodyParams: '', excludeBodyParams: '', requestHeaders: '',
-            promptPostProcessing: 'strict', tavernProfile: '',
+            promptPostProcessing: 'strict',
         };
     }
 
@@ -6848,7 +6782,6 @@
 
     // 进入 API 页：同步草稿 + 读酒馆连接预设列表（对齐 refreshAll）。
     function enterApiPage() {
-        ui.apiTavernProfiles = readTavernConnectionProfiles();
         syncApiDraft();
     }
 
@@ -6910,7 +6843,6 @@
         const connectionOptions = [
             { value: 'main', label: '酒馆主 API' },
             { value: 'custom', label: '自定义' },
-            { value: 'tavern', label: '酒馆预设' },
         ];
         const connectionSeg = el('div', { class: 'dga-seg dga-mode-seg', role: 'group', 'aria-label': '连接方式' },
             connectionOptions.map(option => el('button', {
@@ -6973,19 +6905,6 @@
             value => { draft.model = value; render(); },
         );
 
-        // 酒馆预设下拉：选项来自酒馆连接管理器的 profiles；草稿里存的是 profile id。
-        const profileIds = ui.apiTavernProfiles.map(profile => profile.id);
-        const tavernOptions = [{ value: '', label: '请选择' }]
-            .concat(ui.apiTavernProfiles.map(profile => ({ value: profile.id, label: profile.name })));
-        if (draft.tavernProfile && !profileIds.includes(draft.tavernProfile)) {
-            tavernOptions.push({ value: draft.tavernProfile, label: `${draft.tavernProfile}（不在当前酒馆预设列表）` });
-        }
-        const tavernSelect = selectControl(tavernOptions, draft.tavernProfile, value => { draft.tavernProfile = value; render(); });
-        const refreshProfilesBtn = btn('刷新列表', () => {
-            ui.apiTavernProfiles = readTavernConnectionProfiles();
-            render();
-        }, { ghost: true });
-
         const maxTokensInput = el('input', { class: 'dga-input', type: 'number', min: 1, step: 1, oninput: bindText('maxTokens') });
         maxTokensInput.value = draft.maxTokens != null ? String(draft.maxTokens) : '';
         const temperatureInput = el('input', { class: 'dga-input', type: 'number', min: 0, max: 2, step: 0.05, oninput: bindText('temperature') });
@@ -6995,7 +6914,6 @@
         const saveDraft = () => runAction('保存 API 预设', async () => {
             const preset = normalizeJudgeApiPreset(draft);
             if (!preset) throw new Error('预设名称不能为空。');
-            if (preset.connection === 'tavern' && !preset.tavernProfile) throw new Error('请选择酒馆预设。');
             if (preset.connection === 'custom') {
                 if (!preset.apiurl) throw new Error('自定义 API 需要填写端点(基础URL)。');
                 if (!preset.model) throw new Error('自定义 API 需要填写模型。');
@@ -7055,11 +6973,6 @@
                 field('排除主体参数', excludeBodyArea, '写入 custom_exclude_body，从请求体删掉指定字段。'),
                 field('提示词后处理', postProcessingSelect, '默认严格。未选择 = 原样透传消息，保留 system 段角色。'),
                 field('附加请求标头', requestHeadersArea, '每行一个 Header: Value。'),
-            );
-        } else if (draft.connection === 'tavern') {
-            formChildren.push(
-                field('酒馆预设', tavernSelect, '来自酒馆连接管理器的 profiles。'),
-                el('div', { class: 'dga-inline-action' }, refreshProfilesBtn),
             );
         }
 
@@ -7431,8 +7344,6 @@
             apiItem = { kind: 'error', icon: '×', title: 'API', summary: `选中的 API 预设「${presetName}」已不存在，判断AI会停着不问，直到重新选一个预设。`, badge: '需要处理', badgeKind: 'error' };
         } else if (preset && preset.connection === 'custom' && (!preset.apiurl || !preset.model)) {
             apiItem = { kind: 'error', icon: '×', title: 'API', summary: `API 预设「${presetName}」缺少端点或模型名，还不能发起请求。`, badge: '未配置', badgeKind: 'error' };
-        } else if (preset && preset.connection === 'tavern' && !preset.tavernProfile) {
-            apiItem = { kind: 'error', icon: '×', title: 'API', summary: `API 预设「${presetName}」未选择酒馆连接预设。`, badge: '未配置', badgeKind: 'error' };
         } else if (modelPauseLeft() > 0) {
             const reason = modelGate.lastError.length > 60 ? `${modelGate.lastError.slice(0, 60)}…` : modelGate.lastError;
             apiItem = { kind: 'warning', icon: '!', title: 'API', summary: `判断AI上次请求出错${reason ? `（${reason}）` : ''}，自动检查暂停到 ${modelPauseClock()}。`, badge: '暂停中', badgeKind: 'idle' };
@@ -7442,21 +7353,36 @@
         apiItem.actionLabel = '配置 API';
         apiItem.onAction = () => { enterApiPage(); ui.view = 'api'; ui.navOpen = false; render(); };
 
-        // ── 当前显示：第一条绑定走到哪段。
+        // ── 当前显示：一条绑定时写它走到哪段；多条时只写汇总，各条进度看路线图。
         let stageItem;
+        const brokenContexts = contexts.filter(item => item.broken);
+        const isDone = item => {
+            const total = item.parsed.stages.length;
+            return total > 0 && item.state.stageIndex >= total;
+        };
         if (!first) {
             stageItem = { kind: 'idle', icon: '–', title: '当前显示', summary: '还没有添加指导条目。', badge: '未添加', badgeKind: 'idle' };
-        } else if (first.broken) {
-            stageItem = { kind: 'error', icon: '×', title: '当前显示', summary: String(first.error || '绑定异常。'), badge: '需要处理', badgeKind: 'error' };
-        } else {
-            const total = first.parsed.stages.length;
-            const index = first.state.stageIndex;
-            const done = total > 0 && index >= total;
+        } else if (brokenContexts.length) {
+            const reason = String(brokenContexts[0].error || '绑定异常。');
+            stageItem = {
+                kind: 'error', icon: '×', title: '当前显示',
+                summary: contexts.length > 1 ? `${brokenContexts.length} 条绑定异常：${reason}` : reason,
+                badge: '需要处理', badgeKind: 'error',
+            };
+        } else if (contexts.length === 1) {
+            const done = isDone(first);
             stageItem = {
                 kind: 'ok', icon: '✓', title: '当前显示',
-                summary: (done ? '全部阶段已完成。' : `第 ${index + 1} 段 · ${first.stage ? first.stage.name : '—'}。`)
-                    + (contexts.length > 1 ? ` 共 ${contexts.length} 条绑定。` : ''),
+                summary: done ? '全部阶段已完成。' : `第 ${first.state.stageIndex + 1} 段 · ${first.stage ? first.stage.name : '—'}。`,
                 badge: done ? '已完成' : '正常', badgeKind: 'ok',
+            };
+        } else {
+            const doneCount = contexts.filter(isDone).length;
+            const liveCount = contexts.length - doneCount;
+            stageItem = {
+                kind: 'ok', icon: '✓', title: '当前显示',
+                summary: `共 ${contexts.length} 条绑定：${liveCount} 条进行中，${doneCount} 条已走完。各条走到哪段看路线图。`,
+                badge: liveCount ? '正常' : '已完成', badgeKind: 'ok',
             };
         }
 
@@ -7538,7 +7464,7 @@
         const config = ui.snapshot ? ui.snapshot.config : null;
         const settings = config && config.settings ? config.settings : {};
         const basicChildren = [
-            toggleRow('开启流式输出', '开启后边生成边返回；酒馆预设通道不支持流式。', settings.streamingEnabled === true,
+            toggleRow('开启流式输出', '开启后边生成边返回。', settings.streamingEnabled === true,
                 checked => saveGuideSettings({ streamingEnabled: checked }, checked ? '流式输出已开启' : '流式输出已关闭')),
         ];
         const advancedChildren = [
@@ -7591,15 +7517,6 @@
             field('API 预设', selectControl(presetOptions, settings.judgePreset || '', value => {
                 saveGuideSettings({ judgePreset: value }, value ? `API 预设已切换为：${value}` : '判断AI改用酒馆主 API');
             })),
-            (() => {
-                const chatKey = currentChatKey();
-                if (!chatKey) return null;
-                const own = readPresetOverrides().chats[chatKey] || '';
-                return field('这个聊天用的 API', selectControl(presetOverrideOptions(presetList, '跟随上面的 API 预设', own), own, value => runAction('修改这个聊天的 API', async () => {
-                    setPresetOverride('chats', chatKey, value);
-                    return true;
-                }, { success: value ? '已记下这个聊天用的 API' : '这个聊天改回跟随上面的 API 预设' })), '只存本机，不随角色卡导出。每条线还能在小卡「设置 ›」里单独选。');
-            })(),
             (() => {
                 // 数据库填表同款频率制：每层 / 每 2 层 / 每 3 层 / 每 5 层 / 自定义。
                 const interval = judgeCheckInterval(settings);
@@ -7896,8 +7813,19 @@
         const orderMode = bindingOrderMode(context.binding);
         if (orderMode === 'loop' || context.parsed.loop) hints.push('循环');
         if (context.stage && context.stage.terminal) hints.push('到此结束');
-        if (context.state && context.state.lineCut) hints.push('这条已断');
-        if (context.state && context.state.sideOut) hints.push('正在走另一条');
+        // 走进依附之后这条自己就停了：把走进去的是哪条写出来，免得只看到「已断」（v3.8）。
+        const otherName = key => {
+            const hit = ((ui.snapshot && ui.snapshot.contexts) || []).find(item => item.key === key);
+            return hit ? entryName(hit.entry) : '';
+        };
+        if (context.state && context.state.lineCut) {
+            const into = otherName(context.state.forkInto);
+            hints.push(into ? `已走进「${into}」` : '已走进分岔');
+        }
+        if (context.state && context.state.sideOut) {
+            const into = otherName(context.state.sideOut);
+            hints.push(into ? `正在走支线「${into}」` : '正在走支线');
+        }
         if (context.stage && context.stage.branch) hints.push(`分支·${context.stage.branch}`);
         const hintText = hints.length ? ` · ${hints.join(' · ')}` : '';
         const stageText = total === 0 ? '未分段' : (finished && !context.parsed.loop ? `全部 ${total} 段完成` : `第 ${Math.min(stageIndex, total - 1) + 1} / ${total} 段${hintText}`);
@@ -7949,7 +7877,6 @@
                     }), { refresh: false }),
                 }),
                 el('button', {
-                    type: 'button',
                     type: 'button', class: 'dga-pace-open', text: '提示词 ›',
                     'aria-label': `${entryName(context.entry)}的提示词`,
                     onclick: () => openBindingPrompts(context),
@@ -9644,7 +9571,7 @@
     function styles() {
         const P = `#${PANEL_ID}`;
         return `
-${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: stretch; justify-content: stretch; padding: 0; background: var(--dga-bg-0); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 14px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: #1F2325; --dga-bg-1: #272C2F; --dga-bg-2: #32383C; --dga-bg-3: color-mix(in srgb, var(--dga-bg-2) 88%, var(--dga-text-1)); --dga-text-1: #F0F2EE; --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, var(--dga-bg-0)); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 62%, var(--dga-bg-0)); --dga-accent: #B1B99A; --dga-on-accent: #20251D; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 28%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 14%, var(--dga-bg-1)); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 26%, var(--dga-bg-2)); --dga-hover: color-mix(in srgb, var(--dga-text-1) 6%, transparent); --dga-success: #91BA9B; --dga-warning: #D5B97C; --dga-danger: #D07A74; --dga-radius-sm: 4px; --dga-radius-md: 6px; --dga-radius-lg: 8px; --dga-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; --dga-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
+${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: stretch; justify-content: stretch; padding: 0; background: var(--dga-bg-0); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 14px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: #161719; --dga-bg-1: #1F2023; --dga-bg-2: #2A2C30; --dga-bg-3: color-mix(in srgb, var(--dga-bg-2) 88%, var(--dga-text-1)); --dga-text-1: #EEEDE8; --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, var(--dga-bg-0)); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 62%, var(--dga-bg-0)); --dga-accent: #E8C15A; --dga-on-accent: #1B1A16; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 28%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 14%, var(--dga-bg-1)); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 26%, var(--dga-bg-2)); --dga-hover: color-mix(in srgb, var(--dga-text-1) 6%, transparent); --dga-success: #7FBF8E; --dga-warning: #E8955A; --dga-danger: #E0716A; --dga-radius-sm: 10px; --dga-radius-md: 14px; --dga-radius-lg: 18px; --dga-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; --dga-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
 ${P}[hidden] { display: none; }
 ${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
 ${P} .dga-shell { position: relative; display: flex; flex-direction: row; width: 100%; max-width: none; min-width: 0; height: 100%; min-height: 0; max-height: none; background: var(--dga-bg-0); border: 0; border-radius: 0; box-shadow: none; overflow: hidden; outline: none; }
@@ -9661,18 +9588,47 @@ ${P} .dga-foot { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px s
 ${P} .dga-foot .dga-btn { flex: 1 1 0; }
 ${P} .dga-card { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border-radius: var(--dga-radius-md); background: var(--dga-bg-1); border: 1px solid var(--dga-border); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18); }
 ${P} .dga-card h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--dga-text-1); }
-${P} .dga-roadmap-toggle { align-self: flex-start; padding: 0; border: 0; background: none; color: var(--dga-text-1); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
-${P} .dga-roadmap { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-roadmap-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-left: 3px solid var(--dga-border-2); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); }
-${P} .dga-roadmap-row.is-live { border-left-color: var(--dga-accent); }
-${P} .dga-roadmap-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-${P} .dga-roadmap-head small, ${P} .dga-roadmap-how { color: var(--dga-text-3); font-size: 12px; }
-${P} .dga-roadmap-stages { display: flex; flex-direction: column; align-items: stretch; gap: 3px; font-size: 12px; color: var(--dga-text-2); }
-${P} .dga-roadmap-stages .is-done { color: var(--dga-text-3); text-decoration: line-through; }
-${P} .dga-roadmap-stages .is-now { color: var(--dga-accent); font-weight: 700; }
-${P} .dga-health-list { display: flex; flex-direction: column; gap: 10px; }
-${P} .dga-health-item { display: grid; grid-template-columns: 32px minmax(0, 1fr) max-content; column-gap: 10px; row-gap: 8px; align-items: center; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); }
-${P} .dga-health-item.is-error { border-color: color-mix(in srgb, var(--dga-danger) 45%, transparent); }
+
+/* 路线图（v3.8）：游戏时间线卡片风。
+   每段节点卡片化，时间轴轨道串联；分支小卡内嵌引线，当前阶段高亮。
+   所有宽度 100% 伸展、文字自动换行，移动端自适应。 */
+${P} .dga-roadmap { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+${P} .dga-roadmap-row { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: var(--dga-bg-2); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
+${P} .dga-roadmap-row.is-live { border-color: color-mix(in srgb, var(--dga-accent) 45%, var(--dga-border)); box-shadow: 0 0 12px color-mix(in srgb, var(--dga-accent) 15%, transparent); }
+${P} .dga-roadmap-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
+${P} .dga-roadmap-head b { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700; color: var(--dga-text-1); letter-spacing: 0.2px; overflow-wrap: anywhere; }
+${P} .dga-roadmap-head small, ${P} .dga-roadmap-how { color: var(--dga-text-3); font-size: 12px; overflow-wrap: anywhere; }
+${P} .dga-roadmap-walk { flex: 0 1 auto; min-width: 0; padding: 2px 8px; border-radius: 999px; font-size: 11px; line-height: 18px; font-weight: 600; color: var(--dga-accent); background: color-mix(in srgb, var(--dga-accent) 16%, transparent); border: 1px solid color-mix(in srgb, var(--dga-accent) 30%, transparent); overflow-wrap: anywhere; }
+${P} .dga-roadmap-tag { flex: 0 0 auto; padding: 1px 7px; border-radius: 999px; font-size: 11px; line-height: 18px; font-weight: 700; color: var(--dga-accent); background: color-mix(in srgb, var(--dga-accent) 16%, transparent); border: 1px solid color-mix(in srgb, var(--dga-accent) 28%, transparent); }
+${P} .dga-roadmap-row.is-side > .dga-roadmap-head > .dga-roadmap-tag { color: var(--dga-success); background: color-mix(in srgb, var(--dga-success) 16%, transparent); border-color: color-mix(in srgb, var(--dga-success) 28%, transparent); }
+/* 轨道：中心固定在容器左侧 6px；--dga-dot 按段落左边界算好，圆点永远压在轨道正中。 */
+${P} .dga-roadmap-stages { --dga-dot: -11px; position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 6px; min-width: 0; padding-left: 18px; font-size: 13px; color: var(--dga-text-2); }
+${P} .dga-roadmap-stages::before { content: ''; position: absolute; left: 5px; top: 14px; bottom: 14px; width: 2px; border-radius: 1px; background: linear-gradient(to bottom, var(--dga-border-2), var(--dga-border)); }
+${P} .dga-roadmap-stages > span { position: relative; display: block; min-width: 0; margin-left: -4px; padding: 6px 10px; border-radius: var(--dga-radius-sm); line-height: 1.45; background: var(--dga-bg-1); border: 1px solid var(--dga-border); overflow-wrap: anywhere; transition: border-color 0.15s ease, background 0.15s ease; }
+${P} .dga-roadmap-stages > span::before { content: ''; position: absolute; left: var(--dga-dot); top: 50%; width: 6px; height: 6px; border-radius: 50%; transform: translateY(-50%); background: var(--dga-border-2); }
+${P} .dga-roadmap-stages .is-done { color: var(--dga-text-3); background: color-mix(in srgb, var(--dga-bg-1) 70%, transparent); border-color: transparent; }
+${P} .dga-roadmap-stages .is-done::before { background: var(--dga-text-3); }
+${P} .dga-roadmap-stages .is-now { color: var(--dga-text-1); font-weight: 600; background: color-mix(in srgb, var(--dga-accent) 12%, var(--dga-bg-1)); border-color: color-mix(in srgb, var(--dga-accent) 45%, var(--dga-border)); box-shadow: 0 0 8px color-mix(in srgb, var(--dga-accent) 20%, transparent); }
+${P} .dga-roadmap-stages .is-now::before { left: calc(var(--dga-dot) - 1px); width: 8px; height: 8px; background: var(--dga-accent); box-shadow: 0 0 0 3px var(--dga-accent-glow); }
+${P} .dga-roadmap-dropped { padding-left: 18px; color: var(--dga-text-3); }
+/* 分支：轨道上的浅色小卡，整行宽，带边框与引线。 */
+${P} .dga-roadmap-stages > .dga-roadmap-row { margin: 4px 0 6px; padding: 10px 12px; gap: 6px; background: var(--dga-bg-1); border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border); }
+${P} .dga-roadmap-stages > .dga-roadmap-row.is-fork { border-left: 3px solid var(--dga-accent); }
+${P} .dga-roadmap-stages > .dga-roadmap-row.is-side { border-left: 3px solid var(--dga-success); }
+${P} .dga-roadmap-stages > .dga-roadmap-row .dga-roadmap-head b { font-size: 13px; }
+/* 二级起缩进固定 12px，更深层级不再右移，改由来源路径说明。 */
+${P} .dga-roadmap-stages .dga-roadmap-stages { --dga-dot: -5px; padding-left: 12px; }
+${P} .dga-roadmap-stages .dga-roadmap-stages::before { left: 5px; top: 12px; bottom: 12px; }
+${P} .dga-roadmap-path { font-size: 11px; }
+@media (max-width: 480px) {
+    ${P} .dga-roadmap-row { padding: 10px 12px; }
+    ${P} .dga-roadmap-stages > .dga-roadmap-row { padding: 8px 10px; }
+    ${P} .dga-roadmap-stages > span { padding: 6px 8px; font-size: 12.5px; }
+}
+${P} .dga-health-list { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); overflow: hidden; }
+${P} .dga-health-item { display: grid; grid-template-columns: 32px minmax(0, 1fr) max-content; column-gap: 10px; row-gap: 6px; align-items: center; padding: 8px 12px; border: 0; border-radius: 0; background: transparent; }
+${P} .dga-health-item + .dga-health-item { border-top: 1px solid var(--dga-border); }
+${P} .dga-health-item.is-error { background: color-mix(in srgb, var(--dga-danger) 10%, transparent); }
 ${P} .dga-health-icon { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; border-radius: var(--dga-radius-sm); background: var(--dga-bg-1); color: var(--dga-text-2); font-size: 13px; font-weight: 700; }
 ${P} .dga-health-item.is-ok .dga-health-icon { color: var(--dga-success); background: color-mix(in srgb, var(--dga-success) 14%, transparent); }
 ${P} .dga-health-item.is-warning .dga-health-icon { color: var(--dga-warning); background: color-mix(in srgb, var(--dga-warning) 14%, transparent); }
@@ -9719,6 +9675,11 @@ ${P} .dga-btn.dga-danger { color: var(--dga-danger); border-color: color-mix(in 
 ${P} .dga-btn.dga-danger:hover { background: color-mix(in srgb, var(--dga-danger) 12%, transparent); }
 ${P} .dga-btn.dga-ghost { background: transparent; border-color: transparent; }
 ${P} .dga-btn.dga-ghost:hover { background: var(--dga-hover); }
+${P} .dga-btn { border-radius: 999px; padding: 6px 16px; border-color: color-mix(in srgb, var(--dga-accent) 25%, var(--dga-border-2)); box-shadow: 0 2px 0 rgba(0, 0, 0, 0.28); transition: transform 0.12s ease, background 0.15s ease, box-shadow 0.12s ease; }
+${P} .dga-btn:hover:not(:disabled) { transform: translateY(-1px); }
+${P} .dga-btn:active:not(:disabled) { transform: translateY(1px) scale(0.96); box-shadow: 0 0 0 rgba(0, 0, 0, 0.28); }
+${P} .dga-btn.dga-primary { box-shadow: 0 3px 0 color-mix(in srgb, var(--dga-accent) 50%, #000); }
+${P} .dga-btn.dga-ghost { box-shadow: none; }
 ${P} .dga-field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
 ${P} .dga-field > span { color: var(--dga-text-2); font-weight: 500; }
 ${P} select, ${P} input[type="text"], ${P} input[type="search"], ${P} textarea { width: 100%; min-height: 36px; padding: 6px 10px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); appearance: none; -webkit-appearance: none; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
@@ -9757,11 +9718,16 @@ ${P} .dga-seg-btn { min-height: 36px; border-radius: var(--dga-radius-sm); borde
 ${P} .dga-seg-btn:hover { background: var(--dga-bg-3); }
 ${P} .dga-seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-seg-btn.is-on { background: var(--dga-accent); border-color: transparent; color: var(--dga-on-accent); font-weight: 600; }
-${P} .dga-seg.dga-seg-fill { grid-template-columns: repeat(var(--dga-seg-count, 2), minmax(0, 1fr)); gap: 3px; padding: 3px; border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); border: 1px solid var(--dga-border); }
-${P} .dga-seg.dga-seg-fill .dga-seg-btn { min-height: 32px; padding: 0 6px; border-radius: calc(var(--dga-radius-sm) - 1px); border: 0; background: transparent; color: var(--dga-text-2); font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+${P} .dga-seg.dga-seg-fill { display: flex; flex-wrap: wrap; gap: 3px; padding: 3px; border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); border: 1px solid var(--dga-border); }
+${P} .dga-seg.dga-seg-fill .dga-seg-btn { flex: 1 1 0; min-width: max-content; min-height: 32px; padding: 0 10px; border-radius: calc(var(--dga-radius-sm) - 1px); border: 0; background: transparent; color: var(--dga-text-2); font-size: 13px; font-weight: 500; white-space: nowrap; }
 ${P} .dga-seg.dga-seg-fill .dga-seg-btn:hover:not(.is-on) { background: var(--dga-hover); color: var(--dga-text-1); }
 ${P} .dga-seg.dga-seg-fill .dga-seg-btn.is-on { background: var(--dga-accent); color: var(--dga-on-accent); font-weight: 600; }
 ${P} .dga-seg-stack { display: grid; gap: 6px; }
+${P} .dga-seg-btn { border-radius: 999px; transition: transform 0.12s ease, background 0.15s ease; }
+${P} .dga-seg-btn:active { transform: scale(0.95); }
+${P} .dga-seg.dga-seg-fill { border-radius: 18px; padding: 4px; gap: 4px; }
+${P} .dga-seg.dga-seg-fill .dga-seg-btn { border-radius: 999px; }
+${P} .dga-seg.dga-seg-fill .dga-seg-btn.is-on { box-shadow: 0 2px 0 color-mix(in srgb, var(--dga-accent) 50%, #000); }
 ${P} .dga-chronicle { display: grid; gap: 4px; }
 ${P} .dga-chronicle-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; font-size: 12px; }
 ${P} .dga-chronicle-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--dga-text-2); }
@@ -10196,7 +10162,6 @@ ${P} .dga-map .dga-hint { position: relative; z-index: 1; margin: 16px; }
         judgeTextFromJson,
         parseJudgeSseText,
         fetchAvailableModels,
-        readTavernConnectionProfiles,
         judgeMessagesFor,
         judgeSaysYes,
         judgeBasisText,

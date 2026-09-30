@@ -2730,54 +2730,6 @@ test('判断AI档：卡片自定义提问模板替换占位符后发出', async 
     assert.deepEqual(run.errors, []);
 });
 
-test('判断AI档：酒馆预设连接走酒馆连接管理器', async () => {
-    const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
-    const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
-    const config = {
-        version: 2,
-        bindings: [{ worldbookName: '书A', entryUid: 1, entryName: '大纲A', boundAt: null }],
-        settings: { autoAdvance: 'judge', judgePreset: '代理小模型' },
-    };
-    const message = { message_id: 5, role: 'assistant', message: '这一轮的回复。' };
-    const { state, helper } = multiWorld(books, { config, messages: [message], lastMessageId: 5 });
-    const calls = [];
-    helper.generateRaw = async options => { calls.push(options); return 'YES'; };
-    const cmCalls = [];
-    const SillyTavern = {
-        getContext: () => ({
-            ConnectionManagerRequestService: {
-                sendRequest: async (profileId, messages, maxTokens) => {
-                    cmCalls.push({ profileId, messages, maxTokens });
-                    return { result: { choices: [{ message: { content: 'YES' } }] } };
-                },
-            },
-            extensionSettings: { connectionManager: { profiles: [{ id: '酒馆代理A', name: '酒馆代理A', api: 'koboldcpp' }] } },
-        }),
-    };
-    const localStorage = memoryStorage({
-        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{
-            name: '代理小模型', category: '便宜模型', type: 'proxy', note: '',
-            proxyPreset: '酒馆代理A', model: 'gpt-mini', maxTokens: 16, temperature: 0.2,
-        }]),
-    });
-    const run = load(helper, { localStorage, SillyTavern });
-    await new Promise(setImmediate);
-
-    await state.events.get('message_received')(5);
-    assert.equal(calls.length, 0, '酒馆预设连接不走 generateRaw');
-    assert.equal(cmCalls.length, 1, '要走 ConnectionManagerRequestService.sendRequest');
-    assert.equal(cmCalls[0].profileId, '酒馆代理A');
-    assert.equal(cmCalls[0].maxTokens, 16);
-    assert.equal(cmCalls[0].messages[0].role, 'system');
-    assert.match(cmCalls[0].messages[0].content, /# 判定手册/, '身份和手册合成一段 system');
-    assert.equal(cmCalls[0].messages[1].role, 'user');
-    assert.match(cmCalls[0].messages[1].content, /这一轮的回复/);
-    assert.match(cmCalls[0].messages[1].content, /<verdict>\n- 结论：YES 或 NO，二选一\n<\/verdict>/, '案卷的 verdict 是条目');
-    assert.equal(cmCalls[0].messages.length, 2, '不再有独立的最终注入消息');
-    assert.equal(state.variables.chat.$dynamicGuideAssistant.state.bindings[keyOf('书A', 1)].stageIndex, 1, 'YES 要推进');
-    assert.deepEqual(run.errors, []);
-});
-
 test('判断AI档：自定义 API 预设直连酒馆后端 generate 端点', async () => {
     const content = '## 甲一\n甲一正文\n\n## 甲二\n甲二正文';
     const books = { 书A: [{ uid: 1, name: '大纲A', content, enabled: false }] };
@@ -2941,117 +2893,6 @@ test('判断AI档：旧版酒馆没有 presetToGeneratePayload 时按当前设�
     assert.equal(text.rawCalls.length, 1, '照旧走 generateRaw');
 });
 
-test('判断AI档：Chat Completion 酒馆预设先切换连接，直发后恢复原连接', async () => {
-    const presetCalls = [];
-    const cmCalls = [];
-    const profile = {
-        id: 'p1', name: '小模型', api: 'openrouter', model: 'judge-mini', 'secret-id': 'sec-9',
-        'api-url': '', proxy: 'None', preset: '判断用补全预设', 'prompt-post-processing': 'strict',
-    };
-    const stContext = {
-        mainApi: 'openai',
-        chatCompletionSettings: {},
-        CONNECT_API_MAP: { openrouter: { selected: 'openai', source: 'openrouter' } },
-        extensionSettings: { connectionManager: { selectedProfile: 'other', profiles: [profile] } },
-        getPresetManager: api => (api === 'openai' ? { getCompletionPresetByName: name => (name === '判断用补全预设' ? { temperature: 0.3 } : null) } : null),
-        ChatCompletionService: fakeChatCompletionService(presetCalls),
-        ConnectionManagerRequestService: { sendRequest: async (...args) => { cmCalls.push(args); return { content: 'NO' }; } },
-    };
-    const localStorage = memoryStorage({
-        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1', maxTokens: 300 }]),
-    });
-    let activeProfile = '原连接';
-    const slashCalls = [];
-    const triggerSlash = async command => {
-        slashCalls.push(command);
-        if (command === '/profile') return activeProfile;
-        if (command === '/profile await=true "小模型"') activeProfile = '小模型';
-        if (command === '/profile await=true "原连接"') activeProfile = '原连接';
-        return activeProfile;
-    };
-    const world = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage, triggerSlash });
-    await new Promise(setImmediate);
-    await world.state.events.get('message_received')(5);
-    assert.equal(cmCalls.length, 0, '不走连接管理器');
-    assert.equal(world.rawCalls.length, 0);
-    assert.equal(world.fetches.length, 1);
-    const body = JSON.parse(world.fetches[0].options.body);
-    assert.equal(body.chat_completion_source, 'openrouter');
-    assert.equal(body.model, 'judge-mini');
-    assert.equal('secret_id' in body, false, '目标连接已激活，不再靠手填 secret_id 选择密钥');
-    assert.equal(body.max_tokens, 300);
-    assert.equal(body.custom_prompt_post_processing, 'strict');
-    assert.equal(body.temperature, 0.3, '补全预设的参数要等 async 的 presetToGeneratePayload 生成完');
-    assert.equal(body.stream, false);
-    assert.equal(presetCalls.length, 1);
-    assert.deepEqual(slashCalls, ['/profile', '/profile await=true "小模型"', '/profile', '/profile await=true "原连接"']);
-    assert.equal(activeProfile, '原连接');
-    assert.equal(world.stageIndex(), 1);
-    assert.deepEqual(world.run.errors, []);
-});
-
-test('酒馆预设直发失败也恢复原连接，目标已激活时不重复切换', async () => {
-    const profile = { id: 'p1', name: '小模型', api: 'openrouter', model: 'judge-mini', proxy: 'None' };
-    const stContext = {
-        CONNECT_API_MAP: { openrouter: { selected: 'openai', source: 'openrouter' } },
-        extensionSettings: { connectionManager: { profiles: [profile] } },
-        ChatCompletionService: fakeChatCompletionService([]),
-    };
-    const localStorage = memoryStorage({
-        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1' }]),
-    });
-    let activeProfile = '原连接';
-    const slashCalls = [];
-    const triggerSlash = async command => {
-        slashCalls.push(command);
-        if (command === '/profile') return activeProfile;
-        activeProfile = command.includes('小模型') ? '小模型' : '原连接';
-        return activeProfile;
-    };
-    const failed = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, {
-        localStorage, triggerSlash,
-        fetch: async () => { throw new Error('HTTP 400 配置错误'); },
-    });
-    await new Promise(setImmediate);
-    await failed.state.events.get('message_received')(5);
-    assert.deepEqual(slashCalls, ['/profile', '/profile await=true "小模型"', '/profile', '/profile await=true "原连接"']);
-    assert.equal(activeProfile, '原连接', '请求失败仍恢复');
-    assert.equal(failed.stageIndex(), 0);
-
-    activeProfile = '小模型';
-    slashCalls.length = 0;
-    const active = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage, triggerSlash });
-    await new Promise(setImmediate);
-    await active.state.events.get('message_received')(5);
-    assert.deepEqual(slashCalls, ['/profile'], '已是目标连接时不用切换和恢复');
-    assert.equal(active.stageIndex(), 1);
-});
-
-test('判断AI档：酒馆预设读不到反向代理或不是 Chat Completion 时退回连接管理器', async () => {
-    for (const profile of [
-        { id: 'p1', name: '走代理', api: 'openai', model: 'm', proxy: '我的代理' },
-        { id: 'p1', name: '文本补全', api: 'koboldcpp', model: 'm' },
-    ]) {
-        const cmCalls = [];
-        const stContext = {
-            chatCompletionSettings: {},
-            CONNECT_API_MAP: { openai: { selected: 'openai', source: 'openai' }, koboldcpp: { selected: 'textgenerationwebui', type: 'koboldcpp' } },
-            extensionSettings: { connectionManager: { selectedProfile: 'other', profiles: [profile] } },
-            ChatCompletionService: fakeChatCompletionService([]),
-            ConnectionManagerRequestService: { sendRequest: async (...args) => { cmCalls.push(args); return { content: '<verdict>YES</verdict>' }; } },
-        };
-        const localStorage = memoryStorage({
-            'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1' }]),
-        });
-        const world = directSendWorld({ judgePreset: '走酒馆预设' }, stContext, { localStorage });
-        await new Promise(setImmediate);
-        await world.state.events.get('message_received')(5);
-        assert.equal(world.fetches.length, 0, `${profile.name}：不直发`);
-        assert.equal(cmCalls.length, 1, `${profile.name}：走连接管理器`);
-        assert.equal(world.stageIndex(), 1);
-    }
-});
-
 test('原生 fetch：别的脚本包装了 fetch 时，按标记剥回原函数再发', async () => {
     const nativeCalls = [];
     const wrappedCalls = [];
@@ -3109,7 +2950,7 @@ test('本机判断AI API 预设：连接方式、接口协议与数值字段', (
         name: '自定义判断AI', connection: 'custom', customApiFormat: 'claude_messages',
         apiurl: 'https://api.example.com/v1', key: 'sk-x', model: 'm1',
         maxTokens: 24, temperature: 0.3, bodyParams: 'top_k: 50',
-        excludeBodyParams: '', requestHeaders: '', promptPostProcessing: 'strict', tavernProfile: '',
+        excludeBodyParams: '', requestHeaders: '', promptPostProcessing: 'strict',
     });
 });
 
@@ -3205,20 +3046,6 @@ test('拉模型失败时抛出带状态的错误，空端点直接拒绝', async
     await assert.rejects(() => run.core.fetchAvailableModels('', 'k'), /请输入端点/);
 });
 
-test('酒馆连接预设列表从连接管理器读取', () => {
-    const SillyTavern = {
-        getContext: () => ({
-            extensionSettings: {
-                connectionManager: { profiles: [{ id: 'p1', name: '配置一' }, { id: 'p2' }, { name: '没id不要' }, null] },
-            },
-        }),
-    };
-    const run = load(null, { SillyTavern });
-    assert.deepEqual(plain(run.core.readTavernConnectionProfiles()), [{ id: 'p1', name: '配置一' }, { id: 'p2', name: 'p2' }]);
-    const empty = load(null);
-    assert.deepEqual(plain(empty.core.readTavernConnectionProfiles()), [], '没有 SillyTavern 上下文时返回空列表');
-});
-
 test('normalizeConfig 清除 v2.8/v2.9 遗留字段，只保留当前本机预设名', () => {
     const normalized = core.normalizeConfig({
         version: 2,
@@ -3234,14 +3061,15 @@ test('normalizeConfig 清除 v2.8/v2.9 遗留字段，只保留当前本机预�
     assert.equal('judgeApiPresets' in normalized.settings, false);
 });
 
-test('v1 预设迁移：type=proxy → tavern，type=current → main', () => {
+test('预设迁移：旧的酒馆预设（tavern / type=proxy）改走酒馆主 API，type=current → main', () => {
     const list = core.normalizeJudgeApiPresets([
         { name: '代理', type: 'proxy', proxyPreset: '酒馆代理A', model: 'm' },
         { name: '主 API', type: 'current' },
+        { name: '走酒馆预设', connection: 'tavern', tavernProfile: 'p1' },
     ]);
-    assert.equal(list[0].connection, 'tavern');
-    assert.equal(list[0].tavernProfile, '酒馆代理A');
+    assert.equal(list[0].connection, 'main');
     assert.equal(list[1].connection, 'main');
+    assert.equal(list[2].connection, 'main', 'v3.7.1 起不再有酒馆预设连接');
 });
 
 
@@ -3927,8 +3755,12 @@ test('被依附的条目不能再选回依附它的那条，支线插在那一�
     const css = documentRef.getElementById('dynamic-guide-assistant-style').textContent;
     assert.match(css, /\.dga-roadmap-stages \{[^}]*flex-direction:\s*column/, '每个阶段单独一行');
     assert.equal(text.includes('——————'), false, '支线上下不画横线');
-    assert.ok(text.indexOf('1. 内容1') < text.indexOf('└ 支线'), '支线接在内容1后面');
-    assert.ok(text.indexOf('└ 支线') < text.indexOf('1. 支线内容1') && text.indexOf('1. 支线内容1') < text.indexOf('2. 支线内容2'));
+    const tag = findClass(roadmap, 'dga-roadmap-tag');
+    assert.ok(tag, '依附的那条带分支标签');
+    assert.equal(tag.textContent, '支线', '支线标签写「支线」');
+    assert.equal(text.includes('└'), false, '不再用 └ 前缀');
+    assert.ok(text.indexOf('1. 内容1') < text.indexOf('1. 支线内容1'), '支线接在内容1后面');
+    assert.ok(text.indexOf('1. 支线内容1') < text.indexOf('2. 支线内容2'));
     assert.ok(text.indexOf('2. 支线内容2') < text.indexOf('2. 内容2'));
     const buttons = [];
     const walk = node => {
@@ -3945,6 +3777,270 @@ test('被依附的条目不能再选回依附它的那条，支线插在那一�
     walkSel(panel());
     const attach = selects.find(select => optionsOf(select).some(option => option.textContent === '不依附，自己走'));
     assert.deepEqual(optionsOf(attach).map(option => option.textContent), ['不依附，自己走'], '主线不能再选支线');
+    assert.deepEqual(errors, []);
+});
+
+test('走进分岔口后换轨：分岔接成主线，原路线接点之后划掉', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二', enabled: false });
+    state.entries.push({ uid: 2, name: '分岔', content: '## 分岔1\n乙\n\n## 分岔2\n乙二', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '分岔', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+            ],
+        },
+    };
+    state.variables.chat = {
+        $dynamicGuideAssistant: {
+            state: {
+                version: 2,
+                bindings: {
+                    [keyOf('测试世界书', 1)]: { stageIndex: 0, stageName: '内容1', lineCut: true, forkInto: keyOf('测试世界书', 2) },
+                    [keyOf('测试世界书', 2)]: { stageIndex: 0, stageName: '分岔1' },
+                },
+            },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    assert.ok(roadmap, '有路线图');
+    const text = roadmap.textContent;
+    assert.equal(collectByClass(roadmap, 'dga-roadmap-row', []).length, 1, `换轨后不再单独画分岔那一行：${text}`);
+    assert.equal(findClass(roadmap, 'dga-roadmap-tag'), null, '换轨后不显示分岔口标签');
+    assert.ok(text.includes('1. 内容1'), '接点之前的段照常显示');
+    assert.ok(text.includes('2. 分岔1') && text.includes('3. 分岔2'), '分岔的段接成主线继续编号');
+    assert.equal(text.includes('2. 内容2'), false, '原路线接点之后的段不再编号');
+    assert.ok(text.includes('不再走：内容2'), '原路线接点之后的段单独写成「不再走」');
+    assert.ok(text.includes('现在在走：分岔'), '标题行写明现在走的是哪条线');
+    assert.ok(text.includes('现在第 2 段'), '标题行的段号和站点编号保持一致');
+    assert.match(panel().textContent, /已走进「分岔」/, '小卡上也写明走进了哪条');
+    const stages = collectByClass(roadmap, 'dga-roadmap-stages', [])[0];
+    assert.ok(stages, '有线路');
+    assert.equal(stages.textContent.includes('内容2'), false, '不再走的段不铺进线路里');
+    assert.equal(collectByClass(stages, 'is-cut', []).length, 0, '线路上没有划掉的站点');
+    assert.deepEqual(errors, []);
+});
+
+test('走进一条分岔后，同一接点上已放弃的分岔不再画进路线图', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二', enabled: false });
+    state.entries.push({ uid: 2, name: '分岔甲', content: '## 甲一\n乙', enabled: false });
+    state.entries.push({ uid: 3, name: '分岔乙', content: '## 乙一\n丙', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '分岔甲', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+                { worldbookName: '测试世界书', entryUid: 3, entryName: '分岔乙', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+            ],
+        },
+    };
+    state.variables.chat = {
+        $dynamicGuideAssistant: {
+            state: {
+                version: 2,
+                bindings: {
+                    [keyOf('测试世界书', 1)]: { stageIndex: 0, stageName: '内容1', lineCut: true, forkInto: keyOf('测试世界书', 2) },
+                    [keyOf('测试世界书', 2)]: { stageIndex: 0, stageName: '甲一' },
+                },
+            },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const text = panel().querySelector('.dga-roadmap').textContent;
+    assert.ok(text.includes('甲一'), '走进的那条接成主线');
+    assert.equal(text.includes('乙一'), false, '已放弃的分岔连阶段都不画');
+    assert.equal(text.includes('分岔乙'), false, '已放弃的分岔连条目名都不画');
+    assert.deepEqual(errors, []);
+});
+
+test('依附嵌套超过两级后不再继续缩进，层级改写在来源路径里', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二', enabled: false });
+    state.entries.push({ uid: 2, name: '分岔甲', content: '## 甲一\n乙', enabled: false });
+    state.entries.push({ uid: 3, name: '嵌套', content: '## 嵌一\n丙', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '分岔甲', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+                { worldbookName: '测试世界书', entryUid: 3, entryName: '嵌套', attachKey: '测试世界书#uid:2', attachStage: 1, attachKind: 'side' },
+            ],
+        },
+    };
+    // 只有走进分岔甲之后，深于两级的「嵌套」才会被真正画出来（没走进时按一行摘要收起）。
+    state.variables.chat = {
+        $dynamicGuideAssistant: {
+            state: {
+                version: 2,
+                bindings: {
+                    [keyOf('测试世界书', 1)]: { stageIndex: 0, stageName: '内容1', lineCut: true, forkInto: keyOf('测试世界书', 2) },
+                    [keyOf('测试世界书', 2)]: { stageIndex: 0, stageName: '甲一' },
+                },
+            },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const text = panel().querySelector('.dga-roadmap').textContent;
+    assert.ok(text.includes('嵌套'), '嵌套那条照样画出来');
+    assert.ok(text.includes('来自：主线 › 分岔甲 › 嵌套'), '更深一层写在来源路径里');
+    const css = documentRef.getElementById('dynamic-guide-assistant-style').textContent;
+    assert.match(css, /\.dga-roadmap-stages \.dga-roadmap-stages \{[^}]*padding-left: 12px/, '二级缩进是 12px');
+    assert.match(css, /\.dga-roadmap-stages > span::before[^}]*width: 6px/, '站点是实心小圆点，不是空心圈');
+    assert.equal(/border: 2px solid var\(--dga-border-2\)/.test(css), false, '不再用带描边的空心圆点');
+    assert.equal(/dga-roadmap-stages \.dga-roadmap-stages \.dga-roadmap-stages/.test(css), false, '没有把第三级压成 0 的规则');
+    assert.deepEqual(errors, []);
+});
+
+test('走进分岔口后，这条分岔自己再依附的支线也接在它后面', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二', enabled: false });
+    state.entries.push({ uid: 2, name: '分岔', content: '## 分岔1\n乙', enabled: false });
+    state.entries.push({ uid: 3, name: '支线', content: '## 支线1\n丙', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '分岔', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+                { worldbookName: '测试世界书', entryUid: 3, entryName: '支线', attachKey: '测试世界书#uid:2', attachStage: 1, attachKind: 'side' },
+            ],
+        },
+    };
+    state.variables.chat = {
+        $dynamicGuideAssistant: {
+            state: {
+                version: 2,
+                bindings: {
+                    [keyOf('测试世界书', 1)]: { stageIndex: 0, stageName: '内容1', lineCut: true, forkInto: keyOf('测试世界书', 2) },
+                    [keyOf('测试世界书', 2)]: { stageIndex: 0, stageName: '分岔1' },
+                },
+            },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    const text = roadmap.textContent;
+    assert.ok(text.includes('2. 分岔1'), '分岔接成主线');
+    assert.ok(text.includes('支线1'), '分岔自己再依附的支线也要画出来');
+    const tag = findClass(roadmap, 'dga-roadmap-tag');
+    assert.ok(tag && tag.textContent === '支线', '子支线带「支线」标签');
+    assert.deepEqual(errors, []);
+});
+
+test('分叉再分叉：编号沿着一条线连续往下排，标题写明走进了哪几层', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二', enabled: false });
+    state.entries.push({ uid: 2, name: '分岔甲', content: '## 岔甲1\n乙\n\n## 岔甲2\n乙二', enabled: false });
+    state.entries.push({ uid: 3, name: '分岔乙', content: '## 深1\n丙', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '分岔甲', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+                { worldbookName: '测试世界书', entryUid: 3, entryName: '分岔乙', attachKey: '测试世界书#uid:2', attachStage: 1, attachKind: 'fork' },
+            ],
+        },
+    };
+    state.variables.chat = {
+        $dynamicGuideAssistant: {
+            state: {
+                version: 2,
+                bindings: {
+                    [keyOf('测试世界书', 1)]: { stageIndex: 0, stageName: '内容1', lineCut: true, forkInto: keyOf('测试世界书', 2) },
+                    [keyOf('测试世界书', 2)]: { stageIndex: 0, stageName: '岔甲1', lineCut: true, forkInto: keyOf('测试世界书', 3) },
+                    [keyOf('测试世界书', 3)]: { stageIndex: 0, stageName: '深1' },
+                },
+            },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    const text = roadmap.textContent;
+    assert.equal(collectByClass(roadmap, 'dga-roadmap-row', []).length, 1, '两层分岔接成同一条线，不再各画一块');
+    assert.ok(text.includes('1. 内容1'), '主线接点之前的段照常编号');
+    assert.ok(text.includes('2. 岔甲1'), '第一层分岔接着编号');
+    assert.ok(text.includes('3. 深1'), '第二层分岔继续接着编号，不回到 1');
+    assert.equal(text.includes('4. '), false, '第二层分岔自己没再往下走，不产生空编号');
+    assert.ok(text.includes('现在在走：分岔甲 › 分岔乙'), '标题写明一路走到了哪一层线');
+    assert.ok(text.includes('现在第 3 段'), '标题段号与站点编号一致');
+    assert.ok(text.includes('不再走：内容2'), '主线被放弃的段写成「不再走」');
+    assert.ok(text.includes('「分岔甲」岔甲2'), '分岔被放弃的段也标出来源');
+    assert.equal(collectByClass(roadmap, 'is-cut', []).length, 0, '不再走的段不铺成线路上的站点');
+    assert.deepEqual(errors, []);
+});
+
+test('分岔口和支线用同一种画法：都把分段铺成站点，嵌套写出来源', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲', enabled: false });
+    state.entries.push({ uid: 2, name: '分岔甲', content: '## 岔甲1\n乙', enabled: false });
+    state.entries.push({ uid: 3, name: '分岔乙', content: '## 岔乙1\n丙', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '分岔甲', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+                { worldbookName: '测试世界书', entryUid: 3, entryName: '分岔乙', attachKey: '测试世界书#uid:2', attachStage: 1, attachKind: 'fork' },
+            ],
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    const text = roadmap.textContent;
+    assert.ok(text.includes('岔甲1'), '没走进的分岔也把分段铺出来，和支线一致');
+    assert.ok(text.includes('岔乙1'), '更下层的分岔同样铺出来');
+    assert.equal(findClass(roadmap, 'dga-roadmap-summary'), null, '不再用「共 N 段：…」的一行摘要');
+    assert.equal(collectByClass(roadmap, 'dga-roadmap-stages', []).length, 3, '三层各铺一份站点');
+    assert.match(text, /来自：主线 › 分岔甲 › 分岔乙/, '更深的层级写在来源路径里');
     assert.deepEqual(errors, []);
 });
 
@@ -5068,7 +5164,7 @@ test('中止在途判断请求：结论作废、不算失败，下一层照常�
     assert.deepEqual(run.errors, []);
 });
 
-test('按线 > 按聊天 > 全局选 API；预设改名、删除时引用跟着同步', async () => {
+test('按线 > 全局选 API（按聊天的旧记录不再生效）；预设改名、删除时引用跟着同步', async () => {
     const world = judgeWorld({ judgePreset: '甲' });
     world.helper.getCurrentChatId = () => '聊天一';
     const storage = memoryStorage();
@@ -5077,16 +5173,16 @@ test('按线 > 按聊天 > 全局选 API；预设改名、删除时引用跟着�
     const resolve = key => run.core.resolveJudgePresetName({ judgePreset: '甲' }, { key }).name;
     assert.equal(resolve('线1'), '甲', '没覆盖时跟全局');
     run.core.setPresetOverride('chats', '聊天一', '乙');
-    assert.equal(resolve('线1'), '乙', '按聊天覆盖');
+    assert.equal(resolve('线1'), '甲', 'v3.7.1 起按聊天的记录不再生效');
     run.core.setPresetOverride('lines', '线1', '丙');
     assert.equal(resolve('线1'), '丙', '按线优先');
-    assert.equal(resolve('线2'), '乙');
+    assert.equal(resolve('线2'), '甲', '没有按线覆盖时跟全局');
     run.core.setPresetOverride('lines', '线3', '@main');
     assert.equal(resolve('线3'), '', '@main 表示酒馆主 API');
     await run.core.updatePresetReferences('丙', '丁');
     assert.equal(resolve('线1'), '丁', '改名同步到按线覆盖');
     await run.core.updatePresetReferences('乙', '');
-    assert.equal(resolve('线2'), '甲', '删除后按聊天覆盖清掉，回到全局');
+    assert.equal(resolve('线2'), '甲', '删除预设后仍跟全局');
     await run.core.updatePresetReferences('甲', '戊');
     const config = world.state.variables.character.$dynamicGuideAssistant.config;
     assert.notEqual(config.settings && config.settings.judgePreset, '甲', '全局引用也跟着改');
