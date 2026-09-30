@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.6
+     * 动态指导助手 v3.7
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -14,7 +14,7 @@
      *       所有模型请求都走酒馆的接口，排队一个一个发，出错就暂停。
      *   三、界面：管理页、路线图和编辑器（分段 / 编辑原文）。
      *
-     * 故事结构：每个条目是一条线，按分段往下走（可以循环，或由 AI 按正文选段）。
+     * 故事结构：每个条目是一条线，按分段往下走，可以循环。
      * 一条线可以依附另一条，从某一段接上：分岔口（走进去后原来那条停下）
      * 或支线（走完回到原来那条的下一段）。两条之间还可以设换边。
      *
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.6';
+    const VERSION = '3.7';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -1356,7 +1356,6 @@
             ...(resolved.source === 'global' ? {} : { judgePreset: resolved.name }),
             judgePrompt: '',
             judgeSegments: bindingPromptSpecs(binding, 'judge'),
-            pickStageSegments: bindingPromptSpecs(binding, 'pick'),
             bigCheckSegments: bindingPromptSpecs(binding, 'bigCheck'),
             bigCheckSystemPrompt: undefined,
             bigCheckUserPrompt: undefined,
@@ -1447,7 +1446,7 @@
     }
 
     // 外观配色（v2.29）：--dga-* 令牌层的值跟着人走，存本机 localStorage，不随角色卡导出。
-    // 默认档「默认深色（曜石暮蓝）」= 插件自己的配色，不依赖任何外部主题；
+    // 默认档「默认深色」= 插件自己的配色，不依赖任何外部主题；
     // 'tavern' 档一个令牌都不覆写 —— 直接用样式表里那套 SmartTheme 映射，等于跟随酒馆主题。
     const APPEARANCE_KEY = 'dynamic-guide-assistant:appearance:v1';
     const APPEARANCE_COLORS = [
@@ -1459,18 +1458,18 @@
         { token: '--dga-on-accent', label: '强调色上的文字' },
         { token: '--dga-danger', label: '危险色' },
     ];
-    // 默认深色（曜石暮蓝）：基调近黑的深灰蓝，搭配暮紫曜蓝强调色与纯白文字，提供沉稳清晰的高对比度质感。
+    // 默认深色：中性灰底色，灰绿强调色只用于选中状态与主要操作。
     const APPEARANCE_DEFAULTS = {
-        '--dga-bg-0': '#1F2428',
-        '--dga-bg-1': '#24292E',
-        '--dga-bg-2': '#2D343B',
-        '--dga-text-1': '#F0F3F6',
-        '--dga-accent': '#6E85F7',
-        '--dga-on-accent': '#FFFFFF',
+        '--dga-bg-0': '#1F2325',
+        '--dga-bg-1': '#272C2F',
+        '--dga-bg-2': '#32383C',
+        '--dga-text-1': '#F0F2EE',
+        '--dga-accent': '#B1B99A',
+        '--dga-on-accent': '#20251D',
         '--dga-danger': '#D07A74',
     };
     const APPEARANCE_PRESETS = [
-        { id: 'default-dark', name: '默认深色（曜石暮蓝）', tokens: { ...APPEARANCE_DEFAULTS } },
+        { id: 'default-dark', name: '默认深色', tokens: { ...APPEARANCE_DEFAULTS } },
         {
             id: 'default-light',
             name: '极简浅色',
@@ -2282,8 +2281,10 @@
             if (item.mirrorUid != null && item.mirrorUid !== '') binding.mirrorUid = item.mirrorUid;
             const start = Math.floor(Number(item.startIndex));
             if (Number.isFinite(start) && start > 0) binding.startIndex = start;
-            if (item.orderMode === 'pick') binding.orderMode = 'pick';
-            else if (item.orderMode === 'loop' || item.loop === true) {
+            // 旧版 AI 选段不再支持：即使旧数据同时留有 loop，也统一回退为按顺序。
+            if (item.orderMode === 'pick') {
+                // 按顺序无需写字段。
+            } else if (item.orderMode === 'loop' || item.loop === true) {
                 binding.orderMode = 'loop';
                 binding.loop = true;
                 if (item.loopBranch === 'keep') binding.loopBranch = 'keep';
@@ -2310,7 +2311,7 @@
                 const rules = RuleModule.normalize(item[field]);
                 if (rules.length) binding[field] = rules;
             });
-            ['judgeSegments', 'pickStageSegments', 'bigCheckSegments'].forEach(field => {
+            ['judgeSegments', 'bigCheckSegments'].forEach(field => {
                 const segments = normalizePromptSegments(item[field]);
                 if (segments.length) binding[field] = segments;
             });
@@ -2329,6 +2330,7 @@
         });
         // settings 原样保留，逐个字段校验（目前只有 autoAdvance 三档）。
         const settings = raw.settings && typeof raw.settings === 'object' ? { ...raw.settings } : {};
+        delete settings.pickStageSegments;
         if (settings.autoAdvance === 'marker' || settings.autoAdvance === 'story') settings.autoAdvance = 'off';
         if (settings.autoAdvance !== 'judge') settings.autoAdvance = 'off';
         // 判断AI的提问模板：空值回落到默认文案；引擎非法值归 auto。
@@ -2432,9 +2434,8 @@
         return autoAdvanceMode(config);
     }
 
-    // 阶段怎么走：按顺序停在末尾、循环绕回、或由判断 AI 指定现在该停在哪一段（可以跳回更早的段）。
+    // 阶段怎么走：按顺序停在末尾，或循环绕回。
     function bindingOrderMode(binding) {
-        if (binding && binding.orderMode === 'pick') return 'pick';
         if (binding && (binding.orderMode === 'loop' || binding.loop === true)) return 'loop';
         return 'order';
     }
@@ -3272,7 +3273,7 @@
 
     async function storeOrderMode(worldbookName, entry, mode) {
         if (!worldbookName || !entry) return;
-        const nextMode = mode === 'pick' || mode === 'loop' ? mode : 'order';
+        const nextMode = mode === 'loop' ? 'loop' : 'order';
         const name = entryName(entry);
         const config = await readConfig();
         const binding = findBindingForEntry(config, worldbookName, entry);
@@ -3281,11 +3282,7 @@
         if (layout) layout = { ...layout, loop: nextMode === 'loop' };
         if (binding && !sameUid(binding.entryUid, entry.uid)) binding.entryUid = entry.uid;
         if (binding) {
-            if (nextMode === 'pick') {
-                binding.orderMode = 'pick';
-                delete binding.loop;
-                delete binding.loopBranch;
-            } else if (nextMode === 'loop') {
+            if (nextMode === 'loop') {
                 binding.orderMode = 'loop';
                 binding.loop = true;
             } else {
@@ -3327,13 +3324,7 @@
                 }
             }
             let effective = hasFlag ? flag.loop === true : Boolean(binding.loop || (layout && layout.loop));
-            if (binding.orderMode === 'pick') {
-                effective = false;
-                if (binding.loop === true) {
-                    delete binding.loop;
-                    changed = true;
-                }
-            } else if (effective && binding.orderMode !== 'loop') {
+            if (effective && binding.orderMode !== 'loop') {
                 binding.orderMode = 'loop';
                 changed = true;
             } else if (!effective && binding.orderMode === 'loop' && hasFlag) {
@@ -3450,8 +3441,7 @@
                 }
                 const savedLayout = layoutOnBinding(binding, config);
                 const parsed = outlineFromEntry(located.entry, savedLayout ? { layout: savedLayout, loop: binding.loop } : null);
-                if (bindingOrderMode(binding) === 'pick') parsed.loop = false;
-                else if (bindingOrderMode(binding) === 'loop') {
+                if (bindingOrderMode(binding) === 'loop') {
                     parsed.loop = true;
                     parsed.loopKeepBranch = binding.loopBranch === 'keep';
                 }
@@ -4151,8 +4141,7 @@
                     }
                     const savedLayout = layoutOnBinding(binding, config);
                     const parsed = outlineFromEntry(located.entry, savedLayout ? { layout: savedLayout, loop: binding.loop } : null);
-                    if (bindingOrderMode(binding) === 'pick') parsed.loop = false;
-                    else if (bindingOrderMode(binding) === 'loop') parsed.loop = true;
+                    if (bindingOrderMode(binding) === 'loop') parsed.loop = true;
                     push(label, parsed.stages.length > 0,
                         `${parsed.stages.length} 个阶段；条目${entryIsDisabled(located.entry) ? '已关闭' : '现在是打开的（同步时会自动关闭）'}；位置：${positionText(located.entry.position)}`);
                     // 镜像行：和真正发给 AI 的正文用同一条路径比较，带上循环和起始步。
@@ -4304,8 +4293,7 @@
             boundAt: new Date().toISOString(),
             layout,
         };
-        if (named && named.orderMode === 'pick') candidate.orderMode = 'pick';
-        else if ((flag && flag.loop) || parsed.loop || (named && (named.loop || named.orderMode === 'loop'))) {
+        if ((flag && flag.loop) || parsed.loop || (named && (named.loop || named.orderMode === 'loop'))) {
             candidate.orderMode = 'loop';
             candidate.loop = true;
         }
@@ -4823,46 +4811,10 @@
         return list.find(stage => stage && stage.name === inner) || null;
     }
 
-    // AI 选段（v3.0）：两段——system 身份和规则 / user 本次案卷。
-    const PICK_STAGE_SYSTEM_PROMPT = [
-        '你是剧情定位员。每次只回答一个问题：按最近正文，剧情现在停在哪一段。',
-        '你不续写、不评价文笔、不改大纲。可以先在标签外写几句简短分析；最后必须按作答表填标签，同一标签只认最后一次。',
-        '',
-        '# 定位规则',
-        '- 只有【最近正文】里写出来的事算发生过。阶段说明只是对照标准。',
-        '- 看正文现在像哪一段，不是在现在的序号上加一。可以往后走，也可以跳回更早的段。',
-        '- 正文还是某一段的持续状态，就停在那段。多过了一天、多了一段日常，不算换段。',
-        '- 拿不准就停在现在这段。',
-    ].join('\n');
-
-    function pickStageCase(catalog, current, history) {
-        return [
-            '# 本次案卷',
-            '',
-            '【可选阶段】',
-            catalog,
-            '',
-            '【现在停在】',
-            current,
-            '',
-            '【最近正文】',
-            history,
-            '',
-            '## 作答表',
-            '填正文现在像的那一段，序号可以比现在更小。只填下面的标签。',
-            '<basis>',
-            '- 已发生：正文里对得上的事',
-            '</basis>',
-            '<stage>',
-            '- 序号：第几段',
-            '</stage>',
-        ].join('\n');
-    }
-
     // 大检查（v3.3.1 起收窄）：每 N 层另问一次判断AI，核对近 3 段大纲（前 1 / 当前 / 后 1，贴边时往另一侧补）、
     // 当前段的分岔口和最近 3 段正文：大纲是不是推早了（正文还没演到就进了下一段），或者正文已经跑过大纲。
     // 查出偏差就改到正文对应的那一段；正文走进了分岔就进那条。
-    // 只对判断AI档生效：AI 选段档每次都在重新定位，手动档不另开请求。
+    // 只对判断AI档生效，手动档不另开请求。
     // v3.3.1：前后各 2 段时，日常片段常被误认成更早的阶段，一次退回两段。收窄到前后各 1 段，
     // 并且改段只允许相邻一格（见 bigCheckFor 的 adjacent 判定）。
     const BIG_CHECK_OUTLINE_BEFORE = 1;
@@ -4930,14 +4882,6 @@
             field: 'judgeSegments', label: '常规判断', defaults: DEFAULT_JUDGE_SEGMENTS,
             hint: '占位符：{{stage}} {{prompt}} {{condition}} {{history}} {{previous}} {{elapsed}} {{next}} {{nextPrompt}} {{roads}}。结论读 <verdict>，也兼容 <结论> 和开头的 YES / NO。',
         },
-        pick: {
-            field: 'pickStageSegments', label: 'AI选段',
-            defaults: [
-                { role: 'system', content: PICK_STAGE_SYSTEM_PROMPT },
-                { role: 'user', content: pickStageCase('{{catalog}}', '{{current}}', '{{history}}') },
-            ],
-            hint: '占位符：{{catalog}} 可选阶段、{{current}} 现在停在、{{history}} 最近正文。结论读 <stage>，依据读 <basis>。',
-        },
         bigCheck: {
             field: 'bigCheckSegments', label: '大检查',
             defaults: [
@@ -4952,10 +4896,6 @@
         const type = BINDING_PROMPT_TYPES[kind];
         const segments = normalizePromptSegments(binding && binding[type.field]);
         return segments.some(seg => seg.content.trim()) ? segments : type.defaults.map(seg => ({ ...seg }));
-    }
-
-    function fillPickStagePrompt(template, parts) {
-        return String(template || '').replace(/\{\{\s*(catalog|current|history)\s*\}\}/g, (match, key) => parts[key] || '');
     }
 
     // 用函数替换，正文里带 $ 也不会被当成替换模式。
@@ -5172,7 +5112,7 @@
             || /<结论>[\s\S]*?<\/结论>/i.test(String(text || ''));
     }
 
-    // AI 选段：<stage> 里是从 1 开始的序号，或阶段名。空表、对不上的序号都不换段。
+    // 大检查的 <stage> 是从 1 开始的序号，或阶段名。空表、对不上的序号都不换段。
     function judgePickedIndex(text, stages) {
         const list = Array.isArray(stages) ? stages : [];
         const tag = lastTagInner(text, 'stage');
@@ -5649,22 +5589,11 @@
         if (!context || context.broken || !context.stage || context.stage.terminal) return false;
         if (context.state && (context.state.lineCut === true || context.state.sideOut)) return false;
         if (attachmentAsleep(context, contexts)) return false;
-        if (bindingOrderMode(context.binding) === 'pick') return false;
         if (!force && context.autoAdvance !== 'judge') return false;
         // 同一条消息每条绑定最多推进一次：标记流程先到就轮到判断AI跳过。
         if (context.state.lastCompletionMessageId === messageId) return false;
         // 推进冷却 / 最短停留（v3.3）：只拦自动检查，「现在检查」照常问。
         if (!force && autoWaitReason(context, messageId, settings)) return false;
-        return Boolean(force) || checkIntervalReached(context, messageId, settings);
-    }
-
-    function pickDueFor(context, messageId, settings, contexts, force) {
-        if (!force && autoWaitReason(context, messageId, settings)) return false;
-        if (!context || context.broken || bindingOrderMode(context.binding) !== 'pick') return false;
-        if (!context.parsed || !context.parsed.stages.length) return false;
-        if (context.state && (context.state.lineCut === true || context.state.sideOut)) return false;
-        if (attachmentAsleep(context, contexts)) return false;
-        if (!force && context.state.lastCompletionMessageId === messageId) return false;
         return Boolean(force) || checkIntervalReached(context, messageId, settings);
     }
 
@@ -5932,83 +5861,6 @@
         return true;
     }
 
-    // AI 选段：按正文现在像哪一段直接改到那一段（可以往回跳）。每条各问一次，排在判断后面，不并发。
-    async function pickStageFor(context, messageId, all, options) {
-        const flags = options || {};
-        const settings = settingsForContext(all.config && all.config.settings ? all.config.settings : {}, context);
-        const channel = usableChannel(settings, flags.force);
-        if (!channel) return;
-        const stages = context.parsed && context.parsed.stages || [];
-        const startStageIndex = context.state.stageIndex;
-        const bindingLabel = entryName(context.entry);
-        try {
-            const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
-            // 分支被否决的阶段不进目录（v2.63）；序号就是目录里的序号。
-            const choices = branchChoicesOf(context.state);
-            const visible = stages.filter(item => !stageBranchSkipped(item, choices));
-            const catalog = visible.map((stage, index) => {
-                const body = String(stage.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-                const branchTag = stage.branch && !choices[stage.branch] ? `（分支·${stage.branch}）` : '';
-                // v3.2：目录也带完成条件，和大检查的大纲窗口一致。
-                const condition = stage.completion ? `（完成条件：${String(stage.completion).replace(/\s+/g, ' ').trim().slice(0, 60)}）` : '';
-                return `${index + 1}. ${stage.name}${branchTag}${body ? `：${body}` : ''}${condition}`;
-            }).join('\n');
-            const currentStage = stages[startStageIndex];
-            const currentOrder = visible.indexOf(currentStage);
-            const current = currentStage && currentOrder >= 0 ? `${currentOrder + 1}. ${currentStage.name}` : '（还没有停在某一段）';
-            const extra = String(flags.extra || '').trim();
-            const parts = { catalog, current, history: history || '（没有取到聊天记录）' };
-            const messages = settings.pickStageSegments.filter(seg => seg.content.trim())
-                .map(seg => ({ role: seg.role, content: fillPickStagePrompt(seg.content, parts) }));
-            if (extra) appendToLastUser(messages, `本次只看这一次的附加要求：${extra}`);
-            LogModule.info('判断AI', `「${bindingLabel}」第 ${messageId} 层：按正文选段（现在第 ${Math.min(startStageIndex, stages.length - 1) + 1} 段）`);
-            const text = await askModel(messages, channel.preset, { ...settings, judgeMaxTokens: judgeReplyTokens(channel.preset) },
-                raw => lastTagInner(applyBoundaryRules(raw, settings), 'stage') != null);
-            // 和判断一样先过提取/排除规则，思维链里抄出来的 <stage> 不算。
-            const filtered = applyBoundaryRules(text, settings);
-            const picked = judgePickedIndex(filtered, visible);
-            const pickedStage = picked == null ? null : visible[picked];
-            const moving = pickedStage != null && pickedStage !== currentStage;
-            await patchStateFor(context.key, {
-                lastJudgeCheckedId: messageId,
-                lastJudgeYes: moving,
-                lastJudgeBasis: judgeBasisText(filtered),
-            });
-            judgeRuntime.lastRaw = String(text || '');
-            judgeRuntime.lastFiltered = filtered;
-            judgeRuntime.lastAt = Date.now();
-            judgeRuntime.lastYes = moving;
-            if (!moving) {
-                LogModule.info('判断AI', `「${bindingLabel}」停在当前段`);
-                return;
-            }
-            const fresh = await loadContexts();
-            const latest = fresh.contexts.find(item => item.key === context.key);
-            if (!latest || latest.broken) return;
-            const nowMessageId = currentMessageId();
-            if (latest.state.stageIndex !== startStageIndex
-                || (nowMessageId != null && nowMessageId !== messageId)) {
-                LogModule.warn('判断AI', `「${bindingLabel}」选了「${pickedStage.name}」，但检查期间进度已变化，放弃`);
-                return;
-            }
-            const realIndex = latest.parsed.stages.findIndex(item => item.id === pickedStage.id);
-            if (realIndex < 0) return;
-            LogModule.info('判断AI', `「${bindingLabel}」改到第 ${realIndex + 1} 段「${pickedStage.name}」`);
-            // 选中未决分支即锁定：同组其他分支这次聊天不再走。
-            await moveToIndex(latest, realIndex, { messageId, branchChoices: branchChoiceRecord(latest.state, latest.parsed.stages[realIndex]), source: 'pick', basis: judgeBasisText(filtered) });
-        } catch (error) {
-            if (isAbortError(error)) {
-                LogModule.info('判断AI', `「${bindingLabel}」选段请求已中止`);
-                if (flags.force) throw error;
-                return;
-            }
-            const reason = error && error.message ? error.message : String(error);
-            LogModule.error('判断AI', `「${bindingLabel}」选段失败：${reason}`);
-            if (flags.force) throw error;
-            reportOnce('judge-failed', `AI 选段失败：${reason}。自动检查会先暂停一会儿，免得反复请求；请检查当前 API 连接。`);
-        }
-    }
-
     // 大检查到点：判断AI档、醒着、没断、有下一段可比。同一层重新生成不再问；楼层倒退重新算。
     // 首次检查立即执行。这一层已经被普通判断推进过的，留到下一层再查。
     function bigCheckDueFor(context, messageId, settings, contexts) {
@@ -6018,7 +5870,6 @@
         if (!context.parsed || context.parsed.stages.length < 2) return false;
         if (context.state && (context.state.lineCut === true || context.state.sideOut)) return false;
         if (attachmentAsleep(context, contexts)) return false;
-        if (bindingOrderMode(context.binding) === 'pick') return false;
         if (context.autoAdvance !== 'judge') return false;
         if (context.state.lastCompletionMessageId === messageId) return false;
         if (autoWaitReason(context, messageId, settings)) return false;
@@ -6133,7 +5984,7 @@
         if (moved) await syncMirrors('normal');
     }
 
-    // 一层回复只排一次检查（v2.99.4）：这一层到点的判断档绑定合成一次请求，AI 选段的各问一次，全部排队不并发。
+    // 一层回复只排一次检查（v2.99.4）：这一层到点的判断档绑定合成一次请求，全部排队不并发。
     // 检查还没做完又来了新回复，只记下最新的一层，做完补判一次，中间的层不补。
     const judgeFloor = { active: null, waiting: null };
 
@@ -6178,9 +6029,8 @@
         const settings = all.config.settings || {};
         const judges = all.contexts.filter(context => judgeDueFor(context, messageId, settings, all.contexts, false));
         all.contexts.forEach(context => warnMaxStay(context, messageId));
-        const picks = all.contexts.filter(context => pickDueFor(context, messageId, settings, all.contexts, false));
         const bigs = all.contexts.filter(context => bigCheckDueFor(context, messageId, settings, all.contexts));
-        if (!judges.length && !picks.length && !bigs.length) return;
+        if (!judges.length && !bigs.length) return;
         if (modelPauseLeft() > 0) {
             LogModule.info('判断AI', `第 ${messageId} 层：上次请求出错，自动检查暂停到 ${modelPauseClock()}，这一层不问`);
             reportOnce(`model-paused:${modelGate.pausedUntil}`, `判断AI上次请求出错，自动检查先停到 ${modelPauseClock()}，免得反复请求被限流或封号。要马上试，点小卡「设置 ›」里的「现在检查」。`);
@@ -6205,10 +6055,6 @@
                 await judgeBindings(group, messageId, all);
             }
         }
-        for (const context of picks) {
-            if (modelPauseLeft() > 0) break;
-            await pickStageFor(context, messageId, all);
-        }
         if (bigs.length && modelPauseLeft() <= 0) await runBigChecks(messageId);
     }
 
@@ -6222,11 +6068,6 @@
             if (messageId == null) throw new Error('当前没有可检查的回复。');
             const settings = all.config.settings || {};
             if (guideDisabled(all.config)) throw new Error('动态指导总开关已关闭，先到仪表盘「开关」→「高级设置」打开。');
-            if (bindingOrderMode(context.binding) === 'pick') {
-                if (!pickDueFor(context, messageId, settings, all.contexts, true)) throw new Error('这条绑定现在不能检查。');
-                await pickStageFor(context, messageId, all, { force: true, extra });
-                return;
-            }
             if (context.state && context.state.lastCompletionMessageId === messageId) throw new Error('这一层已经推进过了，等下一条回复再检查。');
             if (!judgeDueFor(context, messageId, settings, all.contexts, true)) throw new Error('这条绑定现在不能检查。');
             await judgeBindings([context], messageId, all, { force: true, extra });
@@ -6257,12 +6098,11 @@
             }
         }
         const config = await readConfig();
-        const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge' && bindingOrderMode(binding) !== 'pick');
-        const pickNeeded = (config.bindings || []).some(binding => bindingOrderMode(binding) === 'pick');
+        const judgeNeeded = (config.bindings || []).some(binding => bindingAdvanceMode(binding, config) === 'judge');
         // 手动不另开请求。判断 AI 才另开请求：这一层到点的绑定合成一次，排队发，不并发。
         // 总开关关着：只擦掉回复里的旧标记，不另开任何判断请求。
         if (guideDisabled(config)) return;
-        if (judgeNeeded || pickNeeded) await runFloorCheck(messageId);
+        if (judgeNeeded) await runFloorCheck(messageId);
     }
 
     // ---------------------------------------------------------------
@@ -6708,10 +6548,9 @@
             const orderOptions = [
                 { value: 'order', label: '按顺序' },
                 { value: 'loop', label: '循环' },
-                { value: 'pick', label: 'AI 选下一段' },
             ];
             const order = selectControl(orderOptions, bindingOrderMode(binding), value => {
-                const label = { order: '按顺序', loop: '循环', pick: 'AI 选下一段' }[value] || '按顺序';
+                const label = { order: '按顺序', loop: '循环' }[value] || '按顺序';
                 runAction('保存阶段怎么走', () => saveBindingOrder(binding, value), {
                     success: `「${binding.entryName || '条目'}」改为${label}`,
                 });
@@ -7250,15 +7089,16 @@
         ];
     }
 
-    // 从绑定卡片进入，三种提示词各自保存；沿用数据库分段编辑和抽屉的草稿/保存语义。
+    // 从绑定卡片进入，两种提示词各自保存；沿用数据库分段编辑和抽屉的草稿/保存语义。
     function promptBinding() {
         const config = ui.snapshot && ui.snapshot.config;
         return config && config.bindings.find(binding => bindingKey(binding) === ui.promptKey);
     }
 
     function openBindingPrompts(context) {
+        ui.workKey = context.key;
         ui.promptKey = context.key;
-        ui.promptKind = bindingOrderMode(context.binding) === 'pick' ? 'pick' : 'judge';
+        ui.promptKind = 'judge';
         ui.judgePromptDraft = null;
         ui.navOpen = false;
         ui.view = 'judgePrompt';
@@ -7383,6 +7223,7 @@
             header(`${type.label}提示词`, `${binding.entryName || '未命名条目'} · ${binding.worldbookName}`, back, '返回', null, { subpage: true }),
             el('div', { class: 'dga-body' },
                 messageBar(),
+                workSwitch('prompt'),
                 segControl(Object.entries(BINDING_PROMPT_TYPES).map(([value, item]) => ({ value, label: item.label })), ui.promptKind, value => {
                     if (value === ui.promptKind || !confirmDraftExit()) return;
                     ui.promptKind = value;
@@ -7397,7 +7238,7 @@
                     segments.length === 0 ? muted('暂无提示词段，用上方按钮添加或恢复默认。') : null,
                     el('div', { class: 'dga-pseg-add' }, btn('＋ 在最下方插入', () => insertAt('bottom'), { ghost: true })),
                 ),
-                el('div', { class: 'dga-api-actions' },
+                el('div', { class: 'dga-api-actions dga-prompt-actions' },
                     btn('导入', () => importInput.click(), { ghost: true }),
                     exportBtn,
                     btn('恢复默认提示词', () => {
@@ -7682,11 +7523,6 @@
     function judgeWaitText(context) {
         if (!context) return '';
         const wait = autoSkipNotes.get(context.key) || '';
-        if (bindingOrderMode(context.binding) === 'pick') {
-            if (context.state.lastJudgeCheckedId == null && !context.state.lastJudgeBasis) return '';
-            const basis = context.state.lastJudgeBasis ? `：${context.state.lastJudgeBasis}` : '';
-            return `上次选段${basis}`;
-        }
         if (context.autoAdvance !== 'judge') return '';
         const verdict = context.state.lastJudgeYes === true
             ? '上次 YES'
@@ -7877,7 +7713,7 @@
 
     function bigCheckWaitText(context) {
         if (!context || !context.state || !context.state.lastBigCheckBasis) return '';
-        if (bindingOrderMode(context.binding) === 'pick' || context.autoAdvance !== 'judge') return '';
+        if (context.autoAdvance !== 'judge') return '';
         return `上次大检查：${context.state.lastBigCheckBasis}`;
     }
 
@@ -7914,7 +7750,6 @@
                 rules[index] = { ...rules[index], ...patch };
                 const row = rules[index];
                 if (String(row.start || '').trim() && String(row.end || '').trim()) persist(key);
-                else render();
             };
             const rows = rules.map((rule, index) => el('div', { class: 'dga-rule-row' },
                 el('input', {
@@ -8059,8 +7894,7 @@
         const percent = total > 0 ? Math.round(Math.min(stageIndex, total) / total * 100) : 0;
         const hints = [];
         const orderMode = bindingOrderMode(context.binding);
-        if (orderMode === 'pick') hints.push('AI选段');
-        else if (orderMode === 'loop' || context.parsed.loop) hints.push('循环');
+        if (orderMode === 'loop' || context.parsed.loop) hints.push('循环');
         if (context.stage && context.stage.terminal) hints.push('到此结束');
         if (context.state && context.state.lineCut) hints.push('这条已断');
         if (context.state && context.state.sideOut) hints.push('正在走另一条');
@@ -8116,6 +7950,12 @@
                 }),
                 el('button', {
                     type: 'button',
+                    type: 'button', class: 'dga-pace-open', text: '提示词 ›',
+                    'aria-label': `${entryName(context.entry)}的提示词`,
+                    onclick: () => openBindingPrompts(context),
+                }),
+                el('button', {
+                    type: 'button',
                     class: 'dga-pace-open dga-set-open',
                     'aria-label': '这条的判断设置',
                     text: '设置 ›',
@@ -8125,13 +7965,7 @@
                         ui.view = 'pace';
                         render();
                     },
-                }),
-                el('button', {
-                    type: 'button', class: 'dga-pace-open', text: '提示词 ›',
-                    'aria-label': `${entryName(context.entry)}的提示词`,
-                    onclick: () => openBindingPrompts(context),
                 })),
-            guideRulesCard(context),
             judgeStatusLine(context, judgeWaitText(context)),
         );
     }
@@ -8147,7 +7981,7 @@
         const context = workContext();
         if (!context || context.broken) return null;
         return el('div', { class: 'dga-work-switch', role: 'tablist', 'aria-label': '这一条的页面' },
-            ...[['editor', '编辑'], ['pace', '设置']].map(([id, label]) => el('button', {
+            ...[['editor', '编辑'], ['prompt', '提示词'], ['pace', '设置']].map(([id, label]) => el('button', {
                 type: 'button',
                 role: 'tab',
                 class: `dga-seg-btn${active === id ? ' is-on' : ''}`,
@@ -8158,9 +7992,11 @@
 
     async function openWorkPage(page) {
         if ((page === 'editor' && ui.view === 'editor')
+            || (page === 'prompt' && ui.view === 'judgePrompt')
             || (page === 'pace' && ui.view === 'pace')) return false;
         const context = workContext();
         if (!context || context.broken || !context.entry) throw new Error('这条绑定不可用。');
+        if (ui.view === 'judgePrompt' && !confirmDraftExit()) return false;
         const sameEditor = ui.editor && ui.editor.entry && context.entry
             && ui.editor.entry.uid === context.entry.uid
             && ui.editor.worldbookName === context.worldbookName;
@@ -8171,7 +8007,7 @@
             ui.view = 'pace';
             return false;
         }
-        if (page !== 'editor' && ui.view === 'editor' && editorUnsaved(ui.editor)) {
+        if (page === 'prompt' && sameEditor && editorUnsaved(ui.editor)) {
             if (!hostWindow.confirm('还有没保存的修改，确定放弃？')) return false;
         }
         ui.workKey = context.key;
@@ -8187,6 +8023,15 @@
                 });
             }
             ui.view = 'editor';
+            return false;
+        }
+        if (page === 'prompt') {
+            if (ui.editor) discardEditor();
+            ui.paceKey = '';
+            ui.promptKey = context.key;
+            ui.promptKind = 'judge';
+            ui.judgePromptDraft = null;
+            ui.view = 'judgePrompt';
             return false;
         }
         if (ui.editor) discardEditor();
@@ -8343,7 +8188,6 @@
         const orderOptions = [
             { value: 'order', label: '按顺序' },
             { value: 'loop', label: '循环' },
-            { value: 'pick', label: 'AI 选下一段' },
         ];
         const hostStages = ((((ui.snapshot && ui.snapshot.contexts) || []).find(item => item.key === binding.attachKey) || {}).parsed || {}).stages || [];
         const attachStageOptions = (hostStages.length ? hostStages : [null]).map((stage, index) => ({
@@ -8352,7 +8196,7 @@
         }));
         const children = [
             field('阶段怎么走', selectControl(orderOptions, orderMode, value => runAction('修改阶段怎么走', () => saveBindingOrder(binding, value), {
-                success: value === 'pick' ? '之后由 AI 按正文选择现在该停在哪一段，可以从后面跳回前面' : (value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止'),
+                success: value === 'loop' ? '到最后一段后回到第一段' : '按顺序往后，到最后一段停止',
             }))),
             orderMode === 'loop' ? field('回到第一段之后', el('div', { class: 'dga-seg' },
                 ...[['fresh', '再选一次'], ['keep', '还走刚才那段']].map(([value, label]) => el('button', {
@@ -8408,8 +8252,9 @@
                 else delete item.advanceMode;
             }), { success: '已记下这条的判断方式' }))),
             chronicleField(context),
+            guideRulesCard(context),
         ];
-        if (orderMode === 'pick' || context.autoAdvance === 'judge') {
+        if (context.autoAdvance === 'judge') {
             const settings = config && config.settings ? config.settings : {};
             const globalInterval = judgeCheckInterval(settings);
             const presets = [1, 2, 3, 5];
@@ -8432,9 +8277,7 @@
             if (statusNode) children.push(statusNode);
             const bigNode = judgeStatusLine({ key: `${context.key}#big` }, bigCheckWaitText(context));
             if (bigNode) children.push(bigNode);
-            const canCheck = orderMode === 'pick'
-                ? context.parsed.stages.length > 0
-                : Boolean(context.stage && !context.stage.terminal);
+            const canCheck = Boolean(context.stage && !context.stage.terminal);
             if (canCheck) {
                 const extra = el('input', {
                     class: 'dga-input',
@@ -8635,9 +8478,7 @@
             bound,
             baseLayout: stored || null,
             bindingLoop: Boolean((binding && binding.loop) || flagLoop || (stored && stored.loop)),
-            orderMode: binding && binding.orderMode === 'pick'
-                ? 'pick'
-                : (Boolean((binding && (binding.loop || binding.orderMode === 'loop')) || flagLoop || (stored && stored.loop)) ? 'loop' : 'order'),
+            orderMode: Boolean((binding && (binding.loop || binding.orderMode === 'loop')) || flagLoop || (stored && stored.loop)) ? 'loop' : 'order',
             pick: null,
             pickListeners: null,
             // 从小卡点进来时带的当前段：渲染完滚到它并高亮一次
@@ -9803,7 +9644,7 @@
     function styles() {
         const P = `#${PANEL_ID}`;
         return `
-${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: stretch; justify-content: stretch; padding: 0; background: var(--dga-bg-0); backdrop-filter: blur(8px); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 14px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: #0E131F; --dga-bg-1: #161C2A; --dga-bg-2: #1E2638; --dga-bg-3: #283348; --dga-text-1: #F0F4FC; --dga-text-2: #9EB1D6; --dga-text-3: #627599; --dga-accent: #6E85F7; --dga-on-accent: #FFFFFF; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 28%, transparent); --dga-border: #243046; --dga-border-2: #32425E; --dga-hover: rgba(255, 255, 255, 0.05); --dga-success: #52C48A; --dga-warning: #E5A83B; --dga-danger: #E05656; --dga-radius-sm: 4px; --dga-radius-md: 6px; --dga-radius-lg: 8px; --dga-shadow: 0 18px 48px rgba(1, 4, 9, 0.45); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; --dga-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
+${P} { position: fixed; top: 0; left: 0; right: 0; width: auto; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; z-index: 100000; display: flex; align-items: stretch; justify-content: stretch; padding: 0; background: var(--dga-bg-0); color: var(--dga-text-1); font-family: var(--dga-font-ui); font-size: 14px; line-height: 1.55; box-sizing: border-box; --dga-bg-0: #1F2325; --dga-bg-1: #272C2F; --dga-bg-2: #32383C; --dga-bg-3: color-mix(in srgb, var(--dga-bg-2) 88%, var(--dga-text-1)); --dga-text-1: #F0F2EE; --dga-text-2: color-mix(in srgb, var(--dga-text-1) 78%, var(--dga-bg-0)); --dga-text-3: color-mix(in srgb, var(--dga-text-1) 62%, var(--dga-bg-0)); --dga-accent: #B1B99A; --dga-on-accent: #20251D; --dga-accent-glow: color-mix(in srgb, var(--dga-accent) 28%, transparent); --dga-border: color-mix(in srgb, var(--dga-text-1) 14%, var(--dga-bg-1)); --dga-border-2: color-mix(in srgb, var(--dga-text-1) 26%, var(--dga-bg-2)); --dga-hover: color-mix(in srgb, var(--dga-text-1) 6%, transparent); --dga-success: #91BA9B; --dga-warning: #D5B97C; --dga-danger: #D07A74; --dga-radius-sm: 4px; --dga-radius-md: 6px; --dga-radius-lg: 8px; --dga-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); --dga-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; --dga-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
 ${P}[hidden] { display: none; }
 ${P} *, ${P} *::before, ${P} *::after { box-sizing: border-box; }
 ${P} .dga-shell { position: relative; display: flex; flex-direction: row; width: 100%; max-width: none; min-width: 0; height: 100%; min-height: 0; max-height: none; background: var(--dga-bg-0); border: 0; border-radius: 0; box-shadow: none; overflow: hidden; outline: none; }
@@ -9897,7 +9738,7 @@ ${P} textarea.dga-raw { min-height: 46vh; font-family: var(--dga-font-mono); fon
 ${P} .dga-heading-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 ${P} .dga-heading-text b { font-size: 14px; font-weight: 600; color: var(--dga-text-1); overflow-wrap: anywhere; }
 ${P} .dga-heading-text small { color: var(--dga-text-2); font-size: 12px; overflow-wrap: anywhere; }
-${P} .dga-tag { flex: 0 0 auto; padding: 2px 8px; border-radius: var(--dga-radius-sm); background: var(--dga-c, #6E85F7); color: var(--dga-on-accent); font-size: 11px; font-weight: 700; white-space: nowrap; }
+${P} .dga-tag { flex: 0 0 auto; padding: 2px 8px; border-radius: var(--dga-radius-sm); background: var(--dga-c, var(--dga-accent)); color: #FFFFFF; font-size: 11px; font-weight: 700; white-space: nowrap; }
 ${P} .dga-chev { color: var(--dga-text-3); font-size: 15px; }
 ${P} .dga-grip { flex: 0 0 auto; width: 16px; align-self: stretch; display: flex; align-items: center; justify-content: center; cursor: grab; color: var(--dga-text-3); touch-action: none; user-select: none; font-size: 14px; letter-spacing: -1px; }
 ${P} .dga-grip:active { cursor: grabbing; }
@@ -9908,7 +9749,7 @@ ${P} .dga-move:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dga-ac
 ${P} .dga-move:disabled { opacity: 0.25; cursor: default; }
 ${P} .dga-hint { margin: 4px 0 0; text-align: center; font-size: 12px; color: var(--dga-text-3); }
 ${P} .dga-pick, ${P} .dga-pick-surface { min-width: 0; max-width: 100%; }
-${P} .dga-segbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: 100%; margin: 6px 0; padding: 8px 12px; border-radius: var(--dga-radius-md); border-left: 4px solid var(--dga-c, #6E85F7); background: var(--dga-bg-2); border-top: 1px solid var(--dga-border); border-right: 1px solid var(--dga-border); border-bottom: 1px solid var(--dga-border); cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+${P} .dga-segbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: 100%; margin: 6px 0; padding: 8px 12px; border-radius: var(--dga-radius-md); border-left: 4px solid var(--dga-c, var(--dga-accent)); background: var(--dga-bg-2); border-top: 1px solid var(--dga-border); border-right: 1px solid var(--dga-border); border-bottom: 1px solid var(--dga-border); cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-segbar:hover, ${P} .dga-segbar:focus-visible { outline: none; border-color: var(--dga-accent); box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-segbar-count { flex: 0 0 auto; color: var(--dga-text-3); font-size: 12px; }
 ${P} .dga-seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
@@ -9924,7 +9765,7 @@ ${P} .dga-seg-stack { display: grid; gap: 6px; }
 ${P} .dga-chronicle { display: grid; gap: 4px; }
 ${P} .dga-chronicle-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; font-size: 12px; }
 ${P} .dga-chronicle-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--dga-text-2); }
-${P} .dga-work-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+${P} .dga-work-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 ${P} .dga-pass { display: flex; flex-direction: column; gap: 8px; }
 ${P} .dga-pass-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 ${P} .dga-pass-card { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); }
@@ -9986,7 +9827,7 @@ ${P} .dga-pick-bar .dga-btn { flex: 0 0 auto; min-height: 34px; padding: 6px 12p
 ${P} .dga-pick-bar select { flex: 1 1 160px; min-width: 0; min-height: 34px; }
 ${P} .dga-pick-bar-text { flex: 1 1 100%; font-size: 13px; color: var(--dga-text-2); }
 ${P} .dga-pick-surface { padding: 12px 14px 18px; border-radius: var(--dga-radius-md); border: 1px solid var(--dga-border); background: var(--dga-bg-2); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.75; user-select: text; -webkit-user-select: text; cursor: text; }
-${P} .dga-text-mark { padding: 1px 0; border-radius: var(--dga-radius-sm); background: color-mix(in srgb, var(--dga-c, #6E85F7) 24%, transparent); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+${P} .dga-text-mark { padding: 1px 0; border-radius: var(--dga-radius-sm); background: color-mix(in srgb, var(--dga-c, var(--dga-accent)) 24%, transparent); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
 ${P} .dga-pending { border-bottom: 2px dashed color-mix(in srgb, var(--dga-text-1) 75%, transparent); }
 ${P} .dga-text-mark.is-pending, ${P} .dga-pending { background: var(--dga-hover); }
 ${P} .dga-pick-surface.dga-tap-mode { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: pointer; }
@@ -10005,7 +9846,7 @@ ${P} .dga-nav-group { display: flex; flex-direction: column; gap: 2px; }
 ${P} .dga-nav-item { display: block; width: 100%; min-height: 38px; padding: 8px 10px; border: 0; border-radius: var(--dga-radius-sm); background: transparent; color: var(--dga-text-2); font: inherit; font-size: 13px; font-weight: 500; text-align: left; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-nav-item:not(.is-on):hover { background: var(--dga-hover); color: var(--dga-text-1); }
 ${P} .dga-nav-item:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--dga-accent-glow); }
-${P} .dga-nav-item.is-on { background: var(--dga-accent); color: var(--dga-on-accent); font-weight: 600; }
+${P} .dga-nav-item.is-on { background: color-mix(in srgb, var(--dga-accent) 14%, var(--dga-bg-1)); color: var(--dga-text-1); font-weight: 600; }
 ${P} .dga-nav-item:disabled { opacity: 0.35; cursor: default; }
 ${P} .dga-icon-btn { width: 38px; min-width: 38px; min-height: 36px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: inherit; font: inherit; font-size: 15px; cursor: pointer; transition: background 0.15s ease; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-icon-btn:hover { background: var(--dga-bg-3); }
@@ -10043,10 +9884,11 @@ ${P} .dga-dev-line input.dga-dev-num { text-align: center; }
     ${P} .dga-dev-line { grid-template-columns: 1fr 1fr; grid-template-areas: "name name" "stage stage" "stepcap ordercap" "step order"; }
 }
 ${P} .dga-bind-pace { display: flex; flex-direction: column; gap: 8px; }
-${P} .dga-bind-actions { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; }
-${P} .dga-pace-open { margin: 0; padding: 0; border: 0; background: transparent; color: var(--dga-text-3); font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; min-height: 0; }
-${P} .dga-bind-actions .dga-pace-open { padding: 4px 8px; min-height: 30px; font-size: 12px; }
-${P} .dga-pace-open:hover, ${P} .dga-pace-open:focus-visible { color: var(--dga-accent); outline: none; }
+${P} .dga-bind-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+${P} .dga-pace-open { margin: 0; padding: 6px 10px; border: 1px solid var(--dga-border-2); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-size: 13px; font-weight: 500; line-height: 1.4; cursor: pointer; min-height: 34px; }
+${P} .dga-bind-actions .dga-pace-open { min-width: 0; }
+${P} .dga-pace-open:hover { background: var(--dga-bg-3); }
+${P} .dga-pace-open:focus-visible { outline: 2px solid var(--dga-accent); outline-offset: 2px; }
 ${P} .dga-judge-status { margin: 0; font-size: 12px; line-height: 1.45; color: var(--dga-text-2); overflow-wrap: anywhere; text-align: center; }
 ${P} .dga-judge-toggle { margin-left: 6px; padding: 0 4px; border: 0; background: transparent; color: var(--dga-accent); font: inherit; font-size: 12px; line-height: 1.45; cursor: pointer; min-height: 0; font-weight: 500; }
 ${P} .dga-judge-toggle:hover, ${P} .dga-judge-toggle:focus-visible { text-decoration: underline; outline: none; }
@@ -10078,6 +9920,8 @@ ${P} .dga-stepper-bar { height: 4px; border-radius: 999px; background: var(--dga
 ${P} .dga-stepper-bar > i { display: block; height: 100%; border-radius: 999px; background: var(--dga-accent); transition: width 0.2s ease; }
 ${P} .dga-api-actions { display: flex; justify-content: flex-end; gap: 8px; }
 ${P} .dga-api-actions .dga-btn { flex: 0 1 auto; min-height: 36px; padding: 6px 16px; }
+${P} .dga-api-actions.dga-prompt-actions { flex-wrap: wrap; }
+${P} .dga-api-actions.dga-prompt-actions .dga-btn { flex: 0 0 auto; min-width: 64px; white-space: nowrap; }
 ${P} .dga-field-hint { font-size: 12px; color: var(--dga-text-3); line-height: 1.5; }
 ${P} .dga-model-pick-arrow { color: var(--dga-accent); font-size: 13px; font-weight: 700; margin-bottom: 4px; animation: dga-pick-bounce 1.2s ease-in-out infinite; }
 @keyframes dga-pick-bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
@@ -10123,7 +9967,7 @@ ${P} .dga-log-toolbar .dga-log-search { flex: 1 1 160px; min-width: 120px; min-h
 ${P} .dga-log-live { margin-left: auto; font-size: 12px; color: var(--dga-text-3); }
 ${P} .dga-log-time { flex-shrink: 0; color: var(--dga-text-3); }
 ${P} .dga-log-level { flex-shrink: 0; min-width: 30px; font-weight: 700; }
-${P} .dga-log-level-info { color: #6E85F7; }
+${P} .dga-log-level-info { color: var(--dga-accent); }
 ${P} .dga-log-level-warn { color: var(--dga-warning); }
 ${P} .dga-log-level-error { color: var(--dga-danger); }
 ${P} .dga-log-level-debug { color: #A78BFA; }
