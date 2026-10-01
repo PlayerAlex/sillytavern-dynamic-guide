@@ -3753,15 +3753,16 @@ test('被依附的条目不能再选回依附它的那条，支线插在那一�
     const roadmap = panel().querySelector('.dga-roadmap');
     const text = roadmap.textContent;
     const css = documentRef.getElementById('dynamic-guide-assistant-style').textContent;
-    assert.match(css, /\.dga-roadmap-stages \{[^}]*flex-direction:\s*column/, '每个阶段单独一行');
+    assert.match(css, /\.dga-roadmap-stages \{[^}]*flex-direction:\s*row/, '横向流程节点排列');
     assert.equal(text.includes('——————'), false, '支线上下不画横线');
     const tag = findClass(roadmap, 'dga-roadmap-tag');
     assert.ok(tag, '依附的那条带分支标签');
     assert.equal(tag.textContent, '支线', '支线标签写「支线」');
     assert.equal(text.includes('└'), false, '不再用 └ 前缀');
-    assert.ok(text.indexOf('1. 内容1') < text.indexOf('1. 支线内容1'), '支线接在内容1后面');
-    assert.ok(text.indexOf('1. 支线内容1') < text.indexOf('2. 支线内容2'));
-    assert.ok(text.indexOf('2. 支线内容2') < text.indexOf('2. 内容2'));
+    assert.equal(/\d+\. /.test(text), false, '站点不带编号前缀');
+    assert.ok(text.indexOf('内容1') < text.indexOf('支线内容1'), '支线接在内容1后面');
+    assert.ok(text.indexOf('支线内容1') < text.indexOf('支线内容2'));
+    assert.ok(text.indexOf('支线内容2') + 2 < text.lastIndexOf('内容2'), '主线内容2排在支线之后');
     const buttons = [];
     const walk = node => {
         if (node.tagName === 'BUTTON' && node.textContent === '设置 ›') buttons.push(node);
@@ -3815,18 +3816,21 @@ test('走进分岔口后换轨：分岔接成主线，原路线接点之后划�
     const roadmap = panel().querySelector('.dga-roadmap');
     assert.ok(roadmap, '有路线图');
     const text = roadmap.textContent;
-    assert.equal(collectByClass(roadmap, 'dga-roadmap-row', []).length, 1, `换轨后不再单独画分岔那一行：${text}`);
+    assert.equal(collectByClass(roadmap, 'dga-roadmap-row', []).length, 2, `换轨后整张图照常画，分岔仍占自己那一行：${text}`);
     assert.equal(findClass(roadmap, 'dga-roadmap-tag'), null, '换轨后不显示分岔口标签');
-    assert.ok(text.includes('1. 内容1'), '接点之前的段照常显示');
-    assert.ok(text.includes('2. 分岔1') && text.includes('3. 分岔2'), '分岔的段接成主线继续编号');
-    assert.equal(text.includes('2. 内容2'), false, '原路线接点之后的段不再编号');
-    assert.ok(text.includes('不再走：内容2'), '原路线接点之后的段单独写成「不再走」');
+    assert.ok(text.includes('内容1'), '接点之前的段照常显示');
+    assert.ok(text.includes('分岔1') && text.includes('分岔2'), '分岔的段接成主线');
+    assert.equal(/\d+\. /.test(text), false, '站点不带编号前缀');
+    assert.equal(text.includes('不再走：'), false, '不再把原线后半段收成一行文字');
+    const missedText = collectByClass(roadmap, 'is-missed', []).map(node => node.textContent).join('|');
+    assert.ok(missedText.includes('内容2'), `原线接点之后的段留在图上并置灰：${missedText}`);
+    assert.equal(missedText.includes('分岔1'), false, '走进的那条分岔不置灰');
     assert.ok(text.includes('现在在走：分岔'), '标题行写明现在走的是哪条线');
     assert.ok(text.includes('现在第 2 段'), '标题行的段号和站点编号保持一致');
     assert.match(panel().textContent, /已走进「分岔」/, '小卡上也写明走进了哪条');
     const stages = collectByClass(roadmap, 'dga-roadmap-stages', [])[0];
     assert.ok(stages, '有线路');
-    assert.equal(stages.textContent.includes('内容2'), false, '不再走的段不铺进线路里');
+    assert.ok(stages.textContent.includes('内容2'), '原线的段照常铺在线路里');
     assert.equal(collectByClass(stages, 'is-cut', []).length, 0, '线路上没有划掉的站点');
     assert.deepEqual(errors, []);
 });
@@ -3867,8 +3871,10 @@ test('走进一条分岔后，同一接点上已放弃的分岔不再画进路�
     findButton(panel(), '动态指导').listeners.click[0]();
     const text = panel().querySelector('.dga-roadmap').textContent;
     assert.ok(text.includes('甲一'), '走进的那条接成主线');
-    assert.equal(text.includes('乙一'), false, '已放弃的分岔连阶段都不画');
-    assert.equal(text.includes('分岔乙'), false, '已放弃的分岔连条目名都不画');
+    assert.ok(text.includes('乙一'), '已放弃的分岔照常画在图上');
+    const missedAbandoned = collectByClass(panel().querySelector('.dga-roadmap'), 'is-missed', []).map(node => node.textContent).join('|');
+    assert.ok(missedAbandoned.includes('乙一'), `已放弃的分岔整条置灰：${missedAbandoned}`);
+    assert.equal(missedAbandoned.includes('甲一'), false, '走进的那条不置灰');
     assert.deepEqual(errors, []);
 });
 
@@ -3908,11 +3914,12 @@ test('依附嵌套超过两级后不再继续缩进，层级改写在来源路�
     panel().querySelector('.dga-nav-toggle').listeners.click[0]();
     findButton(panel(), '动态指导').listeners.click[0]();
     const text = panel().querySelector('.dga-roadmap').textContent;
-    assert.ok(text.includes('嵌套'), '嵌套那条照样画出来');
-    assert.ok(text.includes('来自：主线 › 分岔甲 › 嵌套'), '更深一层写在来源路径里');
+    assert.ok(text.includes('嵌一'), '嵌套那条照样画出来');
+    assert.equal(text.includes('来自：'), false, '分支不再显示来源路径文字');
+    const titleOf = row => (row.getAttribute && row.getAttribute('title')) || row.title || '';
+    assert.ok(collectByClass(panel().querySelector('.dga-roadmap'), 'is-branch', []).some(row => titleOf(row).includes('来自：主线 › 分岔甲 › 嵌套')), '来源路径收进悬停提示');
     const css = documentRef.getElementById('dynamic-guide-assistant-style').textContent;
-    assert.match(css, /\.dga-roadmap-stages \.dga-roadmap-stages \{[^}]*padding-left: 12px/, '二级缩进是 12px');
-    assert.match(css, /\.dga-roadmap-stages > span::before[^}]*width: 6px/, '站点是实心小圆点，不是空心圈');
+    assert.match(css, /\.dga-roadmap-stages > span::before[^}]*border-left:\s*6px solid/, '节点间带箭头指向');
     assert.equal(/border: 2px solid var\(--dga-border-2\)/.test(css), false, '不再用带描边的空心圆点');
     assert.equal(/dga-roadmap-stages \.dga-roadmap-stages \.dga-roadmap-stages/.test(css), false, '没有把第三级压成 0 的规则');
     assert.deepEqual(errors, []);
@@ -3954,7 +3961,7 @@ test('走进分岔口后，这条分岔自己再依附的支线也接在它后�
     findButton(panel(), '动态指导').listeners.click[0]();
     const roadmap = panel().querySelector('.dga-roadmap');
     const text = roadmap.textContent;
-    assert.ok(text.includes('2. 分岔1'), '分岔接成主线');
+    assert.ok(text.includes('分岔1'), '分岔接成主线');
     assert.ok(text.includes('支线1'), '分岔自己再依附的支线也要画出来');
     const tag = findClass(roadmap, 'dga-roadmap-tag');
     assert.ok(tag && tag.textContent === '支线', '子支线带「支线」标签');
@@ -3998,15 +4005,16 @@ test('分叉再分叉：编号沿着一条线连续往下排，标题写明走�
     findButton(panel(), '动态指导').listeners.click[0]();
     const roadmap = panel().querySelector('.dga-roadmap');
     const text = roadmap.textContent;
-    assert.equal(collectByClass(roadmap, 'dga-roadmap-row', []).length, 1, '两层分岔接成同一条线，不再各画一块');
-    assert.ok(text.includes('1. 内容1'), '主线接点之前的段照常编号');
-    assert.ok(text.includes('2. 岔甲1'), '第一层分岔接着编号');
-    assert.ok(text.includes('3. 深1'), '第二层分岔继续接着编号，不回到 1');
-    assert.equal(text.includes('4. '), false, '第二层分岔自己没再往下走，不产生空编号');
+    assert.equal(collectByClass(roadmap, 'dga-roadmap-row', []).length, 3, '两层分岔各占一行，整张图照常画');
+    assert.ok(text.includes('内容1'), '主线接点之前的段照常显示');
+    assert.ok(text.includes('岔甲1'), '第一层分岔接上');
+    assert.ok(text.includes('深1'), '第二层分岔继续接上');
+    assert.equal(/\d+\. /.test(text), false, '站点不带编号前缀');
     assert.ok(text.includes('现在在走：分岔甲 › 分岔乙'), '标题写明一路走到了哪一层线');
     assert.ok(text.includes('现在第 3 段'), '标题段号与站点编号一致');
-    assert.ok(text.includes('不再走：内容2'), '主线被放弃的段写成「不再走」');
-    assert.ok(text.includes('「分岔甲」岔甲2'), '分岔被放弃的段也标出来源');
+    const missedDeep = collectByClass(roadmap, 'is-missed', []).map(node => node.textContent).join('|');
+    assert.ok(missedDeep.includes('内容2') && missedDeep.includes('岔甲2'), `主线和分岔被放弃的段都留在图上置灰：${missedDeep}`);
+    assert.equal(missedDeep.includes('深1'), false, '正在走的最深一层不置灰');
     assert.equal(collectByClass(roadmap, 'is-cut', []).length, 0, '不再走的段不铺成线路上的站点');
     assert.deepEqual(errors, []);
 });
@@ -4040,7 +4048,72 @@ test('分岔口和支线用同一种画法：都把分段铺成站点，嵌套�
     assert.ok(text.includes('岔乙1'), '更下层的分岔同样铺出来');
     assert.equal(findClass(roadmap, 'dga-roadmap-summary'), null, '不再用「共 N 段：…」的一行摘要');
     assert.equal(collectByClass(roadmap, 'dga-roadmap-stages', []).length, 3, '三层各铺一份站点');
-    assert.match(text, /来自：主线 › 分岔甲 › 分岔乙/, '更深的层级写在来源路径里');
+    assert.equal(text.includes('来自：'), false, '分支不再显示来源路径文字');
+    assert.equal(text.includes('分岔口'), false, '分岔口不再显示标签');
+    const titleOf = row => (row.getAttribute && row.getAttribute('title')) || row.title || '';
+    assert.ok(collectByClass(roadmap, 'is-branch', []).some(row => titleOf(row).includes('来自：主线 › 分岔甲 › 分岔乙')), '来源路径收进悬停提示');
+    assert.deepEqual(errors, []);
+});
+
+test('主线走过接点后，没走进的分岔整条置灰，当前段上的分岔照常', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '主线', content: '## 内容1\n甲\n\n## 内容2\n甲二\n\n## 内容3\n甲三', enabled: false });
+    state.entries.push({ uid: 2, name: '错过', content: '## 错过一\n乙\n\n## 错过二\n乙二', enabled: false });
+    state.entries.push({ uid: 3, name: '还能走', content: '## 还能走一\n丙', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '主线' },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '错过', attachKey: '测试世界书#uid:1', attachStage: 1, attachKind: 'fork' },
+                { worldbookName: '测试世界书', entryUid: 3, entryName: '还能走', attachKey: '测试世界书#uid:1', attachStage: 2, attachKind: 'fork' },
+            ],
+        },
+    };
+    state.variables.chat = {
+        $dynamicGuideAssistant: {
+            state: { version: 2, bindings: { [keyOf('测试世界书', 1)]: { stageIndex: 1, stageName: '内容2' } } },
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    const missed = collectByClass(roadmap, 'is-missed', []).map(node => node.textContent).join('|');
+    assert.ok(missed.includes('错过一') && missed.includes('错过二'), `走过的接点上的分岔置灰：${missed}`);
+    assert.equal(missed.includes('还能走一'), false, '当前段上的分岔还能走，不置灰');
+    assert.equal(missed.includes('内容'), false, '主线自己不算错过');
+    assert.deepEqual(errors, []);
+});
+
+test('循环线在路线图上画一根绕回第一段的线，普通线没有', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const { state, helper } = helperFor({ uid: 1, name: '日常', content: '## 早\n甲\n\n## 午\n乙\n\n## 晚\n丙', enabled: false });
+    state.entries.push({ uid: 2, name: '普通', content: '## 一\n丁\n\n## 二\n戊', enabled: false });
+    helper.getWorldbookNames = () => ['测试世界书'];
+    state.variables.character.$dynamicGuideAssistant = {
+        config: {
+            version: 2,
+            bindings: [
+                { worldbookName: '测试世界书', entryUid: 1, entryName: '日常', orderMode: 'loop', loop: true },
+                { worldbookName: '测试世界书', entryUid: 2, entryName: '普通' },
+            ],
+        },
+    };
+    const { errors, sandbox } = loadWithDocument(documentRef, helper);
+    sandbox.confirm = () => true;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '动态指导').listeners.click[0]();
+    const roadmap = panel().querySelector('.dga-roadmap');
+    assert.equal(collectByClass(roadmap, 'dga-roadmap-loop', []).length, 1, '只有循环线带回线');
     assert.deepEqual(errors, []);
 });
 

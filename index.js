@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.8
+     * 动态指导助手 v3.9
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.8';
+    const VERSION = '3.9';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -42,6 +42,9 @@
     const JUDGE_PRESET_STORAGE_KEY = 'dynamic-guide-assistant:judge-api-presets:v1';
 
     const STAGE_COLORS = ['#8b5cf6', '#3b82f6', '#14b8a6', '#f59e0b', '#ef4444', '#ec4899', '#84cc16', '#06b6d4'];
+    // 路线图支线轮换色：同一条支线一个色，不同支线一眼分得开（v3.9）。
+    const SIDE_COLORS = ['#7FBF8E', '#6FB3D9', '#C49BE0', '#E8955A', '#E07FA8', '#9CC56A'];
+
     const KIND_COLORS = { addon: '#9ca3af', always: '#0ea5e9', note: '#6b7280', merged: '#a78bfa' };
     const KIND_LABELS = { stage: '剧情阶段', addon: '附加内容', always: '常驻', note: '备注', merged: '并入已有阶段' };
     const KIND_BY_TAG = {
@@ -3764,6 +3767,8 @@
                 now,
                 live: /^现在/.test(now),
                 here: Math.min(here, stages.length),
+                // 循环线：路线图在末段画一根绕回第一段的线（v3.9）。
+                loop: Boolean(item.parsed && item.parsed.loop),
                 stages: stages.map(stage => stage.name),
                 passes,
                 branches,
@@ -6027,6 +6032,8 @@
         paceKey: '',
         // 分支走向选择（v2.63）：值为绑定 key 时弹出走向选择层
         branchPick: '',
+        roadmapZoom: 100,
+        roadmapZoomOpen: false,
         // 小卡「上次结论」的展开态（绑定 key → true）
         statusOpen: {},
         // 运行日志页：等级 + 标签筛选
@@ -6532,121 +6539,280 @@
             }, item.label)));
     }
 
-    // 一条线按分段画成线路图。走进分岔口后当场换轨：分岔的分段接着编号往下排，
-    // 原线接点之后的段只划掉留痕；分岔再分岔也照样递归接下去（v3.8）。
+    // 路线图：平行轨道（v3.9）。每一段占一列，根线在第 0 行；分岔是主线的另一种可能，
+    // 各占一行、和主线按列对齐一路往右；嵌套分岔沿父分岔那一侧往外开行。
+    // 右边的分岔先排、离主线更近，左边的往外排，连线不会穿过别的轨道。
+    // 走进分岔口后当场换轨：分岔的分段接在主线后面，原线接点之后的段写成「不再走」。
     function roadmapNodeView(node) {
-        const flow = [];
-        // 换轨后不再走的段：从线路里移出来单独写一行，免得看起来还在这条线上（v3.8）。
-        const dropped = [];
-        // 当前正在走的是哪条线、处在合并编号后的第几段；换轨后会落进分岔里，不能只看 node 自己。
-        let head = { number: null, names: [] };
+        const cells = new Map();
+        const grid = [];
+        let minRow = 0;
+        let sideSeq = 0;
+        const cellKey = (row, col) => `${row},${col}`;
+        const take = (row, col, owner) => { cells.set(cellKey(row, col), owner); minRow = Math.min(minRow, row); };
+        const place = (item, row, col, rows, cols) => { grid.push({ item, row, col, rows: rows || 1, cols: cols || 1 }); return item; };
 
-        const pushLine = (line, base, names) => {
+        function buildFlow(line, base, names, state) {
             const lineStages = line.stages || [];
             const entry = (line.branches || []).find(branch => branch.node.kind === 'fork' && branch.node.entered) || null;
             const cutAt = entry
                 ? Math.min(Math.max(1, Math.floor(Number(entry.after) || 1)), Math.max(1, lineStages.length))
                 : 0;
-            // 接点之后的段一确定就知道是哪些：先记下来，顺序自然是外层在前。
-            const cutNames = entry ? lineStages.slice(cutAt) : [];
-            if (cutNames.length) dropped.push({ line: line.name, names: cutNames });
-            // 接点之前挂着的其它依附照旧当分支块画；接点之后的不再走，也就不画。
+            // 走进分岔后不再把原线后半段删掉：整张图照常画，走进的分岔照常亮，
+            // 原线接点之后的段和其余分岔全部置灰（v3.9）。
             const grouped = new Map();
             (line.branches || []).forEach(branch => {
-                if (branch.node.abandoned) return;
-                if (entry && branch.node === entry.node) return;
+                // 已放弃的分岔也照常画出来，由「错过」置灰提示不能再走（v3.9）。
                 const after = Math.max(1, Math.floor(Number(branch.after) || 1));
-                if (entry && after > cutAt) return;
                 const slot = lineStages.length ? Math.min(after, lineStages.length) : 1;
                 if (!grouped.has(slot)) grouped.set(slot, []);
                 grouped.get(slot).push(branch.node);
             });
-            const insertAt = slot => (grouped.get(slot) || []).forEach(child => {
-                const view = roadmapNodeView(child);
-                if (view) flow.push(view);
-            });
+            const stops = [];
             let next = base;
-            let spliced = false;
-            if (!lineStages.length) insertAt(1);
-            lineStages.forEach((name, index) => {
-                const number = index + 1;
-                if (entry && number > cutAt) {
-                    if (!spliced) {
-                        spliced = true;
-                        insertAt(cutAt);
-                        next = pushLine(entry.node, next, names.concat(entry.node.name));
-                    }
-                    // 接点之后这条线不再走：不铺成站点，统一放到下面的「不再走」一行。
-                    return;
-                }
-                const live = index === line.here && line.live;
-                if (live) head = { number: next + 1, names };
-                flow.push(el('span', {
-                    class: live ? 'is-now' : (index < line.here ? 'is-done' : ''),
-                    text: `${next + 1}. ${name}`,
-                }));
-                next += 1;
-                insertAt(number);
-            });
-            if (entry && !spliced) {
-                insertAt(cutAt);
-                next = pushLine(entry.node, next, names.concat(entry.node.name));
+            if (entry) {
+                // 只借递归算出「现在在走哪条、第几段」，分岔自己的站点由它那一行去画。
+                buildFlow(entry.node, base + cutAt, names.concat(entry.node.name), state);
+                lineStages.forEach((text, index) => {
+                    const walked = index < cutAt;
+                    stops.push({ text, cls: walked ? 'is-done' : 'is-missed', kids: grouped.get(index + 1) || [], passed: true, entryKid: index + 1 === cutAt ? entry.node : null });
+                });
+                if (!lineStages.length) stops.push({ text: '还没有分段', cls: 'is-empty', kids: grouped.get(1) || [], passed: true, entryKid: entry.node });
+                return { stops, next: base + lineStages.length };
             }
-            return next;
+            for (let index = 0; index < lineStages.length; index += 1) {
+                const number = index + 1;
+                const live = index === line.here && line.live;
+                if (live) state.head = { number: next + 1, names };
+                // passed：这一段已经走过；挂在上面、没走进去的分岔从此不能再走（v3.9）。
+                stops.push({ text: lineStages[index], cls: live ? 'is-now' : (index < line.here ? 'is-done' : ''), kids: grouped.get(number) || [], passed: !live && index < line.here });
+                next += 1;
+            }
+            if (!lineStages.length) {
+                const kids = grouped.get(1) || [];
+                if (kids.length) stops.push({ text: '还没有分段', cls: 'is-empty', kids });
+            }
+            return { stops, next };
+        }
+
+        const freshState = () => ({ dropped: [], head: { number: null, names: [] } });
+        // 一条分岔要占几格：站点数，加上「不再走」和换边说明各占一格。
+        const flowLength = line => {
+            const state = freshState();
+            const count = buildFlow(line, 0, [], state).stops.length || 1;
+            return count + (state.dropped.length ? 1 : 0) + (line.passes || []).length;
         };
 
-        pushLine(node, 0, []);
+        // 子分岔先往主线那一侧靠：主线上的分岔排位时，在它和主线之间预留子孙要用的行（gap），
+        // 子孙只能落进自己祖先留的 gap 里（accept 记着可以占用的 gap 主人）。
+        const kidsOf = line => buildFlow(line, 0, [], freshState()).stops;
+        // 同一段多条子分岔：前一半往外侧排，其余往主线这侧排；只给往里排的预留行。
+        const outCount = total => (total > 1 ? Math.floor(total / 2) : 0);
+        const needIn = line => kidsOf(line).reduce((sum, stop) => {
+            const outN = outCount(stop.kids.length);
+            return sum + stop.kids.reduce((s, kid, k) => s + (k < outN ? 0 : 1 + needIn(kid)), 0);
+        }, 0);
+        const extent = line => {
+            let wide = Math.max(1, flowLength(line));
+            kidsOf(line).forEach((stop, i) => stop.kids.forEach(kid => { wide = Math.max(wide, i + 1 + extent(kid)); }));
+            return wide;
+        };
 
-        const branchKind = node.kind === 'fork' ? 'fork' : (node.kind === 'side' ? 'side' : '');
-        // 走进依附之后，这一行的标题仍是根线名，光看它分不清现在走的是哪条；
-        // 所以把当前正在走的那条线单独标出来（走进去的分岔可以不止一层）。
-        const currentName = head.names.length ? head.names[head.names.length - 1] : (head.number != null ? node.name : '');
-        const walkText = currentName && currentName !== node.name
-            ? `现在在走：${head.names.length > 1 ? head.names.join(' › ') : currentName}`
-            : '';
-        const headNow = walkText
-            ? (head.number != null ? `现在第 ${head.number} 段` : '')
-            : node.now;
-        const children = [
-            el('div', { class: 'dga-roadmap-head' },
-                branchKind ? el('span', { class: 'dga-roadmap-tag', text: branchKind === 'side' ? '支线' : '分岔口' }) : null,
-                el('b', { text: node.name }),
-                walkText ? el('span', { class: 'dga-roadmap-walk', text: walkText }) : null,
-                headNow ? el('small', { text: headNow }) : null),
-        ];
-        // 依附块接在哪一段由位置本身表达，完整说明留在 title；不再多占一行。
-        // 嵌套超过 2 层不再靠缩进区分层级，改在标题下写来源路径（v3.8）。
-        if (node.deep) children.push(el('small', { class: 'dga-roadmap-how dga-roadmap-path', text: `来自：${node.path}` }));
-        // 分岔口和支线统一成同一种画法：都把分段铺成站点。
-        // 以前分岔口收成一行「共 N 段：…」，和支线不一致，多起来很难读（v3.8）。
-        if (flow.length) {
-            children.push(el('div', { class: 'dga-roadmap-stages' }, ...flow));
-        } else if (branchKind) {
-            children.push(el('small', { class: 'dga-roadmap-how', text: '还没有分段' }));
+        // inherit：上层支线的颜色。挂在支线下面的分岔算这条支线的一部分，跟着打同色「支线」标签（v3.9）。
+        // missed：这条分岔挂在已经走过的段上，没走进去，整条置灰。
+        function lineView(line, row, col, side, accept, inherit, missed) {
+            const allowed = accept || new Set();
+            const state = freshState();
+            const stops = buildFlow(line, 0, [], state).stops;
+            const branchKind = line.kind === 'fork' ? 'fork' : (line.kind === 'side' ? 'side' : '');
+            if (!stops.length && branchKind) stops.push({ text: '还没有分段', cls: 'is-empty', kids: [] });
+            const laneOwner = `lane:${row},${col}`;
+            stops.forEach((stop, i) => take(row, col + i, laneOwner));
+            // 循环线的回线单独占下面一行，不和节点挤在同一行里（v3.9）。
+            const loopBack = Boolean(line.loop && stops.length > 1);
+            if (loopBack) stops.forEach((stop, i) => take(row + 1, col + i, `loop:${row},${col}`));
+            // 支线每一站都带「支线」标签；不同支线轮换颜色，支线下面挂的分岔跟着这条支线的颜色（v3.9）。
+            const sideColor = branchKind === 'side' ? SIDE_COLORS[(sideSeq++) % SIDE_COLORS.length] : (inherit || '');
+
+            // 先定每条分岔往哪一侧：根线上下交替（同一段多条时上下各分一半）；
+            // 已在一侧的分岔，子分岔继续往外，同一段不止一条时多出来的往主线这边分。
+            const requests = [];
+            let flip = 0;
+            stops.forEach((stop, i) => {
+                const total = stop.kids.length;
+                const upCount = total === 1 ? flip % 2 : Math.floor(total / 2) + (total % 2 ? flip % 2 : 0);
+                stop.kids.forEach((kid, k) => {
+                    const dir = side || (k < upCount ? 'up' : 'down');
+                    const prefer = side ? (k < outCount(total) ? 'out' : 'in') : 'out';
+                    requests.push({ kid, at: col + i, dir, prefer, missed: Boolean(missed || (stop.passed && kid !== stop.entryKid)), past: Boolean(missed || stop.passed) });
+                });
+                if (!side && total) flip += 1;
+            });
+
+            const kidRows = [];
+            requests.slice().sort((a, b) => b.at - a.at).forEach(req => {
+                const out = req.dir === 'up' ? -1 : 1;
+                const len = flowLength(req.kid);
+                const linkOwner = `link:${row},${req.at}`;
+                const need = side ? 0 : needIn(req.kid);
+                const wide = need ? extent(req.kid) : 0;
+                const free = (r, c, extra) => {
+                    const who = cells.get(cellKey(r, c));
+                    // 分岔竖线可以穿过循环回线那一行。
+                    return !who || allowed.has(who) || who === extra || Boolean(extra && who.startsWith('loop:'));
+                };
+                const fits = target => {
+                    for (let c = 1; c <= len; c += 1) if (!free(target, req.at + c)) return false;
+                    const step = target > row ? 1 : -1;
+                    for (let r = row + step; r !== target + step; r += step) {
+                        if (!free(r, req.at, linkOwner)) return false;
+                    }
+                    for (let k = 1; k <= need; k += 1) {
+                        const g = target - out * k;
+                        if (g * out <= 0) return false;
+                        for (let c = 1; c <= wide; c += 1) if (!free(g, req.at + c)) return false;
+                    }
+                    return true;
+                };
+                let target = null;
+                if (req.prefer === 'in') {
+                    for (let r = row - out; r * out > 0; r -= out) if (fits(r)) { target = r; break; }
+                }
+                for (let k = 1; target === null && k <= 200; k += 1) if (fits(row + out * k)) target = row + out * k;
+                if (target === null) target = row + out * 201;
+                const step = target > row ? 1 : -1;
+                const gapOwner = `gap:${target},${req.at + 1}`;
+                for (let k = 1; k <= need; k += 1) {
+                    for (let c = 1; c <= wide; c += 1) take(target - out * k, req.at + c, gapOwner);
+                }
+                for (let c = 1; c <= len; c += 1) take(target, req.at + c, `lane:${target},${req.at + 1}`);
+                for (let r = row + step; r !== target + step; r += step) take(r, req.at, linkOwner);
+                // 从走过或错过的节点出发的连线一律调暗，和节点之间的箭头同一亮度（v3.9）。
+                const link = place(el('div', { class: `dga-roadmap-link is-${step > 0 ? 'down' : 'up'}${req.missed ? ' is-missed' : (req.past ? ' is-past' : '')}`, 'aria-hidden': 'true' }, el('i')),
+                    Math.min(row, target), req.at, Math.abs(target - row) + 1);
+                const childAccept = need ? new Set([...allowed, gapOwner]) : allowed;
+                kidRows.push({ req, link, view: lineView(req.kid, target, req.at + 1, req.dir, childAccept, sideColor, req.missed) });
+            });
+
+            // DOM 顺序按列走：站点之后紧跟挂在它上面的分岔，文字顺序与阅读顺序一致。
+            const parts = [];
+            // 支线（含挂在它下面的分岔）每一站都带「支线」标签；不同支线按出现顺序轮换颜色（v3.9）。
+            stops.forEach((stop, i) => {
+                const tag = sideColor ? el('span', { class: 'dga-roadmap-tag', text: '支线' }) : null;
+                const node = el('span', { class: `${stop.cls}${sideColor ? ' is-side-stop' : ''}${missed ? ' is-missed' : ''}`.trim(), title: missed ? '已经走过这里，这条路不能再走了' : null }, tag, stop.text);
+                if (sideColor && node.style && typeof node.style.setProperty === 'function') node.style.setProperty('--dga-side-c', sideColor);
+                parts.push(place(node, row, col + i));
+                requests.filter(req => req.at === col + i).forEach(req => {
+                    const hit = kidRows.find(item => item.req === req);
+                    if (hit) parts.push(hit.link, hit.view);
+                });
+            });
+
+            // 循环线：从最后一段底下绕回第一段，箭头朝上指回开头。
+            if (loopBack) {
+                parts.push(place(el('div', { class: 'dga-roadmap-loop', 'aria-hidden': 'true', title: '走完最后一段，回到第一段' }), row, col, 2, stops.length));
+            }
+            const droppedText = state.dropped.length
+                ? `不再走：${state.dropped.map(item => (item.line === line.name ? '' : `「${item.line}」`) + item.names.join('・')).join('；')}`
+                : '';
+            const notes = (droppedText ? [{ cls: 'dga-roadmap-how dga-roadmap-dropped', text: droppedText }] : [])
+                .concat((line.passes || []).map(text => ({ cls: 'dga-roadmap-how', text })));
+            const head = state.head;
+            if (branchKind) {
+                // 分岔不写标题行，名字和来源路径收进悬停提示；说明文字接在这条轨道末尾。
+                const tail = notes.map((note, i) => {
+                    take(row, col + stops.length + i, laneOwner);
+                    return place(el('small', { class: note.cls, text: note.text }), row, col + stops.length + i);
+                });
+                return el('div', {
+                    class: `dga-roadmap-row${head.number != null ? ' is-live' : ''} is-branch is-${branchKind}`,
+                    title: [line.name, line.deep ? `来自：${line.path}` : '', line.how || ''].filter(Boolean).join('\n') || null,
+                }, el('div', { class: 'dga-roadmap-stages' }, ...parts), ...tail);
+            }
+            // 走进依附之后，标题仍是根线名；把当前正在走的那条线单独标出来。
+            const currentName = head.names.length ? head.names[head.names.length - 1] : (head.number != null ? line.name : '');
+            const walkText = currentName && currentName !== line.name
+                ? `现在在走：${head.names.length > 1 ? head.names.join(' › ') : currentName}`
+                : '';
+            const headNow = walkText ? (head.number != null ? `现在第 ${head.number} 段` : '') : line.now;
+            return el('div', { class: `dga-roadmap-row${head.number != null ? ' is-live' : ''}`, title: line.how || null },
+                el('div', { class: 'dga-roadmap-head' },
+                    el('b', { text: line.name }),
+                    walkText ? el('span', { class: 'dga-roadmap-walk', text: walkText }) : null,
+                    headNow ? el('small', { text: headNow }) : null),
+                line.deep ? el('small', { class: 'dga-roadmap-how dga-roadmap-path', text: `来自：${line.path}` }) : null,
+                parts.length ? el('div', { class: 'dga-roadmap-stages is-track' }, ...parts) : null,
+                ...notes.map(note => el('small', { class: note.cls, text: note.text })));
         }
-        if (dropped.length) {
-            const text = dropped
-                .map(item => (item.line === node.name ? '' : `「${item.line}」`) + item.names.join('・'))
-                .join('；');
-            children.push(el('small', { class: 'dga-roadmap-how dga-roadmap-dropped', text: `不再走：${text}` }));
-        }
-        children.push(...(node.passes || []).map(text => el('small', { class: 'dga-roadmap-how', text })));
-        return el('div', {
-            class: `dga-roadmap-row${head.number != null ? ' is-live' : ''}${branchKind ? ` is-branch is-${branchKind}` : ''}`,
-            title: node.how || null,
-        }, ...children);
+
+        const view = lineView(node, 0, 1, '');
+        // 行号可能是负的（上方分岔），排完后统一平移成从 1 开始的网格行。
+        grid.forEach(({ item, row, col, rows, cols }) => {
+            if (!item || !item.style) return;
+            item.style.gridRow = `${row - minRow + 1} / span ${rows}`;
+            item.style.gridColumn = cols > 1 ? `${col} / span ${cols}` : String(col);
+        });
+        return view;
     }
+
+
 
     function roadmapCard() {
         const contexts = ui.snapshot ? ui.snapshot.contexts : [];
         // v3.8 起路线图常驻展开，不再提供收起按钮。
         const rows = roadmapOutline(contexts);
-        const card = el('section', { class: 'dga-card dga-span dga-roadmap-card' },
+        const zoom = ui.roadmapZoom || 100;
+        const zoomOpen = Boolean(ui.roadmapZoomOpen);
+        const toggleZoomBtn = el('button', {
+            type: 'button',
+            class: `dga-btn dga-ghost dga-zoom-toggle${zoomOpen ? ' is-on' : ''}`,
+            title: '缩放路线图',
+            'aria-label': '缩放路线图',
+            onclick: () => {
+                ui.roadmapZoomOpen = !ui.roadmapZoomOpen;
+                render();
+            },
+        }, '🔍 缩放');
+        const zoomSlider = zoomOpen ? el('div', { class: 'dga-zoom-bar' },
+            el('span', { class: 'dga-zoom-label', text: `${zoom}%` }),
+            el('input', {
+                type: 'range',
+                class: 'dga-zoom-slider',
+                min: '50',
+                max: '150',
+                step: '5',
+                value: String(zoom),
+                oninput: event => {
+                    ui.roadmapZoom = Number(event.target.value) || 100;
+                    const wrap = hostDocument().querySelector('.dga-roadmap-zoom-wrap');
+                    if (wrap) wrap.style.setProperty('--dga-zoom', `${ui.roadmapZoom / 100}`);
+                    const label = hostDocument().querySelector('.dga-zoom-label');
+                    if (label) label.textContent = `${ui.roadmapZoom}%`;
+                },
+                onchange: event => {
+                    ui.roadmapZoom = Number(event.target.value) || 100;
+                    render();
+                },
+            }),
+            btn('重置', () => {
+                ui.roadmapZoom = 100;
+                render();
+            }, { ghost: true }),
+        ) : null;
+        const head = el('div', { class: 'dga-card-header-row' },
             el('h3', { text: '路线图' }),
+            rows.length ? toggleZoomBtn : null,
+        );
+        const card = el('section', { class: 'dga-card dga-span dga-roadmap-card' },
+            head,
+            zoomSlider,
             muted(rows.length
                 ? '按分段和依附排出来，只看不改。要改，去那一条的「设置」。'
                 : '绑定条目后，分段会列在这里。'),
-            rows.length ? el('div', { class: 'dga-roadmap' }, ...rows.map(roadmapNodeView)) : null);
+            rows.length ? el('div', {
+                class: 'dga-roadmap-zoom-wrap',
+                style: { '--dga-zoom': `${zoom / 100}` },
+            }, el('div', { class: 'dga-roadmap' }, ...rows.map(row => roadmapNodeView(row)))) : null);
         card.id = 'dga-card-roadmap';
         return card;
     }
@@ -9588,42 +9754,164 @@ ${P} .dga-foot { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px s
 ${P} .dga-foot .dga-btn { flex: 1 1 0; }
 ${P} .dga-card { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border-radius: var(--dga-radius-md); background: var(--dga-bg-1); border: 1px solid var(--dga-border); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18); }
 ${P} .dga-card h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--dga-text-1); }
+${P} .dga-card-header-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+${P} .dga-zoom-toggle { padding: 3px 8px; font-size: 12px; line-height: 18px; border-radius: var(--dga-radius-sm); }
+${P} .dga-zoom-bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: var(--dga-bg-2); border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); margin-bottom: 4px; }
+${P} .dga-zoom-slider { flex: 1 1 auto; height: 6px; cursor: pointer; accent-color: var(--dga-accent); }
+${P} .dga-zoom-label { font-size: 12px; font-weight: 600; color: var(--dga-text-2); min-width: 40px; }
+/* 缩放只缩轨道里的节点和连线（zoom 参与排版），每条线的框和标题不跟着缩，超出的部分在轨道里横向滚动 */
+${P} .dga-roadmap-zoom-wrap { width: 100%; min-width: 0; }
+${P} .dga-roadmap-stages.is-track { zoom: var(--dga-zoom, 1); }
 
-/* 路线图（v3.8）：游戏时间线卡片风。
-   每段节点卡片化，时间轴轨道串联；分支小卡内嵌引线，当前阶段高亮。
-   所有宽度 100% 伸展、文字自动换行，移动端自适应。 */
-${P} .dga-roadmap { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-${P} .dga-roadmap-row { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: var(--dga-bg-2); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
+/* 路线图：横向节点流程图 / 游戏时间线。
+   节点从左到右卡片化排列，分支从节点处上下分流并列展开，当前阶段高亮；支持横向平滑滑动。 */
+${P} .dga-roadmap { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+${P} .dga-roadmap-row { position: relative; display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: var(--dga-bg-2); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2); }
 ${P} .dga-roadmap-row.is-live { border-color: color-mix(in srgb, var(--dga-accent) 45%, var(--dga-border)); box-shadow: 0 0 12px color-mix(in srgb, var(--dga-accent) 15%, transparent); }
 ${P} .dga-roadmap-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
-${P} .dga-roadmap-head b { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700; color: var(--dga-text-1); letter-spacing: 0.2px; overflow-wrap: anywhere; }
+${P} .dga-roadmap-head b { flex: 0 1 auto; min-width: 0; font-size: 14px; font-weight: 700; color: var(--dga-text-1); letter-spacing: 0.2px; overflow-wrap: anywhere; }
 ${P} .dga-roadmap-head small, ${P} .dga-roadmap-how { color: var(--dga-text-3); font-size: 12px; overflow-wrap: anywhere; }
 ${P} .dga-roadmap-walk { flex: 0 1 auto; min-width: 0; padding: 2px 8px; border-radius: 999px; font-size: 11px; line-height: 18px; font-weight: 600; color: var(--dga-accent); background: color-mix(in srgb, var(--dga-accent) 16%, transparent); border: 1px solid color-mix(in srgb, var(--dga-accent) 30%, transparent); overflow-wrap: anywhere; }
 ${P} .dga-roadmap-tag { flex: 0 0 auto; padding: 1px 7px; border-radius: 999px; font-size: 11px; line-height: 18px; font-weight: 700; color: var(--dga-accent); background: color-mix(in srgb, var(--dga-accent) 16%, transparent); border: 1px solid color-mix(in srgb, var(--dga-accent) 28%, transparent); }
 ${P} .dga-roadmap-row.is-side > .dga-roadmap-head > .dga-roadmap-tag { color: var(--dga-success); background: color-mix(in srgb, var(--dga-success) 16%, transparent); border-color: color-mix(in srgb, var(--dga-success) 28%, transparent); }
-/* 轨道：中心固定在容器左侧 6px；--dga-dot 按段落左边界算好，圆点永远压在轨道正中。 */
-${P} .dga-roadmap-stages { --dga-dot: -11px; position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 6px; min-width: 0; padding-left: 18px; font-size: 13px; color: var(--dga-text-2); }
-${P} .dga-roadmap-stages::before { content: ''; position: absolute; left: 5px; top: 14px; bottom: 14px; width: 2px; border-radius: 1px; background: linear-gradient(to bottom, var(--dga-border-2), var(--dga-border)); }
-${P} .dga-roadmap-stages > span { position: relative; display: block; min-width: 0; margin-left: -4px; padding: 6px 10px; border-radius: var(--dga-radius-sm); line-height: 1.45; background: var(--dga-bg-1); border: 1px solid var(--dga-border); overflow-wrap: anywhere; transition: border-color 0.15s ease, background 0.15s ease; }
-${P} .dga-roadmap-stages > span::before { content: ''; position: absolute; left: var(--dga-dot); top: 50%; width: 6px; height: 6px; border-radius: 50%; transform: translateY(-50%); background: var(--dga-border-2); }
-${P} .dga-roadmap-stages .is-done { color: var(--dga-text-3); background: color-mix(in srgb, var(--dga-bg-1) 70%, transparent); border-color: transparent; }
-${P} .dga-roadmap-stages .is-done::before { background: var(--dga-text-3); }
-${P} .dga-roadmap-stages .is-now { color: var(--dga-text-1); font-weight: 600; background: color-mix(in srgb, var(--dga-accent) 12%, var(--dga-bg-1)); border-color: color-mix(in srgb, var(--dga-accent) 45%, var(--dga-border)); box-shadow: 0 0 8px color-mix(in srgb, var(--dga-accent) 20%, transparent); }
-${P} .dga-roadmap-stages .is-now::before { left: calc(var(--dga-dot) - 1px); width: 8px; height: 8px; background: var(--dga-accent); box-shadow: 0 0 0 3px var(--dga-accent-glow); }
-${P} .dga-roadmap-dropped { padding-left: 18px; color: var(--dga-text-3); }
-/* 分支：轨道上的浅色小卡，整行宽，带边框与引线。 */
-${P} .dga-roadmap-stages > .dga-roadmap-row { margin: 4px 0 6px; padding: 10px 12px; gap: 6px; background: var(--dga-bg-1); border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border); }
-${P} .dga-roadmap-stages > .dga-roadmap-row.is-fork { border-left: 3px solid var(--dga-accent); }
-${P} .dga-roadmap-stages > .dga-roadmap-row.is-side { border-left: 3px solid var(--dga-success); }
-${P} .dga-roadmap-stages > .dga-roadmap-row .dga-roadmap-head b { font-size: 13px; }
-/* 二级起缩进固定 12px，更深层级不再右移，改由来源路径说明。 */
-${P} .dga-roadmap-stages .dga-roadmap-stages { --dga-dot: -5px; padding-left: 12px; }
-${P} .dga-roadmap-stages .dga-roadmap-stages::before { left: 5px; top: 12px; bottom: 12px; }
+/* 横向轨道：从左到右横向排列节点与分叉，支持横向平滑滚动 */
+${P} .dga-roadmap-stages { position: relative; display: flex; flex-direction: row; align-items: center; flex-wrap: nowrap; gap: 0; min-width: 0; padding: 8px 4px 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--dga-border-2) transparent; }
+${P} .dga-roadmap-stages::-webkit-scrollbar { height: 5px; }
+${P} .dga-roadmap-stages::-webkit-scrollbar-thumb { background: var(--dga-border-2); border-radius: 3px; }
+/* 节点卡片：横向自适应卡片，内部文字换行，带向右连接箭头 */
+${P} .dga-roadmap-stages > span, ${P} .dga-roadmap-junction > span { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; min-width: 90px; max-width: 180px; padding: 8px 12px; margin-right: 28px; border-radius: var(--dga-radius-sm); font-size: 13px; line-height: 1.4; color: var(--dga-text-2); background: var(--dga-bg-1); border: 1px solid var(--dga-border); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18); text-align: center; white-space: normal; overflow-wrap: anywhere; }
+${P} .dga-roadmap-stages > span::after { content: ''; position: absolute; right: -26px; top: 50%; width: 22px; height: 2px; background: var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
+${P} .dga-roadmap-stages > span::before { content: ''; position: absolute; right: -28px; top: 50%; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); transform: translateY(-50%); z-index: 1; pointer-events: none; }
+${P} .dga-roadmap-stages > span:last-child::after, ${P} .dga-roadmap-stages > span:last-child::before { display: none; }
+${P} .dga-roadmap-stages > span.is-done, ${P} .dga-roadmap-junction > span.is-done { color: var(--dga-text-3); background: color-mix(in srgb, var(--dga-bg-1) 75%, transparent); border-color: color-mix(in srgb, var(--dga-border) 60%, transparent); opacity: 0.85; }
+${P} .dga-roadmap-stages > span.is-done::after { background: var(--dga-text-3); }
+${P} .dga-roadmap-stages > span.is-done::before { border-left-color: var(--dga-text-3); }
+${P} .dga-roadmap-stages > span.is-now, ${P} .dga-roadmap-junction > span.is-now { color: var(--dga-text-1); font-weight: 700; background: color-mix(in srgb, var(--dga-accent) 14%, var(--dga-bg-1)); border-color: color-mix(in srgb, var(--dga-accent) 55%, var(--dga-border)); box-shadow: 0 0 10px color-mix(in srgb, var(--dga-accent) 22%, transparent); }
+${P} .dga-roadmap-stages > span.is-now::after { background: var(--dga-accent); }
+${P} .dga-roadmap-stages > span.is-now::before { border-left-color: var(--dga-accent); }
+${P} .dga-roadmap-dropped { padding: 4px 8px; color: var(--dga-text-3); font-size: 12px; background: color-mix(in srgb, var(--dga-bg-1) 50%, transparent); border-radius: var(--dga-radius-sm); border: 1px dashed var(--dga-border); }
+/* 接点：三行网格，上下两行等高，节点永远落在正中，主线因此保持一条直线；
+   分岔交替挂在节点上方或下方。主线连线横穿整个接点，箭头尖顶在下一个节点左边。 */
+${P} .dga-roadmap-junction { position: relative; display: grid; grid-template-rows: 1fr auto 1fr; justify-items: start; flex: 0 0 auto; margin-right: 28px; }
+${P} .dga-roadmap-junction > span { grid-row: 2; margin-right: 0; z-index: 1; }
+${P} .dga-roadmap-junction > span::before, ${P} .dga-roadmap-junction > span::after { display: none; }
+${P} .dga-roadmap-junction::before { content: ''; position: absolute; left: 0; right: -26px; top: 50%; height: 2px; background: var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
+${P} .dga-roadmap-junction::after { content: ''; position: absolute; right: -28px; top: 50%; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
+${P} .dga-roadmap-junction:last-child::before, ${P} .dga-roadmap-junction:last-child::after { display: none; }
+/* 竖线从节点水平正中落下：--dga-stop-mid 由渲染后量出的节点半宽填入，量不到时按最小宽度的一半 */
+/* 各级分岔与节点之间统一留 40px，层与层之间不挤 */
+${P} .dga-roadmap-junction > .dga-roadmap-fork.is-up { grid-row: 1; align-self: end; margin: 0 0 40px calc(var(--dga-stop-mid, 45px) - 1px); }
+${P} .dga-roadmap-junction > .dga-roadmap-fork.is-down { grid-row: 3; align-self: start; margin: 40px 0 0 calc(var(--dga-stop-mid, 45px) - 1px); }
+/* 上方分岔：竖线从最上一条的中线一直落到节点顶；下方分岔：从节点底一直到最下一条的中线 */
+${P} .dga-roadmap-junction > .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane:last-child::after { bottom: -40px; }
+${P} .dga-roadmap-junction > .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane:first-child::after { top: -40px; }
+${P} .dga-roadmap-junction > .dga-roadmap-fork > .dga-roadmap-fork-lanes > .dga-roadmap-lane:only-child::after { display: block; }
+/* 分支里的站点向节点那一侧对齐：下方分岔靠上、上方分岔靠下；嵌套接点只留用到的行，不再撑出对称空白（v3.9）。
+   连线按节点中线（--dga-stop-c）定位，不再按整条泳道的 50%。 */
+${P} .dga-roadmap { --dga-stop-c: 18px; }
+${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row, ${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages { align-items: flex-start; }
+${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row, ${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages { align-items: flex-end; }
+${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages > .dga-roadmap-junction, ${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages > .dga-roadmap-junction { grid-template-rows: auto auto auto; }
+${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages > .dga-roadmap-junction::before, ${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages > .dga-roadmap-junction::after { top: var(--dga-stop-y, var(--dga-stop-c)); }
+${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages > .dga-roadmap-junction::before, ${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages > .dga-roadmap-junction::after { top: var(--dga-stop-y, calc(100% - var(--dga-stop-c))); }
+${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane::before, ${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row::before { top: var(--dga-stop-c); }
+${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane::before { top: calc(100% - var(--dga-lane-pad, 0px) - var(--dga-stop-c)); }
+${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row::before { top: calc(100% - var(--dga-stop-c)); }
+${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane:last-child::after { bottom: calc(100% - var(--dga-stop-c)); }
+${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane:first-child::after { top: calc(100% - var(--dga-lane-pad, 0px) - var(--dga-stop-c)); }
+${P} .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-tag { margin-top: calc(var(--dga-stop-c) - 10px); }
+${P} .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-tag { margin-bottom: calc(var(--dga-stop-c) - 10px); }
+${P} .dga-roadmap-fork { position: relative; display: inline-flex; flex-direction: row; align-items: stretch; flex: 0 0 auto; margin-right: 0; }
+${P} .dga-roadmap-fork-lanes { position: relative; display: flex; flex-direction: column; justify-content: center; gap: 16px; padding: 0 0 0 24px; border-left: none; }
+${P} .dga-roadmap-lane { position: relative; display: flex; flex-direction: row; align-items: center; flex-wrap: nowrap; min-width: 0; }
+/* 分岔括号：竖线只连第一条到最后一条支线的中线，不上下伸出；每条支线一段横向短线接进去 */
+${P} .dga-roadmap-lane::before { content: ''; position: absolute; left: -24px; top: 50%; width: 18px; height: 2px; background: var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
+${P} .dga-roadmap-lane::after { content: ''; position: absolute; left: -24px; top: -8px; bottom: -8px; width: 2px; background: var(--dga-border-2); pointer-events: none; }
+${P} .dga-roadmap-lane:first-child::after { top: 50%; }
+${P} .dga-roadmap-lane:last-child::after { bottom: 50%; }
+${P} .dga-roadmap-lane:only-child::after { display: none; }
+/* 分支行：扁平化，无外框无底色无标题，只铺站点；支线前面一个小标签 */
+${P} .dga-roadmap-lane > .dga-roadmap-row { flex-direction: row; align-items: center; flex-wrap: nowrap; gap: 6px; margin: 0; padding: 0; background: transparent; border: none; border-radius: 0; box-shadow: none; }
+${P} .dga-roadmap-lane > .dga-roadmap-row > small { white-space: nowrap; }
+${P} .dga-roadmap-row.is-side > .dga-roadmap-tag { color: var(--dga-success); background: color-mix(in srgb, var(--dga-success) 16%, transparent); border-color: color-mix(in srgb, var(--dga-success) 28%, transparent); }
+/* 分岔横线末端的箭头：尖顶在分支第一个站点（或支线标签）左边 */
+${P} .dga-roadmap-lane > .dga-roadmap-row::before { content: ''; position: absolute; left: -6px; top: 50%; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); transform: translateY(-50%); pointer-events: none; z-index: 1; }
+${P} .dga-roadmap-lane > .dga-roadmap-row .dga-roadmap-head b { font-size: 13px; }
+${P} .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages { padding: 0; }
+/* 嵌套的站点交给最外层那条线统一横向滚动，不再每层各出一条滚动条、也不裁掉上方分岔 */
+${P} .dga-roadmap-stages .dga-roadmap-stages { overflow: visible; }
 ${P} .dga-roadmap-path { font-size: 11px; }
+/* 平行轨道（v3.9）：一段一列、一条线一行；分支行和它的站点容器只是逻辑分组（display: contents），
+   站点都直接落在同一张网格里，所以各条轨道按列对齐。 */
+/* 行高要比节点高出一截，行与行之间留出空隙；段名不换行，节点高度固定，不会挤到上下行（v3.9） */
+${P} .dga-roadmap { --dga-row-h: 64px; --dga-col-gap: 28px; }
+${P} .dga-roadmap-stages.is-track { display: grid; grid-auto-rows: var(--dga-row-h); grid-auto-columns: minmax(90px, max-content); column-gap: var(--dga-col-gap); row-gap: 0; align-items: center; justify-items: stretch; padding: 4px 4px 10px; }
+${P} .dga-roadmap-stages.is-track .dga-roadmap-row, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages { display: contents; }
+${P} .dga-roadmap-stages.is-track > span, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages > span { margin-right: 0; gap: 6px; z-index: 1; white-space: nowrap; max-width: none; }
+${P} .dga-roadmap-stages > span:last-of-type::after, ${P} .dga-roadmap-stages > span:last-of-type::before { display: none; }
+${P} .dga-roadmap-stages > span.is-empty { color: var(--dga-text-3); border-style: dashed; }
+/* 支线标签挂在节点右上角外侧，不占节点宽度，段名不会被挤成两行 */
+${P} .dga-roadmap-stages > span > .dga-roadmap-tag { position: absolute; top: -9px; right: -6px; padding: 0 6px; font-size: 10px; line-height: 16px; z-index: 2; pointer-events: none; white-space: nowrap; }
+${P} .dga-roadmap-stages > span.is-side-stop > .dga-roadmap-tag { color: var(--dga-side-c, var(--dga-success)); background: color-mix(in srgb, var(--dga-side-c, var(--dga-success)) 16%, var(--dga-bg-1)); border-color: color-mix(in srgb, var(--dga-side-c, var(--dga-success)) 40%, transparent); }
+/* 支线站点：边框带上这条支线自己的颜色，同一条支线一个色，不同支线轮换 */
+${P} .dga-roadmap-stages > span.is-side-stop { border-color: color-mix(in srgb, var(--dga-side-c) 55%, var(--dga-border)); }
+/* 错过的分岔：主线已经走过接点、没有走进去，整条置灰，提示不能再走 */
+/* 置灰的节点用不透明底色盖住身后的连线，只把文字和边框调暗，不降整个节点的透明度 */
+/* 灰掉的节点融进卡片底色（不发黑），文字和边框淡下去；还没走到的节点更亮，两者一眼分开 */
+${P} .dga-roadmap-stages > span.is-missed { color: color-mix(in srgb, var(--dga-text-3) 55%, var(--dga-bg-1)); background: var(--dga-bg-1); border-style: dashed; border-color: color-mix(in srgb, var(--dga-border-2) 45%, var(--dga-bg-1)); box-shadow: none; opacity: 1; filter: grayscale(1); }
+/* 主线已经走过的段：和错过的分岔一样置灰（实线框，表示走过而不是错过） */
+${P} .dga-roadmap-stages > span.is-done { color: color-mix(in srgb, var(--dga-text-3) 65%, var(--dga-bg-1)); background: var(--dga-bg-1); border-color: color-mix(in srgb, var(--dga-border-2) 55%, var(--dga-bg-1)); box-shadow: none; opacity: 1; filter: grayscale(1); }
+/* 连线统一一种颜色：走过的、错过的、还没走的都一样，只有当前段出去的那根用主色 */
+/* 调暗用不透明的暗色，不用 opacity：同一列好几根竖线重叠时不会越叠越亮（v3.9） */
+${P} .dga-roadmap { --dga-line-dim: color-mix(in srgb, var(--dga-border-2) 40%, var(--dga-bg-1)); }
+${P} .dga-roadmap-stages > span.is-done::after, ${P} .dga-roadmap-stages > span.is-missed::after { background: var(--dga-line-dim); opacity: 1; }
+${P} .dga-roadmap-stages > span.is-done::before, ${P} .dga-roadmap-stages > span.is-missed::before { border-left-color: var(--dga-line-dim); opacity: 1; }
+/* 通往错过分岔的竖线、拐线和箭头整体调暗，和灰掉的节点一致；其余连线保持原亮度 */
+${P} .dga-roadmap-link { opacity: 1; }
+${P} .dga-roadmap-link.is-missed, ${P} .dga-roadmap-link.is-past { opacity: 1; }
+${P} .dga-roadmap-link.is-missed::before, ${P} .dga-roadmap-link.is-missed::after, ${P} .dga-roadmap-link.is-past::before, ${P} .dga-roadmap-link.is-past::after { background: var(--dga-line-dim); }
+${P} .dga-roadmap-link.is-missed > i, ${P} .dga-roadmap-link.is-past > i { border-left-color: var(--dga-line-dim); }
+/* 循环回线：从末段节点底下落下、横穿到第一段底下，再朝上指回第一段 */
+${P} .dga-roadmap { --dga-stop-half: 18px; }
+${P} .dga-roadmap-loop { position: relative; align-self: stretch; justify-self: stretch; pointer-events: none; z-index: 0; }
+${P} .dga-roadmap-loop::before { content: ''; position: absolute; left: 28px; right: 28px; top: calc(var(--dga-row-h) / 2 + var(--dga-stop-half)); bottom: calc(var(--dga-row-h) / 2); border-style: solid; border-width: 0 2px 2px; border-color: var(--dga-border-2); border-radius: 0 0 10px 10px; }
+${P} .dga-roadmap-loop::after { content: ''; position: absolute; left: 24px; top: calc(var(--dga-row-h) / 2 + var(--dga-stop-half)); width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 7px solid var(--dga-border-2); }
+/* 灰掉节点右上角的「支线」标签也一起调暗，不再比节点本身亮 */
+${P} .dga-roadmap-stages > span.is-missed > .dga-roadmap-tag, ${P} .dga-roadmap-stages > span.is-done > .dga-roadmap-tag { color: color-mix(in srgb, var(--dga-text-3) 55%, var(--dga-bg-1)); background: var(--dga-bg-1); border-color: color-mix(in srgb, var(--dga-border-2) 45%, var(--dga-bg-1)); }
+/* 还没走到的段：比灰掉的亮一档，两者一眼分开 */
+${P} .dga-roadmap-stages > span:not(.is-done):not(.is-missed):not(.is-now):not(.is-empty) { color: var(--dga-text-1); background: var(--dga-bg-2); border-color: var(--dga-border-2); }
+${P} .dga-roadmap-stages.is-track .dga-roadmap-how { justify-self: start; white-space: nowrap; }
+/* 分岔连线：从节点正中落下（被节点盖住起点），拐进分岔第一格，箭头尖顶在第一个站点左边 */
+${P} .dga-roadmap-link { position: relative; align-self: stretch; justify-self: stretch; pointer-events: none; z-index: 0; }
+${P} .dga-roadmap-link::before { content: ''; position: absolute; left: calc(50% - 1px); width: 2px; top: calc(var(--dga-row-h) / 2); bottom: calc(var(--dga-row-h) / 2); background: var(--dga-border-2); }
+${P} .dga-roadmap-link::after { content: ''; position: absolute; left: 50%; right: calc(4px - var(--dga-col-gap)); height: 2px; background: var(--dga-border-2); }
+${P} .dga-roadmap-link.is-down::after { bottom: calc(var(--dga-row-h) / 2 - 1px); }
+${P} .dga-roadmap-link.is-up::after { top: calc(var(--dga-row-h) / 2 - 1px); }
+${P} .dga-roadmap-link > i { position: absolute; right: calc(0px - var(--dga-col-gap)); width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); }
+${P} .dga-roadmap-link.is-down > i { bottom: calc(var(--dga-row-h) / 2 - 4px); }
+${P} .dga-roadmap-link.is-up > i { top: calc(var(--dga-row-h) / 2 - 4px); }
 @media (max-width: 480px) {
-    ${P} .dga-roadmap-row { padding: 10px 12px; }
-    ${P} .dga-roadmap-stages > .dga-roadmap-row { padding: 8px 10px; }
-    ${P} .dga-roadmap-stages > span { padding: 6px 8px; font-size: 12.5px; }
+    ${P} .dga-roadmap-row { padding: 10px 10px; }
+    ${P} .dga-roadmap-lane > .dga-roadmap-row { padding: 0; }
+    ${P} .dga-roadmap-fork-lanes { padding-left: 18px; gap: 12px; }
+    ${P} .dga-roadmap-lane::before { left: -18px; width: 12px; }
+    ${P} .dga-roadmap-lane::after { left: -18px; top: -6px; bottom: -6px; }
+    ${P} .dga-roadmap-lane:first-child::after { top: 50%; }
+    ${P} .dga-roadmap-lane:last-child::after { bottom: 50%; }
+    ${P} .dga-roadmap-junction { margin-right: 20px; }
+    ${P} .dga-roadmap { --dga-stop-c: 15px; }
+    ${P} .dga-roadmap { --dga-row-h: 54px; --dga-col-gap: 20px; }
+    ${P} .dga-roadmap { --dga-stop-half: 15px; }
+    ${P} .dga-roadmap-stages.is-track { grid-auto-columns: minmax(75px, max-content); }
+    ${P} .dga-roadmap-junction::before { right: -18px; }
+    ${P} .dga-roadmap-junction::after { right: -20px; }
+    ${P} .dga-roadmap-junction > .dga-roadmap-fork.is-up { margin: 0 0 28px calc(var(--dga-stop-mid, 37px) - 1px); }
+    ${P} .dga-roadmap-junction > .dga-roadmap-fork.is-down { margin: 28px 0 0 calc(var(--dga-stop-mid, 37px) - 1px); }
+    ${P} .dga-roadmap-junction > .dga-roadmap-fork.is-up > .dga-roadmap-fork-lanes > .dga-roadmap-lane:last-child::after { bottom: -28px; }
+    ${P} .dga-roadmap-junction > .dga-roadmap-fork.is-down > .dga-roadmap-fork-lanes > .dga-roadmap-lane:first-child::after { top: -28px; }
+    ${P} .dga-roadmap-stages > span { min-width: 75px; max-width: 140px; padding: 6px 8px; font-size: 12px; margin-right: 20px; }
+    ${P} .dga-roadmap-stages > span::after { right: -18px; width: 14px; }
+    ${P} .dga-roadmap-stages > span::before { right: -20px; }
 }
 ${P} .dga-health-list { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); overflow: hidden; }
 ${P} .dga-health-item { display: grid; grid-template-columns: 32px minmax(0, 1fr) max-content; column-gap: 10px; row-gap: 6px; align-items: center; padding: 8px 12px; border: 0; border-radius: 0; background: transparent; }
