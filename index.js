@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.9.1
+     * 动态指导助手 v3.9.2
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.9.1';
+    const VERSION = '3.9.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -9782,7 +9782,7 @@ ${P} .dga-roadmap-stages::-webkit-scrollbar-thumb { background: var(--dga-border
 /* 节点卡片：横向自适应卡片，内部文字换行，带向右连接箭头 */
 ${P} .dga-roadmap-stages > span, ${P} .dga-roadmap-junction > span { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; min-width: 90px; max-width: 180px; padding: 8px 12px; margin-right: 28px; border-radius: var(--dga-radius-sm); font-size: 13px; line-height: 1.4; color: var(--dga-text-2); background: var(--dga-bg-1); border: 1px solid var(--dga-border); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18); text-align: center; white-space: normal; overflow-wrap: anywhere; }
 ${P} .dga-roadmap-stages > span::after { content: ''; position: absolute; right: -26px; top: 50%; width: 22px; height: 2px; background: var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
-${P} .dga-roadmap-stages > span::before { content: ''; position: absolute; right: -28px; top: 50%; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); transform: translateY(-50%); z-index: 1; pointer-events: none; }
+${P} .dga-roadmap-stages > span::before { content: ''; position: absolute; right: -28px; top: 50%; width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 10px solid var(--dga-border-2); transform: translateY(-50%); z-index: 1; pointer-events: none; }
 ${P} .dga-roadmap-stages > span:last-child::after, ${P} .dga-roadmap-stages > span:last-child::before { display: none; }
 ${P} .dga-roadmap-stages > span.is-done, ${P} .dga-roadmap-junction > span.is-done { color: var(--dga-text-3); background: color-mix(in srgb, var(--dga-bg-1) 75%, transparent); border-color: color-mix(in srgb, var(--dga-border) 60%, transparent); opacity: 0.85; }
 ${P} .dga-roadmap-stages > span.is-done::after { background: var(--dga-text-3); }
@@ -9797,7 +9797,7 @@ ${P} .dga-roadmap-junction { position: relative; display: grid; grid-template-ro
 ${P} .dga-roadmap-junction > span { grid-row: 2; margin-right: 0; z-index: 1; }
 ${P} .dga-roadmap-junction > span::before, ${P} .dga-roadmap-junction > span::after { display: none; }
 ${P} .dga-roadmap-junction::before { content: ''; position: absolute; left: 0; right: -26px; top: 50%; height: 2px; background: var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
-${P} .dga-roadmap-junction::after { content: ''; position: absolute; right: -28px; top: 50%; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
+${P} .dga-roadmap-junction::after { content: ''; position: absolute; right: -28px; top: 50%; width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 10px solid var(--dga-border-2); transform: translateY(-50%); pointer-events: none; }
 ${P} .dga-roadmap-junction:last-child::before, ${P} .dga-roadmap-junction:last-child::after { display: none; }
 /* 竖线从节点水平正中落下：--dga-stop-mid 由渲染后量出的节点半宽填入，量不到时按最小宽度的一半 */
 /* 各级分岔与节点之间统一留 40px，层与层之间不挤 */
@@ -9836,7 +9836,7 @@ ${P} .dga-roadmap-lane > .dga-roadmap-row { flex-direction: row; align-items: ce
 ${P} .dga-roadmap-lane > .dga-roadmap-row > small { white-space: nowrap; }
 ${P} .dga-roadmap-row.is-side > .dga-roadmap-tag { color: var(--dga-success); background: color-mix(in srgb, var(--dga-success) 16%, transparent); border-color: color-mix(in srgb, var(--dga-success) 28%, transparent); }
 /* 分岔横线末端的箭头：尖顶在分支第一个站点（或支线标签）左边 */
-${P} .dga-roadmap-lane > .dga-roadmap-row::before { content: ''; position: absolute; left: -6px; top: 50%; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); transform: translateY(-50%); pointer-events: none; z-index: 1; }
+${P} .dga-roadmap-lane > .dga-roadmap-row::before { content: ''; position: absolute; left: -6px; top: 50%; width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 10px solid var(--dga-border-2); transform: translateY(-50%); pointer-events: none; z-index: 1; }
 ${P} .dga-roadmap-lane > .dga-roadmap-row .dga-roadmap-head b { font-size: 13px; }
 ${P} .dga-roadmap-lane > .dga-roadmap-row > .dga-roadmap-stages { padding: 0; }
 /* 嵌套的站点交给最外层那条线统一横向滚动，不再每层各出一条滚动条、也不裁掉上方分岔 */
@@ -9845,7 +9845,10 @@ ${P} .dga-roadmap-path { font-size: 11px; }
 /* 平行轨道（v3.9）：一段一列、一条线一行；分支行和它的站点容器只是逻辑分组（display: contents），
    站点都直接落在同一张网格里，所以各条轨道按列对齐。 */
 /* 行高要比节点高出一截，行与行之间留出空隙；段名不换行，节点高度固定，不会挤到上下行（v3.9） */
-${P} .dga-roadmap { --dga-row-h: 64px; --dga-col-gap: 28px; }
+${P} .dga-roadmap { --dga-row-h: 64px; --dga-col-gap: 44px; }
+/* 轨道里节点之间的连线长度跟着列间距走，箭头尖顶在下一个节点左边（v3.9.2） */
+${P} .dga-roadmap-stages.is-track > span::after, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages > span::after { right: calc(4px - var(--dga-col-gap)); width: calc(var(--dga-col-gap) - 10px); }
+${P} .dga-roadmap-stages.is-track > span::before, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages > span::before { right: calc(0px - var(--dga-col-gap)); }
 ${P} .dga-roadmap-stages.is-track { display: grid; grid-auto-rows: var(--dga-row-h); grid-auto-columns: max-content; column-gap: var(--dga-col-gap); row-gap: 0; align-items: center; justify-items: stretch; padding: 4px 4px 10px; }
 ${P} .dga-roadmap-stages.is-track .dga-roadmap-row, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages { display: contents; }
 ${P} .dga-roadmap-stages.is-track > span, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages > span { margin-right: 0; gap: 6px; z-index: 1; white-space: nowrap; max-width: none; }
@@ -9876,7 +9879,7 @@ ${P} .dga-roadmap-link.is-missed > i, ${P} .dga-roadmap-link.is-past > i { borde
 ${P} .dga-roadmap { --dga-stop-half: 18px; }
 ${P} .dga-roadmap-loop { position: relative; align-self: stretch; justify-self: stretch; pointer-events: none; z-index: 0; }
 ${P} .dga-roadmap-loop::before { content: ''; position: absolute; left: 28px; right: 28px; top: calc(var(--dga-row-h) / 2 + var(--dga-stop-half)); bottom: calc(var(--dga-row-h) / 2); border-style: solid; border-width: 0 2px 2px; border-color: var(--dga-border-2); border-radius: 0 0 10px 10px; }
-${P} .dga-roadmap-loop::after { content: ''; position: absolute; left: 24px; top: calc(var(--dga-row-h) / 2 + var(--dga-stop-half)); width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 7px solid var(--dga-border-2); }
+${P} .dga-roadmap-loop::after { content: ''; position: absolute; left: 22px; top: calc(var(--dga-row-h) / 2 + var(--dga-stop-half)); width: 0; height: 0; border-left: 7px solid transparent; border-right: 7px solid transparent; border-bottom: 10px solid var(--dga-border-2); }
 /* 灰掉节点右上角的「支线」标签也一起调暗，不再比节点本身亮 */
 ${P} .dga-roadmap-stages > span.is-missed > .dga-roadmap-tag, ${P} .dga-roadmap-stages > span.is-done > .dga-roadmap-tag { color: color-mix(in srgb, var(--dga-text-3) 55%, var(--dga-bg-1)); background: var(--dga-bg-1); border-color: color-mix(in srgb, var(--dga-border-2) 45%, var(--dga-bg-1)); }
 /* 还没走到的段：比灰掉的亮一档，两者一眼分开 */
@@ -9888,9 +9891,9 @@ ${P} .dga-roadmap-link::before { content: ''; position: absolute; left: calc(50%
 ${P} .dga-roadmap-link::after { content: ''; position: absolute; left: 50%; right: calc(4px - var(--dga-col-gap)); height: 2px; background: var(--dga-border-2); }
 ${P} .dga-roadmap-link.is-down::after { bottom: calc(var(--dga-row-h) / 2 - 1px); }
 ${P} .dga-roadmap-link.is-up::after { top: calc(var(--dga-row-h) / 2 - 1px); }
-${P} .dga-roadmap-link > i { position: absolute; right: calc(0px - var(--dga-col-gap)); width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid var(--dga-border-2); }
-${P} .dga-roadmap-link.is-down > i { bottom: calc(var(--dga-row-h) / 2 - 4px); }
-${P} .dga-roadmap-link.is-up > i { top: calc(var(--dga-row-h) / 2 - 4px); }
+${P} .dga-roadmap-link > i { position: absolute; right: calc(0px - var(--dga-col-gap)); width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 10px solid var(--dga-border-2); }
+${P} .dga-roadmap-link.is-down > i { bottom: calc(var(--dga-row-h) / 2 - 6px); }
+${P} .dga-roadmap-link.is-up > i { top: calc(var(--dga-row-h) / 2 - 6px); }
 @media (max-width: 480px) {
     ${P} .dga-roadmap-row { padding: 10px 10px; }
     ${P} .dga-roadmap-lane > .dga-roadmap-row { padding: 0; }
@@ -9901,7 +9904,7 @@ ${P} .dga-roadmap-link.is-up > i { top: calc(var(--dga-row-h) / 2 - 4px); }
     ${P} .dga-roadmap-lane:last-child::after { bottom: 50%; }
     ${P} .dga-roadmap-junction { margin-right: 20px; }
     ${P} .dga-roadmap { --dga-stop-c: 15px; }
-    ${P} .dga-roadmap { --dga-row-h: 54px; --dga-col-gap: 20px; }
+    ${P} .dga-roadmap { --dga-row-h: 54px; --dga-col-gap: 34px; }
     ${P} .dga-roadmap { --dga-stop-half: 15px; }
     /* 手机上容器窄，minmax 会把列压回最小宽度、字溢出节点；列宽一律按段名实际宽度，放不下就横向滚动（v3.9.1） */
     ${P} .dga-roadmap-stages.is-track { grid-auto-columns: max-content; }

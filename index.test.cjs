@@ -3919,7 +3919,7 @@ test('依附嵌套超过两级后不再继续缩进，层级改写在来源路�
     const titleOf = row => (row.getAttribute && row.getAttribute('title')) || row.title || '';
     assert.ok(collectByClass(panel().querySelector('.dga-roadmap'), 'is-branch', []).some(row => titleOf(row).includes('来自：主线 › 分岔甲 › 嵌套')), '来源路径收进悬停提示');
     const css = documentRef.getElementById('dynamic-guide-assistant-style').textContent;
-    assert.match(css, /\.dga-roadmap-stages > span::before[^}]*border-left:\s*6px solid/, '节点间带箭头指向');
+    assert.match(css, /\.dga-roadmap-stages > span::before[^}]*border-left:\s*10px solid/, '节点间带箭头指向');
     assert.equal(/border: 2px solid var\(--dga-border-2\)/.test(css), false, '不再用带描边的空心圆点');
     assert.equal(/dga-roadmap-stages \.dga-roadmap-stages \.dga-roadmap-stages/.test(css), false, '没有把第三级压成 0 的规则');
     assert.deepEqual(errors, []);
