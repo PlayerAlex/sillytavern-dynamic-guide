@@ -2,7 +2,7 @@
     'use strict';
 
     /* ================================================================
-     * 动态指导助手 v3.9
+     * 动态指导助手 v3.9.1
      *
      * 这个文件分三部分：
      *   一、核心：纯函数与独立模块。把世界书正文解析成阶段，按进度挑出要发的
@@ -29,7 +29,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '3.9';
+    const VERSION = '3.9.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INJECTION_ID = 'dynamic-guide-assistant-current';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
@@ -9759,6 +9759,7 @@ ${P} .dga-zoom-toggle { padding: 3px 8px; font-size: 12px; line-height: 18px; bo
 ${P} .dga-zoom-bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: var(--dga-bg-2); border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); margin-bottom: 4px; }
 ${P} .dga-zoom-slider { flex: 1 1 auto; height: 6px; cursor: pointer; accent-color: var(--dga-accent); }
 ${P} .dga-zoom-label { font-size: 12px; font-weight: 600; color: var(--dga-text-2); min-width: 40px; }
+${P} .dga-zoom-bar .dga-btn { flex: 0 0 auto; white-space: nowrap; }
 /* 缩放只缩轨道里的节点和连线（zoom 参与排版），每条线的框和标题不跟着缩，超出的部分在轨道里横向滚动 */
 ${P} .dga-roadmap-zoom-wrap { width: 100%; min-width: 0; }
 ${P} .dga-roadmap-stages.is-track { zoom: var(--dga-zoom, 1); }
@@ -9845,7 +9846,7 @@ ${P} .dga-roadmap-path { font-size: 11px; }
    站点都直接落在同一张网格里，所以各条轨道按列对齐。 */
 /* 行高要比节点高出一截，行与行之间留出空隙；段名不换行，节点高度固定，不会挤到上下行（v3.9） */
 ${P} .dga-roadmap { --dga-row-h: 64px; --dga-col-gap: 28px; }
-${P} .dga-roadmap-stages.is-track { display: grid; grid-auto-rows: var(--dga-row-h); grid-auto-columns: minmax(90px, max-content); column-gap: var(--dga-col-gap); row-gap: 0; align-items: center; justify-items: stretch; padding: 4px 4px 10px; }
+${P} .dga-roadmap-stages.is-track { display: grid; grid-auto-rows: var(--dga-row-h); grid-auto-columns: max-content; column-gap: var(--dga-col-gap); row-gap: 0; align-items: center; justify-items: stretch; padding: 4px 4px 10px; }
 ${P} .dga-roadmap-stages.is-track .dga-roadmap-row, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages { display: contents; }
 ${P} .dga-roadmap-stages.is-track > span, ${P} .dga-roadmap-stages.is-track .dga-roadmap-stages > span { margin-right: 0; gap: 6px; z-index: 1; white-space: nowrap; max-width: none; }
 ${P} .dga-roadmap-stages > span:last-of-type::after, ${P} .dga-roadmap-stages > span:last-of-type::before { display: none; }
@@ -9902,7 +9903,8 @@ ${P} .dga-roadmap-link.is-up > i { top: calc(var(--dga-row-h) / 2 - 4px); }
     ${P} .dga-roadmap { --dga-stop-c: 15px; }
     ${P} .dga-roadmap { --dga-row-h: 54px; --dga-col-gap: 20px; }
     ${P} .dga-roadmap { --dga-stop-half: 15px; }
-    ${P} .dga-roadmap-stages.is-track { grid-auto-columns: minmax(75px, max-content); }
+    /* 手机上容器窄，minmax 会把列压回最小宽度、字溢出节点；列宽一律按段名实际宽度，放不下就横向滚动（v3.9.1） */
+    ${P} .dga-roadmap-stages.is-track { grid-auto-columns: max-content; }
     ${P} .dga-roadmap-junction::before { right: -18px; }
     ${P} .dga-roadmap-junction::after { right: -20px; }
     ${P} .dga-roadmap-junction > .dga-roadmap-fork.is-up { margin: 0 0 28px calc(var(--dga-stop-mid, 37px) - 1px); }
