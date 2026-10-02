@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v4.0.2**
+当前版本：**v4.0.3**
 
 在酒馆里给角色画一张「路线图」：剧情（也可以是时间、关系变化……）一段一段排好，分出路口，挂上支线。动态指导助手只把**现在走到的这一段**写进世界书，AI 每次回复看到的就是当下该演的内容；走完一段就往下一段走，可以自己点，也可以交给判断用的 AI。
 
@@ -8,10 +8,10 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 
 ## 安装
 
-导入文件位于本项目 `latest/` 目录，也可在 [v4.0.2 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v4.0.2)下载：
+导入文件位于本项目 `latest/` 目录，也可在 [v4.0.3 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v4.0.3)下载：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.0.2/dynamic-guide-offline-v4.0.2.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.0.2/dynamic-guide-online-v4.0.2.json)：启动时加载固定版本的远程脚本。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.0.3/dynamic-guide-offline-v4.0.3.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.0.3/dynamic-guide-online-v4.0.3.json)：启动时加载固定版本的远程脚本。
 
 在酒馆助手里导入并启用，点酒馆左下角魔法棒里的「动态指导助手」打开。
 
@@ -22,7 +22,7 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 3. 一段后面接两段以上就是**路口**：走到这里要选一条路，走进哪条，哪条就是主线。每条路可以写一句什么情况下走，也可以设「都对不上就走这条」。
 4. **支线**挂在某一段上，开始以后和主线同时走；可以设主线停下来等它，结束方式二选一：走完自己的最后一段，或者主线走到某一段。
 5. 一段也可以接回图上已有的段，做汇合或循环。
-6. 「发给 AI 的内容」决定条目里写什么：分成几块，每块选一直发 / 走到某几段时发 / 某条支线在走时发，块里放格子，发送时换成当前那一段的内容。至少有一块「一直发」放着主线当前段，这一块不能删，保证每次都有内容发出去。
+6. 「发给 AI 的内容」决定条目里写什么：分成几块，每块选一直发 / 走到某几段时发 / 某条支线在走时发，块里放格子，发送时换成当前那一段的内容。「一直发」的块里至少要有一块放着主线当前段，保证每次都有内容发出去：不要求每块都放，只有剩最后一块这样的时，它才不能删、不能改发法、不能拿掉主线那一格。
 7. 「位置和顺序」决定条目放在世界书里哪儿。在世界书里直接改这个条目的位置和顺序也行，助手会读回来，不会盖掉。点两条中间的「放到这里」时，如果中间没有空出来的顺序数字，后面的条目会依次往后挪、让出位置，它们之间的先后不变。数据库（ACU）和 MVU 写的条目不列在这里。
 8. 卡片下面是主线、在走的支线、可以开始的支线，各有「上一段 / 下一段」「开始」。
 
@@ -51,7 +51,7 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.0.2/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.0.3/index.js';
 ```
 
 推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。
@@ -80,9 +80,13 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.0.2/
 
 ## 更新日志
 
+### v4.0.3（2026-10-03）
+
+- 改正 v4.0.2 的「主线当前段」规则：只要求「一直发」的块里**至少有一块**放着主线当前段，不是每块都要放、也不是固定锁住第一块。有好几块都放着时，哪块都能删、能改；只有剩最后一块时才拦住。
+
 ### v4.0.2（2026-10-03）
 
-- 每张路线图的「发给 AI 的内容」里一定有一块「一直发」、放着主线当前段：这一块不能删、不能改成别的发法，删掉主线那一格会自动放回去。以前的路线图要是没有，会自动在最前面补上。
+- 「发给 AI 的内容」里至少要有一块「一直发」放着主线当前段（v4.0.3 改成只在剩最后一块时才拦）。以前的路线图要是一块都没有，会自动在最前面补上。
 - 路线图「设置」里判断提示词右边的跳转箭头去掉了。
 - 以 CC BY-NC-SA 4.0 协议开源，加了 LICENSE。
 - 整理了 README、更新日志和代码注释里的说法。

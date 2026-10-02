@@ -98,6 +98,8 @@ function element(tag, registry) {
         append(...items) {
             items.forEach(item => {
                 if (!item) return;
+                // 真浏览器的 append 可以直接收字符串。
+                if (typeof item === 'string') item = { nodeType: 3, __text: true, textContent: item };
                 item.parentNode = this;
                 this.children.push(item);
                 if (item.id) registry.set(item.id, item);
@@ -1207,6 +1209,34 @@ test('路线图：位置和顺序不列数据库和 MVU 的条目；放到顺序
     assert.equal(order('天气'), 202, '和「地点」一样是 200 的「天气」往后挪');
     assert.equal(order('时间'), 203, '后面挨着的也跟着挪，先后不变');
     assert.equal(order('TavernDB-ACU-ReadableDataTable'), 150, '数据库条目不碰');
+    assert.deepEqual(errors, []);
+});
+
+test('路线图：一直发里至少留一块主线当前段——有两块时都能删，剩最后一块才拦住', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    t.route.blocks = [
+        { id: 'ka', when: 'always', text: '开头 ⟦main⟧' },
+        { id: 'kb', when: 'always', text: '只是一句提醒' },
+        { id: 'kc', when: 'always', text: '⟦main⟧ 结尾' },
+    ];
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
+    const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '发给 AI 的内容').listeners.click[0]();
+    const blocks = () => findAllClass(panel().querySelector('.dga-rt-drawer'), 'dga-rt-blk');
+    const deleteBtn = node => findAllClass(node, 'dga-rt-icon').find(item => item.getAttribute('title') === '删掉这一块');
+    assert.equal(blocks().length, 3);
+    assert.ok(blocks().every(node => deleteBtn(node)), '两块都放着主线当前段时，哪块都能删；不放的一直发也能删');
+    deleteBtn(blocks()[0]).listeners.click[0]({ stopPropagation() {} });
+    assert.equal(blocks().length, 2);
+    assert.ok(deleteBtn(blocks()[0]), '不放主线的那块照样能删');
+    assert.ok(!deleteBtn(blocks()[1]), '剩最后一块放着主线当前段的，不能删');
     assert.deepEqual(errors, []);
 });
 

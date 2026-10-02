@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.0.2';
+    const VERSION = '4.0.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -4159,14 +4159,19 @@
         route.blocks.forEach(block => {
             if (block.when === 'nodes') block.nodes = (block.nodes || []).filter(id => route.nodes[id]);
         });
-        if (!routeMainBlock(route)) route.blocks.unshift({ id: routeId('k'), when: 'always', text: '⟦main⟧' });
+        if (!routeMainBlocks(route).length) route.blocks.unshift({ id: routeId('k'), when: 'always', text: '⟦main⟧' });
         return route;
     }
 
-    // 每张图都要有一块「一直发」、里面放着主线当前段（v4.0.2）：保证这一段的内容每次都发得出去。
-    // 第一块这样的就是它，界面上不能删、不能改成别的发法，删掉主线那一格会放回去。
-    function routeMainBlock(route) {
-        return route.blocks.find(block => block.when === 'always' && String(block.text || '').includes('⟦main⟧')) || null;
+    // 「一直发」的块里至少要有一块放着主线当前段（v4.0.2）：保证这一段的内容每次都发得出去。
+    // 不要求每块「一直发」都放；只有剩最后一块这样的时，它才不能删、不能改发法、不能拿掉主线那一格（v4.0.3）。
+    function routeMainBlocks(route) {
+        return route.blocks.filter(block => block.when === 'always' && String(block.text || '').includes('⟦main⟧'));
+    }
+
+    function routeLastMainBlock(route, block) {
+        const list = routeMainBlocks(route);
+        return list.length === 1 && list[0] === block;
     }
 
     function normalizeRoute(raw) {
@@ -6544,7 +6549,7 @@
         const state = routeStateOf(route);
         const open = ui.rt.openBlock[route.id] === block.id;
         const active = routeBlockActive(route, state, block);
-        const guard = routeMainBlock(route) === block;
+        const guard = routeLastMainBlock(route, block);
         const stop = fn => event => { event.stopPropagation(); fn(); };
         const move = delta => {
             const to = index + delta;
@@ -6569,7 +6574,7 @@
         const sync = () => {
             const text = serializeTpl(editor);
             if (guard && !text.includes('⟦main⟧')) {
-                notify('主线当前段这一格要留着，每次都靠它把这一段发出去', 'info');
+                notify('至少要有一块「一直发」放着主线当前段，这是最后一块了', 'info');
                 render();
                 return;
             }
