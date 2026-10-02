@@ -164,6 +164,12 @@ function findClass(node, name, skipSelf) {
     return null;
 }
 
+function findAllClass(node, name, out = []) {
+    if (nodeClassNames(node).includes(name)) out.push(node);
+    (node.children || []).forEach(child => findAllClass(child, name, out));
+    return out;
+}
+
 function fakeDocument(html) {
     const registry = new Map();
     const documentRef = {
@@ -943,6 +949,27 @@ test('路线图：读回时清掉断掉的线和没用的块，顺序数字算�
     assert.equal(R.orderAfter(list, { pos: 'after_character_definition' }, '1'), 150, '排在「人物」后面：取两条中间');
     assert.equal(R.orderAfter(list, { pos: 'after_character_definition' }, '2'), 210, '排在最后一条后面：多 10');
     assert.equal(R.orderAfter(list, { pos: 'after_character_definition' }, '__first__'), 90, '排在最前面');
+    const at = order => ({ pos: 'before_character_definition', depth: 4, order });
+    const tight = [
+        { uid: 1, name: '元数据', placement: at(0) },
+        { uid: 2, name: '运作设定', placement: at(1) },
+        { uid: 3, name: '地点', placement: at(2) },
+        { uid: 4, name: '人物', placement: at(10) },
+    ];
+    const before = { pos: 'before_character_definition' };
+    assert.deepEqual(plain(R.makeRoom(tight, before, '1')), { order: 1, shifts: [{ uid: 2, order: 2 }, { uid: 3, order: 3 }] }, '顺序数字挨着：后面的往后挪，挪到有空位为止');
+    assert.deepEqual(plain(R.makeRoom(tight, before, '__first__')), { order: 0, shifts: [{ uid: 1, order: 1 }, { uid: 2, order: 2 }, { uid: 3, order: 3 }] }, '最前面那条是 0：前面几条一起往后挪');
+    assert.deepEqual(plain(R.makeRoom(tight, before, '3')), { order: 6, shifts: [] }, '有空位就取中间，不动别的');
+    const tie = [1, 2, 3].map(uid => ({ uid, name: `同${uid}`, placement: at(100) }));
+    assert.deepEqual(plain(R.makeRoom(tie, before, '1')), { order: 101, shifts: [{ uid: 2, order: 102 }, { uid: 3, order: 103 }] }, '顺序数字一样：照列出来的先后拉开');
+    const ruled = R.normalizeRoute({
+        ...plain(R.makeRoute('规则')),
+        extractRules: [{ start: '<正文>', end: '' }, { start: ' ', end: '' }, 'x'],
+        excludeRules: [{ start: '<thinking>', end: '</thinking>' }],
+    });
+    assert.deepEqual(plain(ruled.extractRules), [{ start: '<正文>', end: '' }], '填了一半的规则留着，空的和不是对象的丢掉');
+    assert.deepEqual(plain(ruled.excludeRules), [{ start: '<thinking>', end: '</thinking>' }]);
+    assert.deepEqual(plain(R.normalizeRoute(plain(R.makeRoute('没规则'))).excludeRules), [], '旧的路线图读回来没有规则');
 });
 
 function routeWorld() {
@@ -1119,10 +1146,56 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 发给 AI �
     const drawer = () => panel().querySelector('.dga-rt-drawer');
     assert.match(drawer().textContent, /往下走.*删掉这张路线图/);
     assert.doesNotMatch(drawer().textContent, /判断用的 API/, '没选 AI 判断时不出现 AI 判断那一组');
+    assert.ok(!drawer().classList.contains('is-shown'), '刚打开时播一次滑入');
     findButton(drawer(), 'AI 判断').listeners.click[0]();
+    assert.ok(drawer().classList.contains('is-shown'), '开着时点按钮重画，不再播滑入（不闪）');
     assert.match(drawer().textContent, /判断用的 API.*跟随当前活动API.*判断提示词/, '选了 AI 判断才出现');
+    assert.match(drawer().textContent, /判断提示词.*提取 \/ 排除规则.*删掉这张路线图/, '提取 / 排除规则在 AI 判断下面、删除上面');
+    assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 0, '没有规则时不列空行');
+    findButton(drawer(), '＋ 加一条').listeners.click[0]();
+    assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 1, '点「加一条」多一行开始 / 结束');
     findButton(card().querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
     assert.match(card().querySelector('.dga-rt-head').textContent, /完成编辑/);
+    assert.deepEqual(errors, []);
+});
+
+test('路线图：位置和顺序不列数据库和 MVU 的条目；放到顺序数字一样的两条中间，后面的往后挪', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const after = order => ({ type: 'after_character_definition', order });
+    world.state.books.书A.push(
+        { uid: 3, name: 'TavernDB-ACU-ReadableDataTable', content: '表', enabled: true, position: after(150) },
+        { uid: 4, name: '[InitVar]初始化变量', content: '{}', enabled: false, position: after(150) },
+        { uid: 5, name: '天气', content: '晴', enabled: true, position: after(200) },
+        { uid: 6, name: '时间', content: '夏', enabled: true, position: after(201) },
+    );
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    t.route.placement = { ...t.route.placement, pos: 'before_character_definition' };
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
+    const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '位置和顺序').listeners.click[0]();
+    for (let i = 0; i < 5; i += 1) await new Promise(setImmediate);
+    const drawer = panel().querySelector('.dga-rt-drawer');
+    assert.doesNotMatch(drawer.textContent, /TavernDB|InitVar/, '数据库和 MVU 的条目不列');
+    const group = findAllClass(drawer, 'dga-rt-order-group').find(node => /角色定义后/.test(node.textContent));
+    assert.match(group.textContent, /人物设定.*地点.*天气.*时间/);
+    const slots = findAllClass(group, 'dga-rt-slot');
+    assert.equal(slots.length, 5, '每两条中间都能放');
+    slots[2].listeners.click[0]();
+    for (let i = 0; i < 8; i += 1) await new Promise(setImmediate);
+    const order = name => {
+        const entry = world.state.books.书A.find(item => item.name === name);
+        return entry.position.order;
+    };
+    assert.equal(order('地点'), 200, '前面的不动');
+    assert.equal(order('天气'), 202, '和「地点」一样是 200 的「天气」往后挪');
+    assert.equal(order('时间'), 203, '后面挨着的也跟着挪，先后不变');
+    assert.equal(order('TavernDB-ACU-ReadableDataTable'), 150, '数据库条目不碰');
     assert.deepEqual(errors, []);
 });
 
@@ -1181,7 +1254,7 @@ test('路线图：判断提示词预设——默认排第一，改过的默认�
 
 test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论落到进度上', async () => {
     const world = routeWorld();
-    world.state.messages = [{ message_id: 4, role: 'assistant', message: '小林决定离开小镇，提着箱子去了码头。' }];
+    world.state.messages = [{ message_id: 4, role: 'assistant', message: '<thinking>先想想怎么写</thinking>小林决定离开小镇，提着箱子去了码头。' }];
     world.state.lastMessageId = 4;
     const storage = memoryStorage({
         'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'k', model: 'm-small' }]),
@@ -1189,7 +1262,7 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     const fetches = [];
     const fetchMock = async (url, options) => {
         fetches.push({ url, body: JSON.parse(options.body) });
-        const content = '<judge_plan>对上了</judge_plan><answer n="1"><basis>写了离开</basis><done>YES</done><road>2</road></answer><start>0</start>';
+        const content = '<thinking>草稿</thinking><judge_plan>对上了</judge_plan><answer n="1"><basis>写了离开</basis><done>YES</done><road>2</road></answer><start>0</start>';
         const text = JSON.stringify({ choices: [{ message: { content } }] });
         return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
     };
@@ -1200,8 +1273,11 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     t.route.worldbookName = '书A';
     t.route.advance = 'judge';
     t.route.prompt = '简短';
+    t.route.excludeRules = [{ start: '<thinking>', end: '</thinking>' }];
     world.state.variables.character.$dynamicGuideAssistant.config.settings = {
         routePromptPresets: [{ name: '简短', segments: [{ role: 'system', content: '只看正文' }, { role: 'user', content: '{{最近正文}}\n{{作答表}}' }] }],
+        // 旧版设置里的全局规则不再用：要是还用，下面「小林决定离开小镇」会被删掉。
+        excludeRules: [{ start: '小林', end: '码头' }],
     };
     await R.write([t.route]);
     const state = R.normalizeRouteState(null, t.route);
@@ -1215,6 +1291,8 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     assert.equal(fetches[0].body.model, 'm-small');
     assert.equal(fetches[0].body.messages[0].content, '只看正文', '用这张图选的那套提示词');
     assert.match(fetches[0].body.messages[1].content, /小林决定离开小镇/);
+    assert.doesNotMatch(fetches[0].body.messages[1].content, /先想想/, '这张图的排除规则作用在发出去的正文上');
+    assert.doesNotMatch(run.core.getJudgeRuntime().lastFiltered, /草稿/, '也作用在判断 AI 的回答上');
     const saved = (await R.readStates())[t.route.id];
     assert.equal(saved.cur, t.leave, '路口按 <road>2</road> 走了「离开」');
     assert.deepEqual(run.errors, []);

@@ -27,7 +27,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.0';
+    const VERSION = '4.0.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -3056,6 +3056,8 @@
             restoreRouteScroll(shell);
         }
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
+        // 左栏抽屉开着时重画（比如点了总开关）不再播一遍滑入。
+        ui.navShown = ui.navOpen;
     }
 
     function closePanel() {
@@ -3480,7 +3482,7 @@
                 if (event.target === backdrop) { ui.navOpen = false; render(); }
             },
         });
-        backdrop.append(el('aside', { class: 'dga-nav-drawer', role: 'dialog', 'aria-label': '页面导航' }, ...renderNavMenu()));
+        backdrop.append(el('aside', { class: `dga-nav-drawer${ui.navShown ? ' is-shown' : ''}`, role: 'dialog', 'aria-label': '页面导航' }, ...renderNavMenu()));
         return backdrop;
     }
 
@@ -4175,6 +4177,9 @@
             advance: src.advance === 'off' || src.advance === 'judge' ? src.advance : '',
             // 用哪套判断提示词（设置页里的名字）；'' = 默认。判断用哪个 API 只存本机，不在这里。
             prompt: oneLine(src.prompt || ''),
+            // 提取 / 排除规则（v4.0.1）：发给判断 AI 的最近正文、它写回来的回答，都先过一遍。
+            extractRules: routeRuleList(src.extractRules),
+            excludeRules: routeRuleList(src.excludeRules),
         };
         const rawNodes = src.nodes && typeof src.nodes === 'object' ? src.nodes : {};
         Object.keys(rawNodes).forEach(key => {
@@ -4220,6 +4225,14 @@
             })
             : [{ id: routeId('k'), when: 'always', text: '⟦main⟧' }];
         return cleanupRoute(route);
+    }
+
+    // 只填了一半的规则也留着（可能还在填）；真正用的时候 RuleModule 只认开始、结束都填了的。
+    function routeRuleList(raw) {
+        return (Array.isArray(raw) ? raw : [])
+            .filter(item => item && typeof item === 'object')
+            .map(item => ({ start: String(item.start == null ? '' : item.start), end: String(item.end == null ? '' : item.end) }))
+            .filter(item => item.start.trim() || item.end.trim());
     }
 
     // 进度：主线当前段 cur、走过的 hist（上一段按它往回退）、走完 ended；每条支线 idle / on / done / skip。
@@ -4773,13 +4786,21 @@
         return routes;
     }
 
-    async function writeRoutePlacement(route, placement) {
+    // shifts：放到两条挨着的条目中间时，后面那几条要让出来的顺序数字 [{ uid, order }]（只改顺序，别的不动）。
+    async function writeRoutePlacement(route, placement, shifts) {
         const next = normalizeRoutePlacement(placement);
         route.placement = next;
         if (route.worldbookName) {
             await updateWorldbook(route.worldbookName, worldbook => {
                 const entry = findRouteEntry(worldbook, route);
                 if (entry) applyPlacementToEntry(entry, next);
+                (shifts || []).forEach(shift => {
+                    const other = worldbookEntries(worldbook).find(item => sameUid(item.uid, shift.uid));
+                    if (!other || other === entry) return;
+                    const hasPosition = other.position && typeof other.position === 'object';
+                    if (hasPosition) other.position = { ...other.position, order: shift.order };
+                    if ('order' in other || !hasPosition) other.order = shift.order;
+                });
                 return worldbook;
             });
         }
@@ -4795,9 +4816,10 @@
     }
 
     // 「位置和顺序」右边那一列：整本世界书的条目，按位置分组、组里按顺序。
+    // 数据库（ACU）和 MVU 写的条目不列、也不参与算顺序数字（v4.0.1）。
     async function readRouteBook(route) {
         if (!route.worldbookName) return [];
-        const entries = worldbookEntries(await getWorldbook(route.worldbookName));
+        const entries = worldbookEntries(await getWorldbook(route.worldbookName)).filter(entry => !isDatabaseEntry(entry) && !isMvuEntry(entry));
         return entries.map(entry => ({
             uid: entry.uid,
             name: entryName(entry),
@@ -4808,18 +4830,37 @@
         }));
     }
 
-    // 「排在某条后面」算出来的顺序数字：在那一条和它下一条之间取中间。
-    function routeOrderAfter(list, placement, anchorKey) {
+    // 「排在某条后面」：在那一条和它下一条之间取中间的顺序数字。
+    // 中间没有空出来的数字（一样或只差 1）时，把后面同一位置里的条目依次往后挪、让出位置（v4.0.1，用户定的）：
+    // 只挪必须挪的那几条，它们之间的先后不变。shifts = 要改的别的条目 [{ uid, order }]。
+    function routeMakeRoom(list, placement, anchorKey) {
         const peers = list.filter(item => !item.isSelf && item.placement.pos === placement.pos
             && (placement.pos !== 'at_depth' || item.placement.depth === placement.depth))
-            .map(item => item.placement.order).sort((a, b) => a - b);
-        if (anchorKey === '__first__') return Math.max(0, (peers.length ? peers[0] : 110) - 10);
-        const anchor = list.find(item => !item.isSelf && String(item.uid) === String(anchorKey));
-        if (!anchor) return (peers.length ? peers[peers.length - 1] : 90) + 10;
-        const a = anchor.placement.order;
-        const later = peers.filter(order => order > a);
-        if (!later.length) return a + 10;
-        return later[0] - a > 1 ? Math.floor((a + later[0]) / 2) : a + 1;
+            .sort((a, b) => a.placement.order - b.placement.order);
+        const index = anchorKey === '__first__' ? -1 : peers.findIndex(item => String(item.uid) === String(anchorKey));
+        if (anchorKey !== '__first__' && index === -1) {
+            return { order: (peers.length ? peers[peers.length - 1].placement.order : 90) + 10, shifts: [] };
+        }
+        const later = peers.slice(index + 1);
+        if (!later.length) return { order: index >= 0 ? peers[index].placement.order + 10 : 100, shifts: [] };
+        const next = later[0].placement.order;
+        if (index === -1 && next > 0) return { order: Math.max(0, next - 10), shifts: [] };
+        if (index >= 0 && next - peers[index].placement.order >= 2) {
+            return { order: Math.floor((peers[index].placement.order + next) / 2), shifts: [] };
+        }
+        const order = index >= 0 ? peers[index].placement.order + 1 : next;
+        const shifts = [];
+        let last = order;
+        later.forEach(item => {
+            const want = Math.max(item.placement.order, last + 1);
+            if (want !== item.placement.order) shifts.push({ uid: item.uid, order: want });
+            last = want;
+        });
+        return { order, shifts };
+    }
+
+    function routeOrderAfter(list, placement, anchorKey) {
+        return routeMakeRoom(list, placement, anchorKey).order;
     }
 
     async function loadRoutesIntoUi() {
@@ -5125,7 +5166,8 @@
         if (!item || !item.lines.length) return false;
         const channel = usableChannel({ ...settings, judgePreset: routeApiName(route) }, force);
         if (!channel) return false;
-        const history = await recentHistoryText(messageId, judgeHistoryCount(settings), settings);
+        const rules = { extractRules: route.extractRules, excludeRules: route.excludeRules };
+        const history = await recentHistoryText(messageId, judgeHistoryCount(settings), rules);
         const messages = routeJudgeMessages(route, item, history, routePromptSegments(route, settings), routeHostTexts());
         const before = JSON.stringify({ cur: state.cur, hist: state.hist, ended: state.ended, sides: state.sides });
         LogModule.info('判断AI', `「${route.name}」第 ${messageId} 层：问 ${item.lines.length} 条在走的线${item.offers.length ? `、${item.offers.length} 条可以开始的支线` : ''}`);
@@ -5139,7 +5181,7 @@
             return false;
         }
         const raw = String(text || '');
-        const filtered = applyBoundaryRules(raw, settings);
+        const filtered = applyBoundaryRules(raw, rules);
         judgeRuntime.lastRaw = raw;
         judgeRuntime.lastFiltered = filtered;
         judgeRuntime.lastAt = Date.now();
@@ -5574,8 +5616,9 @@
             el('div', { class: 'dga-rt-now' },
                 el('span', {}, '现在：', el('b', { text: cur ? cur.name : '' })),
                 wait ? note(`在等支线「${wait.name}」走完`) : (!state.ended && atFork(cur) ? note('到路口了，等着选一条路') : null)),
-            rtBtn('上一段', () => routeMainBackUi(route), 'small'),
-            rtBtn(state.ended ? '已走完' : '下一段', () => routeMainNextUi(route), 'small primary', { disabled: state.ended || Boolean(wait) })));
+            el('div', { class: 'dga-rt-acts' },
+                rtBtn('上一段', () => routeMainBackUi(route), 'small'),
+                rtBtn(state.ended ? '已走完' : '下一段', () => routeMainNextUi(route), 'small primary', { disabled: state.ended || Boolean(wait) }))));
         routeRunningSides(route, state).forEach(side => {
             const node = route.nodes[routeSideState(route, state, side.id).cur];
             if (!node) return;
@@ -5584,8 +5627,9 @@
                 el('div', { class: 'dga-rt-now' },
                     el('span', {}, '现在：', el('b', { text: node.name })),
                     atFork(node) ? note('到路口了，等着选一条路') : null),
-                rtBtn('上一段', () => routeSideBackUi(route, side), 'small'),
-                rtBtn(node.next.length ? '下一段' : '走完', () => routeSideNextUi(route, side), 'small primary')));
+                el('div', { class: 'dga-rt-acts' },
+                    rtBtn('上一段', () => routeSideBackUi(route, side), 'small'),
+                    rtBtn(node.next.length ? '下一段' : '走完', () => routeSideNextUi(route, side), 'small primary'))));
         });
         routeOfferedSides(route, state).forEach(side => {
             rows.push(el('div', { class: 'dga-rt-row is-offer' },
@@ -5643,9 +5687,39 @@
                             type: 'button', class: 'dga-icon-sq', title: '去编辑这套提示词', 'aria-label': '去编辑这套提示词',
                             onclick: () => { ui.rt.panel[route.id] = ''; openPromptPreset(promptName); openView('settings'); },
                         }, '›')))) : null,
+            judging ? setSection(el('h3', { class: 'dga-set-title' }, '提取 / 排除规则', infoTip(`rules-${route.id}`, [
+                ['提取', '只留开始标记到结束标记中间的那一段，有好几处就取最后一处；找不到就整段照用。比如正文写在 <正文> 和 </正文> 中间，就填这两个。'],
+                ['排除', '把开始标记到结束标记中间的内容连同标记一起删掉，有几处删几处。比如去掉思考过程：<thinking> 和 </thinking>。'],
+                ['用在哪', '发给判断 AI 的最近正文、判断 AI 写回来的回答，都先过一遍这里的规则：先提取，再排除。'],
+            ])), null,
+                routeRuleGroup(route, 'extractRules', '提取'),
+                routeRuleGroup(route, 'excludeRules', '排除')) : null,
             el('section', { class: 'dga-set-sec' },
                 el('div', { class: 'dga-set-box is-danger' },
                     setRow('删掉这张路线图', rtBtn('删掉', () => deleteRouteDialog(route), 'small danger')))));
+    }
+
+    // 一组规则：每条一行「开始标记 → 结束标记 ✕」，标题右边「＋ 加一条」。没有规则时只有标题这一行。
+    function routeRuleGroup(route, key, label) {
+        if (!Array.isArray(route[key])) route[key] = [];
+        const rules = route[key];
+        const input = (rule, field, placeholder) => {
+            const node = el('input', { type: 'text', placeholder, oninput: event => { rule[field] = event.target.value; routeEdited(route, false); } });
+            node.value = rule[field];
+            return node;
+        };
+        return el('div', { class: 'dga-set-row is-col dga-rs-rules' },
+            el('div', { class: 'dga-rs-rule-head' },
+                el('b', { text: label }),
+                rtBtn('＋ 加一条', () => { rules.push({ start: '', end: '' }); render(); }, 'small ghost')),
+            ...rules.map((rule, index) => el('div', { class: 'dga-rs-rule' },
+                input(rule, 'start', '开始标记'),
+                el('span', { class: 'dga-rs-rule-sep', text: '→' }),
+                input(rule, 'end', '结束标记'),
+                el('button', {
+                    type: 'button', class: 'dga-icon-sq is-sm', title: '删掉这条', 'aria-label': '删掉这条',
+                    onclick: () => { rules.splice(index, 1); routeEdited(route, false); render(); },
+                }, '✕'))));
     }
 
     // ---- 走 ----
@@ -6032,9 +6106,12 @@
 
     function renderRouteDrawer() {
         const target = routeDrawerTarget();
+        // 重画前侧边栏就开着：不再播一遍滑入（v4.0.1，不然每点一个按钮侧边栏都闪一下）。
+        const wasOpen = Boolean(ui.rt.drawerKey);
         ui.rt.drawerKey = target ? `${target.route.id}:${target.panel || target.id}:${ui.rt.tab}` : '';
         if (!target) return null;
         const aside = target.panel ? renderRoutePanelDrawer(target.route, target.panel) : renderRouteNodeDrawer(target.route, target.id);
+        if (wasOpen) aside.classList.add('is-shown');
         fitRouteDrawer(aside);
         const body = aside.querySelector('.dga-rt-drawer-body');
         if (body) body.addEventListener('scroll', () => { ui.rt.drawerScroll = { key: ui.rt.drawerKey, top: body.scrollTop }; });
@@ -6299,13 +6376,17 @@
         const peers = entries.filter(item => !item.isSelf && sameGroup(item.placement, p)).sort((a, b) => a.placement.order - b.placement.order);
         const before = peers.filter(item => item.placement.order <= p.order).pop();
         const orderMode = ui.rt.orderMode === 'number' ? 'number' : 'after';
-        const setPlacement = next => runAction('改位置和顺序', async () => {
-            await writeRoutePlacement(route, next);
+        const setPlacement = (next, shifts) => runAction('改位置和顺序', async () => {
+            await writeRoutePlacement(route, next, shifts);
             await writeRoutes(ui.routes);
             ui.rt.book[route.id] = { list: await readRouteBook(route) };
+            if (shifts && shifts.length) notify(`后面 ${shifts.length} 条的顺序数字往后挪了，先后没变`, 'info');
             return true;
         }, { refresh: false });
-        const putAt = (pos, depth, anchor) => setPlacement({ ...p, pos, depth: pos === 'at_depth' ? depth : p.depth, order: routeOrderAfter(entries, { pos, depth }, anchor) });
+        const putAt = (pos, depth, anchor) => {
+            const room = routeMakeRoom(entries, { pos, depth }, anchor);
+            setPlacement({ ...p, pos, depth: pos === 'at_depth' ? depth : p.depth, order: room.order }, room.shifts);
+        };
         const slot = (pos, depth, anchor) => el('button', { type: 'button', class: 'dga-rt-slot', title: '放到这里', onclick: () => putAt(pos, depth, anchor) }, '放到这里');
         const groups = [];
         ROUTE_POSITIONS.forEach(([pos, label]) => {
@@ -6357,7 +6438,7 @@
                         rtSeg([['after', '排在某条后面'], ['number', '自己填数字']], orderMode, value => { ui.rt.orderMode = value; render(); }),
                         el('div', { class: 'dga-rt-mt' }, orderMode === 'after'
                             ? rtSelect([['__first__', '排在最前面']].concat(peers.map(item => [String(item.uid), `排在「${item.name}」后面`])), before ? String(before.uid) : '__first__',
-                                value => setPlacement({ ...p, order: routeOrderAfter(entries, p, value) }))
+                                value => putAt(p.pos, p.depth, value))
                             : el('input', { type: 'number', class: 'dga-rt-num', value: String(p.order), onchange: event => setPlacement({ ...p, order: Math.floor(Number(event.target.value) || 0) }) }))))),
             orderList);
     }
@@ -6979,7 +7060,7 @@ ${P} .dga-text-mark.is-pending, ${P} .dga-pending { background: var(--dga-hover)
 ${P} .dga-pick-surface.dga-tap-mode { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: pointer; }
 ${P} .dga-tap-caret { display: inline-block; width: 0; height: 1.15em; vertical-align: -0.2em; border-left: 2px solid var(--dga-warning); position: relative; }
 ${P} .dga-tap-caret::after { content: '开头'; position: absolute; top: -1.4em; left: -3px; padding: 0 5px; border-radius: var(--dga-radius-sm); background: var(--dga-warning); color: #0E131F; font-size: 11px; line-height: 1.5; white-space: nowrap; font-weight: 600; }
-${P} .dga-nav-backdrop { position: absolute; inset: 0; z-index: 3; display: flex; background: rgba(0, 0, 0, 0.65); }
+${P} .dga-nav-backdrop { position: absolute; inset: 0; z-index: 45; display: flex; background: rgba(0, 0, 0, 0.65); }
 ${P} .dga-nav-drawer { width: 250px; max-width: 84%; height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 20px 10px 16px; background: var(--dga-bg-1); border-right: 1px solid var(--dga-border); box-shadow: 12px 0 40px rgba(0, 0, 0, 0.5); animation: dga-nav-in 0.18s ease-out; }
 @keyframes dga-nav-in { from { transform: translateX(-28px); opacity: 0; } to { transform: none; opacity: 1; } }
 ${P} .dga-nav-brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 18px; margin-bottom: 12px; border-bottom: 1px solid var(--dga-border); }
@@ -7206,13 +7287,13 @@ ${P} .dga-rail-badge { flex: 0 0 auto; padding: 0 7px; border-radius: 999px; bor
 ${P} .dga-rail-badge.is-warn { color: #E3B45A; border-color: rgba(227, 180, 90, .45); }
 ${P} .dga-rail-new { padding: 8px 10px; border-radius: 12px; border: 1px dashed var(--dga-border-2); background: transparent; color: var(--dga-text-2); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 ${P} .dga-rail-new:hover { color: var(--dga-accent); border-color: var(--dga-accent); }
-${P} .dga-rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: 2px; padding-top: 10px; border-top: 1px solid var(--dga-border); }
-${P} .dga-rail-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 10px; border: 0; background: transparent; color: var(--dga-text-2); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+${P} .dga-rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: 4px; padding-top: 10px; border-top: 1px solid var(--dga-border); }
+${P} .dga-rail-item { display: flex; align-items: center; gap: 12px; min-height: 46px; padding: 9px 12px; border-radius: 12px; border: 0; background: transparent; color: var(--dga-text-2); font: inherit; font-size: 14.5px; text-align: left; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-rail-item:hover { background: var(--dga-bg-1); color: var(--dga-text-1); }
 ${P} .dga-rail-item.is-on { background: var(--dga-bg-2); color: var(--dga-text-1); }
-${P} .dga-rail-ico { width: 18px; text-align: center; color: var(--dga-text-3); }
+${P} .dga-rail-ico { width: 20px; font-size: 16px; text-align: center; color: var(--dga-text-3); }
 ${P} .dga-rail-label { display: flex; flex-direction: column; min-width: 0; }
-${P} .dga-rail-label small { color: var(--dga-text-3); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+${P} .dga-rail-label small { color: var(--dga-text-3); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 右边只放一棵树：路线图占满，卡片头里的名字和状态已经在标题栏写了 */
 ${P} .dga-rt-single .dga-rt-name { display: none; }
 ${P} .dga-rt-single .dga-rt-tools { margin-left: auto; }
@@ -7321,6 +7402,17 @@ ${P} .dga-rs .dga-set-ctl select { width: 170px; }
 ${P} .dga-rs-pick { display: flex; align-items: center; gap: 6px; }
 ${P} .dga-rs-pick select { width: 140px !important; }
 ${P} .dga-rs-pick .dga-icon-sq { width: 30px; height: 30px; font-size: 16px; }
+/* 路线图设置里的提取 / 排除规则：每条一行「开始 → 结束 ✕」 */
+${P} .dga-rs .dga-set-row.dga-rs-rules { gap: 8px; }
+${P} .dga-rs-rule-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+${P} .dga-rs-rule-head b { font-size: 13.5px; font-weight: 600; color: var(--dga-text-1); }
+${P} .dga-rs-rule { display: flex; align-items: center; gap: 6px; }
+${P} .dga-rs-rule input[type="text"] { flex: 1 1 0; width: auto; min-width: 0; min-height: 30px; padding: 4px 9px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+${P} .dga-rs-rule-sep { flex: 0 0 auto; color: var(--dga-text-3); }
+/* 侧边栏窄：「!」的说明框跟这一节一样宽，不从「!」那里往右伸出去 */
+${P} .dga-rs .dga-set-head { position: relative; }
+${P} .dga-rs .dga-info { position: static; }
+${P} .dga-rs .dga-info-pop { left: 0; right: 0; width: auto; }
 ${P} .dga-rt-card { gap: 0; padding: 0; overflow: hidden; }
 ${P} .dga-rt-card.is-edit { border-color: color-mix(in srgb, var(--dga-accent) 55%, var(--dga-border)); }
 ${P} .dga-rt-head { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; padding: 12px 14px; }
@@ -7378,6 +7470,7 @@ ${P} .dga-rt-line i { width: 8px; height: 8px; border-radius: 50%; background: c
 ${P} .dga-rt-now { flex: 1 1 180px; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 ${P} .dga-rt-now b { font-size: 14.5px; }
 ${P} .dga-rt-now.is-inline { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; }
+${P} .dga-rt-acts { flex: 0 0 auto; display: flex; gap: 6px; }
 ${P} .dga-rt-note { color: #E3B45A; font-size: 12px; line-height: 1.5; }
 ${P} .dga-rt-cond { color: var(--dga-text-2); font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
 ${P} .dga-rt-tag { display: inline-block; margin-left: 6px; padding: 0 8px; border-radius: 999px; font-size: 11.5px; line-height: 19px; background: var(--dga-bg-2); color: var(--dga-text-2); border: 1px solid var(--dga-border-2); }
@@ -7574,7 +7667,17 @@ ${P} .dga-rt-pv-off { margin-top: 8px; color: var(--dga-text-3); font-size: 12px
     ${P} .dga-rt-drawer-head { padding-top: 22px; }
     ${P} .dga-rt-opts { grid-template-columns: 1fr; }
     ${P} .dga-rt-mm-row { flex-wrap: wrap; }
-}`;
+    /* 手机上路线图区域跟着图的高度走，底下只留一条放缩放；「主线」后面不留固定宽度（v4.0.1） */
+    ${P} .dga-rt-single .dga-rt-graph-wrap { min-height: 0; padding-bottom: 46px; }
+    ${P} .dga-rt-rows .dga-rt-line { min-width: 0; }
+}
+/* 触屏上手指拖得动，路线图底下不显示那条滚动条 */
+@media (hover: none) {
+    ${P} .dga-rt-graph-wrap { scrollbar-width: none; }
+    ${P} .dga-rt-graph-wrap::-webkit-scrollbar { display: none; }
+}
+/* 重画时侧边栏、左栏抽屉已经开着：不再播滑入（放在最后，盖过上面手机的 animation-name） */
+${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }`;
     }
 
     function closeExtensionsMenu() {
@@ -7768,6 +7871,7 @@ ${P} .dga-rt-pv-off { margin-top: 8px; color: var(--dga-text-3); font-size: 12px
             offeredSides: routeOfferedSides,
             compose: composeRoute,
             orderAfter: routeOrderAfter,
+            makeRoom: routeMakeRoom,
             entryName: routeEntryName,
             read: readRoutes,
             write: writeRoutes,
