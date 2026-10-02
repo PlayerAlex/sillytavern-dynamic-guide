@@ -486,14 +486,14 @@ test('API 预设请求体：OpenAI 兼容协议走 custom 源', () => {
     assert.equal(body.proxy_password, '', 'custom 源不用 proxy_password');
     assert.equal(body.model, 'gpt-x', 'models/ 前缀要剥掉');
     assert.equal(body.custom_prompt_post_processing, 'strict', '缺省归一为严格');
-    assert.equal(body.max_tokens, 60000, '缺省最大回复长度对齐数据库 60000');
-    assert.equal(body.temperature, 1, '缺省温度对齐数据库 1');
+    assert.equal(body.max_tokens, 60000, '缺省最大回复长度 60000');
+    assert.equal(body.temperature, 1, '缺省温度 1');
 });
 
-test('本机判断AI API 预设：缺省数值回退数据库默认 60000 / 1', () => {
+test('本机判断AI API 预设：缺省数值回退默认 60000 / 1', () => {
     const preset = plain(core.normalizeJudgeApiPreset({ name: '裸预设', connection: 'main' }));
-    assert.equal(preset.maxTokens, 60000, '最大回复长度缺省 60000（同数据库）');
-    assert.equal(preset.temperature, 1, '温度缺省 1（同数据库）');
+    assert.equal(preset.maxTokens, 60000, '最大回复长度缺省 60000');
+    assert.equal(preset.temperature, 1, '温度缺省 1');
     const broken = plain(core.normalizeJudgeApiPreset({ name: '坏数值', connection: 'main', maxTokens: 'abc', temperature: 'x' }));
     assert.equal(broken.maxTokens, 60000, '非法值也回退 60000');
     assert.equal(broken.temperature, 1, '非法温度回退 1');
@@ -574,7 +574,7 @@ test('预设迁移：旧的酒馆预设（tavern / type=proxy）改走酒馆主 
 
 
 // ---------------------------------------------------------------
-// v2.13：输出提取/排除规则（复刻数据库填表规则）+ 运行日志
+// v2.13：输出提取/排除规则 + 运行日志
 // ---------------------------------------------------------------
 
 test('规则归一化：去空白、丢残缺项与非对象项、去重', () => {
@@ -611,7 +611,7 @@ test('排除规则：删区间含边界、支持嵌套、压空行、不区分�
     assert.equal(core.applyJudgeOutputRules(nested, {}), nested, '没有规则 = 原文直通');
 });
 
-test('先提取后排除：与数据库（shujuku）顺序一致', () => {
+test('先提取后排除', () => {
     const out = core.applyJudgeOutputRules('噪音<a>保留<cut>删我</cut>就好</a>噪音', {
         extractRules: [{ start: '<a>', end: '</a>' }],
         excludeRules: [{ start: '<cut>', end: '</cut>' }],
@@ -729,7 +729,7 @@ test('运行日志页：关键词搜索、暂停攒条数、按等级筛选、�
 
 
 // ---------------------------------------------------------------
-// v2.14：规则语义对齐数据库（发送前过滤角色消息）+ 输出留痕 + 规则预览
+// v2.14：规则在发送前过滤角色消息 + 输出留痕 + 规则预览
 // ---------------------------------------------------------------
 
 test('规则预览：changed / hasTag / yes 三个字段都正确', () => {
@@ -939,8 +939,11 @@ test('路线图：读回时清掉断掉的线和没用的块，顺序数字算�
     assert.equal(route.nodes.n1.fallback, -1);
     assert.equal(route.nodes.n9, undefined, '走不到的段去掉');
     assert.equal(route.sides.length, 0, '宿主没了的支线去掉');
-    assert.deepEqual(plain(route.blocks.map(block => block.id)), ['k2'], '支线没了，它那一块也去掉');
-    assert.deepEqual(plain(route.blocks[0].nodes), ['n2']);
+    const kept = plain(route.blocks);
+    assert.equal(kept.length, 2, '支线没了，它那一块也去掉');
+    assert.deepEqual([kept[0].when, kept[0].text], ['always', '⟦main⟧'], '没有「一直发：主线当前段」那一块时补在最前面');
+    assert.equal(kept[1].id, 'k2');
+    assert.deepEqual(plain(route.blocks[1].nodes), ['n2']);
     const list = [
         { uid: 1, name: '人物', placement: { pos: 'after_character_definition', depth: 4, order: 100 } },
         { uid: 2, name: '地点', placement: { pos: 'after_character_definition', depth: 4, order: 200 } },
@@ -1121,7 +1124,7 @@ test('路线图：左栏是标志和总开关、路线图列表、API / 运行�
     assert.match(settingsText, /在最上面加一段.*在最下面加一段/, '提示词段最上面和最下面都能加一段');
     findButton(rail(), 'API').listeners.click[0]();
     assert.match(panel().querySelector('.dga-head').textContent, /API/);
-    assert.match(panel().querySelector('.dga-body').textContent, /预设名称.*连接方式.*酒馆主 API.*自定义/, 'API 页照数据库：预设名称、连接方式');
+    assert.match(panel().querySelector('.dga-body').textContent, /预设名称.*连接方式.*酒馆主 API.*自定义/, 'API 页：预设名称、连接方式');
     assert.deepEqual(errors, []);
 });
 
@@ -1154,6 +1157,14 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 发给 AI �
     assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 0, '没有规则时不列空行');
     findButton(drawer(), '＋ 加一条').listeners.click[0]();
     assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 1, '点「加一条」多一行开始 / 结束');
+    assert.doesNotMatch(drawer().textContent, /›/, '判断提示词右边不放跳转箭头');
+    findButton(card().querySelector('.dga-rt-head'), '发给 AI 的内容').listeners.click[0]();
+    const first = () => findAllClass(drawer(), 'dga-rt-blk')[0];
+    assert.match(first().textContent, /一直发/);
+    assert.ok(!findAllClass(first(), 'dga-rt-icon').some(node => node.getAttribute('title') === '删掉这一块'), '发主线当前段的那一块没有删除');
+    first().querySelector('.dga-rt-blk-row').listeners.click[0]();
+    const seg = first().querySelector('.dga-rt-seg');
+    assert.equal(findButton(seg, '走到某几段时').getAttribute('disabled'), '', '也改不成别的发法');
     findButton(card().querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
     assert.match(card().querySelector('.dga-rt-head').textContent, /完成编辑/);
     assert.deepEqual(errors, []);
@@ -1298,7 +1309,7 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     assert.deepEqual(run.errors, []);
 });
 
-test('自定义 API 请求体对照数据库：带 top_p，TauriTavern 带 custom_api_format，流式时合并 stream_options', () => {
+test('自定义 API 请求体：带 top_p，TauriTavern 带 custom_api_format，流式时合并 stream_options', () => {
     const preset = { name: 'c', connection: 'custom', customApiFormat: 'claude_messages', apiurl: 'https://api.anthropic.com', key: 'sk', model: 'claude', maxTokens: 100, temperature: 0.5, bodyParams: '{"top_k":50}' };
     const plainBody = core.buildJudgeCustomRequestBody([{ role: 'user', content: 'q' }], preset, false);
     assert.equal(plainBody.top_p, 0.95);

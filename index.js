@@ -3,10 +3,11 @@
 
     /* ================================================================
      * 动态指导助手 v4.0
+     * 协议：CC BY-NC-SA 4.0（署名-非商业性使用-相同方式共享），全文见仓库里的 LICENSE。
      *
      * 这个文件分四部分：
      *   一、核心：常量、运行日志（LogModule）、边界规则（RuleModule）等零依赖的
-     *       工具，仿数据库（shujuku）的 log-buffer.ts / utils.ts 拆分。
+     *       工具。
      *   二、适配层：读写酒馆助手的变量、世界书和事件；API 预设与模型请求。
      *       所有模型请求都走酒馆的接口，排队一个一个发，出错就暂停。
      *   三、界面：面板外壳、左栏、设置页、API 页、运行日志页、样式。
@@ -27,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.0.1';
+    const VERSION = '4.0.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -42,11 +43,11 @@
     const SIDE_COLORS = ['#7FBF8E', '#6FB3D9', '#C49BE0', '#E8955A', '#E07FA8', '#9CC56A'];
 
     // ---------------------------------------------------------------
-    // 一、核心：运行日志模块（仿数据库 shujuku shared/log-buffer.ts）
+    // 一、核心：运行日志模块
     //
     // 零 DOM 依赖的内存环形缓冲：等级 debug / info / warn / error，全部写入
     // 缓冲（debug 默认不采集，运行日志页可开）。每条带时间戳、模块标签、消息；
-    // 订阅机制让日志页打开时实时刷新。只存内存（上限 2000 条，与数据库一致），不写变量、
+    // 订阅机制让日志页打开时实时刷新。只存内存（上限 2000 条），不写变量、
     // 不上传；console 输出仍由各调用点自己负责，模块本身不产生副作用。
     // ---------------------------------------------------------------
 
@@ -58,7 +59,7 @@
         const knownTags = new Set();
         const subscribers = new Set();
 
-        // 参数序列化（照数据库 normalizeLogArg_ACU）：错误对象带 name / message / stack / cause，
+        // 参数序列化：错误对象带 name / message / stack / cause，
         // 普通对象先试 JSON，空对象或循环引用再按自身属性展开，都不行才给占位文字。
         function stringify(value, depth) {
             const level = depth || 0;
@@ -146,7 +147,7 @@
     })();
 
     // ---------------------------------------------------------------
-    // 一、核心：报错处理建议（仿数据库 log-error-hints.ts）
+    // 一、核心：报错处理建议
     //
     // 把 error 级日志翻译成「大概是什么问题 + 可以怎么处理」。按顺序匹配：越靠前越具体
     // （明确短语、HTTP 状态码），越靠后越宽泛（按功能兜底），最后一条通用兜底，
@@ -235,14 +236,14 @@
     }
 
     // ---------------------------------------------------------------
-    // 一、核心：边界规则模块（复刻数据库 shujuku AcuRulePairList / utils.ts）
+    // 一、核心：边界规则模块
     //
     // 每条规则是一对边界 {start, end}，匹配不区分大小写：
     //   提取规则：每条规则取「最后一个结束边界 + 它之前最后一个开始边界」，
     //     含边界本身截取；多条规则的结果用空行拼接；一条都没命中就返回原文。
     //   排除规则：删掉所有「开始边界~结束边界」区间（含边界本身，支持嵌套，
     //     重叠自动合并），最后把 3 个以上连续换行压成 2 个并 trim。
-    //   组合顺序与数据库一致：先提取、后排除。规则为空 = 原文直通。
+    //   组合顺序：先提取、后排除。规则为空 = 原文直通。
     // 用途：先削掉判断AI输出里的思维链/闲聊，再解析 <verdict> 标签（也认旧的 <结论>）。
     // ---------------------------------------------------------------
 
@@ -527,7 +528,7 @@
     // 因此预设实体只存在当前浏览器同源 localStorage；角色 config 只保存当前选择名。
     // ---------------------------------------------------------------
 
-    // 提示词后处理（对齐 shujuku 与酒馆「提示词后处理」下拉）：'' = 未选择（不带该字段原样透传）；
+    // 提示词后处理（和酒馆「提示词后处理」下拉一样）：'' = 未选择（不带该字段原样透传）；
     // 缺失/非法值归一为 'strict'（与历史写死 strict 的行为兼容）。
     const PROMPT_POST_PROCESSING_VALUES = ['', 'merge', 'semi', 'strict', 'single', 'merge_tools', 'semi_tools', 'strict_tools'];
     function normalizePromptPostProcessing(value) {
@@ -559,7 +560,7 @@
             apiurl: connection === 'custom' ? String(item.apiurl || '').trim() : '',
             key: connection === 'custom' ? String(item.key || '') : '',
             model: connection === 'main' ? '' : String(item.model || '').trim(),
-            // 缺省/非法值回退数据库（shujuku）同款默认：最大回复长度 60000、温度 1。
+            // 缺省/非法值回退默认：最大回复长度 60000、温度 1。
             maxTokens: Math.max(1, Math.floor(numberOrDefault(item.maxTokens, 60000))),
             temperature: numberOrDefault(item.temperature, 1),
             bodyParams: connection === 'custom' ? String(item.bodyParams || '') : '',
@@ -617,7 +618,7 @@
         return readJudgeApiPresets().find(item => item.name === wanted) || null;
     }
 
-    // 按聊天 / 按线选判断AI的 API（v3.2，仿数据库 apiPresetBindingsByChat / plotTaskApiPresetOverridesById）。
+    // 按聊天 / 按线选判断AI的 API（v3.2）。
     // 只存本机 localStorage，不写角色变量，照旧不随角色卡导出。优先级：这条线 > 全局。
     // v3.8 起按聊天的选择不再生效（入口已删），chats 字段仅为兼容旧存档保留。
     // 值为 '@main' 表示这里强制用酒馆主 API。
@@ -715,7 +716,7 @@
         return options;
     }
 
-    // 预设改名 / 删除时同步所有引用（仿数据库 renameApiPresetReferences / clearApiPresetReferences）：
+    // 预设改名 / 删除时同步所有引用：
     // 全局 judgePreset / conditionPreset、各角色的本机预设名存档、按聊天和按线的覆盖。newName 为空 = 清掉。
     async function updatePresetReferences(oldName, newName) {
         const from = String(oldName || '').trim();
@@ -797,7 +798,7 @@
     }
 
 
-    // 排除主体参数归一化（复刻 shujuku normalizeExcludeBodyParamsForSillyTavern_ACU）：
+    // 排除主体参数归一化：
     // 逗号/换行分隔的键名列表转成 YAML 序列；已是 YAML（- 开头 / [ / {）则原样透传。
     function normalizeExcludeBodyParams(raw) {
         if (typeof raw !== 'string') return '';
@@ -807,7 +808,7 @@
         return trimmed.split(/[,\n]/).map(item => item.trim()).filter(Boolean).map(key => `- ${key}`).join('\n');
     }
 
-    // 原版酒馆原生协议源的 reverse_proxy 基址归一化（复刻 shujuku normalizeSTNativeProxyBase_ACU）：
+    // 原版酒馆原生协议源的 reverse_proxy 基址归一化：
     // - claude 源后端 fetch(基址 + '/messages')：基址须含 /v1；
     // - makersuite 源后端自补 /v1beta：基址不得带版本段。
     function normalizeNativeProxyBase(rawUrl, nativeSource) {
@@ -827,7 +828,7 @@
         return base;
     }
 
-    // TauriTavern（Rust 后端）认 custom_api_format；原版酒馆不认，要映射到原生协议源（复刻 shujuku host-detect）。
+    // TauriTavern（Rust 后端）认 custom_api_format；原版酒馆不认，要映射到原生协议源。
     function isTauriTavernHost() {
         try {
             return Boolean((hostWindow && hostWindow.__TAURITAVERN__) || (currentWindow && currentWindow.__TAURITAVERN__));
@@ -836,7 +837,7 @@
         }
     }
 
-    // 插件要加进请求体的字段和用户写的「附加主体参数」合并（复刻 shujuku composeCustomIncludeBody_ACU）。
+    // 插件要加进请求体的字段和用户写的「附加主体参数」合并。
     // 酒馆按 YAML 解析这一格，JSON 是合法 YAML：用户留空或写的是 JSON 对象时合并成 JSON；
     // 写的是别的 YAML 就原样交给酒馆，跳过插件字段，不冒险改用户的写法。
     function composeCustomIncludeBody(userBody, pluginFields) {
@@ -857,7 +858,7 @@
         return JSON.stringify(merged);
     }
 
-    // 自定义连接的判断AI请求体（复刻 shujuku buildCustomApiRequestBody_ACU）。
+    // 自定义连接的判断AI请求体。
     // 接口协议映射原版酒馆：claude_messages→claude、gemini_interactions→makersuite（原生协议源），
     // openai_compat / openai_responses→custom（ST 无 Responses 后端，回退 /chat/completions）；
     // TauriTavern 下一律 custom，带 custom_api_format 由它自己分流。
@@ -884,7 +885,7 @@
             max_tokens: preset.maxTokens != null ? preset.maxTokens : 60000,
             temperature: preset.temperature != null ? preset.temperature : 1,
             top_p: 0.95,
-            // 流式输出（v2.18，数据库 streamingEnabled 同款）：开启后酒馆后端返回 SSE。
+            // 流式输出（v2.18）：开启后酒馆后端返回 SSE。
             stream: Boolean(streaming),
             chat_completion_source: chatCompletionSource,
             ...(tauri ? { custom_api_format: format } : {}),
@@ -908,7 +909,7 @@
     }
 
     // ---------------------------------------------------------------
-    // 二、适配层：酒馆宿主接口（对齐 shujuku ai-gateway，全部走酒馆）
+    // 二、适配层：酒馆宿主接口（全部走酒馆）
     //
     // 脚本不直接连第三方 API：拉模型走酒馆后端 /api/backends/chat-completions/status
     // （由酒馆服务器代发，行为和酒馆自己的「测试连接 / 拉模型」一致，也没有浏览器跨域问题）；
@@ -951,7 +952,7 @@
         return fetchFn(...args);
     }
 
-    // 原生 fetch（v3.4，照数据库 pristine-fetch）：有的酒馆脚本（例如 Kemini 伴生面板）会包装 fetch，
+    // 原生 fetch（v3.4）：有的酒馆脚本（例如 Kemini 伴生面板）会包装 fetch，
     // 命中 /api/backends/*/generate 就改写请求体和响应。判断请求打同一个端点，被改写后结论会被污染。
     // 先按已知标记剥掉包装；剥完仍不是原生的，改用专用隐藏 iframe 里的原生 fetch（第三方脚本碰不到新建的窗口）；
     // 都拿不到就退回 hostFetch 并告警一次。每次都重新解析：脚本可能比本插件晚装上。
@@ -1025,7 +1026,7 @@
         return hostFetch(input, init);
     }
 
-    // 复刻 shujuku fetchAvailableModels_ACU：把拉模型请求发给酒馆后端
+    // 拉模型列表：把请求发给酒馆后端
     // /api/backends/chat-completions/status，由酒馆服务器带着端点与密钥去请求目标 API。
     async function fetchAvailableModels(apiurl, key) {
         const url = String(apiurl || '').trim();
@@ -1541,7 +1542,7 @@
             if (settings.guideEnabled === false) settings.guideEnabled = false;
             else delete settings.guideEnabled;
         }
-        // 推进冷却（v3.3，仿格林推演圈层冷却）：刚换段后 N 层内不自动推进。缺省 1；0 = 不冷却。
+        // 推进冷却（v3.3）：刚换段后 N 层内不自动推进。缺省 1；0 = 不冷却。
         if (settings.advanceCooldown != null) {
             const n = Math.floor(Number(settings.advanceCooldown));
             if (Number.isFinite(n) && n >= 0) settings.advanceCooldown = n;
@@ -1558,12 +1559,12 @@
             if (typeof settings[field] !== 'string') settings[field] = String(settings[field]);
             if (!settings[field].trim()) delete settings[field];
         });
-        // 流式输出（v2.18，数据库 streamingEnabled 同款）：只认布尔，缺省 false。
+        // 流式输出（v2.18）：只认布尔，缺省 false。
         if (settings.streamingEnabled != null) settings.streamingEnabled = settings.streamingEnabled === true;
         if (settings.storageMode != null && settings.storageMode !== 'card' && settings.storageMode !== 'user') {
             delete settings.storageMode;
         }
-        // 判断AI输出的提取/排除规则（v2.13）：数据库填表同款 {start,end} 边界对；
+        // 判断AI输出的提取/排除规则（v2.13）：{start,end} 边界对；
         // 非法项丢弃，整列为空时删字段（= 不过滤，原文直通）。
         ['extractRules', 'excludeRules'].forEach(field => {
             if (settings[field] == null) return;
@@ -1602,7 +1603,7 @@
         return config;
     }
 
-    // 数据库把设置放在酒馆 extensionSettings 里，再 saveSettingsDebounced 写进服务器的设置文件。
+    // 设置放在酒馆 extensionSettings 里，再 saveSettingsDebounced 写进服务器的设置文件。
     // 世界书列表里看不到，保存世界书时也不会把这份数据清掉。
     const EXTENSION_SETTINGS_KEY = 'dynamic-guide-assistant';
 
@@ -2035,7 +2036,7 @@
     }
 
     // 判断AI（judge 档）：每条 AI 回复后静默问一次当前阶段是否完成。
-    // 回复长度（v3.2.1，对齐数据库 resolveRequestMaxTokens_ACU）：用 API 预设里的最大回复长度；
+    // 回复长度（v3.2.1）：用 API 预设里的最大回复长度；
     // 没选预设（酒馆主 API）时缺省 4096。不再单独压到 1024，免得标签外的分析或推理把作答表截掉。
     const JUDGE_REPLY_CAP = 4096;
     function judgeReplyTokens(preset) {
@@ -2044,15 +2045,15 @@
     }
     // 提示词在二级页面按「段」自定义（每段可选 system/user/assistant 角色，
     // 支持 {{stage}}/{{prompt}}/{{condition}}/{{history}} 占位符，可导入导出/恢复默认）；
-    // 调用通道按 API 预设的连接方式分流（全部走酒馆，对齐 shujuku）：
+    // 调用通道按 API 预设的连接方式分流（全部走酒馆）：
     //   酒馆主 API → Chat Completion 时直发生成端点，文本补全走酒馆助手 generateRaw；
     //   酒馆预设 → Chat Completion 预设直发生成端点，其余走 ConnectionManagerRequestService；
-    //   自定义 → 酒馆后端 /api/backends/chat-completions/generate（body 复刻 shujuku 构建）。
+    //   自定义 → 酒馆后端 /api/backends/chat-completions/generate。
     //   发生成端点一律用原生 fetch（pristineFetch，v3.4）。
-    // 判断AI结论只信一次；请求本身遇到临时性错误（5xx、超时、网络）原地重试一次（仿数据库
-    // isRetryableAiRequestError），401/400/404 等确定性错误和 429 限流不重试，直接进暂停。
+    // 判断AI结论只信一次；请求本身遇到临时性错误（5xx、超时、网络）原地重试一次，
+    // 401/400/404 等确定性错误和 429 限流不重试，直接进暂停。
 
-    // 请求闸门（v2.99.4，仿数据库 shujuku 的串行队列）：发给模型的请求一律排队，一次只发一个，
+    // 请求闸门（v2.99.4，串行队列）：发给模型的请求一律排队，一次只发一个，
     // 不会几条绑定同时请求。失败后暂停自动检查一阵：公益站对短时间反复请求会限流甚至封号，
     // 出错时继续每层都问只会越撞越狠。暂停期间「现在检查」仍可以手动试。
     const modelGate = { tail: Promise.resolve(), failures: 0, pausedUntil: 0, lastError: '' };
@@ -2075,13 +2076,13 @@
         return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
     }
 
-    // 中止（v3.2，仿数据库 AbortSignal）：切换聊天时把在途和排队中的请求作废。能取消的通道
+    // 中止（v3.2，AbortSignal）：切换聊天时把在途和排队中的请求作废。能取消的通道
     // （自定义 API 和直发生成端点的 fetch）真的取消；generateRaw / 连接管理器取消不了，就把回来的结论丢掉。
     // 中止不算失败、不暂停。
     const modelAbort = { epoch: 0, controller: null };
-    // 重试（v3.2.1，对齐数据库填表 / 剧情推进）：一次请求最多试 3 次（tableMaxRetries / loopSettings.maxRetries 缺省 3），
-    // 每次失败等 5 秒。两类情况重试：请求的临时性错误（isRetryableAiRequestError_ACU 口径：429、5xx、超时、网络），
-    // 以及模型回了但缺作答标签（填表缺 <tableEdit>、剧情推进缺标签同款）。密钥 / 参数 / 额度类错误不重试。
+    // 重试（v3.2.1）：一次请求最多试 3 次，
+    // 每次失败等 5 秒。两类情况重试：请求的临时性错误（429、5xx、超时、网络），
+    // 以及模型回了但缺作答标签。密钥 / 参数 / 额度类错误不重试。
     const MODEL_RETRY_DELAY = 5000;
     const MODEL_MAX_ATTEMPTS = 3;
 
@@ -2123,7 +2124,7 @@
         LogModule.info('判断AI', `${reason || '中止'}：在途和排队中的判断请求作废`);
     }
 
-    // validate(text) 为 false 表示缺作答标签，按数据库口径重试；最后一次仍缺就原样交回，调用方照常「不推进」。
+    // validate(text) 为 false 表示缺作答标签，重试；最后一次仍缺就原样交回，调用方照常「不推进」。
     function askModel(messages, preset, settings, validate) {
         const epoch = modelAbort.epoch;
         const run = async () => {
@@ -2149,7 +2150,7 @@
                     if (epoch !== modelAbort.epoch) throw modelAbortError();
                     if (typeof validate !== 'function' || validate(text) || attempt === MODEL_MAX_ATTEMPTS) break;
                     LogModule.warn('判断AI', `第 ${attempt}/${MODEL_MAX_ATTEMPTS} 次回复缺作答标签，${MODEL_RETRY_DELAY / 1000} 秒后重试`);
-                    // 仿数据库填表 SQL_ERROR_MARKER：重试时把错在哪告诉模型，不再原样重发。
+                    // 重试时把错在哪告诉模型，不再原样重发。
                     sending = appendToLastUser(messages.map(item => ({ ...item })), MODEL_RETRY_FEEDBACK);
                     await modelDelay(MODEL_RETRY_DELAY);
                     if (epoch !== modelAbort.epoch) throw modelAbortError();
@@ -2260,10 +2261,10 @@
     const JUDGE_IDENTITY_V30 = DEFAULT_JUDGE_SYSTEM_PROMPT.split('\n').slice(0, 2)
         .concat(['答案只按案卷末尾的作答表填写，标签外不写任何字。']).join('\n');
 
-    // v3.2：身份和判定手册合成一段静态 system（仿数据库 V19 单 system 前缀：有的兼容网关会把所有
+    // v3.2：身份和判定手册合成一段静态 system（有的兼容网关会把所有
     // system 提到指令前缀，一段字节稳定的前缀也更容易命中服务商的提示词缓存）。
     const DEFAULT_JUDGE_ROOT_PROMPT = [DEFAULT_JUDGE_SYSTEM_PROMPT, '', DEFAULT_JUDGE_RULES_PROMPT].join('\n');
-    // v3.2 案卷：多给上一阶段和已在这段停了几层（仿数据库注入阶段历史），状态型阶段更好判。
+    // v3.2 案卷：多给上一阶段和已在这段停了几层，状态型阶段更好判。
     const DEFAULT_JUDGE_CASE_PROMPT = LEGACY_JUDGE_CASE_PROMPT_V30
         .replace('【下一阶段】{{next}}', '【上一阶段】{{previous}}\n【已停多久】{{elapsed}}\n\n【下一阶段】{{next}}');
 
@@ -2272,7 +2273,7 @@
         { role: 'user', content: DEFAULT_JUDGE_CASE_PROMPT },
     ];
 
-    // 默认提示词迁移（v3.2，仿数据库 default-lineage）：用户存下的段里，和历史默认一字不差的换成
+    // 默认提示词迁移（v3.2）：用户存下的段里，和历史默认一字不差的换成
     // 新默认（v3.0 的身份 + 手册两段合成一段），改过的段原样保留。只在读取时换，不改存档。
     function migrateJudgeSegments(segments) {
         if (!Array.isArray(segments)) return segments;
@@ -2425,7 +2426,7 @@
             .trim();
     }
 
-    // 同一标签写了几次只认最后一次（v3.2，仿数据库「标签外可写思路，只读标签」）：
+    // 同一标签写了几次只认最后一次（v3.2，标签外可以写思路，只读标签）：
     // 思维链或草稿里先写过的标签会被后面的正式作答盖掉。
     function lastTagInner(text, tag) {
         const source = String(text || '');
@@ -2469,8 +2470,8 @@
             || /<结论>[\s\S]*?<\/结论>/i.test(String(text || ''));
     }
 
-    // 边界规则应用（v2.13 输出侧 / v2.14 起对齐数据库：同时作用于发送前的最近剧情）。
-    // 先按提取规则截取、再按排除规则删除（与数据库顺序一致）；规则为空 = 原文直通。
+    // 边界规则应用（v2.13 输出侧 / v2.14 起同时作用于发送前的最近剧情）。
+    // 先按提取规则截取、再按排除规则删除；规则为空 = 原文直通。
     function applyBoundaryRules(text, settings) {
         const source = settings && typeof settings === 'object' ? settings : {};
         return RuleModule.apply(text, {
@@ -2494,7 +2495,7 @@
         };
     }
 
-    // 判断AI检查频率（数据库填表同款「每 N 层」频率制）：每 N 条 AI 回复检查一次；
+    // 判断AI检查频率（「每 N 层」频率制）：每 N 条 AI 回复检查一次；
     // 缺省/非法值回退 1 = 每层都查。
     function judgeCheckInterval(settings) {
         const n = Math.floor(Number(settings && settings.judgeInterval));
@@ -2510,7 +2511,7 @@
 
     // 最近剧情（v2.15 语义）：只取 AI 发的正文——用户消息、系统消息一律不发给判断AI。
     // count = 参考最近几段角色回复（默认 1 = 只判断最新一段）；窗口按 count 放大，
-    // 防止用户连发时凑不够段数。提取/排除规则在发送前逐段作用于角色消息（数据库同款），
+    // 防止用户连发时凑不够段数。提取/排除规则在发送前逐段作用于角色消息，
     // 过滤后为空的消息整条丢弃。
     async function recentHistoryText(messageId, count, settings) {
         const getChatMessages = api('getChatMessages', false);
@@ -2535,7 +2536,7 @@
             .join('\n\n');
     }
 
-    // 直发生成端点（v3.4，照数据库 30b304da / a2e394c6）：酒馆主 API 是 Chat Completion 时，
+    // 直发生成端点（v3.4）：酒馆主 API 是 Chat Completion 时，
     // 按酒馆自己的字段拼好请求体，用原生 fetch 直接发到 /api/backends/chat-completions/generate。
     // generateRaw 和连接管理器都经过酒馆的全局 fetch，会被别的脚本改写；generateRaw 还会触发酒馆的生成事件，
     // 本插件的镜像同步和数据库等插件都会把一次判断当成正文生成。直发两样都没有，而且能中止。
@@ -2592,7 +2593,7 @@
 
     // 酒馆主 API 的请求体：优先让酒馆按当前 Chat Completion 设置自己生成（presetToGeneratePayload 传空预设 =
     // 原样用当前设置，和酒馆 quiet 生成同一套 createGenerationParameters，各家来源的特殊字段都带上）；
-    // 旧版酒馆没有这个接口时，照数据库 sendMainApiChatCompletionRequest_ACU 的字段手拼。
+    // 旧版酒馆没有这个接口时，按酒馆的字段手拼。
     async function mainApiDirectPayload(context, messages, maxTokens, temperature) {
         const oai = context.chatCompletionSettings;
         const model = typeof context.getChatCompletionModel === 'function' ? context.getChatCompletionModel() : undefined;
@@ -2649,7 +2650,7 @@
     }
 
     // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
-    // （复刻 shujuku 的自定义 API 调用，附加主体/排除参数/请求标头/提示词后处理全部生效）。
+    // （附加主体/排除参数/请求标头/提示词后处理全部生效）。
     // messages 为完整段列表（含最终注入）。
     // 从 OpenAI 形态 JSON 里取正文（自定义通道非流式/流式归一化都走这里）。
     function judgeTextFromJson(data) {
@@ -2662,7 +2663,7 @@
     }
 
     // 流式响应（SSE）聚合（v2.18）：OpenAI 形态 choices[0].delta.content 与
-    // Claude 原生 content_block_delta 都认（对齐数据库「流式 Claude 为原样 Anthropic SSE」），
+    // Claude 原生 content_block_delta 都认（流式 Claude 是原样的 Anthropic SSE），
     // [DONE] 结束，半包/注释行忽略。返回拼接出的完整文本。
     function parseJudgeSseText(raw) {
         let text = '';
@@ -2725,7 +2726,7 @@
         // 酒馆主 API（或无预设）：Chat Completion 时直发生成端点（v3.4）；文本补全照旧走酒馆助手 generateRaw。
         const direct = await askJudgeViaMainApiDirect(messages, preset, settings);
         if (direct != null) return direct;
-        // generateRaw 回退：和数据库填表一样，完整段列表直接交给 ordered_prompts。
+        // generateRaw 回退：完整段列表直接交给 ordered_prompts。
         // 最近剧情已通过 {{history}} 占位符写进段内容，不再叠加聊天历史。
         const generateRaw = api('generateRaw', false);
         if (!generateRaw) return null;
@@ -2830,7 +2831,7 @@
         editor: null,
         // 外观配色（v2.29）：null = 还没从本机读取；'tavern' 档不覆写任何令牌
         appearance: null,
-        // API 页草稿态（对齐 shujuku ApiConfigPanel 的 draft/snapshot/formMode）
+        // API 页草稿态（draft/snapshot/formMode）
         apiFormMode: 'empty',
         apiDraft: null,
         apiDraftOriginalName: '',
@@ -2838,12 +2839,12 @@
         apiModelOptions: [],
         apiModelStatus: 'idle',
         apiModelError: '',
-        // 判断AI提示词二级页草稿态（draft/snapshot 脏检查，对齐 shujuku 提示词抽屉）
+        // 判断AI提示词二级页草稿态（draft/snapshot 脏检查）
         judgePromptDraft: null,
         judgePromptDraftSnapshot: '',
         promptKey: '',
         promptKind: 'judge',
-        // 动态指导页「提取/排除规则」分组的展开态（默认折叠，对齐 AcuRulePairList）
+        // 动态指导页「提取/排除规则」分组的展开态（默认折叠）
         guideRulesOpen: new Map(),
         // 动态指导页规则行本地态（null = 还没从设置读取；半填的行只存在这里）
         guideRuleRows: new Map(),
@@ -3487,10 +3488,10 @@
     }
 
     // ---------------------------------------------------------------
-    // 三、界面：API 页（照数据库 shujuku test 分支 ApiConfigPanel）
+    // 三、界面：API 页
     //
     // 最上面一行「预设下拉 ＋ 删除」，下面是选中那个预设的表单，保存后留在这个预设上。
-    // 字段和顺序照数据库：预设名称 → 连接方式（酒馆主 API / 自定义）→ 自定义才有的：
+    // 字段和顺序：预设名称 → 连接方式（酒馆主 API / 自定义）→ 自定义才有的：
     // 接口协议 → 端点 → API 密钥 → 模型名 → 加载模型 → 模型列表 → 最大回复长度 / 温度
     // → 附加主体参数 → 排除主体参数 → 提示词后处理 → 附加请求标头。
     // 插件不自带预设；每张路线图用哪个，在它自己的「设置」里选，没选就跟随当前活动API。
@@ -3500,7 +3501,7 @@
     function emptyApiDraft() {
         return {
             name: '', connection: 'custom', customApiFormat: 'openai_compat',
-            // 默认值与数据库（shujuku）一致：最大回复长度 60000、温度 1，不留空。
+            // 默认值：最大回复长度 60000、温度 1，不留空。
             apiurl: '', key: '', model: '', maxTokens: 60000, temperature: 1,
             bodyParams: '', excludeBodyParams: '', requestHeaders: '',
             promptPostProcessing: 'strict',
@@ -3548,7 +3549,7 @@
         const dirty = JSON.stringify(draft) !== ui.apiDraftSnapshot;
         const leaveDraft = () => !(JSON.stringify(ui.apiDraft) !== ui.apiDraftSnapshot) || hostWindow.confirm('这个预设还没保存，确定放弃修改？');
 
-        // ── 预设选择行：下拉 + 新建 + 删除（对齐 AcuPresetDropdown 行）
+        // ── 预设选择行：下拉 + 新建 + 删除
         const pick = list.length
             ? rtSelect([...(creating ? [['', '（新建中）']] : []), ...list.map(item => [item.name, item.name])], creating ? '' : ui.apiDraftOriginalName, value => {
                 if (!value || value === ui.apiDraftOriginalName) return;
@@ -3617,7 +3618,7 @@
         ];
 
         // 加载模型：始终可点，直接用当前表单里的端点与密钥（不需要先保存），
-        // 请求走酒馆后端 /api/backends/chat-completions/status（与 shujuku 一致）。
+        // 请求走酒馆后端 /api/backends/chat-completions/status。
         const loadModels = () => {
             ui.apiModelStatus = 'loading';
             ui.apiModelError = '';
@@ -3662,7 +3663,7 @@
             if (ui.apiDraftOriginalName && ui.apiDraftOriginalName !== preset.name) {
                 await updatePresetReferences(ui.apiDraftOriginalName, preset.name);
             }
-            // 保存以后留在这个预设上，和数据库一样。
+            // 保存以后留在这个预设上。
             openApiPreset(preset.name);
         }, { success: creating ? `新建了「${oneLine(draft.name)}」` : `「${oneLine(draft.name)}」保存了` });
 
@@ -3722,7 +3723,7 @@
     // ---------------------------------------------------------------
     // 三、界面：运行日志页（目录页，左上角可以打开导航）
     //
-    // 仿数据库 useLogViewer / log-viewer：等级 + 模块筛选、关键词搜索、暂停 / 恢复（暂停期间
+    // 等级 + 模块筛选、关键词搜索、暂停 / 恢复（暂停期间
     // 新日志只计数，恢复时一次显示）、调试日志采集开关、复制 / 导出（文本或 JSON）/ 清空。
     // 错误日志下面附「可能原因 + 怎么处理」（resolveLogErrorHint）。最新在最上面；
     // 日志只存内存（上限 2000 条），不写变量、不上传。
@@ -3767,7 +3768,7 @@
         const paused = Boolean(ui.logPaused);
         const all = paused && ui.logSnapshot ? ui.logSnapshot : LogModule.list();
         const tags = LogModule.tags();
-        // 选中的模块被清空后不在列表里了，回到全部（数据库同款）。
+        // 选中的模块被清空后不在列表里了，回到全部。
         if (ui.logTagFilter && ui.logTagFilter !== 'all' && !tags.includes(ui.logTagFilter)) ui.logTagFilter = 'all';
         const debugOn = LogModule.isDebugEnabled();
         if (ui.logLevelFilter === 'debug' && !debugOn) ui.logLevelFilter = 'all';
@@ -3816,7 +3817,7 @@
             setMessage(`导出了 ${filtered.length} 条`, 'success');
         };
         const exportJson = () => {
-            // 数据库同款结构：time（ISO）/ level / tag / message。
+            // 结构：time（ISO）/ level / tag / message。
             const data = filtered.map(entry => ({ time: new Date(entry.time).toISOString(), level: entry.level, tag: entry.tag, message: entry.message }));
             downloadLogFile(`动态指导助手-运行日志-${logFileStamp()}.json`, JSON.stringify(data, null, 2), 'application/json');
             setMessage(`导出了 ${data.length} 条（JSON）`, 'success');
@@ -4158,7 +4159,14 @@
         route.blocks.forEach(block => {
             if (block.when === 'nodes') block.nodes = (block.nodes || []).filter(id => route.nodes[id]);
         });
+        if (!routeMainBlock(route)) route.blocks.unshift({ id: routeId('k'), when: 'always', text: '⟦main⟧' });
         return route;
+    }
+
+    // 每张图都要有一块「一直发」、里面放着主线当前段（v4.0.2）：保证这一段的内容每次都发得出去。
+    // 第一块这样的就是它，界面上不能删、不能改成别的发法，删掉主线那一格会放回去。
+    function routeMainBlock(route) {
+        return route.blocks.find(block => block.when === 'always' && String(block.text || '').includes('⟦main⟧')) || null;
     }
 
     function normalizeRoute(raw) {
@@ -4893,11 +4901,11 @@
     // ---------------------------------------------------------------
 
     // 判断提示词（v4.0）：做成预设，像 API 预设一样在设置页管理，每张路线图选用哪一套。
-    // 一套 = 几段 { role, content, enabled }，照数据库剧情推进的提示词段；段里的格子发送时换成当时的内容：
+    // 一套 = 几段 { role, content, enabled }；段里的格子发送时换成当时的内容：
     //   {{路线图}} {{在走的线}} {{可以开始的支线}} {{最近正文}} {{角色设定}} {{用户设定}} {{作答表}}
     // 「作答表」是插件读结论靠的格式，哪一段都没放时自动补在最后一段 USER 的末尾。
     // 内置的叫「默认」，不能删；改过就把改过的那套存进配置，「恢复默认」就是删掉这份改动。
-    // 写法参考用户给的数据库剧情推进二创预设：身份 → 一问一答 → 资料分块带结束标记 → 规则带例子
+    // 默认的写法：身份 → 一问一答 → 资料分块带结束标记 → 规则带例子
     // → 作答格式 → 思考清单。最后一段是 USER，不用助手预填（有的接口不接受以助手消息结尾）。
     const ROUTE_PROMPT_DEFAULT_NAME = '默认';
     const ROUTE_PROMPT_SLOTS = [
@@ -4905,8 +4913,8 @@
         ['在走的线', '主线和在走的支线：现在这一段、完成条件、后面的路'],
         ['可以开始的支线', '这一段上还能开始的支线和开始的条件'],
         ['最近正文', '最近几层 AI 写的正文'],
-        ['角色设定', '角色卡的描述（数据库里的 $C）'],
-        ['用户设定', '你的用户设定（数据库里的 $U）'],
+        ['角色设定', '角色卡的描述'],
+        ['用户设定', '你的用户设定'],
         ['作答表', '要它按什么格式回答（插件靠这个读结果）'],
     ];
     const DEFAULT_ROUTE_JUDGE_SEGMENTS = [
@@ -5677,16 +5685,11 @@
                         render();
                     })),
                 setRow('判断提示词',
-                    el('div', { class: 'dga-rs-pick' },
-                        rtSelect(prompts.map(item => [item.name, item.name]), promptName, value => {
-                            route.prompt = value === ROUTE_PROMPT_DEFAULT_NAME ? '' : value;
-                            routeEdited(route, false);
-                            render();
-                        }),
-                        el('button', {
-                            type: 'button', class: 'dga-icon-sq', title: '去编辑这套提示词', 'aria-label': '去编辑这套提示词',
-                            onclick: () => { ui.rt.panel[route.id] = ''; openPromptPreset(promptName); openView('settings'); },
-                        }, '›')))) : null,
+                    rtSelect(prompts.map(item => [item.name, item.name]), promptName, value => {
+                        route.prompt = value === ROUTE_PROMPT_DEFAULT_NAME ? '' : value;
+                        routeEdited(route, false);
+                        render();
+                    }))) : null,
             judging ? setSection(el('h3', { class: 'dga-set-title' }, '提取 / 排除规则', infoTip(`rules-${route.id}`, [
                 ['提取', '只留开始标记到结束标记中间的那一段，有好几处就取最后一处；找不到就整段照用。比如正文写在 <正文> 和 </正文> 中间，就填这两个。'],
                 ['排除', '把开始标记到结束标记中间的内容连同标记一起删掉，有几处删几处。比如去掉思考过程：<thinking> 和 </thinking>。'],
@@ -6541,6 +6544,7 @@
         const state = routeStateOf(route);
         const open = ui.rt.openBlock[route.id] === block.id;
         const active = routeBlockActive(route, state, block);
+        const guard = routeMainBlock(route) === block;
         const stop = fn => event => { event.stopPropagation(); fn(); };
         const move = delta => {
             const to = index + delta;
@@ -6557,12 +6561,22 @@
             el('span', { class: 'dga-rt-blk-ops' },
                 el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', onclick: stop(() => move(-1)) }, '↑'),
                 el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', onclick: stop(() => move(1)) }, '↓'),
-                el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '删掉这一块', onclick: stop(() => { route.blocks.splice(index, 1); routeEdited(route, false); render(); }) }, '×')),
+                guard ? null : el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '删掉这一块', onclick: stop(() => { route.blocks.splice(index, 1); routeEdited(route, false); render(); }) }, '×')),
             el('span', { class: 'dga-rt-blk-caret', text: open ? '▾' : '▸' }));
         const box = el('div', { class: `dga-rt-blk${open ? ' is-open' : ''}${active ? '' : ' is-idle'}`, style: `--cc:${routeBlockColor(route, block)}` }, row);
         if (!open) return box;
         const editor = el('div', { class: `dga-rt-tpl dga-rt-tpl-${block.id}`, contenteditable: 'true', spellcheck: 'false' });
-        const sync = () => { block.text = serializeTpl(editor); routeLive(route); scheduleRouteSave(600); };
+        const sync = () => {
+            const text = serializeTpl(editor);
+            if (guard && !text.includes('⟦main⟧')) {
+                notify('主线当前段这一格要留着，每次都靠它把这一段发出去', 'info');
+                render();
+                return;
+            }
+            block.text = text;
+            routeLive(route);
+            scheduleRouteSave(600);
+        };
         const remember = () => {
             const sel = hostWindow.getSelection ? hostWindow.getSelection() : null;
             if (sel && sel.rangeCount && editor.contains(sel.anchorNode)) tplFocus = { blockId: block.id, range: sel.getRangeAt(0).cloneRange() };
@@ -6620,7 +6634,7 @@
         };
         box.append(el('div', { class: 'dga-rt-blk-body' },
             el('div', { class: 'dga-rt-blk-q', text: '什么时候发' }),
-            rtSeg([['always', '一直发'], ['nodes', '走到某几段时'], ['side', '某条支线在走时', !route.sides.length]], kind, setKind),
+            rtSeg([['always', '一直发'], ['nodes', '走到某几段时', guard], ['side', '某条支线在走时', guard || !route.sides.length]], kind, setKind),
             picker,
             el('div', { class: 'dga-rt-blk-q' }, '写什么'),
             editor,
@@ -7399,9 +7413,6 @@ ${P} .dga-rs .dga-set-sec { margin-top: 18px; }
 ${P} .dga-rs .dga-set-sec:first-child { margin-top: 4px; }
 ${P} .dga-rs .dga-set-row { padding: 11px 14px; gap: 12px; }
 ${P} .dga-rs .dga-set-ctl select { width: 170px; }
-${P} .dga-rs-pick { display: flex; align-items: center; gap: 6px; }
-${P} .dga-rs-pick select { width: 140px !important; }
-${P} .dga-rs-pick .dga-icon-sq { width: 30px; height: 30px; font-size: 16px; }
 /* 路线图设置里的提取 / 排除规则：每条一行「开始 → 结束 ✕」 */
 ${P} .dga-rs .dga-set-row.dga-rs-rules { gap: 8px; }
 ${P} .dga-rs-rule-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
