@@ -20,7 +20,7 @@
      * 数据怎么存：
      *   - 路线图存在角色变量 $dynamicGuideAssistant.routes；设置和判断提示词在 config.settings。
      *   - 进度按聊天存在聊天变量 $dynamicGuideAssistant.routeState。
-     *   - API 预设和每张路线图选的 API 存在当前浏览器 localStorage，不随角色卡导出。
+     *   - API 预设和每张路线图选的 API 存在酒馆用户设置；旧 localStorage 只作迁移备份，不随角色卡导出。
      * ================================================================ */
 
     // ---------------------------------------------------------------
@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.0.3';
+    const VERSION = '4.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -163,11 +163,11 @@
             summary: '请求被中止（通常是停止了生成、切换了聊天或关闭了面板）。',
             steps: ['如果是你主动停止的，可以忽略这条。', '没有手动停止却出现时，检查网络是否在请求途中断开，然后重试。'] },
         { id: 'storage-quota', test: /quotaexceeded|exceeded the quota|storage.*full|out of storage|存储空间不足/,
-            summary: '浏览器本地存储满了，API 预设或本机设置写不进去。',
+            summary: '浏览器本地存储满了，本机辅助设置写不进去。API 配置需检查酒馆设置保存是否成功。',
             steps: ['清理浏览器里其他站点或扩展占用的存储。', '无痕模式下存储受限，换普通窗口再试。'] },
-        { id: 'preset-missing', test: /找不到本机 ?api ?预设|预设.*(不存在|未找到|找不到)|preset .* not found/,
-            summary: '选中的 API 预设已经不在本机（被删除、改名，或换了浏览器）。',
-            steps: ['到「API」页确认预设还在，或新建一个同名预设。', '在路线图的「设置」里重新选一次判断用的 API。', 'API 预设只存在当前浏览器，换设备后要重新建。'] },
+        { id: 'preset-missing', test: /找不到(?:本机|所选)? ?api ?预设|预设.*(不存在|未找到|找不到)|preset .* not found/,
+            summary: '选中的 API 预设不可用，可能被删除、改名，或尚未迁移到当前酒馆用户。',
+            steps: ['到「API」页确认预设还在，或新建一个同名预设。', '在路线图的「设置」里重新选一次判断用的 API。', '旧版升级请先在原浏览器迁移；其他浏览器需使用同一酒馆、同一用户。'] },
         { id: 'tavern-profile', test: /connectionmanagerrequestservice|连接管理器|未选择酒馆连接预设|连接预设.*(不存在|无效|失败)|connection profile/,
             summary: '「酒馆预设」连接不可用：酒馆的连接管理器缺失，或所选连接预设被删除、没配 API。',
             steps: ['打开酒馆「API 连接」→「连接配置」，确认该预设存在并绑好了 API。', '回到本插件「API」页重新选一次连接预设并保存。', '酒馆版本过旧时没有连接管理器，升级酒馆或改用「自定义」连接。'] },
@@ -522,10 +522,11 @@
     }
 
     // ---------------------------------------------------------------
-    // 二、适配层：API 预设（浏览器本地存储）
+    // 二、适配层：API 预设（酒馆用户设置）
     //
     // 完整预设可能含 API Key，绝不能写角色/聊天变量（会随角色卡或聊天数据传播）。
-    // 因此预设实体只存在当前浏览器同源 localStorage；角色 config 只保存当前选择名。
+    // 预设与路线图选择一起存 extensionSettings；旧 localStorage 仅用于迁移，不再写入。
+    // saveSettingsDebounced 无返回值时只能确认已提交保存请求，不能确认服务端落盘。
     // ---------------------------------------------------------------
 
     // 提示词后处理（和酒馆「提示词后处理」下拉一样）：'' = 未选择（不带该字段原样透传）；
@@ -594,23 +595,20 @@
     }
 
     function readJudgeApiPresets() {
-        const storage = presetStorage();
-        if (!storage) return [];
         try {
-            const raw = storage.getItem(JUDGE_PRESET_STORAGE_KEY);
-            return normalizeJudgeApiPresets(raw ? JSON.parse(raw) : []);
+            return readApiStore().presets;
         } catch (error) {
-            reportOnce('judge-preset-read', `读取本地API 预设失败：${error.message || error}`);
+            apiStoreNotice = error.message;
+            reportOnce('judge-preset-read', error.message);
             return [];
         }
     }
 
-    function writeJudgeApiPresets(presets) {
-        const storage = presetStorage();
-        if (!storage) throw new Error('当前页面无法访问 localStorage，不能保存API 预设。');
-        const normalized = normalizeJudgeApiPresets(presets);
-        storage.setItem(JUDGE_PRESET_STORAGE_KEY, JSON.stringify(normalized));
-        return normalized;
+    function writeJudgeApiPresets(presets, oldName = '', newName = '') {
+        return mutateApiStore(store => {
+            store.presets = normalizeJudgeApiPresets(presets);
+            rewritePresetOverrides(store.overrides, oldName, newName);
+        });
     }
 
     function findJudgeApiPreset(name) {
@@ -619,49 +617,152 @@
     }
 
     // 按聊天 / 按线选判断AI的 API（v3.2）。
-    // 只存本机 localStorage，不写角色变量，照旧不随角色卡导出。优先级：这条线 > 全局。
+    // 与 API 预设一起存酒馆用户设置，不写角色变量，不随角色卡导出。优先级：这条线 > 全局。
     // v3.8 起按聊天的选择不再生效（入口已删），chats 字段仅为兼容旧存档保留。
     // 值为 '@main' 表示这里强制用酒馆主 API。
     const PRESET_OVERRIDES_KEY = 'dynamic-guide-assistant:preset-overrides:v1';
     const PRESET_MAIN = '@main';
 
-    function readPresetOverrides() {
-        const empty = { chats: {}, lines: {} };
+    // 一个信封保存预设及引用，避免重命名/删除只成功一半。空信封也是权威配置。
+    const API_STORE_FIELD = 'apiStore';
+    let apiStoreQueue = Promise.resolve();
+    let apiStoreNotice = 'API 配置保存在酒馆用户设置；换浏览器需连接同一酒馆、同一用户。';
+
+    function apiSettingsContext() {
+        const context = sillyTavernContext();
+        const settings = context && context.extensionSettings;
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+            throw new Error('酒馆用户设置尚未就绪，API 配置未保存。请等待酒馆加载完成后重试。');
+        }
+        const root = settings[EXTENSION_SETTINGS_KEY];
+        if (root != null && (typeof root !== 'object' || Array.isArray(root))) {
+            throw new Error('酒馆中的动态指导助手设置格式异常，已停止写入，请先备份并检查设置。');
+        }
+        return { context, settings, root };
+    }
+
+    function normalizeApiStore(value) {
+        if (!value || value.version !== 1 || !Array.isArray(value.presets)
+            || !value.overrides || typeof value.overrides !== 'object' || Array.isArray(value.overrides)) {
+            throw new Error('酒馆 API 配置格式异常或版本不兼容，已停止写入，不会用本地旧数据覆盖。');
+        }
+        for (const group of ['chats', 'lines']) {
+            const entries = value.overrides[group];
+            if (entries != null && (typeof entries !== 'object' || Array.isArray(entries))) {
+                throw new Error('API 选择关系格式异常，已停止写入，请先备份并检查设置。');
+            }
+        }
+        return { version: 1, presets: normalizeJudgeApiPresets(value.presets), overrides: normalizePresetOverrides(value.overrides) };
+    }
+
+    function legacyApiStore() {
         const storage = presetStorage();
-        if (!storage) return empty;
         try {
-            const raw = storage.getItem(PRESET_OVERRIDES_KEY);
-            const parsed = raw ? JSON.parse(raw) : {};
-            const clean = source => {
-                const out = {};
-                if (source && typeof source === 'object') {
-                    Object.keys(source).forEach(key => {
-                        if (typeof source[key] === 'string' && source[key].trim()) out[key] = source[key].trim();
-                    });
-                }
-                return out;
+            const rawPresets = storage ? storage.getItem(JUDGE_PRESET_STORAGE_KEY) : null;
+            const rawOverrides = storage ? storage.getItem(PRESET_OVERRIDES_KEY) : null;
+            const presets = rawPresets === null ? [] : JSON.parse(rawPresets);
+            const overrides = rawOverrides === null ? {} : JSON.parse(rawOverrides);
+            if (!Array.isArray(presets) || !overrides || typeof overrides !== 'object' || Array.isArray(overrides)) throw new Error();
+            return {
+                exists: rawPresets !== null || rawOverrides !== null,
+                store: normalizeApiStore({ version: 1, presets, overrides }),
             };
-            return { chats: clean(parsed && parsed.chats), lines: clean(parsed && parsed.lines) };
         } catch (error) {
-            return empty;
+            // 不带 JSON 原文/解析错误，避免密钥进入日志。
+            throw new Error('旧浏览器 API 配置读取失败，未迁移、未覆盖。请保留旧浏览器数据并检查站点存储权限。');
         }
     }
 
-    function writePresetOverrides(overrides) {
-        const storage = presetStorage();
-        if (!storage) throw new Error('当前页面无法访问 localStorage，不能保存按聊天 / 按线的 API 选择。');
-        storage.setItem(PRESET_OVERRIDES_KEY, JSON.stringify({ chats: overrides.chats || {}, lines: overrides.lines || {} }));
+    function readApiStore() {
+        const { root } = apiSettingsContext();
+        if (root && Object.prototype.hasOwnProperty.call(root, API_STORE_FIELD)) {
+            return normalizeApiStore(root[API_STORE_FIELD]);
+        }
+        const legacy = legacyApiStore();
+        if (legacy.exists) apiStoreNotice = '正在使用旧浏览器配置，尚未提交到酒馆；请点击「迁移 / 重试保存」。';
+        return legacy.store;
+    }
+
+    function mutateApiStore(mutator, migrationOnly = false) {
+        const task = apiStoreQueue.then(async () => {
+            const { context, settings, root } = apiSettingsContext();
+            const hasStore = root && Object.prototype.hasOwnProperty.call(root, API_STORE_FIELD);
+            if (migrationOnly && hasStore) { normalizeApiStore(root[API_STORE_FIELD]); return false; }
+            const legacy = hasStore ? null : legacyApiStore();
+            // 无旧数据的普通读取不创建空服务端配置，给原浏览器留出迁移机会。
+            if (migrationOnly && !legacy.exists) return false;
+            const save = context.saveSettingsDebounced;
+            if (typeof save !== 'function') throw new Error('酒馆设置保存接口不可用，API 配置未保存；旧浏览器数据已保留。');
+            const next = hasStore ? normalizeApiStore(root[API_STORE_FIELD]) : legacy.store;
+            mutator(next);
+            const target = root || {};
+            const previous = target[API_STORE_FIELD];
+            const payload = normalizeApiStore(next);
+            target[API_STORE_FIELD] = payload;
+            settings[EXTENSION_SETTINGS_KEY] = target;
+            try {
+                const result = await save.call(context);
+                if (result === false || (result && (result.ok === false || result.saved === false))) throw new Error();
+            } catch (error) {
+                if (target[API_STORE_FIELD] === payload) {
+                    if (hasStore) target[API_STORE_FIELD] = previous;
+                    else delete target[API_STORE_FIELD];
+                }
+                // 保留其他模块可能同时写入的 layouts 等字段。
+                if (!root && Object.keys(target).length === 0) delete settings[EXTENSION_SETTINGS_KEY];
+                throw new Error('提交酒馆 API 配置保存失败，已回滚本次修改；旧浏览器数据未删除。请检查连接后重试。');
+            }
+            apiStoreNotice = '已提交酒馆保存（延迟保存接口不保证返回落盘确认）。请稍候，再到另一浏览器核对。旧本地备份仍保留。';
+            return true;
+        });
+        apiStoreQueue = task.catch(error => { apiStoreNotice = error.message; });
+        return task;
+    }
+
+    function migrateApiStore() {
+        return mutateApiStore(() => {}, true);
+    }
+
+    function readPresetOverrides() {
+        try {
+            return readApiStore().overrides;
+        } catch (error) {
+            apiStoreNotice = error.message;
+            reportOnce('preset-overrides-read', error.message);
+            return { chats: {}, lines: {} };
+        }
+    }
+
+    function normalizePresetOverrides(value) {
+        const clean = source => Object.fromEntries(Object.entries(source || {})
+            .filter(([key, name]) => !['__proto__', 'constructor', 'prototype'].includes(key) && typeof name === 'string' && name.trim())
+            .map(([key, name]) => [key, name.trim()]));
+        return { chats: clean(value.chats), lines: clean(value.lines) };
+    }
+
+    function rewritePresetOverrides(overrides, from, to) {
+        if (!from || from === to) return;
+        for (const group of ['chats', 'lines']) {
+            for (const key of Object.keys(overrides[group])) {
+                if (overrides[group][key] !== from) continue;
+                if (to) overrides[group][key] = to;
+                else delete overrides[group][key];
+            }
+        }
     }
 
     // group = 'chats' | 'lines'；name 为空 = 改回跟随上一级。
     function setPresetOverride(group, key, name) {
         if (group !== 'chats' && group !== 'lines') throw new Error(`未知的覆盖类型：${group}`);
         if (!key) throw new Error(group === 'chats' ? '拿不到当前聊天的 id，不能按聊天单独选 API。' : '这条绑定没有 key。');
-        const overrides = readPresetOverrides();
-        const value = String(name || '').trim();
-        if (value) overrides[group][key] = value;
-        else delete overrides[group][key];
-        writePresetOverrides(overrides);
+        return mutateApiStore(store => {
+            const value = String(name || '').trim();
+            if (value && value !== PRESET_MAIN && !store.presets.some(preset => preset.name === value)) {
+                throw new Error('找不到所选 API 预设，请先保存预设。');
+            }
+            if (value) store.overrides[group][key] = value;
+            else delete store.overrides[group][key];
+        });
     }
 
     function currentChatKey() {
@@ -718,19 +819,11 @@
 
     // 预设改名 / 删除时同步所有引用：
     // 全局 judgePreset / conditionPreset、各角色的本机预设名存档、按聊天和按线的覆盖。newName 为空 = 清掉。
-    async function updatePresetReferences(oldName, newName) {
+    async function updatePresetReferences(oldName, newName, apiStoreUpdated = false) {
         const from = String(oldName || '').trim();
         const to = String(newName || '').trim();
         if (!from || from === to) return;
-        const overrides = readPresetOverrides();
-        let touched = false;
-        ['chats', 'lines'].forEach(group => Object.keys(overrides[group]).forEach(key => {
-            if (overrides[group][key] !== from) return;
-            if (to) overrides[group][key] = to;
-            else delete overrides[group][key];
-            touched = true;
-        }));
-        if (touched) writePresetOverrides(overrides);
+        if (!apiStoreUpdated) await mutateApiStore(store => rewritePresetOverrides(store.overrides, from, to));
         const storage = presetStorage();
         if (storage && typeof storage.key === 'function' && typeof storage.length === 'number') {
             try {
@@ -2748,13 +2841,13 @@
             : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
     }
 
-    // 判断走哪条通道：本机 API 预设（酒馆预设 / 自定义），没选预设就用酒馆主 API（直发或 generateRaw 回退）。
+    // 判断走哪条通道：酒馆用户设置里的 API 预设，没选预设就用酒馆主 API。
     // 全部走酒馆的接口。用不了时返回 { error }，自动检查只提醒一次，「现在检查」直接报出来。
     function judgeChannel(settings) {
         const presetName = typeof settings.judgePreset === 'string' ? settings.judgePreset.trim() : '';
         const preset = presetName ? findJudgeApiPreset(presetName) : null;
         if (presetName && !preset) {
-            return { key: `judge-preset-missing:${presetName}`, error: `找不到本机 API 预设「${presetName}」，本次不检查；请重新选择或保存同名预设。` };
+            return { key: `judge-preset-missing:${presetName}`, error: `找不到 API 预设「${presetName}」，本次不检查；请重新选择或在原浏览器迁移。` };
         }
         if ((!preset || preset.connection === 'main') && !api('generateRaw', false)
             && !mainApiIsChatCompletion(sillyTavernContext())) {
@@ -3567,8 +3660,8 @@
                     rtBtn('删掉', () => {
                         ui.rt.modal = null;
                         runAction('删除 API 预设', async () => {
-                            writeJudgeApiPresets(readJudgeApiPresets().filter(item => item.name !== name));
-                            await updatePresetReferences(name, '');
+                            await writeJudgeApiPresets(readApiStore().presets.filter(item => item.name !== name), name, '');
+                            await updatePresetReferences(name, '', true);
                             ui.apiDraft = null;
                             ui.apiDraftOriginalName = '';
                             enterApiPage();
@@ -3658,14 +3751,14 @@
             if (readJudgeApiPresets().some(item => item.name === preset.name && item.name !== ui.apiDraftOriginalName)) {
                 throw new Error(`已经有叫「${preset.name}」的预设了。`);
             }
-            const remaining = readJudgeApiPresets().filter(item => item.name !== ui.apiDraftOriginalName);
-            writeJudgeApiPresets(remaining.concat([preset]));
+            const remaining = readApiStore().presets.filter(item => item.name !== ui.apiDraftOriginalName);
+            await writeJudgeApiPresets(remaining.concat([preset]), ui.apiDraftOriginalName, preset.name);
             if (ui.apiDraftOriginalName && ui.apiDraftOriginalName !== preset.name) {
-                await updatePresetReferences(ui.apiDraftOriginalName, preset.name);
+                await updatePresetReferences(ui.apiDraftOriginalName, preset.name, true);
             }
             // 保存以后留在这个预设上。
             openApiPreset(preset.name);
-        }, { success: creating ? `新建了「${oneLine(draft.name)}」` : `「${oneLine(draft.name)}」保存了` });
+        }, { success: `「${oneLine(draft.name)}」已提交酒馆保存，请稍候再关闭页面。` });
 
         const formChildren = [
             af('预设名称', input('name', { maxlength: '60' })),
@@ -3716,7 +3809,17 @@
                             el('div', { class: 'dga-af-foot' },
                                 el('span'),
                                 el('div', { class: 'dga-af-foot-r' }, discard, save)))),
-                    el('p', { class: 'dga-pg-foot', text: '密钥以明文存在这台设备上。' }))),
+                    el('p', { class: 'dga-pg-foot', text: apiStoreNotice }),
+                    rtBtn('迁移 / 重试保存', () => runAction('迁移 API 配置', async () => {
+                        const migrated = await migrateApiStore();
+                        if (!migrated) {
+                            const { root } = apiSettingsContext();
+                            if (root && Object.prototype.hasOwnProperty.call(root, API_STORE_FIELD)) await mutateApiStore(() => {});
+                            else apiStoreNotice = '没有旧数据可迁移，请先在原来保存过 API 的浏览器升级。';
+                        }
+                        enterApiPage();
+                    }), 'small', { disabled: Boolean(ui.busy) }),
+                    el('p', { class: 'dga-pg-foot', text: '密钥以明文保存在酒馆用户设置，不随角色卡或聊天导出；请保护酒馆账号与设置备份。旧浏览器迁移备份不会自动删除。' }))),
         ];
     }
 
@@ -5153,19 +5256,20 @@
         return true;
     }
 
-    // 每张路线图自己选判断用的 API。API 预设只存本机，所以这个选择也只存本机（和预设同一份存档，按路线图 id）。
+    // 每张路线图自己选判断用的 API，与预设一起存酒馆用户设置，按路线图 id 区分。
     // 没选 = 跟随当前活动API（酒馆现在连着的那个）。
     function routeApiKey(route) {
         return `route:${route.id}`;
     }
 
-    function routeApiName(route) {
-        const name = readPresetOverrides().lines[routeApiKey(route)] || '';
+    function routeApiName(route, strict = false) {
+        const overrides = strict ? readApiStore().overrides : readPresetOverrides();
+        const name = overrides.lines[routeApiKey(route)] || '';
         return name === PRESET_MAIN ? '' : name;
     }
 
     function setRouteApi(route, name) {
-        setPresetOverride('lines', routeApiKey(route), name);
+        return setPresetOverride('lines', routeApiKey(route), name);
     }
 
     // 问一张图。force = 不看间隔，出错直接报出来（测试和以后的手动入口用）。
@@ -5177,7 +5281,8 @@
         if (!routeJudgeDue(route, state, messageId, settings, force)) return false;
         const item = routeJudgeCase(route, state);
         if (!item || !item.lines.length) return false;
-        const channel = usableChannel({ ...settings, judgePreset: routeApiName(route) }, force);
+        // 设置不可读时拒绝判断，不能把读取失败当成「跟随主 API」而发给错误的模型。
+        const channel = usableChannel({ ...settings, judgePreset: routeApiName(route, true) }, force);
         if (!channel) return false;
         const rules = { extractRules: route.extractRules, excludeRules: route.excludeRules };
         const history = await recentHistoryText(messageId, judgeHistoryCount(settings), rules);
@@ -5668,7 +5773,7 @@
         const apiName = routeApiName(route);
         const apiList = readJudgeApiPresets();
         const apiOptions = [['', '跟随当前活动API']].concat(apiList.map(item => [item.name, item.name]));
-        if (apiName && !apiList.some(item => item.name === apiName)) apiOptions.push([apiName, `${apiName}（已不在本机）`]);
+        if (apiName && !apiList.some(item => item.name === apiName)) apiOptions.push([apiName, `${apiName}（预设不可用）`]);
         const prompts = routePromptPresets(settings);
         const promptName = prompts.some(item => item.name === route.prompt) ? route.prompt : prompts[0].name;
         return el('div', { class: 'dga-rs' },
@@ -5685,10 +5790,7 @@
                     }, 'is-fill'))),
             judging ? setSection('AI 判断', null,
                 setRow('判断用的 API',
-                    rtSelect(apiOptions, apiName, value => {
-                        try { setRouteApi(route, value); } catch (error) { setMessage(error.message || String(error), 'error'); }
-                        render();
-                    })),
+                    rtSelect(apiOptions, apiName, value => runAction('保存路线图 API 选择', () => setRouteApi(route, value)))),
                 setRow('判断提示词',
                     rtSelect(prompts.map(item => [item.name, item.name]), promptName, value => {
                         route.prompt = value === ROUTE_PROMPT_DEFAULT_NAME ? '' : value;
@@ -7838,6 +7940,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         normalizeConfig,
         normalizeJudgeApiPreset,
         normalizeJudgeApiPresets,
+        apiStorage: { read: readApiStore, writePresets: writeJudgeApiPresets, migrate: migrateApiStore, notice: () => apiStoreNotice },
         normalizePromptPostProcessing,
         normalizeExcludeBodyParams,
         normalizeNativeProxyBase,
@@ -7915,6 +8018,8 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     LogModule.info('系统', `${SCRIPT_NAME} v${VERSION} 已加载`);
     removeStaleUi();
     registerMenuEntry(0);
+    // 迁移失败不妨碍路线图本身加载；可在 API 页重试。
+    runEventTask('迁移 API 配置', migrateApiStore);
     // 页面一打开：有旧版绑定就停用，再把每棵树的条目同步到当前进度。
     runEventTask('准备指导', () => withIoCache(async () => {
         await parkExportedSecrets();

@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v4.0.3**
+当前版本：**v4.1**
 
 在酒馆里给角色画一张「路线图」：剧情（也可以是时间、关系变化……）一段一段排好，分出路口，挂上支线。动态指导助手只把**现在走到的这一段**写进世界书，AI 每次回复看到的就是当下该演的内容；走完一段就往下一段走，可以自己点，也可以交给判断用的 AI。
 
@@ -8,10 +8,10 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 
 ## 安装
 
-导入文件位于本项目 `latest/` 目录，也可在 [v4.0.3 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v4.0.3)下载：
+导入文件位于本项目 `latest/` 目录，也可在 [v4.1 发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/tag/v4.1)下载：
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.0.3/dynamic-guide-offline-v4.0.3.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.0.3/dynamic-guide-online-v4.0.3.json)：启动时加载固定版本的远程脚本。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.1/dynamic-guide-offline-v4.1.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.1/dynamic-guide-online-v4.1.json)：启动时加载固定版本的远程脚本。
 
 在酒馆助手里导入并启用，点酒馆左下角魔法棒里的「动态指导助手」打开。
 
@@ -40,7 +40,15 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 
 ## API
 
-左栏「API」管所有 API 预设：连接方式选「酒馆主 API」或「自定义」；自定义时填接口协议、端点、API 密钥、模型名（可以「加载模型」）、最大回复长度、温度，以及附加主体参数、排除主体参数、提示词后处理、附加请求标头。所有请求都走酒馆的接口。预设只存在当前浏览器，密钥是明文，不随角色卡导出；共享设备别存密钥。
+左栏「API」管所有 API 预设：连接方式选「酒馆主 API」或「自定义」；自定义时填接口协议、端点、API 密钥、模型名（可以「加载模型」）、最大回复长度、温度，以及附加主体参数、排除主体参数、提示词后处理、附加请求标头。所有请求都走酒馆的接口。
+
+**v4.1 起，API 预设和每张路线图的 API 选择一起存入酒馆用户设置。** 换浏览器或设备后，连接同一个酒馆实例、同一个酒馆用户，重新加载页面即可读取已保存的配置；换另一套酒馆不会自动迁移，也不是多浏览器实时协同编辑。
+
+- **从旧版升级：先在原来保存过 API 的浏览器里升级并运行一次。** 启动时会尝试迁移旧 `localStorage`；如果酒馆尚未就绪，到 API 页点击「迁移 / 重试保存」。其他浏览器应在迁移后刷新页面。
+- 已有酒馆 API 配置时以它为准，包括主动删除后的空配置，绝不被旧浏览器备份覆盖。没有旧数据的浏览器不会仅因启动就建立空配置。
+- 预设与路线图选择一起保存；重命名、删除会同步处理选择关系。保存接口缺失、抛错或明确返回失败时会报错并回滚，不会静默改存浏览器。
+- 酒馆的 `saveSettingsDebounced()` 是延迟保存接口，通常不返回服务端落盘确认。「已提交酒馆保存」不等于已经验证落盘；请稍候再关闭页面，并在另一浏览器核对。旧浏览器原始备份不会自动删除，也不会继续更新。
+- **密钥以明文保存在酒馆用户设置及保留的旧浏览器备份里，不写进角色卡、世界书或聊天变量。** 请保护酒馆账号和设置备份，共享设备谨慎保存密钥。
 
 ## 运行日志
 
@@ -51,7 +59,7 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口。酒馆助手脚本正文可以只写一行：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.0.3/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.1/index.js';
 ```
 
 推荐直接导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；升级时导入新版在线版 JSON，或替换地址中的版本号。
@@ -67,7 +75,7 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.0.3/
 - 路线图：角色变量 `$dynamicGuideAssistant.routes = { version: 1, list }`。
 - 进度：聊天变量 `$dynamicGuideAssistant.routeState.routes[路线图 id]`。
 - 设置和判断提示词：角色变量 `$dynamicGuideAssistant.config.settings`。
-- API 预设、每张路线图选的 API：只存当前浏览器的 `localStorage`。
+- API 预设、每张路线图选的 API：酒馆用户设置 `extensionSettings["dynamic-guide-assistant"].apiStore`；旧浏览器的 `localStorage` 仅保留为迁移备份。
 
 ## 协议
 
@@ -79,6 +87,14 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.0.3/
 - 改过再发布的版本也要用同样的协议。
 
 ## 更新日志
+
+### v4.1
+
+- API 预设和路线图 API 选择改存酒馆用户设置，同一酒馆用户换浏览器后可重新加载，不再依赖浏览器本地配置。
+- 首次升级在原浏览器自动迁移旧数据，保留旧备份；已有酒馆配置（包括空配置）不会被旧数据覆盖。API 页新增「迁移 / 重试保存」和保存状态说明。
+- 预设重命名、删除与路线图引用作为同一份配置提交；明确保存失败时回滚并提示，宿主未就绪或配置损坏时阻止误写，判断时不把读取失败当成跟随主 API。
+- 密钥继续与角色卡、世界书和聊天变量隔离；修正文档和界面里“只存本机”的旧说明。
+- 脚本测试增加迁移、双浏览器存储模拟、服务端空配置优先、异步保存失败和回滚等回归用例。
 
 ### v4.0.3（2026-10-03）
 

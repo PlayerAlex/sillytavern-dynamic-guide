@@ -8,6 +8,15 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
 
+function settingsHost(settings = {}) {
+    const state = { settings, saves: 0, persisted: JSON.parse(JSON.stringify(settings)) };
+    const context = {
+        extensionSettings: settings,
+        saveSettingsDebounced() { state.saves += 1; state.persisted = plain(settings); },
+    };
+    return { state, context, SillyTavern: { getContext: () => context } };
+}
+
 function load(helper, extra) {
     const logs = [];
     const errors = [];
@@ -15,6 +24,7 @@ function load(helper, extra) {
         Buffer,
         console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
         TavernHelper: helper,
+        SillyTavern: settingsHost().SillyTavern,
     };
     Object.assign(sandbox, extra || {});
     vm.runInNewContext(source, sandbox, { filename: 'index.js' });
@@ -222,6 +232,7 @@ function loadWithDocument(documentRef, helper) {
         console: { log: message => logs.push(message), warn: message => logs.push(message), error: message => errors.push(message) },
         TavernHelper: helper,
         document: documentRef,
+        SillyTavern: settingsHost().SillyTavern,
         getComputedStyle: () => ({ display: 'none', visibility: 'hidden' }),
         setTimeout: () => 0,
         setInterval: () => 0,
@@ -239,6 +250,7 @@ function loadWithNestedDocuments(topDocument, frameDocument, helper) {
     const errors = [];
     const topWindow = {
         document: topDocument,
+        SillyTavern: settingsHost().SillyTavern,
         getComputedStyle: () => ({ display: 'none', visibility: 'hidden' }),
         setTimeout: () => 0,
         innerWidth: 390,
@@ -1251,6 +1263,135 @@ function memoryStorage(initial) {
     };
 }
 
+const API_PRESETS_KEY = 'dynamic-guide-assistant:judge-api-presets:v1';
+const API_OVERRIDES_KEY = 'dynamic-guide-assistant:preset-overrides:v1';
+const API_SETTINGS_KEY = 'dynamic-guide-assistant';
+const sampleApiPreset = name => ({ name, connection: 'custom', apiurl: 'https://example.com/v1', key: 'test-secret-only', model: 'test-model' });
+
+test('API 存储：旧预设和路线图选择一起迁移，保留原始备份及布局，不向角色/聊天泄露密钥', async () => {
+    const world = routeWorld();
+    const host = settingsHost({ [API_SETTINGS_KEY]: { layouts: { kept: true } }, otherExtension: { kept: true } });
+    const presets = JSON.stringify([sampleApiPreset('旧预设')]);
+    const overrides = JSON.stringify({ chats: { oldChat: '旧预设' }, lines: { 'route:r1': '旧预设' } });
+    const storage = memoryStorage({ [API_PRESETS_KEY]: presets, [API_OVERRIDES_KEY]: overrides });
+    const run = load(world.helper, { SillyTavern: host.SillyTavern, localStorage: storage });
+    await new Promise(setImmediate);
+    const stored = host.state.persisted[API_SETTINGS_KEY];
+    assert.equal(stored.apiStore.presets[0].key, 'test-secret-only');
+    assert.equal(stored.apiStore.overrides.lines['route:r1'], '旧预设');
+    assert.equal(stored.apiStore.overrides.chats.oldChat, '旧预设');
+    assert.deepEqual(stored.layouts, { kept: true });
+    assert.deepEqual(host.state.persisted.otherExtension, { kept: true });
+    assert.equal(host.state.saves, 1);
+    assert.equal(await run.core.apiStorage.migrate(), false);
+    assert.equal(host.state.saves, 1, '重复迁移不能重复保存');
+    assert.equal(storage.getItem(API_PRESETS_KEY), presets);
+    assert.equal(storage.getItem(API_OVERRIDES_KEY), overrides);
+    assert.doesNotMatch(JSON.stringify(world.state.variables), /test-secret-only|test-model|example.com/);
+    assert.doesNotMatch(JSON.stringify(run.core.log.list()), /test-secret-only/);
+});
+
+test('API 存储：另一浏览器不需要 localStorage；已有空配置也不被旧备份复活', async () => {
+    const firstHost = settingsHost();
+    const first = load(null, { SillyTavern: firstHost.SillyTavern }).core;
+    await first.apiStorage.writePresets([sampleApiPreset('共享')]);
+    await first.routes.setApi({ id: 'r1' }, '共享');
+    const secondHost = settingsHost(plain(firstHost.state.persisted));
+    const second = load(null, { SillyTavern: secondHost.SillyTavern, localStorage: memoryStorage() }).core;
+    assert.equal(second.apiStorage.read().presets[0].key, 'test-secret-only');
+    assert.equal(second.routes.apiName({ id: 'r1' }), '共享');
+    await second.apiStorage.writePresets([], '共享', '');
+    const stale = memoryStorage({ [API_PRESETS_KEY]: JSON.stringify([sampleApiPreset('共享')]), [API_OVERRIDES_KEY]: JSON.stringify({ lines: { 'route:r1': '共享' } }) });
+    const thirdHost = settingsHost(plain(secondHost.state.persisted));
+    const third = load(null, { SillyTavern: thirdHost.SillyTavern, localStorage: stale }).core;
+    assert.equal(await third.apiStorage.migrate(), false);
+    assert.deepEqual(plain(third.apiStorage.read().presets), []);
+    assert.equal(third.routes.apiName({ id: 'r1' }), '');
+    assert.equal(thirdHost.state.saves, 0);
+});
+
+test('API 存储：新浏览器无旧数据时不抢先建立空配置', async () => {
+    const host = settingsHost();
+    const run = load(null, { SillyTavern: host.SillyTavern }).core;
+    assert.deepEqual(plain(run.apiStorage.read().presets), []);
+    assert.equal(await run.apiStorage.migrate(), false);
+    assert.deepEqual(host.state.settings, {});
+    assert.equal(host.state.saves, 0);
+});
+
+test('API 存储：宿主未就绪/无保存接口时拒绝写入，稍后可重试迁移', async () => {
+    const host = settingsHost();
+    let ready = false;
+    const localStorage = memoryStorage({ [API_PRESETS_KEY]: JSON.stringify([sampleApiPreset('旧')]) });
+    const run = load(null, { SillyTavern: { getContext: () => ready ? host.context : null }, localStorage }).core;
+    await assert.rejects(run.apiStorage.migrate(), /尚未就绪/);
+    assert.deepEqual(host.state.settings, {});
+    ready = true;
+    const save = host.context.saveSettingsDebounced;
+    delete host.context.saveSettingsDebounced;
+    await assert.rejects(run.apiStorage.migrate(), /接口不可用/);
+    assert.deepEqual(host.state.settings, {});
+    host.context.saveSettingsDebounced = save;
+    assert.equal(await run.apiStorage.migrate(), true);
+    assert.equal(run.apiStorage.read().presets[0].name, '旧');
+});
+
+test('API 存储：同步异常、异步拒绝和失败返回均回滚，队列仍可重试', async () => {
+    for (const fail of [() => { throw new Error('test-secret-only'); }, async () => { throw new Error('test-secret-only'); }, () => false, () => ({ ok: false })]) {
+        const host = settingsHost();
+        const run = load(null, { SillyTavern: host.SillyTavern }).core;
+        await run.apiStorage.writePresets([sampleApiPreset('原名')]);
+        await run.routes.setApi({ id: 'r1' }, '原名');
+        const before = plain(host.state.settings);
+        const save = host.context.saveSettingsDebounced;
+        host.context.saveSettingsDebounced = fail;
+        await assert.rejects(run.apiStorage.writePresets([sampleApiPreset('新名')], '原名', '新名'), /已回滚/);
+        assert.deepEqual(plain(host.state.settings), before, '预设及引用一起回滚');
+        assert.doesNotMatch(run.apiStorage.notice(), /test-secret-only/);
+        host.context.saveSettingsDebounced = save;
+        await run.apiStorage.writePresets([sampleApiPreset('新名')], '原名', '新名');
+        assert.equal(run.routes.apiName({ id: 'r1' }), '新名');
+        await run.apiStorage.writePresets([], '新名', '');
+        assert.equal(run.routes.apiName({ id: 'r1' }), '');
+    }
+});
+
+test('API 存储：迁移失败保留旧备份和布局，坏 JSON/未知版本不覆盖', async () => {
+    const raw = JSON.stringify([sampleApiPreset('旧')]);
+    const storage = memoryStorage({ [API_PRESETS_KEY]: raw });
+    const host = settingsHost({ [API_SETTINGS_KEY]: { layouts: { keep: true } } });
+    host.context.saveSettingsDebounced = async () => { throw new Error(); };
+    const run = load(null, { SillyTavern: host.SillyTavern, localStorage: storage }).core;
+    await assert.rejects(run.apiStorage.migrate(), /已回滚/);
+    assert.deepEqual(host.state.settings, { [API_SETTINGS_KEY]: { layouts: { keep: true } } });
+    assert.equal(storage.getItem(API_PRESETS_KEY), raw);
+    storage.setItem(API_PRESETS_KEY, 'test-secret-only{');
+    await assert.rejects(run.apiStorage.migrate(), error => /读取失败/.test(error.message) && !error.message.includes('test-secret-only'));
+    const unknown = { version: 2, presets: [], overrides: {} };
+    host.state.settings[API_SETTINGS_KEY].apiStore = unknown;
+    await assert.rejects(run.apiStorage.migrate(), /版本不兼容/);
+    assert.equal(host.state.settings[API_SETTINGS_KEY].apiStore, unknown);
+});
+
+test('API 存储：串行等待异步保存，失败后不阻塞后续路线图选择', async () => {
+    const host = settingsHost();
+    const run = load(null, { SillyTavern: host.SillyTavern }).core;
+    await run.apiStorage.writePresets([sampleApiPreset('甲')]);
+    let rejectSave;
+    host.context.saveSettingsDebounced = () => new Promise((resolve, reject) => { rejectSave = reject; });
+    const first = run.routes.setApi({ id: 'r1' }, '甲');
+    const failed = assert.rejects(first, /已回滚/);
+    await new Promise(setImmediate);
+    const second = run.routes.setApi({ id: 'r2' }, '甲');
+    host.context.saveSettingsDebounced = () => { host.state.persisted = plain(host.state.settings); };
+    rejectSave(new Error());
+    await failed;
+    await second;
+    assert.equal(run.routes.apiName({ id: 'r1' }), '');
+    assert.equal(run.routes.apiName({ id: 'r2' }), '甲');
+    assert.equal(host.state.persisted[API_SETTINGS_KEY].apiStore.overrides.lines['route:r2'], '甲');
+});
+
 test('路线图：判断提示词按段发，格子换成当时的内容；关掉的段不发，没放作答表自动补上', () => {
     const R = load().core.routes;
     const t = demoRoute(R);
@@ -1324,8 +1465,8 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     const state = R.normalizeRouteState(null, t.route);
     R.mainStep(t.route, state);
     await R.writeState(t.route.id, state);
-    R.setApi(t.route, '便宜的');
-    assert.equal(R.apiName(t.route), '便宜的', '这张图选的 API 存在本机');
+    await R.setApi(t.route, '便宜的');
+    assert.equal(R.apiName(t.route), '便宜的', '这张图选的 API 存在酒馆用户设置');
     const moved = await R.judge(t.route, 4);
     assert.equal(moved, true);
     assert.equal(fetches.length, 1, '走自定义 API');
