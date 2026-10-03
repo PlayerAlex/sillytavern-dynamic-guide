@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.1';
+    const VERSION = '4.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -722,6 +722,107 @@
     function migrateApiStore() {
         return mutateApiStore(() => {}, true);
     }
+    // 通用提示词库与 API 同属酒馆用户，但使用独立字段，导出不包含连接凭据。
+    const PROMPT_STORE_FIELD = 'promptStore';
+    const PROMPT_BUILTIN_ID = '@default';
+
+    function cleanPromptPreset(raw) {
+        return { id: String((raw && raw.id) || ''), name: oneLine(raw && raw.name), segments: normalizeRouteJudgeSegments(raw && raw.segments) };
+    }
+
+    function normalizePromptStore(raw) {
+        if (!raw || raw.version !== 1 || !Array.isArray(raw.presets)
+            || !raw.migrations || typeof raw.migrations !== 'object' || Array.isArray(raw.migrations)) {
+            throw new Error('通用提示词库格式异常或版本不兼容，已停止读写。');
+        }
+        const ids = new Set();
+        const presets = raw.presets.map(item => {
+            const preset = cleanPromptPreset(item);
+            if (!/^p[a-z0-9]+$/.test(preset.id) || ids.has(preset.id) || !preset.name || !preset.segments.length) {
+                throw new Error('通用提示词预设格式异常，已停止读写。');
+            }
+            ids.add(preset.id);
+            return preset;
+        });
+        return { version: 1, presets, migrations: cloneData(raw.migrations) };
+    }
+
+    function readPromptStore() {
+        const { root } = apiSettingsContext();
+        return root && Object.prototype.hasOwnProperty.call(root, PROMPT_STORE_FIELD)
+            ? normalizePromptStore(root[PROMPT_STORE_FIELD]) : { version: 1, presets: [], migrations: {} };
+    }
+
+    function mutatePromptStore(mutator) {
+        // 复用用户设置队列，避免 API 保存和提示词保存并发创建根对象或回滚互相覆盖。
+        const task = apiStoreQueue.then(async () => {
+            const { context, settings, root } = apiSettingsContext();
+            const hasStore = root && Object.prototype.hasOwnProperty.call(root, PROMPT_STORE_FIELD);
+            const next = readPromptStore();
+            const result = mutator(next);
+            if (result === false) return false;
+            if (typeof context.saveSettingsDebounced !== 'function') throw new Error('酒馆设置保存接口不可用，通用提示词未保存。');
+            const payload = normalizePromptStore(next);
+            const target = root || {};
+            const previous = target[PROMPT_STORE_FIELD];
+            target[PROMPT_STORE_FIELD] = payload;
+            settings[EXTENSION_SETTINGS_KEY] = target;
+            try {
+                const saved = await context.saveSettingsDebounced();
+                if (saved === false || (saved && (saved.ok === false || saved.saved === false))) throw new Error();
+            } catch (error) {
+                if (hasStore) target[PROMPT_STORE_FIELD] = previous;
+                else delete target[PROMPT_STORE_FIELD];
+                if (!root && !Object.keys(target).length) delete settings[EXTENSION_SETTINGS_KEY];
+                throw new Error('提交通用提示词保存失败，已回滚；原角色配置未删除，请重试。');
+            }
+            return result;
+        });
+        apiStoreQueue = task.catch(() => {});
+        return task;
+    }
+
+
+    function saveUserPrompt(raw) {
+        const preset = cleanPromptPreset(raw);
+        if (!preset.name || !preset.segments.length) return Promise.reject(new Error('提示词需要名称和至少一段内容。'));
+        return mutatePromptStore(store => {
+            if (preset.id && !store.presets.some(item => item.id === preset.id)) throw new Error('所编辑的提示词已不存在，请重新选择或新建。');
+            if (store.presets.some(item => item.name === preset.name && item.id !== preset.id)) throw new Error('已有同名通用提示词，请换一个名称。');
+            if (!preset.id) preset.id = routeId('p');
+            store.presets = store.presets.filter(item => item.id !== preset.id).concat([preset]);
+            return preset.id;
+        });
+    }
+
+    function deleteUserPrompt(id) {
+        return mutatePromptStore(store => {
+            store.presets = store.presets.filter(item => item.id !== id);
+            // 保留迁移映射作为墓碑，旧卡/失败重试不能复活已删除的预设。
+            return true;
+        });
+    }
+
+    function importPromptData(parsed) {
+        if (parsed && parsed.format && (parsed.format !== 'dynamic-guide-prompt' || parsed.version !== 1)) {
+            throw new Error('不支持该提示词文件版本。');
+        }
+        const raw = Array.isArray(parsed) ? parsed : parsed && (parsed.segments || parsed.promptGroup);
+        const segments = normalizeRouteJudgeSegments(raw);
+        if (!segments.length) throw new Error('导入的文件里没有提示词段。');
+        return { name: oneLine(parsed && parsed.name), segments };
+    }
+
+    function exportPromptData(preset) {
+        return { format: 'dynamic-guide-prompt', version: 1, name: oneLine(preset.name), segments: normalizeRouteJudgeSegments(preset.segments) };
+    }
+
+    function localPromptCopy(route) {
+        const preset = resolveRoutePrompt(route);
+        return { name: preset.name, segments: cloneData(preset.segments) };
+    }
+
+
 
     function readPresetOverrides() {
         try {
@@ -817,38 +918,12 @@
         return options;
     }
 
-    // 预设改名 / 删除时同步所有引用：
-    // 全局 judgePreset / conditionPreset、各角色的本机预设名存档、按聊天和按线的覆盖。newName 为空 = 清掉。
+    // 预设及有效引用只在 apiStore 中修改；已退役的本机预设名备份不再读写。
     async function updatePresetReferences(oldName, newName, apiStoreUpdated = false) {
         const from = String(oldName || '').trim();
         const to = String(newName || '').trim();
         if (!from || from === to) return;
         if (!apiStoreUpdated) await mutateApiStore(store => rewritePresetOverrides(store.overrides, from, to));
-        const storage = presetStorage();
-        if (storage && typeof storage.key === 'function' && typeof storage.length === 'number') {
-            try {
-                for (let index = 0; index < storage.length; index += 1) {
-                    const key = storage.key(index);
-                    if (!key || !key.startsWith(LOCAL_PRESET_PREFIX)) continue;
-                    const parsed = JSON.parse(storage.getItem(key) || '{}');
-                    let changed = false;
-                    ['judgePreset', 'conditionPreset'].forEach(field => {
-                        if (parsed && parsed[field] === from) { parsed[field] = to; changed = true; }
-                    });
-                    if (changed) storage.setItem(key, JSON.stringify(parsed));
-                }
-            } catch (error) { /* 别的角色的存档读不了就跳过，当前角色下面照样更新 */ }
-        }
-        const fresh = await readConfig();
-        const settings = { ...(fresh.settings || {}) };
-        let changed = false;
-        ['judgePreset', 'conditionPreset'].forEach(field => {
-            if (settings[field] === from) { settings[field] = to; changed = true; }
-        });
-        if (changed) {
-            fresh.settings = settings;
-            await writeConfig(fresh);
-        }
         LogModule.info('API', to ? `API 预设「${from}」改名为「${to}」，引用已同步` : `API 预设「${from}」已删除，引用已清掉`);
     }
 
@@ -1193,50 +1268,6 @@
         });
     }
 
-    // 配置存哪（开发者模式里切）：
-    //   绑定的正本永远是当前角色的角色变量。酒馆换卡时这份变量跟着换，所以天然按卡分开，
-    //   不再用头像文件名在 localStorage 里另存一份（那份会和角色变量打架，改头像还会丢）。
-    //   'user' = 只本机：只写角色变量，不写世界书。
-    //   'card' = 跟角色卡：角色变量之外，再把一份脱敏配置写进世界书的「（动态指导·配置）」条目。
-    //            导入的人如果没有角色变量，就从这条读回来。
-    //   存放方式本身也写进角色变量。只放在浏览器里的话，过一段时间或换一台电脑就会掉回「只本机」。
-    //   v2.32 按头像存过的本机档只在角色变量还没有配置时读一次，用来迁移。
-    const CONFIG_STORAGE_KEY = 'dynamic-guide-assistant:config-storage:v1';
-    const LOCAL_CONFIG_PREFIX = 'dynamic-guide-assistant:config:v2:';
-    const LOCAL_PRESET_PREFIX = 'dynamic-guide-assistant:preset-names:v1:';
-    // 世界书里的配置条目：关着的，只给插件读，永远不进 AI 上下文，也不参与关键词触发。
-    const CONFIG_ENTRY_NAME = '（动态指导·配置）';
-    // 循环如果只放在条目 extra 里，手机会在酒馆自己保存世界书时把这份隐藏数据清掉。
-    // 状态条目是关着的正文，世界书一定会把它留下。
-    const STATE_ENTRY_NAME = '（动态指导·状态）';
-
-    function configStorageMode() {
-        const storage = presetStorage();
-        if (!storage) return 'user';
-        try {
-            return storage.getItem(CONFIG_STORAGE_KEY) === 'card' ? 'card' : 'user';
-        } catch (error) {
-            return 'user';
-        }
-    }
-
-    function setConfigStorageMode(mode) {
-        const storage = presetStorage();
-        if (storage) {
-            try { storage.setItem(CONFIG_STORAGE_KEY, mode === 'card' ? 'card' : 'user'); } catch (error) { /* 存不了就只用内存 */ }
-        }
-        return configStorageMode();
-    }
-
-    async function persistStorageMode(mode) {
-        const next = mode === 'card' ? 'card' : 'user';
-        setConfigStorageMode(next);
-        const config = await readConfig();
-        config.settings = { ...(config.settings || {}), storageMode: next };
-        await writeConfig(config);
-        return next;
-    }
-
     // 同一张卡的稳定身份：优先用头像文件名（酒馆里每张卡唯一），没有才退回名字。
     function characterScopeId(card) {
         if (!card || typeof card !== 'object') return '';
@@ -1255,110 +1286,128 @@
         }
     }
 
-    function localConfigStorageKey(scopeId) {
-        return scopeId ? `${LOCAL_CONFIG_PREFIX}${scopeId}` : '';
-    }
+    // 正本：角色变量。以下旧键/条目只读迁移，不再持续双写或改变旧备份。
+    const CONFIG_STORAGE_KEY = 'dynamic-guide-assistant:config-storage:v1';
+    const LOCAL_CONFIG_PREFIX = 'dynamic-guide-assistant:config:v2:';
+    const CONFIG_ENTRY_NAME = '（动态指导·配置）';
+    const STATE_ENTRY_NAME = '（动态指导·状态）';
+    let configStoreQueue = Promise.resolve();
 
-    async function readLocalConfig() {
-        const storage = presetStorage();
-        const key = localConfigStorageKey(await currentScopeId());
-        if (!storage || !key) return null;
-        try {
-            const raw = storage.getItem(key);
-            return raw ? JSON.parse(raw) : null;
-        } catch (error) {
-            return null;
+    function validateStoredConfig(raw) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+            || (raw.version != null && raw.version !== 2)
+            || (raw.storageVersion != null && raw.storageVersion !== 1)
+            || (raw.bindings != null && !Array.isArray(raw.bindings))
+            || (raw.settings != null && (typeof raw.settings !== 'object' || Array.isArray(raw.settings)))) {
+            throw new Error('角色配置格式异常或版本不兼容，已停止读写；请保留备份后检查。');
         }
+        return raw;
     }
 
-    // 角色变量会随卡走，但世界书列表里看不到。API 预设名只留本机。
-    // 划分放在绑定上，不放进世界书里那条能打开看见的配置条目。
     function configForCharacter(config) {
-        const settings = { ...((config && config.settings) || {}) };
-        delete settings.judgePreset;
-        delete settings.conditionPreset;
-        return {
-            version: 2,
-            bindings: (config && config.bindings) || [],
-            settings,
-            layouts: (config && config.layouts) || {},
-        };
+        const normalized = normalizeConfig(validateStoredConfig(config));
+        const settings = {};
+        // 只存当前功能字段；API 凭据、已退役预设名、存放模式和布局不能再混进角色卡。
+        for (const key of ['guideEnabled', 'autoAdvance', 'judgeInterval', 'judgeHistoryCount', 'streamingEnabled']) {
+            if (Object.prototype.hasOwnProperty.call(normalized.settings, key)) settings[key] = normalized.settings[key];
+        }
+        if (Object.prototype.hasOwnProperty.call(normalized.settings, 'routePromptPresets')) {
+            settings.routePromptPresets = validateLegacyPrompts(normalized.settings.routePromptPresets);
+        }
+        // 旧绑定仅留下完成退役清理所需的定位字段，不把旧布局等负载继续传播。
+        const bindings = normalized.bindings.map(({ worldbookName, entryUid, entryName }) => ({ worldbookName, entryUid, entryName }));
+        return { version: 2, storageVersion: 1, bindings, settings };
     }
 
-    function configForCard(config) {
-        const base = configForCharacter(config);
-        base.bindings = (base.bindings || []).map(item => {
-            const copy = { ...item };
-            delete copy.layout;
-            return copy;
-        });
-        delete base.layouts;
-        return base;
+    async function currentStoredConfig() {
+        const variables = await readVariables('character');
+        const root = variables[VARIABLE_ROOT];
+        if (root == null) return undefined;
+        if (typeof root !== 'object' || Array.isArray(root)) throw new Error('角色变量根格式异常，未修改。');
+        if (!Object.prototype.hasOwnProperty.call(root, 'config')) return undefined;
+        return validateStoredConfig(root.config);
     }
 
-    async function presetNameStorageKey() {
-        const scope = await currentScopeId();
-        return `${LOCAL_PRESET_PREFIX}${scope || 'global'}`;
+    function readLegacyConfigJson(text) {
+        try { return validateStoredConfig(JSON.parse(text)); }
+        catch (error) { throw new Error('旧配置损坏或版本不兼容，未迁移、未覆盖；原始备份已保留。'); }
     }
 
-    async function readLocalPresetNames() {
+    async function assertConfigScope(epoch, scope) {
+        const current = await currentScopeId();
+        if (ioCache.epoch !== epoch || current !== scope) throw new Error('读取配置期间切换了角色或聊天，已取消旧操作，请重试。');
+    }
+
+
+    async function readLegacyConfig(scope) {
+        if (!scope) return null;
         const storage = presetStorage();
-        const empty = { judgePreset: '', conditionPreset: '' };
-        if (!storage) return empty;
+        let local = null;
+        let mode = null;
         try {
-            const raw = storage.getItem(await presetNameStorageKey());
-            const parsed = raw ? JSON.parse(raw) : {};
-            return {
-                judgePreset: typeof parsed.judgePreset === 'string' ? parsed.judgePreset : '',
-                conditionPreset: typeof parsed.conditionPreset === 'string' ? parsed.conditionPreset : '',
-            };
+            local = storage ? storage.getItem(`${LOCAL_CONFIG_PREFIX}${scope}`) : null;
+            mode = storage ? storage.getItem(CONFIG_STORAGE_KEY) : null;
         } catch (error) {
-            return empty;
+            throw new Error('旧浏览器配置不可读，未迁移；请检查站点存储权限后重试。');
+        }
+        const fromBook = async () => {
+            const bound = await boundWorldbookNames(await currentCharacter());
+            for (const name of bound) {
+                const entry = worldbookEntries(await getWorldbook(name)).find(item => entryName(item) === CONFIG_ENTRY_NAME);
+                if (entry) return readLegacyConfigJson(String(entry.content || ''));
+            }
+            return null;
+        };
+        // 只在缺少角色正本时读取旧模式；保留用户当时选定的来源优先级。
+        if (mode === 'card') {
+            const card = await fromBook();
+            if (card) return card;
+        }
+        if (local !== null) return readLegacyConfigJson(local);
+        return mode === 'card' ? null : fromBook();
+    }
+
+    const configOrigins = new WeakMap();
+
+    function queueConfigTask(task) {
+        const pending = configStoreQueue.then(task);
+        configStoreQueue = pending.catch(() => {});
+        return pending;
+    }
+
+    async function commitCharacterConfig(stored, epoch, scope, onlyIfMissing = false) {
+        await assertConfigScope(epoch, scope);
+        const update = api('updateVariablesWith', true);
+        const result = await Promise.resolve(update(variables => {
+            if (ioCache.epoch !== epoch) throw new Error('保存配置期间切换了聊天，已取消旧操作。');
+            const safe = variables && typeof variables === 'object' ? variables : {};
+            const root = safe[VARIABLE_ROOT] || {};
+            if (typeof root !== 'object' || Array.isArray(root)) throw new Error('角色变量根格式异常，未修改。');
+            if (Object.prototype.hasOwnProperty.call(root, 'config')) validateStoredConfig(root.config);
+            if (onlyIfMissing && Object.prototype.hasOwnProperty.call(root, 'config')) return safe;
+            // 不原地改宿主对象，保存调用失败时不会污染原配置。
+            return { ...safe, [VARIABLE_ROOT]: { ...root, config: cloneData(stored) } };
+        }, { type: 'character' }));
+        if (result === false || (result && (result.ok === false || result.saved === false))) {
+            throw new Error('角色配置保存失败，未确认迁移；旧备份已保留，请重试。');
         }
     }
 
-    async function writeLocalPresetNames(names) {
-        const storage = presetStorage();
-        if (!storage) return;
-        const next = {
-            judgePreset: names && typeof names.judgePreset === 'string' ? names.judgePreset : '',
-            conditionPreset: names && typeof names.conditionPreset === 'string' ? names.conditionPreset : '',
-        };
-        try { storage.setItem(await presetNameStorageKey(), JSON.stringify(next)); } catch (error) { /* 存不了就只用这次内存里的名字 */ }
-    }
-
-    async function rememberPresetNames(config) {
-        const settings = (config && config.settings) || {};
-        const hasJudge = Object.prototype.hasOwnProperty.call(settings, 'judgePreset');
-        const hasCondition = Object.prototype.hasOwnProperty.call(settings, 'conditionPreset');
-        if (!hasJudge && !hasCondition) return;
-        const local = await readLocalPresetNames();
-        await writeLocalPresetNames({
-            judgePreset: hasJudge ? String(settings.judgePreset || '') : local.judgePreset,
-            conditionPreset: hasCondition ? String(settings.conditionPreset || '') : local.conditionPreset,
+    async function writeConfig(config) {
+        const origin = configOrigins.get(config);
+        const epoch = origin ? origin.epoch : ioCache.epoch;
+        const scope = origin ? origin.scope : await currentScopeId();
+        if (config.settings && Object.prototype.hasOwnProperty.call(config.settings, 'routePromptPresets')) {
+            throw new Error('通用提示词请保存到用户预设库，不再写入角色设置。');
+        }
+        const stored = configForCharacter(config);
+        return queueConfigTask(async () => {
+            await commitCharacterConfig(stored, epoch, scope);
+            return stored;
         });
     }
 
-    async function currentBoundWorldbooks() {
-        try {
-            return await boundWorldbookNames(await currentCharacter());
-        } catch (error) {
-            return [];
-        }
-    }
 
-    async function readCardConfig() {
-        const bound = await currentBoundWorldbooks();
-        for (const worldbookName of bound) {
-            try {
-                const entry = worldbookEntries(await getWorldbook(worldbookName)).find(item => entryName(item) === CONFIG_ENTRY_NAME);
-                if (!entry) continue;
-                const parsed = JSON.parse(String(entry.content || '{}'));
-                if (parsed && Array.isArray(parsed.bindings)) return parsed;
-            } catch (error) { /* 读不了、不是 JSON，都跳过 */ }
-        }
-        return null;
-    }
 
     // 配置条目只给插件读：关掉，并清掉从模板克隆来的关键词和常驻开关，避免被重新打开后发给 AI。
     // 酒馆助手的次要关键词是 { logic, keys }，不能写成数组，否则保存时 keys.map 会报错。
@@ -1368,120 +1417,6 @@
             ? raw.logic
             : 'and_any';
         return { logic, keys: [] };
-    }
-
-    function sealConfigEntry(entry) {
-        entry.enabled = false;
-        entry.disable = true;
-        entry.constant = false;
-        entry.selective = false;
-        entry.keys = [];
-        entry.key = [];
-        entry.secondary_keys = [];
-        entry.keysecondary = [];
-        if (entry.strategy && typeof entry.strategy === 'object') {
-            entry.strategy = {
-                ...entry.strategy,
-                type: 'selective',
-                keys: [],
-                keys_secondary: sealedSecondaryKeys(entry.strategy),
-            };
-        }
-        return entry;
-    }
-
-    async function writeCardConfig(config) {
-        const bound = await currentBoundWorldbooks();
-        const target = ((config.bindings || [])[0] || {}).worldbookName || bound[0] || '';
-        if (!target) return false;
-        const payload = JSON.stringify(configForCard(config), null, 2);
-        // 内容没变、条目也关着，就不再写世界书（写一次就是存一次世界书文件）。
-        try {
-            const current = worldbookEntries(await getWorldbook(target)).find(item => entryName(item) === CONFIG_ENTRY_NAME);
-            if (current && String(current.content || '') === payload && entryIsDisabled(current) && !current.constant) return true;
-        } catch (error) { /* 读不到就照常写 */ }
-        await updateWorldbook(target, worldbook => {
-            const list = worldbookEntries(worldbook);
-            const existing = list.find(item => entryName(item) === CONFIG_ENTRY_NAME);
-            if (existing) {
-                existing.content = payload;
-                sealConfigEntry(existing);
-                return worldbook;
-            }
-            // 克隆同一本世界书里已有条目的字段形态，保证是被酒馆认得的完整条目；然后强制关闭。
-            const template = list.find(entry => !entryName(entry).endsWith(MIRROR_SUFFIX) && entryName(entry) !== CONFIG_ENTRY_NAME) || {};
-            const entry = sealConfigEntry({
-                ...template,
-                uid: freshUid(worldbook),
-                comment: CONFIG_ENTRY_NAME,
-                name: CONFIG_ENTRY_NAME,
-                title: CONFIG_ENTRY_NAME,
-                content: payload,
-            });
-            addEntryToWorldbook(worldbook, entry);
-            return worldbook;
-        });
-        return true;
-    }
-
-    async function readRawConfig() {
-        const fromCharacter = await readRootField('character', 'config');
-        if (fromCharacter) return fromCharacter;
-        if (configStorageMode() === 'card') {
-            const fromCard = await readCardConfig();
-            if (fromCard) return fromCard;
-        }
-        const legacy = await readLocalConfig();
-        if (legacy && Array.isArray(legacy.bindings)) return legacy;
-        return null;
-    }
-
-    async function writeConfig(config) {
-        await rememberPresetNames(config);
-        const stored = configForCharacter(config);
-        await writeRootField('character', 'config', stored);
-        await writeExtensionLayouts(stored);
-        const mode = stored.settings && (stored.settings.storageMode === 'card' || stored.settings.storageMode === 'user')
-            ? stored.settings.storageMode
-            : configStorageMode();
-        if (mode === 'card') await writeCardConfig(configForCard(stored));
-        return config;
-    }
-
-    // 启动时把已经写进角色变量的预设名搬回本机，并记下存放方式。
-    // 世界书里还有「（动态指导·配置）」但浏览器里的开关丢了，就恢复成跟卡走。
-    async function parkExportedSecrets() {
-        const raw = await readRootField('character', 'config');
-        const normalized = normalizeConfig(raw);
-        const leakedJudge = raw && raw.settings && typeof raw.settings.judgePreset === 'string' ? raw.settings.judgePreset : '';
-        const leakedCondition = raw && raw.settings && typeof raw.settings.conditionPreset === 'string' ? raw.settings.conditionPreset : '';
-        if (leakedJudge || leakedCondition) {
-            const local = await readLocalPresetNames();
-            await writeLocalPresetNames({
-                judgePreset: local.judgePreset || leakedJudge,
-                conditionPreset: local.conditionPreset || leakedCondition,
-            });
-            delete normalized.settings.judgePreset;
-            delete normalized.settings.conditionPreset;
-        }
-        const storage = presetStorage();
-        const stored = storage ? storage.getItem(CONFIG_STORAGE_KEY) : null;
-        let mode = normalized.settings.storageMode;
-        if (mode !== 'card' && mode !== 'user') {
-            if (stored === 'card' || stored === 'user') mode = stored;
-            else if (await readCardConfig()) mode = 'card';
-        }
-        if (mode === 'card' || mode === 'user') {
-            if (storage) {
-                try { storage.setItem(CONFIG_STORAGE_KEY, mode); } catch (error) { /* 浏览器拒写时仍写进角色变量 */ }
-            }
-            normalized.settings.storageMode = mode;
-        }
-        const savedMode = raw && raw.settings ? raw.settings.storageMode : undefined;
-        const leaked = Boolean(leakedJudge || leakedCondition);
-        if (leaked || ((mode === 'card' || mode === 'user') && savedMode !== mode)) {
-            await writeConfig(normalized);
-        }
     }
 
     function bindingKey(binding) {
@@ -1502,12 +1437,13 @@
     }
 
     function configWithBindings(config, bindings) {
-        return {
+        const next = {
             version: 2,
             bindings,
             settings: (config && config.settings) || {},
-            layouts: (config && config.layouts) || {},
         };
+        if (configOrigins.has(config)) configOrigins.set(next, configOrigins.get(config));
+        return next;
     }
 
     function normalizePromptSegments(segments) {
@@ -1612,9 +1548,9 @@
                 else delete settings.judgeSegments;
             }
         }
-        // 判断AI选用的本地 API 预设名；空字符串 = 使用酒馆当前 API。
-        if (settings.judgePreset != null && typeof settings.judgePreset !== 'string') settings.judgePreset = String(settings.judgePreset);
-        if (settings.conditionPreset != null && typeof settings.conditionPreset !== 'string') settings.conditionPreset = String(settings.conditionPreset);
+        // v3 绑定的 API 名称已退役；路线图选择只从用户 apiStore 读取。
+        delete settings.judgePreset;
+        delete settings.conditionPreset;
         ['conditionSystemPrompt', 'conditionUserPrompt'].forEach(field => {
             if (settings[field] == null) return;
             if (typeof settings[field] !== 'string') settings[field] = String(settings[field]);
@@ -1654,9 +1590,7 @@
         });
         // 流式输出（v2.18）：只认布尔，缺省 false。
         if (settings.streamingEnabled != null) settings.streamingEnabled = settings.streamingEnabled === true;
-        if (settings.storageMode != null && settings.storageMode !== 'card' && settings.storageMode !== 'user') {
-            delete settings.storageMode;
-        }
+        delete settings.storageMode;
         // 判断AI输出的提取/排除规则（v2.13）：{start,end} 边界对；
         // 非法项丢弃，整列为空时删字段（= 不过滤，原文直通）。
         ['extractRules', 'excludeRules'].forEach(field => {
@@ -1683,89 +1617,110 @@
         return mode === 'judge' ? 'judge' : 'off';
     }
 
+    function validateLegacyPrompts(legacy) {
+        if (!Array.isArray(legacy)) throw new Error('旧角色提示词库格式异常，已停止迁移并保留原数据。');
+        const names = new Set();
+        return legacy.map(cleanPromptPreset).filter(item => {
+            if (!item.name || !item.segments.length) throw new Error('旧角色提示词缺少名称或内容，已停止迁移并保留原数据。');
+            if (names.has(item.name)) return false;
+            names.add(item.name);
+            return true;
+        }).map(({ name, segments }) => ({ name, segments }));
+    }
+
+    async function migrateCharacterPrompts(raw, epoch, scope) {
+        const legacy = raw && raw.settings && raw.settings.routePromptPresets;
+        const presets = validateLegacyPrompts(legacy);
+        const mapping = presets.length ? await mutatePromptStore(store => {
+            if (ioCache.epoch !== epoch) throw new Error('切换聊天，已取消提示词迁移。');
+            const map = Object.create(null);
+            for (const preset of presets) {
+                // 内容作为重试身份，不同角色的同名不同内容不会互相覆盖。
+                const key = JSON.stringify([scope, preset.name, preset.segments]);
+                let id = store.migrations[key];
+                if (typeof id !== 'string') {
+                    const same = store.presets.find(item => item.name === preset.name && JSON.stringify(item.segments) === JSON.stringify(preset.segments));
+                    id = same ? same.id : routeId('p');
+                    if (!same) {
+                        let name = preset.name;
+                        let index = 2;
+                        while (store.presets.some(item => item.name === name)) name = `${preset.name}（迁移 ${index++}）`;
+                        store.presets.push({ id, name, segments: preset.segments });
+                    }
+                    store.migrations[key] = id;
+                }
+                map[preset.name] = id;
+            }
+            return map;
+        }) : Object.create(null);
+        await assertConfigScope(epoch, scope);
+        // 迁移用户库成功后才更新角色；失败保留旧库，重试复用映射。
+        const update = api('updateVariablesWith', true);
+        const result = await Promise.resolve(update(variables => {
+            if (ioCache.epoch !== epoch) throw new Error('切换聊天，已取消提示词迁移。');
+            const root = variables[VARIABLE_ROOT] || {};
+            const config = root.config;
+            if (!config || JSON.stringify(config.settings && config.settings.routePromptPresets) !== JSON.stringify(legacy)) {
+                throw new Error('角色提示词在迁移期间已变化，请重试。');
+            }
+            const stored = configForCharacter(config);
+            delete stored.settings.routePromptPresets;
+            const routes = root.routes;
+            if (routes && (routes.version !== 1 || !Array.isArray(routes.list))) {
+                throw new Error('角色路线数据格式异常或版本不兼容，未改写提示词引用。');
+            }
+            const list = routes && Array.isArray(routes.list) ? routes.list.map(item => {
+                const route = normalizeRoute(item);
+                if (!route.promptId && !route.promptLocal) {
+                    const name = route.prompt || ROUTE_PROMPT_DEFAULT_NAME;
+                    route.promptId = mapping[name] || (name === ROUTE_PROMPT_DEFAULT_NAME ? PROMPT_BUILTIN_ID : `missing:${name}`);
+                    route.prompt = '';
+                }
+                return route;
+            }) : null;
+            return { ...variables, [VARIABLE_ROOT]: { ...root, config: stored, ...(list ? { routes: { ...routes, list } } : {}) } };
+        }, { type: 'character' }));
+        if (result === false || (result && (result.ok === false || result.saved === false))) throw new Error('角色提示词迁移保存失败，旧配置已保留，请重试。');
+        await assertConfigScope(epoch, scope);
+        const saved = await currentStoredConfig();
+        if (!saved || Object.prototype.hasOwnProperty.call(saved.settings || {}, 'routePromptPresets')) {
+            throw new Error('角色提示词迁移尚未得到确认，未宣告完成，请重试。');
+        }
+    }
+
+
     async function readConfig() {
-        const config = normalizeConfig(await readRawConfig());
-        const local = await readLocalPresetNames();
-        const judge = local.judgePreset || (typeof config.settings.judgePreset === 'string' ? config.settings.judgePreset : '');
-        const condition = local.conditionPreset || (typeof config.settings.conditionPreset === 'string' ? config.settings.conditionPreset : '');
-        if (judge) config.settings.judgePreset = judge;
-        else delete config.settings.judgePreset;
-        if (condition) config.settings.conditionPreset = condition;
-        else delete config.settings.conditionPreset;
-        await hydrateLayouts(config);
-        return config;
+        const epoch = ioCache.epoch;
+        const scope = await currentScopeId();
+        return queueConfigTask(async () => {
+            await assertConfigScope(epoch, scope);
+            let raw = await currentStoredConfig();
+            if (raw === undefined) {
+                const legacy = await readLegacyConfig(scope);
+                if (legacy) {
+                    await commitCharacterConfig(configForCharacter(legacy), epoch, scope, true);
+                    raw = await currentStoredConfig();
+                    if (raw === undefined) throw new Error('角色配置迁移未得到确认，旧备份已保留，请重试。');
+                }
+            } else if (raw.storageVersion !== 1) {
+                await commitCharacterConfig(configForCharacter(raw), epoch, scope);
+                raw = await currentStoredConfig();
+            }
+            if (raw && Object.prototype.hasOwnProperty.call(raw.settings || {}, 'routePromptPresets')) {
+                await migrateCharacterPrompts(raw, epoch, scope);
+                raw = await currentStoredConfig();
+            }
+            await assertConfigScope(epoch, scope);
+            const config = configForCharacter(raw === undefined ? { version: 2, bindings: [], settings: {} } : raw);
+            configOrigins.set(config, { epoch, scope });
+            return config;
+        });
     }
 
     // 设置放在酒馆 extensionSettings 里，再 saveSettingsDebounced 写进服务器的设置文件。
     // 世界书列表里看不到，保存世界书时也不会把这份数据清掉。
     const EXTENSION_SETTINGS_KEY = 'dynamic-guide-assistant';
 
-    function tavernContext() {
-        try {
-            const tavern = (currentWindow && currentWindow.SillyTavern) || (hostWindow && hostWindow.SillyTavern);
-            if (tavern && typeof tavern.getContext === 'function') return tavern.getContext();
-        } catch (error) { /* 测试环境没有酒馆上下文 */ }
-        return null;
-    }
-
-    function extensionLayoutRoot() {
-        const context = tavernContext();
-        const settings = context && context.extensionSettings;
-        if (!settings || typeof settings !== 'object') return null;
-        if (!settings[EXTENSION_SETTINGS_KEY] || typeof settings[EXTENSION_SETTINGS_KEY] !== 'object') {
-            settings[EXTENSION_SETTINGS_KEY] = {};
-        }
-        const root = settings[EXTENSION_SETTINGS_KEY];
-        if (!root.layouts || typeof root.layouts !== 'object') root.layouts = {};
-        return root.layouts;
-    }
-
-    function saveExtensionSettings() {
-        const context = tavernContext();
-        if (context && typeof context.saveSettingsDebounced === 'function') {
-            try { context.saveSettingsDebounced(); } catch (error) { /* 酒馆拒写时角色变量里还有一份 */ }
-        }
-    }
-
-    function layoutRecordKey(worldbookName, entryName) {
-        return `${worldbookName}#${entryName}`;
-    }
-
-    async function readExtensionLayout(worldbookName, entryName) {
-        const root = extensionLayoutRoot();
-        if (!root) return null;
-        const scope = (await currentScopeId()) || 'global';
-        const bucket = root[scope];
-        const record = bucket && bucket[layoutRecordKey(worldbookName, entryName)];
-        return record ? cleanLayout(record.layout) : null;
-    }
-
-    async function writeExtensionLayout(worldbookName, entryName, layout) {
-        const root = extensionLayoutRoot();
-        if (!root || !cleanLayout(layout)) return;
-        const scope = (await currentScopeId()) || 'global';
-        if (!root[scope] || typeof root[scope] !== 'object') root[scope] = {};
-        const key = layoutRecordKey(worldbookName, entryName);
-        const previous = root[scope][key] && root[scope][key].layout;
-        if (previous && JSON.stringify(previous) === JSON.stringify(layout)) return;
-        root[scope][key] = { layout };
-        saveExtensionSettings();
-    }
-
-    async function writeExtensionLayouts(config) {
-        for (const binding of (config && config.bindings) || []) {
-            if (!cleanLayout(binding.layout)) continue;
-            await writeExtensionLayout(binding.worldbookName, binding.entryName, binding.layout);
-        }
-    }
-
-    async function hydrateLayouts(config) {
-        for (const binding of config.bindings || []) {
-            if (cleanLayout(binding.layout)) continue;
-            const layout = await readExtensionLayout(binding.worldbookName, binding.entryName);
-            if (layout) binding.layout = layout;
-        }
-    }
 
     // ---------------------------------------------------------------
     // 二、适配层：角色与世界书
@@ -3378,13 +3333,13 @@
 
     // ---- 判断提示词：和 API 预设一样，「下拉 ＋ 删除」管一套套提示词，下面编辑选中的那一套 ----
 
-    function openPromptPreset(name) {
-        const config = ui.snapshot ? ui.snapshot.config : null;
-        const list = routePromptPresets((config && config.settings) || {});
-        const found = list.find(item => item.name === name);
-        const base = found || list.find(item => item.name === ui.prompt.sel) || list[0];
-        ui.prompt.sel = found ? found.name : '';
+    function openPromptPreset(id) {
+        const list = routePromptPresets();
+        const found = list.find(item => item.id === id);
+        const base = found || list.find(item => item.id === ui.prompt.sel) || list[0];
+        ui.prompt.sel = found ? found.id : '';
         ui.prompt.draft = {
+            id: found ? found.id : '',
             name: found ? found.name : '',
             builtin: Boolean(found && found.builtin),
             segments: base.segments.map(seg => ({ ...seg })),
@@ -3399,53 +3354,27 @@
 
     function savePromptPreset() {
         const draft = ui.prompt.draft;
-        const name = draft.builtin ? ROUTE_PROMPT_DEFAULT_NAME : oneLine(draft.name);
+        const name = oneLine(draft.name);
         const from = ui.prompt.sel;
         return runAction('保存判断提示词', async () => {
-            if (!name) throw new Error('先给这套提示词起个名字。');
-            const fresh = await readConfig();
-            const settings = fresh.settings || {};
-            const list = routePromptPresets(settings);
-            if (list.some(item => item.name === name && item.name !== from)) throw new Error(`已经有叫「${name}」的提示词了。`);
-            const segments = normalizeRouteJudgeSegments(draft.segments);
-            if (!segments.length) throw new Error('至少要有一段。');
-            const saved = { name, segments };
-            const next = from ? list.map(item => (item.name === from ? saved : item)) : list.concat([saved]);
-            // 「默认」没改过就不存，读的时候用内置的那一套。
-            settings.routePromptPresets = next
-                .filter(item => item.name !== ROUTE_PROMPT_DEFAULT_NAME || JSON.stringify(item.segments) !== JSON.stringify(normalizeRouteJudgeSegments(DEFAULT_ROUTE_JUDGE_SEGMENTS)))
-                .map(item => ({ name: item.name, segments: item.segments }));
-            fresh.settings = settings;
-            await writeConfig(fresh);
-            if (from && from !== name) {
-                ui.routes.forEach(route => { if (route.prompt === from) route.prompt = name; });
-                await saveRoutesNow();
-            }
-            ui.snapshot = { ...(ui.snapshot || {}), config: fresh };
-            openPromptPreset(name);
+            const id = await saveUserPrompt({ id: draft.builtin ? '' : from, name: draft.builtin ? '默认（自定义）' : name, segments: draft.segments });
+            openPromptPreset(id);
             return true;
-        }, { refresh: false, success: from ? `「${name}」保存了` : `新建了「${name}」` });
+        }, { refresh: false, success: '已提交通用提示词到酒馆保存；延迟接口不保证返回落盘确认。' });
     }
 
-    function deletePromptPreset(name) {
-        const used = ui.routes.filter(route => route.prompt === name).length;
+    function deletePromptPreset(id) {
+        const preset = readPromptStore().presets.find(item => item.id === id);
+        if (!preset) return;
+        const name = preset.name;
         openRouteModal(`删掉提示词「${name}」？`,
-            el('p', { class: 'dga-rt-p', text: used ? `有 ${used} 张路线图在用它，删掉以后它们改用「默认」。` : '没有路线图在用它。' }), [
+            el('p', { class: 'dga-rt-p', text: '其他角色也可能引用此方案。删除后相关路线会提示缺失并停止 AI 判断，不会自动换成默认；路线专用副本不受影响。' }), [
                 rtBtn('取消', closeRouteModal, 'ghost'),
                 rtBtn('删掉', () => {
                     ui.rt.modal = null;
                     runAction('删掉判断提示词', async () => {
-                        const fresh = await readConfig();
-                        const settings = fresh.settings || {};
-                        settings.routePromptPresets = (settings.routePromptPresets || []).filter(item => item && item.name !== name);
-                        fresh.settings = settings;
-                        await writeConfig(fresh);
-                        if (used) {
-                            ui.routes.forEach(route => { if (route.prompt === name) route.prompt = ''; });
-                            await saveRoutesNow();
-                        }
-                        ui.snapshot = { ...(ui.snapshot || {}), config: fresh };
-                        openPromptPreset(ROUTE_PROMPT_DEFAULT_NAME);
+                        await deleteUserPrompt(id);
+                        openPromptPreset(PROMPT_BUILTIN_ID);
                         return true;
                     }, { refresh: false, success: `删掉了「${name}」` });
                 }, 'danger'),
@@ -3461,12 +3390,10 @@
             file.text().then(text => {
                 let parsed;
                 try { parsed = JSON.parse(text); } catch (error) { throw new Error('导入的文件不是合法的 JSON。'); }
-                const raw = Array.isArray(parsed) ? parsed : (parsed && (parsed.segments || parsed.promptGroup));
-                const segments = normalizeRouteJudgeSegments(raw);
-                if (!segments.length) throw new Error('导入的文件里没有提示词段。');
+                const { segments } = importPromptData(parsed);
                 ui.prompt.draft.segments = segments;
                 if (!ui.prompt.draft.builtin && parsed && typeof parsed.name === 'string' && !ui.prompt.sel) ui.prompt.draft.name = oneLine(parsed.name);
-                setMessage(`导入了 ${segments.length} 段，点保存才生效`, 'info');
+                setMessage(`导入了 ${segments.length} 段，点保存才生效；仅支持提示词段，不执行第三方剧情预设的其他规则或参数。`, 'info');
                 render();
             }).catch(error => { setMessage(error.message || String(error), 'error'); render(); });
         });
@@ -3480,17 +3407,19 @@
     function exportPromptPreset() {
         const draft = ui.prompt.draft;
         const name = draft.name || ROUTE_PROMPT_DEFAULT_NAME;
-        downloadLogFile(`动态指导助手-判断提示词-${name}.json`, JSON.stringify({ name, segments: normalizeRouteJudgeSegments(draft.segments) }, null, 2), 'application/json');
+        downloadLogFile(`动态指导助手-判断提示词-${name}.json`, JSON.stringify(exportPromptData({ name, segments: draft.segments }), null, 2), 'application/json');
     }
 
     function renderPromptSection(settings) {
-        const list = routePromptPresets(settings);
-        if (!ui.prompt.draft || (ui.prompt.sel && !list.some(item => item.name === ui.prompt.sel))) openPromptPreset(list[0].name);
+        let list;
+        try { list = routePromptPresets(); }
+        catch (error) { return setSection('通用判断提示词', null, messageBar({ type: 'error', text: error.message })); }
+        if (!ui.prompt.draft || (ui.prompt.sel && !list.some(item => item.id === ui.prompt.sel))) openPromptPreset(list[0].id);
         const draft = ui.prompt.draft;
         const segs = draft.segments;
         const creating = !ui.prompt.sel;
         const dirty = promptDraftDirty();
-        const pick = rtSelect([...(creating ? [['', '（新建中）']] : []), ...list.map(item => [item.name, item.name])], creating ? '' : ui.prompt.sel, value => {
+        const pick = rtSelect([...(creating ? [['', '（新建中）']] : []), ...list.map(item => [item.id, item.name])], creating ? '' : ui.prompt.sel, value => {
             if (!value || value === ui.prompt.sel) return;
             if (promptDraftDirty() && !hostWindow.confirm('这套提示词还没保存，确定放弃修改？')) { render(); return; }
             openPromptPreset(value);
@@ -3544,7 +3473,8 @@
         const missingAnswer = !segs.some(seg => seg.enabled !== false && /\{\{\s*作答表\s*\}\}/.test(seg.content));
         const nameInput = el('input', { type: 'text', class: 'dga-input', maxlength: '40', oninput: event => { draft.name = event.target.value; } });
         nameInput.value = draft.name;
-        return setSection('判断提示词', null,
+        return setSection('通用判断提示词', null,
+            el('small', { class: 'dga-rt-note', text: '通用库跟酒馆用户走，跨角色复用。内置默认不可覆盖，修改后另存为通用方案；路线专用副本在路线设置中编辑。' }),
             el('div', { class: 'dga-set-pad' }, pickRow),
             el('div', { class: 'dga-set-pad dga-pseg-body' },
                 draft.builtin ? null : el('label', { class: 'dga-af' }, el('span', { class: 'dga-af-label', text: '名称' }), nameInput),
@@ -3561,7 +3491,7 @@
                         rtBtn('导入', importPromptPreset, 'ghost small'),
                         rtBtn('导出', exportPromptPreset, 'ghost small')),
                     el('div', { class: 'dga-af-foot-r' },
-                        rtBtn(creating ? '取消' : '放弃修改', () => { openPromptPreset(creating ? list[0].name : ui.prompt.sel); render(); }, 'ghost small', { disabled: !creating && !dirty }),
+                        rtBtn(creating ? '取消' : '放弃修改', () => { openPromptPreset(creating ? list[0].id : ui.prompt.sel); render(); }, 'ghost small', { disabled: !creating && !dirty }),
                         rtBtn(creating ? '保存' : '保存当前提示词', savePromptPreset, 'small primary', { disabled: Boolean(ui.busy) || (!creating && !dirty) })))));
     }
 
@@ -4291,8 +4221,10 @@
             placement: normalizeRoutePlacement(src.placement),
             // 怎么往下走：'' 跟随设置页 / 'off' 只能手动 / 'judge' 让 AI 判断。
             advance: src.advance === 'off' || src.advance === 'judge' ? src.advance : '',
-            // 用哪套判断提示词（设置页里的名字）；'' = 默认。判断用哪个 API 只存本机，不在这里。
+            // prompt 仅用于旧名称迁移；新引用使用稳定 ID，专用副本随角色携带。
             prompt: oneLine(src.prompt || ''),
+            ...(src.promptId ? { promptId: String(src.promptId) } : {}),
+            ...(src.promptLocal ? { promptLocal: { name: oneLine(src.promptLocal.name), segments: normalizeRouteJudgeSegments(src.promptLocal.segments) } } : {}),
             // 提取 / 排除规则（v4.0.1）：发给判断 AI 的最近正文、它写回来的回答，都先过一遍。
             extractRules: routeRuleList(src.extractRules),
             excludeRules: routeRuleList(src.excludeRules),
@@ -4738,7 +4670,7 @@
     }
 
     async function writeRoutes(list) {
-        await writeRootField('character', 'routes', { version: 1, list: (list || []).map(route => cloneData(route)) });
+        await writeRootField('character', 'routes', { version: 1, list: (list || []).map(normalizeRoute) });
     }
 
     async function readRouteStates() {
@@ -5049,26 +4981,27 @@
         return DEFAULT_ROUTE_JUDGE_SEGMENTS.map(seg => ({ ...seg }));
     }
 
-    // 配置里存的是改过的「默认」和自己建的几套；读出来时「默认」永远排第一。
-    function routePromptPresets(settings) {
-        const saved = Array.isArray(settings && settings.routePromptPresets) ? settings.routePromptPresets : [];
-        const list = [];
-        const seen = new Set();
-        saved.forEach(item => {
-            const name = oneLine(item && item.name);
-            const segments = normalizeRouteJudgeSegments(item && item.segments);
-            if (!name || seen.has(name) || !segments.length) return;
-            seen.add(name);
-            list.push({ name, segments, builtin: name === ROUTE_PROMPT_DEFAULT_NAME });
-        });
-        if (!seen.has(ROUTE_PROMPT_DEFAULT_NAME)) list.unshift({ name: ROUTE_PROMPT_DEFAULT_NAME, segments: defaultRouteJudgeSegments(), builtin: true });
-        else list.sort((a, b) => Number(b.builtin) - Number(a.builtin));
-        return list;
+    function routePromptPresets() {
+        return [{ id: PROMPT_BUILTIN_ID, name: ROUTE_PROMPT_DEFAULT_NAME, segments: defaultRouteJudgeSegments(), builtin: true }]
+            .concat(readPromptStore().presets);
     }
 
-    function routePromptSegments(route, settings) {
-        const list = routePromptPresets(settings);
-        return (list.find(item => item.name === route.prompt) || list[0]).segments;
+    function resolveRoutePrompt(route) {
+        if (route.promptLocal) {
+            const preset = cleanPromptPreset(route.promptLocal);
+            if (!preset.segments.length) throw new Error('路线专用提示词没有可用段，请先编辑修复。');
+            return preset;
+        }
+        const id = route.promptId;
+        if (!id && route.prompt) throw new Error(`旧提示词「${route.prompt}」尚未迁移，请重新打开角色或明确选择方案。`);
+        if (!id || id === PROMPT_BUILTIN_ID) return { name: ROUTE_PROMPT_DEFAULT_NAME, segments: defaultRouteJudgeSegments() };
+        const preset = readPromptStore().presets.find(item => item.id === id);
+        if (!preset) throw new Error('引用的通用提示词已不存在，请重新选择，或使用随卡携带的专用方案；未回退默认。');
+        return preset;
+    }
+
+    function routePromptSegments(route) {
+        return resolveRoutePrompt(route).segments;
     }
 
     // 角色卡描述、用户设定、{{user}} {{char}} 这类酒馆宏：从酒馆上下文取，取不到就空着。
@@ -5286,7 +5219,7 @@
         if (!channel) return false;
         const rules = { extractRules: route.extractRules, excludeRules: route.excludeRules };
         const history = await recentHistoryText(messageId, judgeHistoryCount(settings), rules);
-        const messages = routeJudgeMessages(route, item, history, routePromptSegments(route, settings), routeHostTexts());
+        const messages = routeJudgeMessages(route, item, history, routePromptSegments(route), routeHostTexts());
         const before = JSON.stringify({ cur: state.cur, hist: state.hist, ended: state.ended, sides: state.sides });
         LogModule.info('判断AI', `「${route.name}」第 ${messageId} 层：问 ${item.lines.length} 条在走的线${item.offers.length ? `、${item.offers.length} 条可以开始的支线` : ''}`);
         let text;
@@ -5331,7 +5264,11 @@
         let moved = false;
         for (const route of routes) {
             if (modelPauseLeft() > 0) break;
-            if (await judgeRoute(route, messageId, config, {})) moved = true;
+            try {
+                if (await judgeRoute(route, messageId, config, {})) moved = true;
+            } catch (error) {
+                LogModule.error('判断AI', `「${route.name}」未判断：${error.message || String(error)}`);
+            }
         }
         if (moved) await syncRouteEntriesNow({ config });
     }
@@ -5765,6 +5702,55 @@
 
     // 这张路线图自己的设置（标题栏「设置」打开）：和设置页同一套小卡片。
     // 「AI 判断」那一组只有这张图实际用 AI 判断时才出现。
+    function renderRoutePromptControl(route) {
+        let presets = [];
+        let error = '';
+        try { presets = routePromptPresets(); } catch (cause) { error = cause.message; }
+        let available = false;
+        try { resolveRoutePrompt(route); available = true; } catch (cause) { error = cause.message; }
+        const selected = route.promptLocal ? '@local' : (route.promptId || (route.prompt ? `missing:${route.prompt}` : PROMPT_BUILTIN_ID));
+        const options = presets.map(item => [item.id, item.builtin ? '内置默认' : `通用 · ${item.name}`]);
+        if (route.promptLocal) options.push(['@local', `专用 · ${route.promptLocal.name || '本路线'}`]);
+        if (!options.some(item => item[0] === selected)) options.push([selected, '当前引用不可用（请重新选择）']);
+        const controls = [setRow('判断提示词', rtSelect(options, selected, value => {
+            if (value === '@local') return;
+            if (route.promptLocal && !hostWindow.confirm('切换到通用方案会移除这张路线图的专用副本，确定继续？')) { render(); return; }
+            delete route.promptLocal;
+            route.promptId = value;
+            route.prompt = '';
+            routeEdited(route, false);
+            render();
+        }))];
+        if (error) controls.push(messageBar({ type: 'error', text: error }));
+        if (!route.promptLocal) {
+            controls.push(setRow('随角色卡携带', rtBtn('复制为路线专用方案', () => {
+                route.promptLocal = localPromptCopy(route);
+                delete route.promptId;
+                route.prompt = '';
+                routeEdited(route, false);
+                render();
+            }, 'ghost small', { disabled: !available })));
+        } else {
+            const local = route.promptLocal;
+            const edit = () => routeEdited(route, false);
+            const name = el('input', { class: 'dga-input', type: 'text', oninput: event => { local.name = event.target.value; edit(); } });
+            name.value = local.name;
+            controls.push(setRow('专用方案名称', name));
+            local.segments.forEach((seg, index) => {
+                const area = el('textarea', { class: 'dga-input', rows: '4', oninput: event => { seg.content = event.target.value; edit(); } });
+                area.value = seg.content;
+                controls.push(el('div', { class: 'dga-set-pad' },
+                    rtSelect([['system', 'SYSTEM'], ['user', 'USER'], ['assistant', 'ASSISTANT']], seg.role, value => { seg.role = value; edit(); }),
+                    switchBtn(seg.enabled !== false, value => { seg.enabled = value; edit(); render(); }, '启用专用段'),
+                    area,
+                    rtBtn('删除此段', () => { local.segments.splice(index, 1); edit(); render(); }, 'ghost small', { disabled: local.segments.length === 1 })));
+            });
+            controls.push(rtBtn('＋ 添加专用段', () => { local.segments.push({ role: 'user', content: '' }); edit(); render(); }, 'ghost small'));
+        }
+        return el('div', {}, ...controls);
+    }
+
+
     function renderRouteSettings(route) {
         const config = ui.snapshot ? ui.snapshot.config : null;
         const settings = (config && config.settings) || {};
@@ -5774,8 +5760,6 @@
         const apiList = readJudgeApiPresets();
         const apiOptions = [['', '跟随当前活动API']].concat(apiList.map(item => [item.name, item.name]));
         if (apiName && !apiList.some(item => item.name === apiName)) apiOptions.push([apiName, `${apiName}（预设不可用）`]);
-        const prompts = routePromptPresets(settings);
-        const promptName = prompts.some(item => item.name === route.prompt) ? route.prompt : prompts[0].name;
         return el('div', { class: 'dga-rs' },
             setSection('往下走', null,
                 el('div', { class: 'dga-set-row is-col' },
@@ -5791,12 +5775,7 @@
             judging ? setSection('AI 判断', null,
                 setRow('判断用的 API',
                     rtSelect(apiOptions, apiName, value => runAction('保存路线图 API 选择', () => setRouteApi(route, value)))),
-                setRow('判断提示词',
-                    rtSelect(prompts.map(item => [item.name, item.name]), promptName, value => {
-                        route.prompt = value === ROUTE_PROMPT_DEFAULT_NAME ? '' : value;
-                        routeEdited(route, false);
-                        render();
-                    }))) : null,
+                renderRoutePromptControl(route)) : null,
             judging ? setSection(el('h3', { class: 'dga-set-title' }, '提取 / 排除规则', infoTip(`rules-${route.id}`, [
                 ['提取', '只留开始标记到结束标记中间的那一段，有好几处就取最后一处；找不到就整段照用。比如正文写在 <正文> 和 </正文> 中间，就填这两个。'],
                 ['排除', '把开始标记到结束标记中间的内容连同标记一起删掉，有几处删几处。比如去掉思考过程：<thinking> 和 </thinking>。'],
@@ -7938,6 +7917,8 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     const publicApi = {
         version: VERSION,
         normalizeConfig,
+        configStorage: { read: readConfig, write: writeConfig },
+        promptStorage: { read: readPromptStore, save: saveUserPrompt, remove: deleteUserPrompt, resolve: resolveRoutePrompt, copy: localPromptCopy, import: importPromptData, export: exportPromptData },
         normalizeJudgeApiPreset,
         normalizeJudgeApiPresets,
         apiStorage: { read: readApiStore, writePresets: writeJudgeApiPresets, migrate: migrateApiStore, notice: () => apiStoreNotice },
@@ -8022,7 +8003,6 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     runEventTask('迁移 API 配置', migrateApiStore);
     // 页面一打开：有旧版绑定就停用，再把每棵树的条目同步到当前进度。
     runEventTask('准备指导', () => withIoCache(async () => {
-        await parkExportedSecrets();
         await retireLegacyBindings();
         await syncMirrors('startup');
     }));
@@ -8054,7 +8034,6 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             LogModule.info('事件', '切换聊天，按这个聊天的进度重新同步路线图');
             resetIoCache();
             await withIoCache(async () => {
-                await parkExportedSecrets();
                 await retireLegacyBindings();
                 await syncMirrors('normal');
             });

@@ -560,7 +560,7 @@ test('拉模型失败时抛出带状态的错误，空端点直接拒绝', async
     await assert.rejects(() => run.core.fetchAvailableModels('', 'k'), /请输入端点/);
 });
 
-test('normalizeConfig 清除 v2.8/v2.9 遗留字段，只保留当前本机预设名', () => {
+test('normalizeConfig 清除旧引擎、完整预设和已退役的本机预设名', () => {
     const normalized = core.normalizeConfig({
         version: 2,
         bindings: [],
@@ -570,7 +570,7 @@ test('normalizeConfig 清除 v2.8/v2.9 遗留字段，只保留当前本机预�
             judgePreset: '本机预设',
         },
     });
-    assert.equal(normalized.settings.judgePreset, '本机预设');
+    assert.equal('judgePreset' in normalized.settings, false);
     assert.equal('judgeEngine' in normalized.settings, false);
     assert.equal('judgeApiPresets' in normalized.settings, false);
 });
@@ -1421,17 +1421,15 @@ test('路线图：判断提示词按段发，格子换成当时的内容；关�
     assert.match(sent[1].content, /## 作答表\n每条线一个 <answer>/, '没放作答表，补在最后一段 USER 末尾');
 });
 
-test('路线图：判断提示词预设——默认排第一，改过的默认和自己建的从配置里读', () => {
-    const R = load().core.routes;
-    assert.deepEqual(plain(R.promptPresets({}).map(item => item.name)), ['默认']);
-    const list = R.promptPresets({ routePromptPresets: [
-        { name: '简短', segments: [{ role: 'user', content: '{{作答表}}' }] },
-        { name: '默认', segments: [{ role: 'SYSTEM', content: '改过的默认' }] },
-        { name: '空的', segments: [] },
-    ] });
-    assert.deepEqual(plain(list.map(item => item.name)), ['默认', '简短'], '默认排第一，没有段的丢掉');
-    assert.equal(list[0].segments[0].role, 'system', '角色统一小写');
-    assert.equal(list[0].segments[0].content, '改过的默认');
+test('路线图：内置默认不被覆盖，通用判断提示词从用户库读取', async () => {
+    const run = load().core;
+    assert.deepEqual(plain(run.routes.promptPresets().map(item => item.name)), ['默认']);
+    const id = await run.promptStorage.save({ name: '简短', segments: [{ role: 'SYSTEM', content: '{{作答表}}' }] });
+    const list = run.routes.promptPresets();
+    assert.deepEqual(plain(list.map(item => item.name)), ['默认', '简短']);
+    assert.equal(list[1].id, id);
+    assert.equal(list[1].segments[0].role, 'system');
+    await assert.rejects(run.promptStorage.save({ name: '空的', segments: [] }), /至少一段/);
 });
 
 test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论落到进度上', async () => {
@@ -1454,10 +1452,10 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     const t = demoRoute(R);
     t.route.worldbookName = '书A';
     t.route.advance = 'judge';
-    t.route.prompt = '简短';
+    t.route.promptId = await run.core.promptStorage.save({ name: '简短', segments: [{ role: 'system', content: '只看正文' }, { role: 'user', content: '{{最近正文}}\n{{作答表}}' }] });
     t.route.excludeRules = [{ start: '<thinking>', end: '</thinking>' }];
     world.state.variables.character.$dynamicGuideAssistant.config.settings = {
-        routePromptPresets: [{ name: '简短', segments: [{ role: 'system', content: '只看正文' }, { role: 'user', content: '{{最近正文}}\n{{作答表}}' }] }],
+
         // 旧版设置里的全局规则不再用：要是还用，下面「小林决定离开小镇」会被删掉。
         excludeRules: [{ start: '小林', end: '码头' }],
     };
@@ -1515,3 +1513,354 @@ test('路线图：旧版绑定不再支持，启动时停用——原条目重�
     assert.equal(world.state.books.书A.find(item => item.uid === 5).content, '## 一\n正文', '正文一个字不动');
     assert.deepEqual(run.errors, []);
 });
+
+const LEGACY_CONFIG_KEY = 'dynamic-guide-assistant:config:v2:name:测试角色';
+const LEGACY_MODE_KEY = 'dynamic-guide-assistant:config-storage:v1';
+const LEGACY_NAMES_KEY = 'dynamic-guide-assistant:preset-names:v1:name:测试角色';
+const characterRoot = world => world.state.variables.character.$dynamicGuideAssistant;
+const legacyConfig = settings => ({ version: 2, bindings: [], settings });
+
+async function storageWorld(extra = {}, beforeLoad = () => {}) {
+    const world = routeWorld();
+    beforeLoad(world);
+    const run = load(world.helper, extra);
+    await new Promise(setImmediate);
+    return { world, run, store: run.core.configStorage };
+}
+
+test('配置存储：旧本机配置只迁移一次，空配置权威，另一浏览器读取角色正本', async () => {
+    const raw = JSON.stringify(legacyConfig({ judgeInterval: 7, storageMode: 'user', judgePreset: '旧名' }));
+    const storage = memoryStorage({ [LEGACY_CONFIG_KEY]: raw });
+    storage.setItem = () => { throw new Error('禁止写浏览器'); };
+    const { world, store } = await storageWorld({ localStorage: storage }, world => { delete characterRoot(world).config; });
+    assert.equal((await store.read()).settings.judgeInterval, 7);
+    assert.equal(characterRoot(world).config.storageVersion, 1);
+    assert.equal(storage.getItem(LEGACY_CONFIG_KEY), raw);
+    const second = load(world.helper, { localStorage: memoryStorage() }).core;
+    await new Promise(setImmediate);
+    assert.equal((await second.configStorage.read()).settings.judgeInterval, 7);
+    await second.configStorage.write(legacyConfig({}));
+    const third = load(world.helper, { localStorage: storage }).core;
+    await new Promise(setImmediate);
+    assert.equal((await third.configStorage.read()).settings.judgeInterval, undefined);
+    assert.equal((await third.configStorage.read()).settings.judgePreset, undefined);
+});
+
+test('配置存储：无旧数据不抢建空配置；坏 JSON 和未知版本不覆盖、不泄露原文', async () => {
+    const storage = memoryStorage();
+    const { world, store } = await storageWorld({ localStorage: storage }, world => { delete characterRoot(world).config; });
+    await store.read();
+    assert.equal(characterRoot(world).config, undefined);
+    storage.setItem(LEGACY_CONFIG_KEY, 'secret-test{');
+    await assert.rejects(store.read(), error => /旧配置损坏/.test(error.message) && !error.message.includes('secret-test'));
+    assert.equal(characterRoot(world).config, undefined);
+    characterRoot(world).config = { version: 99, bindings: [] };
+    const before = plain(characterRoot(world));
+    await assert.rejects(store.read(), /版本不兼容/);
+    await assert.rejects(store.write(legacyConfig({})), /版本不兼容/);
+    assert.deepEqual(plain(characterRoot(world)), before);
+});
+
+
+test('配置存储：旧模式仅决定迁移来源，世界书配置和状态保持原样，不再双写布局', async () => {
+    for (const mode of ['card', 'user']) {
+        const raw = JSON.stringify(legacyConfig({ judgeInterval: 8 }));
+        const storage = memoryStorage({ [LEGACY_CONFIG_KEY]: raw, [LEGACY_MODE_KEY]: mode });
+        const host = settingsHost({ [API_SETTINGS_KEY]: { layouts: { backup: true } } });
+        const entry = { uid: 99, name: '（动态指导·配置）', enabled: false, content: JSON.stringify(legacyConfig({ judgeInterval: 4 })) };
+        const stateEntry = { uid: 100, name: '（动态指导·状态）', enabled: false, content: '旧状态备份' };
+        const { world, store } = await storageWorld({ localStorage: storage, SillyTavern: host.SillyTavern }, world => {
+            delete characterRoot(world).config;
+            world.state.books.书A.push(plain(entry), plain(stateEntry));
+        });
+        assert.equal((await store.read()).settings.judgeInterval, mode === 'card' ? 4 : 8);
+        await store.write(legacyConfig({ judgeInterval: 2, storageMode: 'card' }));
+        assert.deepEqual(world.state.books.书A.find(item => item.uid === 99), entry);
+        assert.deepEqual(world.state.books.书A.find(item => item.uid === 100), stateEntry);
+        assert.deepEqual(host.state.settings, { [API_SETTINGS_KEY]: { layouts: { backup: true } } });
+        assert.equal(host.state.saves, 0);
+        assert.equal(storage.getItem(LEGACY_CONFIG_KEY), raw);
+    }
+});
+
+test('配置存储：同步/异步失败和明确拒绝不污染原对象，失败后可重试', async () => {
+    const { world, store } = await storageWorld();
+    const update = world.helper.updateVariablesWith;
+    for (const failure of ['throw', 'reject', 'false']) {
+        const before = plain(world.state.variables.character);
+        world.helper.updateVariablesWith = (updater, { type }) => {
+            updater(world.state.variables[type]);
+            if (failure === 'throw') throw new Error('拒绝');
+            if (failure === 'reject') return Promise.reject(new Error('拒绝'));
+            return false;
+        };
+        await assert.rejects(store.write(legacyConfig({ judgeInterval: 9 })));
+        assert.deepEqual(plain(world.state.variables.character), before);
+    }
+    world.helper.updateVariablesWith = update;
+    await store.write(legacyConfig({ judgeInterval: 3 }));
+    assert.equal((await store.read()).settings.judgeInterval, 3);
+});
+
+
+test('配置存储：切角色后拒绝旧配置写入，不把异步迁移结果写进新角色', async () => {
+    const { world, store } = await storageWorld();
+    const previous = await store.read();
+    previous.settings.judgeInterval = 20;
+    world.helper.getCharData = () => ({ name: '另一个角色' });
+    world.state.variables.character = { $dynamicGuideAssistant: { config: legacyConfig({ judgeInterval: 2 }) } };
+    await world.state.events.get('chat_changed')();
+    await assert.rejects(store.write(previous), /切换了角色或聊天/);
+    assert.equal((await store.read()).settings.judgeInterval, 2);
+
+    delete characterRoot(world).config;
+    world.helper.getCharData = () => ({ name: '测试角色', data: { extensions: { world: '书A' } } });
+    let resume;
+    world.helper.getWorldbook = () => new Promise(resolve => { resume = resolve; });
+    const pending = store.read();
+    const rejected = assert.rejects(pending, /切换了角色或聊天/);
+    await new Promise(setImmediate);
+    world.helper.getCharData = () => ({ name: '新角色' });
+    world.state.variables.character = { $dynamicGuideAssistant: { config: legacyConfig({ judgeInterval: 5 }) } };
+    resume([{ name: '（动态指导·配置）', content: JSON.stringify(legacyConfig({ judgeInterval: 99 })) }]);
+    await rejected;
+    assert.equal(characterRoot(world).config.settings.judgeInterval, 5);
+});
+
+test('配置存储：有效设置和提示词保留；退役字段、API 凭据不进入角色/世界书', async () => {
+    const rawNames = JSON.stringify({ judgePreset: '原名', conditionPreset: '原名' });
+    const storage = memoryStorage({ [LEGACY_NAMES_KEY]: rawNames });
+    const { world, run, store } = await storageWorld({ localStorage: storage });
+    await store.write(legacyConfig({
+        autoAdvance: 'judge', judgeInterval: 3, judgeHistoryCount: 4, streamingEnabled: true,
+        storageMode: 'card', judgePreset: '原名', conditionPreset: '原名',
+        key: 'secret-test', apiurl: 'https://secret.invalid', judgeApiPresets: [sampleApiPreset('原名')],
+    }));
+    const promptId = await run.core.promptStorage.save({ name: '我的提示词', key: 'secret-test', segments: [{ role: 'system', content: '保留正文', enabled: true }] });
+    const saved = await store.read();
+    assert.equal(run.core.promptStorage.resolve({ promptId }).segments[0].content, '保留正文');
+    assert.equal(saved.settings.routePromptPresets, undefined);
+    assert.equal(saved.settings.autoAdvance, 'judge');
+    assert.equal(saved.settings.streamingEnabled, true);
+    assert.doesNotMatch(JSON.stringify(world.state.variables), /secret-test|secret.invalid|test-secret-only|judgePreset|storageMode/);
+    const route = run.core.routes.makeRoute('安全路线');
+    route.key = 'secret-test';
+    route.api = sampleApiPreset('原名');
+    await run.core.routes.write([route]);
+    assert.doesNotMatch(JSON.stringify(world.state.variables), /secret-test|test-secret-only/);
+    await run.core.apiStorage.writePresets([sampleApiPreset('原名')]);
+    await run.core.updatePresetReferences('原名', '新名');
+    assert.equal(storage.getItem(LEGACY_NAMES_KEY), rawNames, '退役引用备份不再更新');
+    assert.equal(world.state.books.书A.length, 2, '普通配置保存不新增世界书配置/状态条目');
+    assert.doesNotMatch(source, /storage\.(?:setItem|removeItem)\s*\(/);
+});
+
+const promptPreset = (name, content = name) => ({ name, segments: [{ role: 'system', content }] });
+
+function seedLegacyPrompts(world, presets, selections = ['']) {
+    const root = characterRoot(world);
+    root.config = { ...legacyConfig({ routePromptPresets: presets }), storageVersion: 1 };
+    root.routes = { version: 1, list: selections.map((prompt, index) => ({
+        ...core.routes.makeRoute(`旧路线${index}`), id: `tlegacy${index}`, prompt,
+    })) };
+}
+
+test('提示词分层：跨角色/跨浏览器共享用户库，改名不改 ID，副本可随卡独立使用', async () => {
+    const host = settingsHost();
+    const first = await storageWorld({ SillyTavern: host.SillyTavern });
+    const P = first.run.core.promptStorage;
+    const id = await P.save(promptPreset('剧情推进', '慢节奏推进'));
+    const route = first.run.core.routes.makeRoute('A');
+    route.promptId = id;
+    await first.run.core.routes.write([route]);
+    assert.equal(characterRoot(first.world).config.settings.routePromptPresets, undefined);
+    assert.doesNotMatch(JSON.stringify(first.world.state.variables), /慢节奏推进/);
+    const copy = P.copy(route);
+    const second = await storageWorld({ SillyTavern: host.SillyTavern });
+    assert.equal(second.run.core.promptStorage.resolve({ promptId: id }).segments[0].content, '慢节奏推进');
+    await P.save({ ...promptPreset('推进改名', '新规则'), id });
+    assert.equal(second.run.core.promptStorage.resolve({ promptId: id }).name, '推进改名');
+    assert.equal(copy.segments[0].content, '慢节奏推进');
+    const otherBrowser = load(null, { SillyTavern: settingsHost(plain(host.state.persisted)).SillyTavern }).core;
+    assert.equal(otherBrowser.promptStorage.resolve({ promptId: id }).segments[0].content, '新规则');
+    await P.remove(id);
+    assert.throws(() => P.resolve(route), /已不存在/);
+    route.promptLocal = copy;
+    delete route.promptId;
+    await first.run.core.routes.write([route]);
+    const cardRoute = plain(characterRoot(first.world).routes.list[0]);
+    const receiver = load(null, { SillyTavern: null }).core;
+    assert.equal(receiver.promptStorage.resolve(cardRoute).segments[0].content, '慢节奏推进');
+    cardRoute.promptLocal.segments[0].content = '卡专属修改';
+    assert.equal(copy.segments[0].content, '慢节奏推进', '保存后的随卡副本不共享内存');
+    assert.deepEqual(plain(P.read().presets), []);
+});
+
+
+test('提示词迁移：旧默认及名称选择转稳定引用，同名不同内容不覆盖，重复启动不重复导入', async () => {
+    const host = settingsHost();
+    const first = await storageWorld({ SillyTavern: host.SillyTavern }, world => {
+        seedLegacyPrompts(world, [promptPreset('默认', '改过的默认'), promptPreset('剧情', '甲剧情')], ['', '剧情', '不存在']);
+    });
+    const P = first.run.core.promptStorage;
+    const routes = await first.run.core.routes.read();
+    assert.equal(P.resolve(routes[0]).segments[0].content, '改过的默认');
+    assert.equal(P.resolve(routes[1]).segments[0].content, '甲剧情');
+    assert.throws(() => P.resolve(routes[2]), /已不存在/);
+    assert.equal(characterRoot(first.world).config.settings.routePromptPresets, undefined);
+    const count = P.read().presets.length;
+    const saves = host.state.saves;
+    await first.store.read();
+    assert.equal(P.read().presets.length, count);
+    assert.equal(host.state.saves, saves);
+    const second = await storageWorld({ SillyTavern: host.SillyTavern }, world => {
+        world.helper.getCharData = () => ({ name: '角色乙' });
+        seedLegacyPrompts(world, [promptPreset('剧情', '乙剧情')], ['剧情']);
+    });
+    const other = (await second.run.core.routes.read())[0];
+    assert.notEqual(other.promptId, routes[1].promptId);
+    assert.equal(P.resolve(other).segments[0].content, '乙剧情');
+    assert.equal(P.resolve(routes[1]).segments[0].content, '甲剧情');
+});
+
+test('提示词迁移：用户库保存失败保留旧角色库；角色提交失败重试不重复，删除后不复活', async () => {
+    const host = settingsHost();
+    const first = await storageWorld({ SillyTavern: host.SillyTavern });
+    seedLegacyPrompts(first.world, [promptPreset('待迁移')], ['待迁移']);
+    const old = plain(first.world.state.variables);
+    const save = host.context.saveSettingsDebounced;
+    host.context.saveSettingsDebounced = () => false;
+    await assert.rejects(first.store.read(), /已回滚/);
+    assert.deepEqual(plain(first.world.state.variables), old);
+    assert.equal(host.state.settings[API_SETTINGS_KEY], undefined);
+    host.context.saveSettingsDebounced = save;
+    const update = first.world.helper.updateVariablesWith;
+    first.world.helper.updateVariablesWith = () => false;
+    await assert.rejects(first.store.read(), /迁移保存失败/);
+    assert.deepEqual(plain(first.world.state.variables), old);
+    const P = first.run.core.promptStorage;
+    assert.equal(P.read().presets.length, 1);
+    const id = P.read().presets[0].id;
+    await P.remove(id);
+    first.world.helper.updateVariablesWith = update;
+    await first.store.read();
+    assert.equal(P.read().presets.length, 0);
+    assert.equal((await first.run.core.routes.read())[0].promptId, id);
+    assert.throws(() => P.resolve({ promptId: id }), /已不存在/);
+});
+
+
+test('提示词库：宿主未就绪、未知版本和保存失败拒绝写入，不污染 API 数据', async () => {
+    const host = settingsHost();
+    const run = load(null, { SillyTavern: host.SillyTavern }).core;
+    await run.apiStorage.writePresets([sampleApiPreset('隔离')]);
+    const P = run.promptStorage;
+    const id = await P.save(promptPreset('原名'));
+    const before = plain(host.state.settings);
+    const save = host.context.saveSettingsDebounced;
+    for (const fail of [() => { throw new Error(); }, async () => { throw new Error(); }, () => ({ saved: false })]) {
+        host.context.saveSettingsDebounced = fail;
+        await assert.rejects(P.save({ ...promptPreset('改名'), id }), /已回滚/);
+        assert.deepEqual(plain(host.state.settings), before);
+    }
+    delete host.context.saveSettingsDebounced;
+    await assert.rejects(P.remove(id), /接口不可用/);
+    host.context.saveSettingsDebounced = save;
+    await P.save({ ...promptPreset('恢复'), id });
+    assert.equal(run.apiStorage.read().presets[0].key, 'test-secret-only');
+    assert.doesNotMatch(JSON.stringify(P.read()), /test-secret-only/);
+    const bad = { version: 99, presets: [], migrations: {} };
+    host.state.settings[API_SETTINGS_KEY].promptStore = bad;
+    await assert.rejects(P.save(promptPreset('不覆盖')), /版本不兼容/);
+    assert.equal(host.state.settings[API_SETTINGS_KEY].promptStore, bad);
+    const absent = load(null, { SillyTavern: null }).core.promptStorage;
+    await assert.rejects(absent.save(promptPreset('等待')), /尚未就绪/);
+});
+
+test('提示词迁移：坏库不清空；空旧库不创建用户空信封；切角色不串写', async () => {
+    const host = settingsHost();
+    const { world, store, run } = await storageWorld({ SillyTavern: host.SillyTavern });
+    characterRoot(world).config.settings.routePromptPresets = '坏库';
+    await assert.rejects(store.read(), /格式异常/);
+    assert.equal(characterRoot(world).config.settings.routePromptPresets, '坏库');
+    characterRoot(world).config.settings.routePromptPresets = [];
+    await store.read();
+    assert.deepEqual(host.state.settings, {});
+    assert.equal(characterRoot(world).config.settings.routePromptPresets, undefined);
+    seedLegacyPrompts(world, [promptPreset('角色甲方案')], ['角色甲方案']);
+    let resume;
+    host.context.saveSettingsDebounced = () => new Promise(resolve => { resume = resolve; });
+    const pending = assert.rejects(store.read(), /切换了角色或聊天/);
+    await new Promise(setImmediate);
+    world.helper.getCharData = () => ({ name: '另一个角色' });
+    world.state.variables.character = { $dynamicGuideAssistant: { config: legacyConfig({ judgeInterval: 8 }) } };
+    const changed = world.state.events.get('chat_changed')();
+    resume();
+    await pending;
+    await changed;
+    assert.equal(characterRoot(world).config.settings.judgeInterval, 8);
+    assert.equal(characterRoot(world).routes, undefined);
+    assert.equal(run.core.promptStorage.read().presets.length, 1, '已保存的用户方案保留，角色提交可重试');
+});
+
+
+test('提示词引用：缺失时拒绝模型请求，导入导出只携带提示词数据', async () => {
+    let requests = 0;
+    const { world, run } = await storageWorld({ fetch: async () => { requests += 1; throw new Error('不应请求'); } });
+    const R = run.core.routes;
+    const route = demoRoute(R).route;
+    route.advance = 'judge';
+    route.promptId = 'pmissing';
+    world.state.messages = [{ message_id: 4, role: 'assistant', message: '正文' }];
+    world.state.lastMessageId = 4;
+    await run.core.apiStorage.writePresets([sampleApiPreset('接口')]);
+    await R.setApi(route, '接口');
+    await assert.rejects(R.judge(route, 4), /已不存在/);
+    assert.equal(requests, 0);
+    const P = run.core.promptStorage;
+    const imported = P.import({ name: '剧情推进', promptGroup: [{ role: 'SYSTEM', content: '推进规则', enabled: false }], key: 'secret-test', rules: '第三方规则' });
+    const exported = plain(P.export({ ...imported, key: 'secret-test', id: 'pold' }));
+    assert.equal(exported.format, 'dynamic-guide-prompt');
+    assert.equal(exported.version, 1);
+    assert.equal(exported.segments[0].enabled, false);
+    assert.doesNotMatch(JSON.stringify(exported), /secret-test|第三方规则|pold/);
+    assert.deepEqual(plain(P.import(exported)), plain(imported));
+    assert.throws(() => P.import({ format: 'dynamic-guide-prompt', version: 99, segments: imported.segments }), /不支持/);
+});
+
+test('提示词界面：从通用方案复制为路线专用，编辑后保存到角色且不改通用库', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const route = demoRoute(core.routes).route;
+    route.advance = 'judge';
+    route.worldbookName = '书A';
+    characterRoot(world).routes = { version: 1, list: [plain(route)] };
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    const run = sandbox.DynamicGuideAssistantCore;
+    let flushRouteSave;
+    sandbox.setTimeout = (callback, delay) => { if (delay === 600) flushRouteSave = callback; return 1; };
+    sandbox.clearTimeout = () => { flushRouteSave = null; };
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await run.refresh();
+    const id = await run.promptStorage.save(promptPreset('共用规则', '共用正文'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector(`.dga-rt-card-${route.id}`).querySelector('.dga-rt-head'), '设置').listeners.click[0]();
+    const drawer = () => panel().querySelector('.dga-rt-drawer');
+    const nodes = (node, tag) => [node, ...(node.children || []).flatMap(child => nodes(child, tag))].filter(item => item.tagName === tag);
+    const select = nodes(drawer(), 'SELECT').find(item => item.textContent.includes('共用规则'));
+    select.listeners.change[0]({ target: { value: id } });
+    findButton(drawer(), '复制为路线专用方案').listeners.click[0]();
+    const area = nodes(drawer(), 'TEXTAREA')[0];
+    area.listeners.input[0]({ target: { value: '专属剧情要求' } });
+    assert.equal(typeof flushRouteSave, 'function', '编辑触发真实延迟保存入口');
+    flushRouteSave();
+    await new Promise(setImmediate);
+    const stored = characterRoot(world).routes.list[0];
+    assert.equal(stored.promptLocal.segments[0].content, '专属剧情要求');
+    assert.equal(stored.promptId, undefined);
+    assert.match(drawer().textContent, /专用方案名称/);
+    assert.equal(run.promptStorage.resolve({ promptId: id }).segments[0].content, '共用正文');
+    assert.deepEqual(errors, []);
+});
+
+
