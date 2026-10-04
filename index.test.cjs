@@ -1134,6 +1134,14 @@ test('路线图：左栏是标志和总开关、路线图列表、API / 运行�
     findButton(rail(), '设置').listeners.click[0]();
     const settingsText = panel().querySelector('.dga-body').textContent;
     assert.match(settingsText, /往下走.*AI 判断.*多久问一次.*给它看几段回复.*流式输出.*判断提示词/, '设置页：往下走、AI 判断、判断提示词');
+    const titles = findAllClass(panel(), 'dga-set-title');
+    const promptTitle = titles.find(node => node.textContent.includes('判断提示词'));
+    const judgeDot = titles.find(node => node.textContent.includes('AI 判断')).querySelector('.dga-info-dot');
+    const promptDot = promptTitle.querySelector('.dga-info-dot');
+    assert.equal(promptDot.textContent, '!', '判断提示词旁边有感叹号');
+    assert.equal(promptDot.className, judgeDot.className, '两个感叹号用同一套样式');
+    assert.match(promptTitle.querySelector('.dga-info-pop').textContent, /跟酒馆用户走/);
+    assert.doesNotMatch(promptTitle.parentNode.parentNode.querySelector('.dga-set-box').textContent, /跟酒馆用户走/, '说明不再铺在卡片里');
     assert.doesNotMatch(settingsText, /大检查|推进冷却|开发者模式|外观|配色/, '用不上的设置都去掉了');
     assert.match(settingsText, /在最上面加一段.*在最下面加一段/, '提示词段最上面和最下面都能加一段');
     findButton(rail(), 'API').listeners.click[0]();
@@ -1684,7 +1692,7 @@ test('提示词分层：跨角色/跨浏览器共享用户库，改名不改 ID�
     const otherBrowser = load(null, { SillyTavern: settingsHost(plain(host.state.persisted)).SillyTavern }).core;
     assert.equal(otherBrowser.promptStorage.resolve({ promptId: id }).segments[0].content, '新规则');
     await P.remove(id);
-    assert.throws(() => P.resolve(route), /已不存在/);
+    assert.throws(() => P.resolve(route), /找不到了/);
     route.promptLocal = copy;
     delete route.promptId;
     await first.run.core.routes.write([route]);
@@ -1706,7 +1714,7 @@ test('提示词迁移：旧默认及名称选择转稳定引用，同名不同�
     const routes = await first.run.core.routes.read();
     assert.equal(P.resolve(routes[0]).segments[0].content, '改过的默认');
     assert.equal(P.resolve(routes[1]).segments[0].content, '甲剧情');
-    assert.throws(() => P.resolve(routes[2]), /已不存在/);
+    assert.throws(() => P.resolve(routes[2]), /找不到了/);
     assert.equal(characterRoot(first.world).config.settings.routePromptPresets, undefined);
     const count = P.read().presets.length;
     const saves = host.state.saves;
@@ -1746,7 +1754,7 @@ test('提示词迁移：用户库保存失败保留旧角色库；角色提交�
     await first.store.read();
     assert.equal(P.read().presets.length, 0);
     assert.equal((await first.run.core.routes.read())[0].promptId, id);
-    assert.throws(() => P.resolve({ promptId: id }), /已不存在/);
+    assert.throws(() => P.resolve({ promptId: id }), /找不到了/);
 });
 
 
@@ -1815,7 +1823,7 @@ test('提示词引用：缺失时拒绝模型请求，导入导出只携带提�
     world.state.lastMessageId = 4;
     await run.core.apiStorage.writePresets([sampleApiPreset('接口')]);
     await R.setApi(route, '接口');
-    await assert.rejects(R.judge(route, 4), /已不存在/);
+    await assert.rejects(R.judge(route, 4), /找不到了/);
     assert.equal(requests, 0);
     const P = run.core.promptStorage;
     const imported = P.import({ name: '剧情推进', promptGroup: [{ role: 'SYSTEM', content: '推进规则', enabled: false }], key: 'secret-test', rules: '第三方规则' });
@@ -1828,7 +1836,7 @@ test('提示词引用：缺失时拒绝模型请求，导入导出只携带提�
     assert.throws(() => P.import({ format: 'dynamic-guide-prompt', version: 99, segments: imported.segments }), /不支持/);
 });
 
-test('提示词界面：从通用方案复制为路线专用，编辑后保存到角色且不改通用库', async () => {
+test('提示词界面：侧边栏只选一套，复制成专用后在设置页编辑，存到角色且不改通用库', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const world = routeWorld();
     const route = demoRoute(core.routes).route;
@@ -1847,20 +1855,40 @@ test('提示词界面：从通用方案复制为路线专用，编辑后保存�
     findButton(panel().querySelector(`.dga-rt-card-${route.id}`).querySelector('.dga-rt-head'), '设置').listeners.click[0]();
     const drawer = () => panel().querySelector('.dga-rt-drawer');
     const nodes = (node, tag) => [node, ...(node.children || []).flatMap(child => nodes(child, tag))].filter(item => item.tagName === tag);
-    const select = nodes(drawer(), 'SELECT').find(item => item.textContent.includes('共用规则'));
-    select.listeners.change[0]({ target: { value: id } });
-    findButton(drawer(), '复制为路线专用方案').listeners.click[0]();
-    const area = nodes(drawer(), 'TEXTAREA')[0];
-    area.listeners.input[0]({ target: { value: '专属剧情要求' } });
-    assert.equal(typeof flushRouteSave, 'function', '编辑触发真实延迟保存入口');
+    const pick = () => nodes(drawer(), 'SELECT').find(item => item.textContent.includes('共用规则'));
+    pick().listeners.change[0]({ target: { value: id } });
+    assert.equal(nodes(drawer(), 'TEXTAREA').length, 0, '侧边栏里不放提示词编辑');
+    pick().listeners.change[0]({ target: { value: '@copy' } });
+    assert.equal(typeof flushRouteSave, 'function', '选了专用触发真实延迟保存入口');
     flushRouteSave();
+    await new Promise(setImmediate);
+    assert.equal(characterRoot(world).routes.list[0].promptLocal.segments[0].content, '共用正文', '专用的从当前那套复制');
+    assert.match(pick().textContent, /这张图专用/);
+    assert.equal(nodes(drawer(), 'TEXTAREA').length, 0);
+    // 专用的那套到设置页「判断提示词」里改，和通用的同一套编辑器。
+    findButton(panel().querySelector('.dga-rail'), '设置').listeners.click[0]();
+    const editor = () => nodes(panel(), 'SELECT').find(item => item.textContent.includes('专用'));
+    editor().listeners.change[0]({ target: { value: `local:${route.id}` } });
+    nodes(panel(), 'TEXTAREA')[0].listeners.input[0]({ target: { value: '专属剧情要求', selectionStart: 0, selectionEnd: 0 } });
+    await findButton(panel(), '保存当前提示词').listeners.click[0]();
     await new Promise(setImmediate);
     const stored = characterRoot(world).routes.list[0];
     assert.equal(stored.promptLocal.segments[0].content, '专属剧情要求');
     assert.equal(stored.promptId, undefined);
-    assert.match(drawer().textContent, /专用方案名称/);
-    assert.equal(run.promptStorage.resolve({ promptId: id }).segments[0].content, '共用正文');
+    assert.equal(run.promptStorage.resolve({ promptId: id }).segments[0].content, '共用正文', '不改通用库');
     assert.deepEqual(errors, []);
 });
 
 
+
+test('提示词：「默认」可以改，改过的存进通用库；改回原样就不单存', async () => {
+    const run = load().core;
+    const P = run.promptStorage;
+    await P.saveDefault([{ role: 'system', content: '我改过的默认' }, { role: 'user', content: '{{作答表}}' }]);
+    assert.equal(P.read().defaultSegments[0].content, '我改过的默认');
+    assert.equal(P.resolve({}).segments[0].content, '我改过的默认', '没选提示词的路线图用改过的默认');
+    assert.equal(run.routes.promptPresets()[0].segments[0].content, '我改过的默认');
+    await assert.rejects(P.save({ name: '默认', segments: [{ role: 'user', content: 'x' }] }), /已经有叫「默认」/);
+    await P.saveDefault(core.routes.promptPresets()[0].segments);
+    assert.equal(P.read().defaultSegments, undefined, '和内置一样就不存');
+});

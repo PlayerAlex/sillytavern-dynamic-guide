@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.2';
+    const VERSION = '4.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -626,7 +626,8 @@
     // 一个信封保存预设及引用，避免重命名/删除只成功一半。空信封也是权威配置。
     const API_STORE_FIELD = 'apiStore';
     let apiStoreQueue = Promise.resolve();
-    let apiStoreNotice = 'API 配置保存在酒馆用户设置；换浏览器需连接同一酒馆、同一用户。';
+    // 有事要你动手（旧配置没搬、保存失败）时才有字，API 页底部显示。
+    let apiStoreNotice = '';
 
     function apiSettingsContext() {
         const context = sillyTavernContext();
@@ -679,7 +680,7 @@
             return normalizeApiStore(root[API_STORE_FIELD]);
         }
         const legacy = legacyApiStore();
-        if (legacy.exists) apiStoreNotice = '正在使用旧浏览器配置，尚未提交到酒馆；请点击「迁移 / 重试保存」。';
+        if (legacy.exists) apiStoreNotice = '这台浏览器里还有旧的 API 配置，没搬到酒馆里。点「迁移」搬过去。';
         return legacy.store;
     }
 
@@ -712,7 +713,7 @@
                 if (!root && Object.keys(target).length === 0) delete settings[EXTENSION_SETTINGS_KEY];
                 throw new Error('提交酒馆 API 配置保存失败，已回滚本次修改；旧浏览器数据未删除。请检查连接后重试。');
             }
-            apiStoreNotice = '已提交酒馆保存（延迟保存接口不保证返回落盘确认）。请稍候，再到另一浏览器核对。旧本地备份仍保留。';
+            apiStoreNotice = '';
             return true;
         });
         apiStoreQueue = task.catch(error => { apiStoreNotice = error.message; });
@@ -744,7 +745,24 @@
             ids.add(preset.id);
             return preset;
         });
-        return { version: 1, presets, migrations: cloneData(raw.migrations) };
+        // 改过的「默认」：没改过就不存，读的时候用内置那一套。
+        const defaults = normalizeRouteJudgeSegments(raw.defaultSegments);
+        return { version: 1, presets, migrations: cloneData(raw.migrations), ...(defaults.length ? { defaultSegments: defaults } : {}) };
+    }
+
+    function builtinPromptSegments(store) {
+        return store && store.defaultSegments && store.defaultSegments.length
+            ? store.defaultSegments.map(seg => ({ ...seg })) : defaultRouteJudgeSegments();
+    }
+
+    function saveDefaultPrompt(segments) {
+        const next = normalizeRouteJudgeSegments(segments);
+        if (!next.length) return Promise.reject(new Error('至少要有一段。'));
+        return mutatePromptStore(store => {
+            if (JSON.stringify(next) === JSON.stringify(defaultRouteJudgeSegments())) delete store.defaultSegments;
+            else store.defaultSegments = next;
+            return PROMPT_BUILTIN_ID;
+        });
     }
 
     function readPromptStore() {
@@ -788,7 +806,7 @@
         if (!preset.name || !preset.segments.length) return Promise.reject(new Error('提示词需要名称和至少一段内容。'));
         return mutatePromptStore(store => {
             if (preset.id && !store.presets.some(item => item.id === preset.id)) throw new Error('所编辑的提示词已不存在，请重新选择或新建。');
-            if (store.presets.some(item => item.name === preset.name && item.id !== preset.id)) throw new Error('已有同名通用提示词，请换一个名称。');
+            if (preset.name === ROUTE_PROMPT_DEFAULT_NAME || store.presets.some(item => item.name === preset.name && item.id !== preset.id)) throw new Error(`已经有叫「${preset.name}」的提示词了。`);
             if (!preset.id) preset.id = routeId('p');
             store.presets = store.presets.filter(item => item.id !== preset.id).concat([preset]);
             return preset.id;
@@ -1638,13 +1656,20 @@
                 // 内容作为重试身份，不同角色的同名不同内容不会互相覆盖。
                 const key = JSON.stringify([scope, preset.name, preset.segments]);
                 let id = store.migrations[key];
+                // 旧版改过的「默认」：通用库里的「默认」还没改过（或改得一样）就直接当「默认」。
+                if (typeof id !== 'string' && preset.name === ROUTE_PROMPT_DEFAULT_NAME
+                    && (!store.defaultSegments || JSON.stringify(store.defaultSegments) === JSON.stringify(preset.segments))) {
+                    store.defaultSegments = preset.segments;
+                    id = PROMPT_BUILTIN_ID;
+                    store.migrations[key] = id;
+                }
                 if (typeof id !== 'string') {
                     const same = store.presets.find(item => item.name === preset.name && JSON.stringify(item.segments) === JSON.stringify(preset.segments));
                     id = same ? same.id : routeId('p');
                     if (!same) {
                         let name = preset.name;
                         let index = 2;
-                        while (store.presets.some(item => item.name === name)) name = `${preset.name}（迁移 ${index++}）`;
+                        while (name === ROUTE_PROMPT_DEFAULT_NAME || store.presets.some(item => item.name === name)) name = `${preset.name}（迁移 ${index++}）`;
                         store.presets.push({ id, name, segments: preset.segments });
                     }
                     store.migrations[key] = id;
@@ -3306,7 +3331,9 @@
         return el('span', { class: `dga-info${open ? ' is-open' : ''}` },
             el('button', { type: 'button', class: 'dga-info-dot', 'aria-label': '怎么用', onclick: () => { ui.infoOpen = open ? '' : key; render(); } }, '!'),
             el('span', { class: 'dga-info-pop', role: 'tooltip' },
-                ...items.map(([name, text]) => el('span', { class: 'dga-info-item' }, el('b', { text: name }), el('span', { text })))));
+                ...items.map(item => (typeof item === 'string'
+                    ? el('span', { class: 'dga-info-item', text: item })
+                    : el('span', { class: 'dga-info-item' }, el('b', { text: item[0] }), el('span', { text: item[1] }))))));
     }
 
     // 设置：对所有路线图都有效的东西，加上判断提示词。每张路线图自己的东西在它的「设置」里。
@@ -3334,14 +3361,15 @@
     // ---- 判断提示词：和 API 预设一样，「下拉 ＋ 删除」管一套套提示词，下面编辑选中的那一套 ----
 
     function openPromptPreset(id) {
-        const list = routePromptPresets();
+        const list = promptEditorList();
         const found = list.find(item => item.id === id);
         const base = found || list.find(item => item.id === ui.prompt.sel) || list[0];
         ui.prompt.sel = found ? found.id : '';
         ui.prompt.draft = {
             id: found ? found.id : '',
-            name: found ? found.name : '',
+            name: found ? (found.local ? oneLine(routeById(found.local).promptLocal.name) : found.name) : '',
             builtin: Boolean(found && found.builtin),
+            local: found && found.local ? found.local : '',
             segments: base.segments.map(seg => ({ ...seg })),
         };
         ui.prompt.snapshot = JSON.stringify(ui.prompt.draft);
@@ -3352,23 +3380,61 @@
         return Boolean(ui.prompt.draft) && JSON.stringify(ui.prompt.draft) !== ui.prompt.snapshot;
     }
 
+    function routeById(id) {
+        return (ui.routes || []).find(route => route.id === id) || null;
+    }
+
     function savePromptPreset() {
         const draft = ui.prompt.draft;
         const name = oneLine(draft.name);
         const from = ui.prompt.sel;
         return runAction('保存判断提示词', async () => {
-            const id = await saveUserPrompt({ id: draft.builtin ? '' : from, name: draft.builtin ? '默认（自定义）' : name, segments: draft.segments });
+            const segments = normalizeRouteJudgeSegments(draft.segments);
+            if (!segments.length) throw new Error('至少要有一段。');
+            let id;
+            if (draft.local) {
+                // 路线图专用的那套存在路线图上，跟角色卡走。
+                const route = routeById(draft.local);
+                if (!route || !route.promptLocal) throw new Error('这张路线图已经不用专用提示词了。');
+                route.promptLocal = { name: name || route.name, segments };
+                await saveRoutesNow();
+                id = from;
+            } else if (draft.builtin) {
+                id = await saveDefaultPrompt(segments);
+            } else {
+                if (!name) throw new Error('先给这套提示词起个名字。');
+                id = await saveUserPrompt({ id: from, name, segments });
+            }
             openPromptPreset(id);
             return true;
-        }, { refresh: false, success: '已提交通用提示词到酒馆保存；延迟接口不保证返回落盘确认。' });
+        }, { refresh: false, success: from ? '保存了' : `新建了「${name}」` });
     }
 
     function deletePromptPreset(id) {
+        const local = ui.prompt.draft && ui.prompt.draft.local ? routeById(ui.prompt.draft.local) : null;
+        if (local) {
+            openRouteModal(`删掉「${local.name}」专用的提示词？`,
+                el('p', { class: 'dga-rt-p', text: '删掉以后这张路线图改用「默认」。' }), [
+                    rtBtn('取消', closeRouteModal, 'ghost'),
+                    rtBtn('删掉', () => {
+                        ui.rt.modal = null;
+                        runAction('删掉判断提示词', async () => {
+                            delete local.promptLocal;
+                            local.promptId = PROMPT_BUILTIN_ID;
+                            await saveRoutesNow();
+                            openPromptPreset(PROMPT_BUILTIN_ID);
+                            return true;
+                        }, { refresh: false, success: '删掉了' });
+                    }, 'danger'),
+                ]);
+            return;
+        }
         const preset = readPromptStore().presets.find(item => item.id === id);
         if (!preset) return;
         const name = preset.name;
+        const used = (ui.routes || []).filter(route => !route.promptLocal && route.promptId === id).length;
         openRouteModal(`删掉提示词「${name}」？`,
-            el('p', { class: 'dga-rt-p', text: '其他角色也可能引用此方案。删除后相关路线会提示缺失并停止 AI 判断，不会自动换成默认；路线专用副本不受影响。' }), [
+            el('p', { class: 'dga-rt-p', text: `${used ? `这张角色卡有 ${used} 张路线图在用它。` : ''}用它的路线图会停下 AI 判断，等你重选一套。` }), [
                 rtBtn('取消', closeRouteModal, 'ghost'),
                 rtBtn('删掉', () => {
                     ui.rt.modal = null;
@@ -3393,7 +3459,7 @@
                 const { segments } = importPromptData(parsed);
                 ui.prompt.draft.segments = segments;
                 if (!ui.prompt.draft.builtin && parsed && typeof parsed.name === 'string' && !ui.prompt.sel) ui.prompt.draft.name = oneLine(parsed.name);
-                setMessage(`导入了 ${segments.length} 段，点保存才生效；仅支持提示词段，不执行第三方剧情预设的其他规则或参数。`, 'info');
+                setMessage(`导入了 ${segments.length} 段，点保存才生效`, 'info');
                 render();
             }).catch(error => { setMessage(error.message || String(error), 'error'); render(); });
         });
@@ -3412,8 +3478,8 @@
 
     function renderPromptSection(settings) {
         let list;
-        try { list = routePromptPresets(); }
-        catch (error) { return setSection('通用判断提示词', null, messageBar({ type: 'error', text: error.message })); }
+        try { list = promptEditorList(); }
+        catch (error) { return setSection('判断提示词', null, messageBar({ type: 'error', text: error.message })); }
         if (!ui.prompt.draft || (ui.prompt.sel && !list.some(item => item.id === ui.prompt.sel))) openPromptPreset(list[0].id);
         const draft = ui.prompt.draft;
         const segs = draft.segments;
@@ -3473,11 +3539,13 @@
         const missingAnswer = !segs.some(seg => seg.enabled !== false && /\{\{\s*作答表\s*\}\}/.test(seg.content));
         const nameInput = el('input', { type: 'text', class: 'dga-input', maxlength: '40', oninput: event => { draft.name = event.target.value; } });
         nameInput.value = draft.name;
-        return setSection('通用判断提示词', null,
-            el('small', { class: 'dga-rt-note', text: '通用库跟酒馆用户走，跨角色复用。内置默认不可覆盖，修改后另存为通用方案；路线专用副本在路线设置中编辑。' }),
+        return setSection(el('h3', { class: 'dga-set-title' }, '判断提示词', infoTip('promptStore', [
+            ['通用的', '「默认」和自己建的几套跟酒馆用户走，换角色卡也能选。'],
+            ['专用的', '「某张路线图」专用的那套存在路线图上，跟角色卡一起导出。在路线图「设置」里选「复制一份给这张图专用」就有了。'],
+        ])), null,
             el('div', { class: 'dga-set-pad' }, pickRow),
             el('div', { class: 'dga-set-pad dga-pseg-body' },
-                draft.builtin ? null : el('label', { class: 'dga-af' }, el('span', { class: 'dga-af-label', text: '名称' }), nameInput),
+                draft.builtin || draft.local ? null : el('label', { class: 'dga-af' }, el('span', { class: 'dga-af-label', text: '名称' }), nameInput),
                 el('div', { class: 'dga-slot-bar' },
                     el('span', { class: 'dga-slot-label', text: '放一个格子：' }),
                     ...ROUTE_PROMPT_SLOTS.map(([token, tip]) => el('button', { type: 'button', class: 'dga-slot-chip', title: tip, onclick: () => insert(`{{${token}}}`) }, token))),
@@ -3688,7 +3756,7 @@
             }
             // 保存以后留在这个预设上。
             openApiPreset(preset.name);
-        }, { success: `「${oneLine(draft.name)}」已提交酒馆保存，请稍候再关闭页面。` });
+        }, { success: creating ? `新建了「${oneLine(draft.name)}」` : `「${oneLine(draft.name)}」保存了` });
 
         const formChildren = [
             af('预设名称', input('name', { maxlength: '60' })),
@@ -3739,17 +3807,17 @@
                             el('div', { class: 'dga-af-foot' },
                                 el('span'),
                                 el('div', { class: 'dga-af-foot-r' }, discard, save)))),
-                    el('p', { class: 'dga-pg-foot', text: apiStoreNotice }),
-                    rtBtn('迁移 / 重试保存', () => runAction('迁移 API 配置', async () => {
+                    apiStoreNotice ? el('small', { class: 'dga-rt-note', text: apiStoreNotice }) : null,
+                    apiStoreNotice ? rtBtn('迁移', () => runAction('迁移 API 配置', async () => {
                         const migrated = await migrateApiStore();
                         if (!migrated) {
                             const { root } = apiSettingsContext();
                             if (root && Object.prototype.hasOwnProperty.call(root, API_STORE_FIELD)) await mutateApiStore(() => {});
-                            else apiStoreNotice = '没有旧数据可迁移，请先在原来保存过 API 的浏览器升级。';
+                            else apiStoreNotice = '这台浏览器里没有旧配置。到原来存过 API 的浏览器里打开一次就会搬过去。';
                         }
                         enterApiPage();
-                    }), 'small', { disabled: Boolean(ui.busy) }),
-                    el('p', { class: 'dga-pg-foot', text: '密钥以明文保存在酒馆用户设置，不随角色卡或聊天导出；请保护酒馆账号与设置备份。旧浏览器迁移备份不会自动删除。' }))),
+                    }), 'small', { disabled: Boolean(ui.busy) }) : null,
+                    el('p', { class: 'dga-pg-foot', text: '密钥以明文存在酒馆的用户设置里。' }))),
         ];
     }
 
@@ -4982,8 +5050,19 @@
     }
 
     function routePromptPresets() {
-        return [{ id: PROMPT_BUILTIN_ID, name: ROUTE_PROMPT_DEFAULT_NAME, segments: defaultRouteJudgeSegments(), builtin: true }]
-            .concat(readPromptStore().presets);
+        const store = readPromptStore();
+        return [{ id: PROMPT_BUILTIN_ID, name: ROUTE_PROMPT_DEFAULT_NAME, segments: builtinPromptSegments(store), builtin: true }]
+            .concat(store.presets);
+    }
+
+    // 设置页编辑器的下拉：通用库里的几套，后面跟这个角色里各张路线图专用的那套。
+    function promptEditorList() {
+        const list = routePromptPresets();
+        (ui.routes || []).forEach(route => {
+            if (!route.promptLocal) return;
+            list.push({ id: `local:${route.id}`, name: `「${route.name}」专用`, segments: normalizeRouteJudgeSegments(route.promptLocal.segments), local: route.id });
+        });
+        return list;
     }
 
     function resolveRoutePrompt(route) {
@@ -4994,9 +5073,10 @@
         }
         const id = route.promptId;
         if (!id && route.prompt) throw new Error(`旧提示词「${route.prompt}」尚未迁移，请重新打开角色或明确选择方案。`);
-        if (!id || id === PROMPT_BUILTIN_ID) return { name: ROUTE_PROMPT_DEFAULT_NAME, segments: defaultRouteJudgeSegments() };
-        const preset = readPromptStore().presets.find(item => item.id === id);
-        if (!preset) throw new Error('引用的通用提示词已不存在，请重新选择，或使用随卡携带的专用方案；未回退默认。');
+        const store = readPromptStore();
+        if (!id || id === PROMPT_BUILTIN_ID) return { name: ROUTE_PROMPT_DEFAULT_NAME, segments: builtinPromptSegments(store) };
+        const preset = store.presets.find(item => item.id === id);
+        if (!preset) throw new Error('这张路线图选的判断提示词找不到了（可能被删了），到路线图「设置」里重选一套。');
         return preset;
     }
 
@@ -5267,7 +5347,13 @@
             try {
                 if (await judgeRoute(route, messageId, config, {})) moved = true;
             } catch (error) {
-                LogModule.error('判断AI', `「${route.name}」未判断：${error.message || String(error)}`);
+                // 同一个原因只报一次，不在每条回复后刷日志。
+                const text = `「${route.name}」没有 AI 判断：${error.message || String(error)}`;
+                if (!reported.has(text)) {
+                    reported.add(text);
+                    LogModule.error('判断AI', text);
+                    notify(text, 'warning');
+                }
             }
         }
         if (moved) await syncRouteEntriesNow({ config });
@@ -5709,45 +5795,27 @@
         let available = false;
         try { resolveRoutePrompt(route); available = true; } catch (cause) { error = cause.message; }
         const selected = route.promptLocal ? '@local' : (route.promptId || (route.prompt ? `missing:${route.prompt}` : PROMPT_BUILTIN_ID));
-        const options = presets.map(item => [item.id, item.builtin ? '内置默认' : `通用 · ${item.name}`]);
-        if (route.promptLocal) options.push(['@local', `专用 · ${route.promptLocal.name || '本路线'}`]);
-        if (!options.some(item => item[0] === selected)) options.push([selected, '当前引用不可用（请重新选择）']);
-        const controls = [setRow('判断提示词', rtSelect(options, selected, value => {
-            if (value === '@local') return;
-            if (route.promptLocal && !hostWindow.confirm('切换到通用方案会移除这张路线图的专用副本，确定继续？')) { render(); return; }
-            delete route.promptLocal;
-            route.promptId = value;
-            route.prompt = '';
-            routeEdited(route, false);
-            render();
-        }))];
-        if (error) controls.push(messageBar({ type: 'error', text: error }));
-        if (!route.promptLocal) {
-            controls.push(setRow('随角色卡携带', rtBtn('复制为路线专用方案', () => {
-                route.promptLocal = localPromptCopy(route);
-                delete route.promptId;
+        const options = presets.map(item => [item.id, item.name]);
+        if (route.promptLocal) options.push(['@local', '这张图专用']);
+        else if (available) options.push(['@copy', '复制一份给这张图专用']);
+        if (!options.some(item => item[0] === selected)) options.push([selected, '（找不到了，重选一套）']);
+        // 只选一套；专用的那套到设置页「判断提示词」里改。
+        return el('div', {},
+            setRow('判断提示词', rtSelect(options, selected, value => {
+                if (value === selected) return;
+                if (value === '@copy') {
+                    route.promptLocal = localPromptCopy(route);
+                    delete route.promptId;
+                } else {
+                    if (route.promptLocal && !hostWindow.confirm('换成别的提示词，这张图专用的那套就删掉了，确定？')) { render(); return; }
+                    delete route.promptLocal;
+                    route.promptId = value;
+                }
                 route.prompt = '';
                 routeEdited(route, false);
                 render();
-            }, 'ghost small', { disabled: !available })));
-        } else {
-            const local = route.promptLocal;
-            const edit = () => routeEdited(route, false);
-            const name = el('input', { class: 'dga-input', type: 'text', oninput: event => { local.name = event.target.value; edit(); } });
-            name.value = local.name;
-            controls.push(setRow('专用方案名称', name));
-            local.segments.forEach((seg, index) => {
-                const area = el('textarea', { class: 'dga-input', rows: '4', oninput: event => { seg.content = event.target.value; edit(); } });
-                area.value = seg.content;
-                controls.push(el('div', { class: 'dga-set-pad' },
-                    rtSelect([['system', 'SYSTEM'], ['user', 'USER'], ['assistant', 'ASSISTANT']], seg.role, value => { seg.role = value; edit(); }),
-                    switchBtn(seg.enabled !== false, value => { seg.enabled = value; edit(); render(); }, '启用专用段'),
-                    area,
-                    rtBtn('删除此段', () => { local.segments.splice(index, 1); edit(); render(); }, 'ghost small', { disabled: local.segments.length === 1 })));
-            });
-            controls.push(rtBtn('＋ 添加专用段', () => { local.segments.push({ role: 'user', content: '' }); edit(); render(); }, 'ghost small'));
-        }
-        return el('div', {}, ...controls);
+            })),
+            error ? messageBar({ type: 'error', text: error }) : null);
     }
 
 
@@ -7478,10 +7546,10 @@ ${P} .dga-slot-chip { padding: 2px 10px; border-radius: 6px; border: 1px dashed 
 ${P} .dga-slot-chip:hover { color: var(--dga-text-1); border-color: var(--dga-text-3); }
 ${P} .dga-pseg-list { display: flex; flex-direction: column; gap: 10px; }
 ${P} .dga-pseg { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-md); background: var(--dga-bg-0); }
-${P} .dga-pseg-head { display: flex; align-items: center; gap: 6px; }
-${P} .dga-pseg-head select { width: auto; min-height: 28px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+${P} .dga-pseg-head { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+${P} .dga-pseg-head select { flex: 0 1 auto; max-width: none; width: auto; min-height: 28px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
 ${P} .dga-pseg-on { display: inline-flex; align-items: center; gap: 6px; color: var(--dga-text-2); font-size: 12px; }
-${P} .dga-pseg-n { flex: 1; color: var(--dga-text-3); font-size: 12px; }
+${P} .dga-pseg-n { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--dga-text-3); font-size: 12px; }
 ${P} .dga-pseg-text { min-height: 0; font: 13px/1.6 var(--dga-font-mono); }
 ${P} .dga-pseg.is-off textarea, ${P} .dga-pseg.is-off select { opacity: .45; }
 ${P} .dga-pseg-add { width: 100%; padding: 7px 0; border: 1px dashed var(--dga-border-2); border-radius: var(--dga-radius-md); background: transparent; color: var(--dga-text-2); font: inherit; font-size: 12.5px; cursor: pointer; }
@@ -7758,6 +7826,7 @@ ${P} .dga-rt-pv-off { margin-top: 8px; color: var(--dga-text-3); font-size: 12px
     ${P} .dga-rt-send-split[data-view="tpl"] .dga-rt-col-pv, ${P} .dga-rt-send-split[data-view="pv"] .dga-rt-col-tpl { display: none; }
 }
 @media (max-width: 700px) {
+    ${P} .dga-pseg-n { font-size: 0; }
     ${P} .dga-rt-drawer, ${P} .dga-rt-drawer.is-wide { top: auto; left: 0; width: 100%; height: 80%; max-height: 95%; border-left: 0; border-top: 1px solid var(--dga-border-2); border-radius: 18px 18px 0 0; animation-name: dga-rt-up; }
     ${P} .dga-rt-grip { left: 0; right: 0; top: 0; bottom: auto; width: auto; height: 22px; cursor: ns-resize; }
     ${P} .dga-rt-grip::after { left: 50%; top: 8px; width: 42px; height: 4px; margin: 0 0 0 -21px; opacity: 1; background: var(--dga-border-2); }
@@ -7918,7 +7987,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         version: VERSION,
         normalizeConfig,
         configStorage: { read: readConfig, write: writeConfig },
-        promptStorage: { read: readPromptStore, save: saveUserPrompt, remove: deleteUserPrompt, resolve: resolveRoutePrompt, copy: localPromptCopy, import: importPromptData, export: exportPromptData },
+        promptStorage: { read: readPromptStore, save: saveUserPrompt, saveDefault: saveDefaultPrompt, remove: deleteUserPrompt, resolve: resolveRoutePrompt, copy: localPromptCopy, import: importPromptData, export: exportPromptData },
         normalizeJudgeApiPreset,
         normalizeJudgeApiPresets,
         apiStorage: { read: readApiStore, writePresets: writeJudgeApiPresets, migrate: migrateApiStore, notice: () => apiStoreNotice },
