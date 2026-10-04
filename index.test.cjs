@@ -1055,7 +1055,7 @@ test('路线图：世界书里一棵树只有一个条目，走一步换内容�
     assert.deepEqual(run.errors, []);
 });
 
-test('路线图：条目名带「（动态指导）」也不会被当成旧镜像重建绑定；总开关关掉时条目关掉', async () => {
+test('路线图：条目名带「（动态指导）」也不会被当成旧镜像重建绑定；旧卡上存的「总开关关闭」不再认', async () => {
     const world = routeWorld();
     world.state.books.书A.push({ uid: 3, name: '海边书店', content: '## 一\n正文', enabled: true });
     const run = load(world.helper);
@@ -1071,10 +1071,7 @@ test('路线图：条目名带「（动态指导）」也不会被当成旧镜�
     world.state.variables.character.$dynamicGuideAssistant.config.settings = { guideEnabled: false };
     await world.state.events.get('generate')('normal');
     const entry = world.state.books.书A.find(item => item.name === '海边书店（动态指导）');
-    assert.equal(entry.enabled, false, '总开关关掉，路线图条目也关掉');
-    world.state.variables.character.$dynamicGuideAssistant.config.settings = { guideEnabled: true };
-    await world.state.events.get('generate')('normal');
-    assert.equal(entry.enabled, true, '重新打开后照常发');
+    assert.equal(entry.enabled, true, '总开关没有了，旧卡上存的关闭不能让条目一直关着');
     assert.deepEqual(run.errors, []);
 });
 
@@ -1106,7 +1103,7 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     assert.deepEqual(errors, []);
 });
 
-test('路线图：左栏是标志和总开关、路线图列表、API / 运行日志 / 设置', async () => {
+test('路线图：左栏是标志、路线图列表、API / 运行日志 / 设置', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const world = routeWorld();
     const R = load().core.routes;
@@ -1120,8 +1117,9 @@ test('路线图：左栏是标志和总开关、路线图列表、API / 运行�
     await sandbox.DynamicGuideAssistantCore.refresh();
     const panel = () => documentRef.getElementById(PANEL_ID);
     const rail = () => panel().querySelector('.dga-rail');
-    assert.ok(rail().querySelector('.dga-rail-toggle'), '标志那一行带总开关');
-    assert.match(rail().querySelector('.dga-rail-state').textContent, /指导中/);
+    assert.equal(rail().querySelector('.dga-rail-toggle'), null, '标志那一行不放总开关');
+    assert.equal(rail().querySelector('[role="switch"]'), null);
+    assert.match(rail().querySelector('.dga-rail-state').textContent, /^v\d+\.\d+\.\d+$/, '标题下面只写版本号');
     const trees = rail().querySelector('.dga-rail-trees');
     assert.equal(trees.children.length, 2, '每棵树一行');
     assert.match(trees.textContent, /海边书店开场/, '名字下面只写现在在哪一段');

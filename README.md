@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v4.3.4**
+当前版本：**v4.3.5**
 
 在酒馆里给角色画一张「路线图」：剧情（也可以是时间、关系变化……）一段一段排好，分出路口，挂上支线。动态指导助手只把**现在走到的这一段**写进世界书，AI 每次回复看到的就是当下该演的内容；走完一段就往下一段走，可以自己点，也可以交给判断用的 AI。
 
@@ -8,8 +8,8 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 
 ## 安装
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.4/dynamic-guide-offline-v4.3.4.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.4/dynamic-guide-online-v4.3.4.json)：每次打开酒馆时从网上下载脚本。**不会自己升级**，想更新时改一下里面的版本号就行（见下面「在线加载」）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.5/dynamic-guide-offline-v4.3.5.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.5/dynamic-guide-online-v4.3.5.json)：每次打开酒馆时从网上下载脚本。**不会自己升级**，想更新时改一下里面的版本号就行（见下面「在线加载」）。
 
 在酒馆助手里导入并启用，点酒馆左下角魔法棒里的「动态指导助手」打开。
 
@@ -24,7 +24,7 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 7. 「位置和顺序」决定条目放在世界书里哪儿。在世界书里直接改这个条目的位置和顺序也行，助手会读回来，不会盖掉。点两条中间的「放到这里」时，如果中间没有空出来的顺序数字，后面的条目会依次往后挪、让出位置，它们之间的先后不变。数据库（ACU）和 MVU 写的条目不列在这里。
 8. 卡片下面是主线、在走的支线、可以开始的支线，各有「上一段 / 下一段」「开始」。
 
-进度按聊天分开：路线图存在角色卡上，开新聊天就从起点开始。左栏最上面的开关是总开关，关掉以后所有路线图的条目都关掉。
+进度按聊天分开：路线图存在角色卡上，开新聊天就从起点开始。想让助手停下来，在酒馆助手里把这个脚本关掉就行；世界书里的路线图条目会停在当时的样子，不想让 AI 再看到就到世界书里把它关掉。
 
 ## 让 AI 判断往下走
 
@@ -65,10 +65,10 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 在线版的脚本内容只有一小段，最上面一行是版本号：
 
 ```js
-const VERSION = 'v4.3.4';
+const VERSION = 'v4.3.5';
 ```
 
-- **想更新**：在酒馆助手里打开这个脚本，把引号里的版本号改成新版本（比如 `v4.3.4`），保存后刷新酒馆页面。有哪些版本看[发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases)。不改就一直用这个版本，不会自动升级。
+- **想更新**：在酒馆助手里打开这个脚本，把引号里的版本号改成新版本（比如 `v4.3.5`），保存后刷新酒馆页面。有哪些版本看[发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases)。不改就一直用这个版本，不会自动升级。
 - **下载地址**：同时向 testingcf / fastly / cdn / gcore 这几个 jsDelivr 节点和 GitHub 原地址要文件，谁先给对就用谁，所以其中一两个连不上也能用。只认版本号对得上的文件，下错了不运行。
 - **全都连不上**（或者版本号写错了）：右上角会弹提示，按 F12 在控制台能看到每个地址失败的原因。这时换离线版就行。
 - v4.3.2 及以前的在线版只认 `cdn.jsdelivr.net` 一个地址，连不上就什么都没有。想用新的在线版，重新导入一次 v4.3.3 或更新的在线版 JSON。新的在线版里把版本号改成更早的版本（v4.0 起）也能用。
@@ -86,7 +86,7 @@ const VERSION = 'v4.3.4';
 | API 预设（含密钥）、路线图 API 选择 | `extensionSettings["dynamic-guide-assistant"].apiStore` | 酒馆用户；不随角色卡导出 |
 | 通用判断提示词库 | `extensionSettings["dynamic-guide-assistant"].promptStore` | 酒馆用户；不随角色卡导出 |
 | 路线定义、分支、内容模板、规则、提示词引用（`promptId`）与路线专用副本（`promptLocal`） | 角色变量 `$dynamicGuideAssistant.routes = { version: 1, list }` | 当前角色；专用副本随卡携带 |
-| 总开关、默认推进方式、判断频率、流式设置 | 角色变量 `$dynamicGuideAssistant.config.settings` | 当前角色 |
+| 默认推进方式、判断频率、流式设置 | 角色变量 `$dynamicGuideAssistant.config.settings` | 当前角色 |
 | 当前段、走过的路线、支线进度、判断结果 | 聊天变量 `$dynamicGuideAssistant.routeState.routes[路线图 id]` | 当前聊天；新聊天重新开始 |
 | 当前发给 AI 的文本、条目启用状态 | 世界书中的路线图条目 | 从路线与当前聊天进度生成；不作为完整进度存档 |
 | 条目注入位置和顺序 | 世界书条目 | 允许直接在世界书编辑，路线记录会读回该值 |
@@ -113,6 +113,11 @@ const VERSION = 'v4.3.4';
 - 改过再发布的版本也要用同样的协议。
 
 ## 更新日志
+
+### v4.3.5（2026-10-05）
+
+- 左栏最上面的总开关去掉了：想停就在酒馆助手里把脚本关掉。标题下面只写版本号。
+- 以前用总开关暂停过的角色卡，升级后会自己恢复指导。
 
 ### v4.3.4（2026-10-04）
 

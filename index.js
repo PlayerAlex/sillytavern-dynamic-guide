@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.4';
+    const VERSION = '4.3.5';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -1327,7 +1327,7 @@
         const normalized = normalizeConfig(validateStoredConfig(config));
         const settings = {};
         // 只存当前功能字段；API 凭据、已退役预设名、存放模式和布局不能再混进角色卡。
-        for (const key of ['guideEnabled', 'autoAdvance', 'judgeInterval', 'judgeHistoryCount', 'streamingEnabled']) {
+        for (const key of ['autoAdvance', 'judgeInterval', 'judgeHistoryCount', 'streamingEnabled']) {
             if (Object.prototype.hasOwnProperty.call(normalized.settings, key)) settings[key] = normalized.settings[key];
         }
         if (Object.prototype.hasOwnProperty.call(normalized.settings, 'routePromptPresets')) {
@@ -1585,11 +1585,8 @@
             const n = Math.floor(Number(settings.judgeHistoryCount));
             settings.judgeHistoryCount = Number.isFinite(n) && n >= 1 ? n : 1;
         }
-        // 动态指导总开关（v3.2）：只认 false = 关闭；缺省即开启。
-        if (settings.guideEnabled != null) {
-            if (settings.guideEnabled === false) settings.guideEnabled = false;
-            else delete settings.guideEnabled;
-        }
+        // 总开关 v4.3.5 起没有了（要停就在酒馆助手里关掉脚本）：旧卡上存的「关闭」不再认，读到就丢掉。
+        delete settings.guideEnabled;
         // 推进冷却（v3.3）：刚换段后 N 层内不自动推进。缺省 1；0 = 不冷却。
         if (settings.advanceCooldown != null) {
             const n = Math.floor(Number(settings.advanceCooldown));
@@ -2089,11 +2086,7 @@
         return bindings.length;
     }
 
-    function guideDisabled(config) {
-        return Boolean(config && config.settings && config.settings.guideEnabled === false);
-    }
-
-    // v4.0：同步就是把每棵树现在该发的内容写进它的条目（总开关关着时条目关掉）。
+    // v4.0：同步就是把每棵树现在该发的内容写进它的条目。
     function syncMirrors(generationType) {
         return withIoCache(() => syncMirrorsNow(generationType));
     }
@@ -3122,7 +3115,7 @@
         const page = ui.view === 'api' ? renderApiPage()
             : (ui.view === 'logs' ? renderLogPage()
                 : (ui.view === 'settings' ? renderSettingsPage() : renderRoutePage()));
-        // v4.0：左栏是助手自己的：标志和总开关、这个角色的路线图、底下的 API / 日志 / 设置。
+        // v4.0：左栏是助手自己的：标志、这个角色的路线图、底下的 API / 日志 / 设置。
         const main = el('div', { class: 'dga-main' }, ...page);
         // 提示放右上但不盖住按钮：路线图页挂在图的右上角（卡片标题栏下面），其他页挂在标题栏下沿。
         const toast = messageToast();
@@ -3140,7 +3133,7 @@
             restoreRouteScroll(shell);
         }
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
-        // 左栏抽屉开着时重画（比如点了总开关）不再播一遍滑入。
+        // 左栏抽屉开着时重画（比如点了里面的按钮）不再播一遍滑入。
         ui.navShown = ui.navOpen;
     }
 
@@ -3187,7 +3180,7 @@
     async function refreshNow() {
         const card = await currentCharacter();
         ui.characterName = characterName(card);
-        // 设置（判断方式、总开关、存放方式……）都在 config.settings 里；v4.0 起 contexts 一直是空的。
+        // 设置（判断方式……）都在 config.settings 里；v4.0 起 contexts 一直是空的。
         try {
             ui.snapshot = { config: await readConfig(), contexts: [] };
             ui.contextError = '';
@@ -3223,14 +3216,12 @@
     }
 
     // 左栏（v4.0，助手自己的样子）：
-    //   最上面是标志和总开关（标题下一行小字写着在不在指导）；
+    //   最上面是标志和标题（标题下一行小字是版本号）；
     //   中间是这个角色的路线图，每棵树一行：名字下面只写现在在哪一段，在走的支线名跟在后面、用支线的颜色；
     //   到路口 / 走完了在右边挂一个小标签。左边不放圆点。
     //   最下面是不常用的入口：API、运行日志、设置。
     // 电脑上常驻在左边；窄屏收成抽屉，左上角 ☰ 拉开。
     function renderNavMenu() {
-        const config = ui.snapshot ? ui.snapshot.config : null;
-        const on = !guideDisabled(config);
         const item = (view, icon, label, sub) => el('button', {
             type: 'button',
             class: `dga-rail-item${ui.view === view ? ' is-on' : ''}`,
@@ -3241,10 +3232,9 @@
         const trees = ui.routes.map(route => {
             const state = routeStateOf(route);
             const cur = route.nodes[state.cur];
-            const parts = !on ? [el('span', { text: '已暂停' })]
-                : [el('span', { text: cur ? cur.name : '' })].concat(state.ended ? [] : routeRunningSides(route, state)
+            const parts = [el('span', { text: cur ? cur.name : '' })].concat(state.ended ? [] : routeRunningSides(route, state)
                     .map(side => el('span', { class: 'dga-rail-side', style: `color:${side.color}`, text: side.name })));
-            const badge = !on ? null : (state.ended ? ['终点', ''] : (cur && cur.next.length > 1 ? ['路口', ' is-warn'] : null));
+            const badge = state.ended ? ['终点', ''] : (cur && cur.next.length > 1 ? ['路口', ' is-warn'] : null);
             const selected = ui.view === 'route' && ui.routeCurrent === route.id;
             return el('button', {
                 type: 'button',
@@ -3263,19 +3253,7 @@
                 el('div', { class: 'dga-rail-mark', 'aria-hidden': 'true' }, brandIcon()),
                 el('div', { class: 'dga-rail-brand-text' },
                     el('div', { class: 'dga-rail-title', text: SCRIPT_NAME }),
-                    el('div', { class: `dga-rail-state${on ? ' is-on' : ''}` }, el('i'), on ? `指导中 · v${VERSION}` : '已暂停')),
-                el('button', {
-                    type: 'button',
-                    role: 'switch',
-                    'aria-checked': on ? 'true' : 'false',
-                    'aria-label': '动态指导总开关',
-                    class: `dga-rail-toggle${on ? ' is-on' : ''}`,
-                    title: on ? '暂停：所有路线图都不往世界书里发东西' : '继续指导',
-                    onclick: () => {
-                        if (on) abortModelRequests('关闭动态指导');
-                        saveGuideSettings({ guideEnabled: !on }, on ? '已暂停，世界书里的条目都关掉了' : '继续指导');
-                    },
-                })),
+                    el('div', { class: 'dga-rail-state', text: `v${VERSION}` }))),
             el('div', { class: 'dga-rail-sec' }, '路线图', el('span', { text: String(ui.routes.length) })),
             el('div', { class: 'dga-rail-trees' }, ...trees),
             el('button', { type: 'button', class: 'dga-rail-new', onclick: () => { ui.navOpen = false; ui.view = 'route'; createRoute(); } }, '＋ 新建路线图'),
@@ -4875,7 +4853,6 @@
         if (config === undefined) {
             try { config = await readConfig(); } catch (error) { config = null; }
         }
-        const off = guideDisabled(config);
         const states = await readRouteStates();
         let fallbackBook = '';
         let dirty = false;
@@ -4890,7 +4867,7 @@
                 dirty = true;
             }
             const state = normalizeRouteState(states[route.id], route);
-            const content = off ? '' : composeRoute(route, state);
+            const content = composeRoute(route, state);
             const enabled = Boolean(content);
             let current;
             try {
@@ -5365,7 +5342,6 @@
     // 每条 AI 回复后：开了 AI 判断的每张图各问一次，排队一个一个来。
     async function checkRoutesFloor(messageId) {
         const config = await readConfig();
-        if (guideDisabled(config)) return;
         const routes = (await readRoutes()).filter(route => routeAdvanceMode(route, config) === 'judge');
         if (!routes.length) return;
         if (modelPauseLeft() > 0) {
@@ -7518,23 +7494,15 @@ ${routeStyles(P)}`;
     // 路线图（v4.0）的样式：卡片、路线图、侧边栏、弹窗、模板编辑。
     function routeStyles(P) {
         return `
-/* 左栏（v4.0）：标志和总开关 / 路线图列表 / 底部入口 */
+/* 左栏（v4.0）：标志 / 路线图列表 / 底部入口 */
 ${P} .dga-rail, ${P} .dga-nav-drawer { display: flex; flex-direction: column; gap: 10px; padding: 16px 12px 12px; background: #1B1C1F; }
 ${P} .dga-rail { flex: 0 0 252px; width: 252px; overflow: hidden; }
 ${P} .dga-nav-drawer { width: 270px; }
 ${P} .dga-rail-brand { display: flex; align-items: center; gap: 10px; padding: 2px 4px 12px 6px; border-bottom: 1px solid var(--dga-border); }
-${P} .dga-rail-mark { flex: 0 0 auto; width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; background: #26282C; border: 1px solid #3A3D42; transition: filter .2s, opacity .2s; }
-${P} .dga-rail-brand:has(.dga-rail-toggle:not(.is-on)) .dga-rail-mark { filter: grayscale(1); opacity: .6; }
+${P} .dga-rail-mark { flex: 0 0 auto; width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; background: #26282C; border: 1px solid #3A3D42; }
 ${P} .dga-rail-brand-text { flex: 1; min-width: 0; }
 ${P} .dga-rail-title { font-weight: 700; font-size: 14.5px; letter-spacing: .5px; color: var(--dga-text-1); }
-${P} .dga-rail-state { display: flex; align-items: center; gap: 5px; margin-top: 1px; color: var(--dga-text-3); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-${P} .dga-rail-state i { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--dga-text-3); }
-${P} .dga-rail-state.is-on { color: #9FD0AA; }
-${P} .dga-rail-state.is-on i { background: var(--dga-success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dga-success) 18%, transparent); }
-${P} .dga-rail-toggle { flex: 0 0 auto; position: relative; width: 34px; height: 20px; padding: 0; border-radius: 999px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); cursor: pointer; transition: background .15s, border-color .15s; }
-${P} .dga-rail-toggle::after { content: ''; position: absolute; left: 2px; top: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--dga-text-3); transition: left .15s, background .15s; }
-${P} .dga-rail-toggle.is-on { background: #3F6B49; border-color: #5E9A6B; }
-${P} .dga-rail-toggle.is-on::after { left: 16px; background: #EAF6ED; }
+${P} .dga-rail-state { margin-top: 1px; color: var(--dga-text-3); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 ${P} .dga-rail-sec { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px 0; color: var(--dga-text-3); font-size: 11.5px; letter-spacing: 1px; }
 ${P} .dga-rail-sec span { padding: 0 6px; border-radius: 999px; background: var(--dga-bg-2); font-size: 10.5px; letter-spacing: 0; }
 ${P} .dga-rail-trees { display: flex; flex-direction: column; gap: 4px; overflow: auto; min-height: 0; flex: 0 1 auto; }
