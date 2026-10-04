@@ -3,16 +3,16 @@
   "enabled": true,
   "name": "动态指导助手（在线版）",
   "id": "912c8dc1-cf5c-4c9f-a8a1-2bf8b2d4cf79",
-  "info": "动态指导助手 v4.3.1：给角色画路线图，剧情、时间或关系变化一段段排好，分出路口、挂上支线；每张路线图在世界书中只生成一个当前内容条目。可手动推进或由 AI 判断，支持分块模板、注入位置和顺序、判断提示词预设及提取/排除规则。API 预设和判断提示词存酒馆用户设置，换浏览器（同一酒馆、同一用户）也能用；路线图存角色变量，进度存聊天变量。每张路线图可以把选中的判断提示词绑定至角色卡随卡携带。密钥是酒馆用户设置中的明文，不随角色卡导出。v4.0 起不兼容 v3 绑定，升级会停用旧绑定并保留大纲正文，请用路线图重新搭建。以 CC BY-NC-SA 4.0 协议发布：允许转载修改，须署名，禁止商用，修改版使用相同协议。 本在线版固定加载 v4.3.1，首次使用需要联网。",
+  "info": "动态指导助手 v4.3.2：给角色画路线图，剧情、时间或关系变化一段段排好，分出路口、挂上支线；每张路线图在世界书中只生成一个当前内容条目。可手动推进或由 AI 判断，支持分块模板、注入位置和顺序、判断提示词预设及提取/排除规则。API 预设和判断提示词存酒馆用户设置，换浏览器（同一酒馆、同一用户）也能用；路线图存角色变量，进度存聊天变量。每张路线图可以把选中的判断提示词绑定至角色卡随卡携带。密钥是酒馆用户设置中的明文，不随角色卡导出。v4.0 起不兼容 v3 绑定，升级会停用旧绑定并保留大纲正文，请用路线图重新搭建。以 CC BY-NC-SA 4.0 协议发布：允许转载修改，须署名，禁止商用，修改版使用相同协议。 本在线版固定加载 v4.3.2，首次使用需要联网。",
   "button": {
     "enabled": false,
     "buttons": []
   },
   "data": {
-    "version": "4.3.1",
+    "version": "4.3.2",
     "format": "dynamic-guide-v4",
     "loader": "jsdelivr",
-    "source": "PlayerAlex/sillytavern-dynamic-guide@v4.3.1"
+    "source": "PlayerAlex/sillytavern-dynamic-guide@v4.3.2"
   },
-  "content": "import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.3.1/index.js';\n"
+  "content": "import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.3.2/index.js';\n"
 }

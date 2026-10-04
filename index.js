@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.1';
+    const VERSION = '4.3.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -3353,13 +3353,17 @@
         const save = patch => saveGuideSettings(patch);
         const body = el('div', { class: 'dga-body' },
             el('div', { class: 'dga-pg' },
-                setSection('往下走', null,
+                setSection(el('h3', { class: 'dga-set-title' }, '往下走', infoTip('advance', [
+                    ['只手动', '要你自己点「下一段」，路线图才往下走。'],
+                    ['AI 判断', '每次 AI 回复完，另外问一个 AI「这一段演完了没有」，演完了就自动走到下一段。'],
+                    ['每张路线图', '路线图自己的「设置」里也能单独选，单独选了就不听这里的。'],
+                ])), null,
                     setRow('默认怎么往下走',
                         rtSeg([['off', '只手动'], ['judge', 'AI 判断']], autoAdvanceMode(config), value => save({ autoAdvance: value })))),
                 setSection(el('h3', { class: 'dga-set-title' }, 'AI 判断', infoTip('judge', [
-                    ['多久问一次', '每隔几层 AI 回复，问一次判断用的 AI：这一段演完没有、到路口走哪条、支线开始没有。设成每 2 层，就是隔一层问一次，请求少一半。'],
-                    ['给它看几段回复', '判断时把最近几层 AI 写的正文给它看，不带你发的消息。看得多判断更稳，花的也多。'],
-                    ['流式输出', '判断的请求边生成边返回。接口老是等很久没回音、或者半路断开时，打开试试。'],
+                    ['多久问一次', '每 1 层：AI 每回复一次就问一次。每 2 层：隔一次问一次，花的钱少一半。'],
+                    ['给它看几段回复', '问的时候，把最近几次 AI 写的正文一起给它看。看得多判断得准，花得也多。'],
+                    ['流式输出', '一般不用开。判断老是等很久没反应、或者半路断掉时，再打开试试。'],
                 ])), null,
                 setRow('多久问一次', stepper('每', judgeCheckInterval(settings), '层', 1, 50, value => save({ judgeInterval: value }))),
                 setRow('给它看几段回复', stepper('最近', judgeHistoryCount(settings), '段', 1, 20, value => save({ judgeHistoryCount: value }))),
@@ -3549,8 +3553,11 @@
         const nameInput = el('input', { type: 'text', class: 'dga-input', maxlength: '40', oninput: event => { draft.name = event.target.value; } });
         nameInput.value = draft.name;
         return setSection(el('h3', { class: 'dga-set-title' }, '判断提示词', infoTip('promptStore', [
-            ['默认和自己建的', '跟酒馆用户走，换角色卡也能选。'],
-            ['角色卡里的', '在路线图「设置」里点「绑定」，选中的那套就复制进角色卡，跟卡一起导出。在这里改它不影响原来那套。'],
+            ['这是什么', '问判断 AI 时发过去的话。一般用「默认」就行，不用改。'],
+            ['一段一段', '每段选这段算谁说的：SYSTEM 是定规矩，USER 是你在问，ASSISTANT 是 AI 已经回答过的话。关掉的段不发。'],
+            ['放一个格子', '格子发出去时会换成真内容，比如「最近正文」会换成最近几次 AI 写的东西。「作答表」是让它按固定格式回答，没放会自动加上。'],
+            ['默认和自己建的', '跟着你的酒馆账号走，换角色卡也能选。'],
+            ['角色卡里的', '在路线图「设置」里点「绑定」放进角色卡的那份，分享角色卡时会一起带走。在这里改它，不影响原来那套。'],
         ])), null,
             el('div', { class: 'dga-set-pad' }, pickRow),
             el('div', { class: 'dga-set-pad dga-pseg-body' },
@@ -3689,7 +3696,7 @@
 
         // ── 草稿表单
         const bindText = key => event => { draft[key] = event.target.value; refreshApiButtons(); };
-        const af = (label, control) => el('label', { class: 'dga-af' }, el('span', { class: 'dga-af-label', text: label }), control);
+        const af = (label, control, tip) => el('label', { class: 'dga-af' }, el('span', { class: 'dga-af-label' }, label, tip ? infoTip(`api-${label}`, tip) : null), control);
         const input = (key, attrs) => {
             const node = el('input', { class: 'dga-input', type: 'text', autocomplete: 'off', oninput: bindText(key), ...(attrs || {}) });
             node.value = draft[key] != null ? String(draft[key]) : '';
@@ -3774,18 +3781,30 @@
         ];
         if (draft.connection === 'custom') {
             formChildren.push(
-                af('接口协议', rtSelect(formatOptions, draft.customApiFormat, value => { draft.customApiFormat = value; refreshApiButtons(); })),
-                af('端点(基础URL)', input('apiurl', { maxlength: '500', placeholder: 'https://example.com/v1' })),
+                af('接口协议', rtSelect(formatOptions, draft.customApiFormat, value => { draft.customApiFormat = value; refreshApiButtons(); }), [
+                    ['接口协议', '大多数选「兼容 OpenAI」就行。网站说明里写的是哪种就选哪种。'],
+                ]),
+                af('端点(基础URL)', input('apiurl', { maxlength: '500', placeholder: 'https://example.com/v1' }), [
+                    ['端点', '网站给你的 API 地址，一般是 https:// 开头、/v1 结尾。'],
+                ]),
                 af('API 密钥', input('key', { type: 'password', maxlength: '500' })),
-                af('模型名', input('model', { maxlength: '160' })),
+                af('模型名', input('model', { maxlength: '160' }), [
+                    ['模型名', '用哪个模型。填好地址和密钥后点下面「加载模型」，从列表里选最省事。'],
+                ]),
                 el('div', { class: 'dga-inline-action' }, rtBtn('加载模型', loadModels, 'small'), modelStatus),
                 ui.apiModelOptions.length
                     ? af('模型列表', rtSelect([['', '请选择']].concat(ui.apiModelOptions.map(name => [name, name])), ui.apiModelOptions.includes(draft.model) ? draft.model : '', value => { if (value) { draft.model = value; render(); } }))
                     : null,
                 el('div', { class: 'dga-two-col' },
                     af('最大回复长度', input('maxTokens', { type: 'number', min: '1', step: '1' })),
-                    af('温度', input('temperature', { type: 'number', min: '0', max: '2', step: '0.05' }))),
+                    af('温度', input('temperature', { type: 'number', min: '0', max: '2', step: '0.05' }), [
+                        ['最大回复长度', '它最多写多长。判断用不着写很长，默认就行。'],
+                        ['温度', '越低回答越稳定，越高越随意。判断建议低一点。'],
+                    ])),
                 el('div', { class: 'dga-af-sep' }),
+                el('div', { class: 'dga-af-label' }, '下面几项一般不用填', infoTip('api-advanced', [
+                    ['什么时候要填', '有的 API 要特别的设置才能用，网站说明里会写。没说就都空着；出错时「运行日志」里会告诉你要不要改这里。'],
+                ])),
                 af('附加主体参数', area('bodyParams', 3, 'response_format:\n  type: json_object\ntop_k: 50')),
                 af('排除主体参数', area('excludeBodyParams', 2, 'top_p, reasoning_effort')),
                 af('提示词后处理', rtSelect(postProcessingOptions, draft.promptPostProcessing, value => { draft.promptPostProcessing = value; refreshApiButtons(); })),
@@ -3810,7 +3829,11 @@
             }, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body' },
                 el('div', { class: 'dga-pg' },
-                    setSection('API 预设', null,
+                    setSection(el('h3', { class: 'dga-set-title' }, 'API 预设', infoTip('apiPresets', [
+                        ['这是干嘛的', '只有用「AI 判断」时才用得到：存的是拿哪个 AI 来判断。可以存好几个，到每张路线图的「设置」里挑。'],
+                        ['酒馆主 API', '直接用酒馆现在连着的那个，什么都不用填。'],
+                        ['自定义', '单独连一个 AI，比如便宜的小模型，不占你聊天用的那个。地址、密钥、模型名在你买 API 的网站上都能找到。'],
+                    ])), null,
                         el('div', { class: 'dga-set-pad' }, pickRow),
                         el('div', { class: 'dga-set-pad dga-api-form' }, ...formChildren.filter(Boolean),
                             el('div', { class: 'dga-af-foot' },
@@ -5857,7 +5880,11 @@
         const apiOptions = [['', '跟随当前活动API']].concat(apiList.map(item => [item.name, item.name]));
         if (apiName && !apiList.some(item => item.name === apiName)) apiOptions.push([apiName, `${apiName}（预设不可用）`]);
         return el('div', { class: 'dga-rs' },
-            setSection('往下走', null,
+            setSection(el('h3', { class: 'dga-set-title' }, '往下走', infoTip(`advance-${route.id}`, [
+                ['跟随设置', '用设置页里选的那个。'],
+                ['只手动', '要你自己点「下一段」才走。'],
+                ['AI 判断', '每次 AI 回复完，另外问一个 AI 这一段演完没有，演完就自动走。'],
+            ])), null,
                 el('div', { class: 'dga-set-row is-col' },
                     rtSeg([
                         ['', `跟随设置（${globalMode === 'judge' ? 'AI 判断' : '手动'}）`],
@@ -5868,14 +5895,18 @@
                         routeEdited(route, false);
                         render();
                     }, 'is-fill'))),
-            judging ? setSection('AI 判断', null,
+            judging ? setSection(el('h3', { class: 'dga-set-title' }, 'AI 判断', infoTip(`judge-${route.id}`, [
+                ['判断用的 API', '用哪个 AI 来判断。「跟随当前活动API」就是你现在聊天用的那个；也可以在「API」页加一个便宜的，专门用来判断。'],
+                ['判断提示词', '问它的时候发什么话，一般用「默认」。'],
+                ['绑定至角色卡', '把上面选的那套复制一份存进角色卡，分享角色卡时别人也能用上。绑定后上面就不能换了，要换先解除绑定；想改内容到设置页「判断提示词」里改。'],
+            ])), null,
                 setRow('判断用的 API',
                     rtSelect(apiOptions, apiName, value => runAction('保存路线图 API 选择', () => setRouteApi(route, value)))),
                 renderRoutePromptControl(route)) : null,
             judging ? setSection(el('h3', { class: 'dga-set-title' }, '提取 / 排除规则', infoTip(`rules-${route.id}`, [
-                ['提取', '只留开始标记到结束标记中间的那一段，有好几处就取最后一处；找不到就整段照用。比如正文写在 <正文> 和 </正文> 中间，就填这两个。'],
-                ['排除', '把开始标记到结束标记中间的内容连同标记一起删掉，有几处删几处。比如去掉思考过程：<thinking> 和 </thinking>。'],
-                ['用在哪', '发给判断 AI 的最近正文、判断 AI 写回来的回答，都先过一遍这里的规则：先提取，再排除。'],
+                ['这是干嘛的', '有的 AI 回复里夹着思考过程、状态栏之类的东西，会干扰判断。用这两种规则把它们去掉。不需要就空着。'],
+                ['提取', '只留两个记号中间的那部分。比如正文都写在 <正文> 和 </正文> 中间，就填这两个。找不到记号就整段照用。'],
+                ['排除', '把两个记号中间的部分删掉，记号也一起删。比如删掉思考过程：填 <thinking> 和 </thinking>。'],
             ])), null,
                 routeRuleGroup(route, 'extractRules', '提取'),
                 routeRuleGroup(route, 'excludeRules', '排除')) : null,
@@ -6385,7 +6416,9 @@
                     el('label', { text: '支线名字' }),
                     el('input', { type: 'text', value: side.name, placeholder: '整条支线的名字', oninput: event => { side.name = oneLine(event.target.value) || '支线'; live(); } })),
                 el('div', { class: 'dga-rt-grp' },
-                    el('div', { class: 'dga-rt-grp-title', text: '开始' }),
+                    el('div', { class: 'dga-rt-grp-title dga-tip-host' }, '开始', infoTip(`side-start-${route.id}`, [
+                        ['开始的条件', '主线走到上面选的那一段以后，剧情里发生这件事，支线就开始。'],
+                    ])),
                     el('div', { class: 'dga-rt-f' },
                         el('label', { text: '从哪一段开始' }),
                         rtSelect(hostOptions, side.host, value => {
@@ -6398,12 +6431,18 @@
                         el('label', { text: '开始的条件' }),
                         el('input', { type: 'text', value: side.cond, placeholder: '比如：{{char}}约{{user}}去祭典', oninput: event => { side.cond = event.target.value; live(); } }))),
                 el('div', { class: 'dga-rt-grp' },
-                    el('div', { class: 'dga-rt-grp-title', text: '走的时候' }),
+                    el('div', { class: 'dga-rt-grp-title dga-tip-host' }, '走的时候', infoTip(`side-run-${route.id}`, [
+                        ['照常往下走', '支线和主线各走各的，同时进行。'],
+                        ['停下来等支线走完', '主线先停住，等支线演完了再接着往下走。'],
+                    ])),
                     el('div', { class: 'dga-rt-f' },
                         el('label', { text: '主线' }),
                         rtSeg([['go', '照常往下走'], ['wait', '停下来等支线走完']], side.wait ? 'wait' : 'go', value => { side.wait = value === 'wait'; routeEdited(route, false); render(); }))),
                 el('div', { class: 'dga-rt-grp' },
-                    el('div', { class: 'dga-rt-grp-title', text: '结束' }),
+                    el('div', { class: 'dga-rt-grp-title dga-tip-host' }, '结束', infoTip(`side-end-${route.id}`, [
+                        ['走完自己的最后一段', '支线自己演完就结束。'],
+                        ['主线到了某一段', '不管支线演到哪，主线走到那一段时支线就结束。'],
+                    ])),
                     el('div', { class: 'dga-rt-f' },
                         rtSeg([['self', '走完自己的最后一段'], ['main', '主线到了某一段', !later.length]], endByMain ? 'main' : 'self', value => {
                             side.until = value === 'main' && later.length ? (side.until || later[0][0]) : '';
@@ -6447,7 +6486,7 @@
         const step = (n, title, sub, ...kids) => el('div', { class: 'dga-rt-tl-step' },
             el('div', { class: 'dga-rt-tl-dot', text: String(n) }),
             el('div', { class: 'dga-rt-tl-body' },
-                el('div', { class: 'dga-rt-tl-title' }, title, sub ? el('span', { class: 'dga-rt-muted', text: sub }) : null),
+                el('div', { class: 'dga-rt-tl-title dga-tip-host' }, title, sub ? el('span', { class: 'dga-rt-muted', text: sub }) : null),
                 ...kids));
         const moveRoute = (index, delta) => {
             const to = index + delta;
@@ -6485,7 +6524,9 @@
                 el('span', { class: 'dga-rt-muted', text: [hosted.length ? `${hosted.length} 条支线` : '', extraOn ? `额外发 ${extraOn} 块` : '', node.note ? '有笔记' : ''].filter(Boolean).join(' · ') })),
             ui.rt.more ? el('div', {},
                 el('div', { class: 'dga-rt-f' },
-                    el('div', { class: 'dga-rt-fl' }, '挂在这一段的支线', el('button', { type: 'button', class: 'dga-rt-link', onclick: () => routeSideDialog(route, id) }, '＋ 挂一条')),
+                    el('div', { class: 'dga-rt-fl dga-tip-host' }, '挂在这一段的支线', infoTip(`hosted-${route.id}`, [
+                        ['支线', '走到这一段以后可以开始的另一条小故事，和主线同时进行。'],
+                    ]), el('button', { type: 'button', class: 'dga-rt-link', onclick: () => routeSideDialog(route, id) }, '＋ 挂一条')),
                     hosted.length ? hosted.map(item => el('div', { class: 'dga-rt-r2', style: `--sc:${item.color}` },
                         el('span', { class: 'dga-rt-dot', style: `--cc:${item.color}` }),
                         el('button', { type: 'button', class: 'dga-rt-r2-name', style: `color:${item.color}`, title: '去改这条支线', onclick: () => { selectRouteNode(route, item.root, true); ui.rt.tab = 'side'; render(); } },
@@ -6493,7 +6534,9 @@
                         el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '删掉这条支线', onclick: () => removeSide(item) }, '×')))
                         : el('div', { class: 'dga-rt-muted', text: '没有。' })),
                 el('div', { class: 'dga-rt-f' },
-                    el('div', { class: 'dga-rt-fl' }, '走到这一段时额外发'),
+                    el('div', { class: 'dga-rt-fl dga-tip-host' }, '走到这一段时额外发', infoTip(`extra-${route.id}`, [
+                        ['额外发', '「发给 AI 的内容」里「走到某几段时发」的块会列在这里，点亮的那块走到这一段时就会发出去。'],
+                    ])),
                     rangeBlocks.length
                         ? el('div', { class: 'dga-rt-chips' }, ...rangeBlocks.map(block => el('button', {
                             type: 'button', class: `dga-rt-chip${(block.nodes || []).includes(id) ? ' is-on' : ''}`, title: block.text.replace(ROUTE_TOKEN_RE, '〔格子〕'),
@@ -6514,10 +6557,18 @@
                 hasEntry ? step(1, '怎么走到这里', '', ...entry) : null,
                 step(hasEntry ? 2 : 1, '这一段要发生什么', '',
                     el('textarea', { placeholder: '写下这一段要演的事', oninput: event => { node.content = event.target.value; live(); } }, node.content)),
-                step(hasEntry ? 3 : 2, '完成条件', '',
+                step(hasEntry ? 3 : 2, el('span', {}, '完成条件', infoTip(`done-${route.id}`, [
+                    ['写一句', '写一件看得见的事，比如「两人交换了真名」。AI 判断时就看这件事发生了没有。'],
+                    ['交给 AI 看', '不写条件，让 AI 自己看这一段演完了没有。'],
+                    ['只能手动点', 'AI 判断不会动它，要你自己点「下一段」。'],
+                ])), '',
                     rtSeg([['text', '写一句'], ['ai', '交给 AI 看'], ['manual', '只能手动点']], node.doneMode, value => { node.doneMode = value; routeEdited(route, false); render(); }),
                     node.doneMode === 'text' ? el('input', { type: 'text', class: 'dga-rt-mt', value: node.done, placeholder: '写成一件看得见的事，比如：两人交换了真名', oninput: event => { node.done = event.target.value; scheduleRouteSave(600); } }) : null),
-                step(hasEntry ? 4 : 3, isFork ? `走完以后：路口，${node.next.length} 条路` : '走完以后', '',
+                step(hasEntry ? 4 : 3, el('span', {}, isFork ? `走完以后：路口，${node.next.length} 条路` : '走完以后', infoTip(`next-${route.id}`, [
+                    ['接一段', '这一段演完，接着演哪一段。'],
+                    ['路口', '接了两段以上就是路口。每条路写一句条件，AI 按剧情挑一条走；哪条都对不上时，可以指定走一条，或者停在路口等你选。'],
+                    ['接回', '接到图上已经有的段，用来让几条路汇到一起，或者绕回去循环。'],
+                ])), '',
                     nextList.length ? el('div', { class: 'dga-rt-tl-nexts' }, ...nextList)
                         : el('span', { class: 'dga-rt-end-chip', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
                     isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
@@ -6607,8 +6658,13 @@
             }));
         return el('div', { class: 'dga-rt-place-grid' },
             el('div', {},
-                el('div', { class: 'dga-rt-pf-row' },
-                    el('span', { class: 'dga-rt-pf-label', text: '位置' }),
+                el('div', { class: 'dga-rt-pf-row dga-tip-host' },
+                    el('span', { class: 'dga-rt-pf-label' }, '位置', infoTip(`pos-${route.id}`, [
+                        ['位置', '这张路线图的内容放在发给 AI 的哪个地方。拿不准就用「角色定义后」。'],
+                        ['按深度插入', '插进聊天记录里。深度 0 是最新一条消息后面，数字越大越往前。越靠后，AI 越容易注意到。'],
+                        ['身份', '这段话算谁说的，一般选「系统」。'],
+                        ['锚点', '要在别的地方写上同一个名字配合才有用，不懂就别选。'],
+                    ])),
                     el('div', {},
                         rtSelect(ROUTE_POSITIONS, p.pos, value => setPlacement({ ...p, pos: value, order: routeOrderAfter(entries, { pos: value, depth: p.depth }, '__last__') })),
                         p.pos === 'at_depth' ? el('div', { class: 'dga-rt-inline' },
@@ -6617,8 +6673,12 @@
                             el('span', { text: '身份' }),
                             rtSelect(ROUTE_ROLES, p.role, value => setPlacement({ ...p, role: value }))) : null,
                         p.pos === 'outlet' ? el('div', { class: 'dga-rt-muted dga-rt-hint', text: '锚点名在世界书里这个条目上填。' }) : null)),
-                el('div', { class: 'dga-rt-pf-row' },
-                    el('span', { class: 'dga-rt-pf-label', text: '顺序' }),
+                el('div', { class: 'dga-rt-pf-row dga-tip-host' },
+                    el('span', { class: 'dga-rt-pf-label' }, '顺序', infoTip(`order-${route.id}`, [
+                        ['顺序', '同一个位置里有好几个条目时，谁先谁后。数字小的排前面。'],
+                        ['排在某条后面', '直接选排在哪个条目后面，数字自动算好。'],
+                        ['右边的列表', '世界书里的条目按发出去的先后排好了，点「放到这里」也能挪。'],
+                    ])),
                     el('div', {},
                         rtSeg([['after', '排在某条后面'], ['number', '自己填数字']], orderMode, value => { ui.rt.orderMode = value; render(); }),
                         el('div', { class: 'dga-rt-mt' }, orderMode === 'after'
@@ -6867,7 +6927,12 @@
             rtSeg([['tpl', '改内容'], ['pv', '看实际发出去的']], view, value => { ui.rt.sendView = value; render(); }, 'dga-rt-send-switch'),
             el('div', { class: 'dga-rt-send-split', 'data-view': view },
                 el('div', { class: 'dga-rt-col-tpl' },
-                    el('div', { class: 'dga-rt-col-title', text: `分成 ${route.blocks.length} 块，点一块展开来改` }),
+                    el('div', { class: 'dga-rt-col-title dga-tip-host' }, `分成 ${route.blocks.length} 块，点一块展开来改`, infoTip(`send-${route.id}`, [
+                        ['这是什么', '这张路线图在世界书里有一个条目，发给 AI 的就是这里写的字。'],
+                        ['块', '分成几块，每块自己定什么时候发：一直发、走到某几段时才发、某条支线在走时才发。'],
+                        ['格子', '写的时候放一个格子，发出去会换成真内容。比如「主线」会换成主线现在这一段写的东西。'],
+                        ['看实际发出去的', '能看到现在真正发给 AI 的是什么。'],
+                    ])),
                     el('div', { class: 'dga-rt-blk-list' }, ...route.blocks.map((block, index) => renderTplBlock(route, block, index))),
                     el('div', { class: 'dga-rt-ins-row' },
                         el('span', { class: 'dga-rt-muted', text: '加一块：' }),
@@ -7606,6 +7671,10 @@ ${P} .dga-rs-rule-sep { flex: 0 0 auto; color: var(--dga-text-3); }
 /* 侧边栏窄：「!」的说明框跟这一节一样宽，不从「!」那里往右伸出去 */
 ${P} .dga-rs .dga-set-head { position: relative; }
 ${P} .dga-rs .dga-info { position: static; }
+${P} .dga-tip-host { position: relative; }
+${P} .dga-tip-host .dga-info { position: static; margin-left: 6px; vertical-align: middle; }
+${P} .dga-tip-host .dga-info-pop { left: 0; right: 0; width: auto; }
+${P} .dga-af-label .dga-info { margin-left: 6px; vertical-align: middle; }
 ${P} .dga-rs .dga-info-pop { left: 0; right: 0; width: auto; }
 ${P} .dga-rt-card { gap: 0; padding: 0; overflow: hidden; }
 ${P} .dga-rt-card.is-edit { border-color: color-mix(in srgb, var(--dga-accent) 55%, var(--dga-border)); }
@@ -7789,7 +7858,8 @@ ${P} .dga-rt-ni-list { display: flex; flex-direction: column; gap: 4px; }
 /* 位置和顺序 */
 ${P} .dga-rt-place-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
 ${P} .dga-rt-pf-row { display: grid; grid-template-columns: 44px 1fr; gap: 12px; align-items: start; margin-bottom: 16px; }
-${P} .dga-rt-pf-label { padding-top: 8px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
+${P} .dga-rt-pf-label { padding-top: 8px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+${P} .dga-rt-pf-label .dga-info { margin-left: 4px; }
 ${P} .dga-rt-pf-row select { width: 100%; }
 ${P} .dga-rt-pf-note { padding-left: 56px; }
 ${P} .dga-rt-order-list { max-height: 70vh; overflow: auto; padding: 10px; border-radius: var(--dga-radius-md); background: #19191C; border: 1px solid var(--dga-border); }

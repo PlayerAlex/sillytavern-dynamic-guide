@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v4.3.1**
+当前版本：**v4.3.2**
 
 在酒馆里给角色画一张「路线图」：剧情（也可以是时间、关系变化……）一段一段排好，分出路口，挂上支线。动态指导助手只把**现在走到的这一段**写进世界书，AI 每次回复看到的就是当下该演的内容；走完一段就往下一段走，可以自己点，也可以交给判断用的 AI。
 
@@ -8,8 +8,8 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 
 ## 安装
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.1/dynamic-guide-offline-v4.3.1.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.1/dynamic-guide-online-v4.3.1.json)：启动时加载固定版本的远程脚本。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.2/dynamic-guide-offline-v4.3.2.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.2/dynamic-guide-online-v4.3.2.json)：启动时加载固定版本的远程脚本。
 
 在酒馆助手里导入并启用，点酒馆左下角魔法棒里的「动态指导助手」打开。
 
@@ -65,7 +65,7 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 远程 `index.js` 会自行在左下角魔法棒菜单注册“动态指导助手”入口：
 
 ```js
-import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.3.1/index.js';
+import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.3.2/index.js';
 ```
 
 正式发布后的版本可导入[发布仓库](https://github.com/PlayerAlex/sillytavern-dynamic-guide)提供的在线版 JSON。固定标签地址不会随新版本发布而改变；本地尚未发布的版本不能直接替换 CDN 地址中的版本号使用。
@@ -110,6 +110,11 @@ import 'https://cdn.jsdelivr.net/gh/PlayerAlex/sillytavern-dynamic-guide@v4.3.1/
 - 改过再发布的版本也要用同样的协议。
 
 ## 更新日志
+
+### v4.3.2（2026-10-04）
+
+- 难懂的地方都加了「!」说明，鼠标移上去（手机上点一下）就能看：设置页的「往下走」；路线图「设置」里的「往下走」「AI 判断」（判断用的 API、判断提示词、绑定至角色卡）；编辑一段时的「完成条件」「走完以后」「挂在这一段的支线」「走到这一段时额外发」；整条支线的「开始」「走的时候」「结束」；「位置和顺序」的「位置」「顺序」；「发给 AI 的内容」；API 页的「API 预设」「接口协议」「端点」「模型名」「温度」，以及新加的一行「下面几项一般不用填」。
+- 原来就有的几个说明（AI 判断、判断提示词、提取 / 排除规则）改写得更白话，判断提示词的说明里讲了 SYSTEM / USER / ASSISTANT 和格子是什么。
 
 ### v4.3.1（2026-10-04）
 

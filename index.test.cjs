@@ -1140,8 +1140,8 @@ test('路线图：左栏是标志和总开关、路线图列表、API / 运行�
     const promptDot = promptTitle.querySelector('.dga-info-dot');
     assert.equal(promptDot.textContent, '!', '判断提示词旁边有感叹号');
     assert.equal(promptDot.className, judgeDot.className, '两个感叹号用同一套样式');
-    assert.match(promptTitle.querySelector('.dga-info-pop').textContent, /跟酒馆用户走/);
-    assert.doesNotMatch(promptTitle.parentNode.parentNode.querySelector('.dga-set-box').textContent, /跟酒馆用户走/, '说明不再铺在卡片里');
+    assert.match(promptTitle.querySelector('.dga-info-pop').textContent, /酒馆账号走/);
+    assert.doesNotMatch(promptTitle.parentNode.parentNode.querySelector('.dga-set-box').textContent, /酒馆账号走/, '说明不再铺在卡片里');
     assert.doesNotMatch(settingsText, /大检查|推进冷却|开发者模式|外观|配色/, '用不上的设置都去掉了');
     assert.match(settingsText, /在最上面加一段.*在最下面加一段/, '提示词段最上面和最下面都能加一段');
     findButton(rail(), 'API').listeners.click[0]();
@@ -1925,5 +1925,38 @@ test('路线图：左栏「新建路线图」能新建，世界书里多一个�
     assert.equal(list[0].worldbookName, '书A');
     assert.ok(world.state.books.书A.some(entry => /（动态指导）$/.test(entry.name || entry.comment || '')), '世界书里有路线图条目');
     assert.doesNotMatch(documentRef.getElementById(PANEL_ID).textContent, /is not defined/);
+    assert.deepEqual(errors, []);
+});
+
+test('界面：难懂的地方都有感叹号，说明不用专业词', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const route = demoRoute(core.routes).route;
+    route.advance = 'judge';
+    route.worldbookName = '书A';
+    characterRoot(world).routes = { version: 1, list: [plain(route)] };
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    const run = sandbox.DynamicGuideAssistantCore;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await run.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const pops = () => findAllClass(panel(), 'dga-info-pop').map(node => node.textContent).join('\n');
+    const head = () => panel().querySelector(`.dga-rt-card-${route.id}`).querySelector('.dga-rt-head');
+    const seen = [];
+    findButton(head(), '设置').listeners.click[0]();
+    seen.push(pops());
+    findButton(head(), '位置和顺序').listeners.click[0]();
+    seen.push(pops());
+    findButton(head(), '发给 AI 的内容').listeners.click[0]();
+    seen.push(pops());
+    findButton(panel().querySelector('.dga-rail'), '设置').listeners.click[0]();
+    seen.push(pops());
+    findButton(panel().querySelector('.dga-rail'), 'API').listeners.click[0]();
+    seen.push(pops());
+    const all = seen.join('\n');
+    for (const word of ['只手动', '判断用的 API', '绑定至角色卡', '这是干嘛的', '按深度插入', '数字小的排前面', '格子', 'SYSTEM', '酒馆主 API']) {
+        assert.ok(all.includes(word), `说明里讲到「${word}」`);
+    }
+    assert.doesNotMatch(all, /请求体|payload|endpoint|token|宏|正则|注入|上下文/i, '说明不用专业词');
     assert.deepEqual(errors, []);
 });
