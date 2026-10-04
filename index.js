@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.5';
+    const VERSION = '4.3.6';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -4365,10 +4365,38 @@
     function normalizeRouteState(raw, route) {
         const src = raw && typeof raw === 'object' ? raw : {};
         const mainNode = id => route.nodes[id] && !route.nodes[id].side;
+        // 各条支线的样子；hist 每一格还记着离开那一段时支线的样子（histSides，和 hist 一样长），退回去时照原样放回来。
+        const normSides = raw => {
+            const out = {};
+            route.sides.forEach(side => {
+                const item = raw && raw[side.id] && typeof raw[side.id] === 'object' ? raw[side.id] : {};
+                const inSide = id => route.nodes[id] && route.nodes[id].side === side.id;
+                const entry = {
+                    status: ['idle', 'on', 'done', 'skip'].includes(item.status) ? item.status : 'idle',
+                    cur: inSide(item.cur) ? item.cur : null,
+                    hist: (Array.isArray(item.hist) ? item.hist : []).filter(inSide),
+                };
+                if (entry.status === 'on' && !entry.cur) Object.assign(entry, { status: 'idle', hist: [] });
+                out[side.id] = entry;
+            });
+            return out;
+        };
+        const rawHist = Array.isArray(src.hist) ? src.hist : [];
+        const rawMarks = Array.isArray(src.histSides) ? src.histSides : [];
+        const hist = [];
+        const histSides = [];
+        rawHist.forEach((id, index) => {
+            if (!mainNode(id)) return;
+            hist.push(id);
+            const mark = rawMarks[index];
+            histSides.push(mark && typeof mark === 'object' ? normSides(mark) : null);
+        });
         const state = {
             cur: mainNode(src.cur) ? src.cur : route.root,
-            hist: (Array.isArray(src.hist) ? src.hist : []).filter(mainNode),
+            hist,
+            histSides,
             ended: Boolean(src.ended),
+            endSides: src.ended && src.endSides && typeof src.endSides === 'object' ? normSides(src.endSides) : null,
             sides: {},
             // 上次 AI 判断：问到第几层、它的依据（给小卡看、给「多久检查一次」算层数）。
             judge: src.judge && typeof src.judge === 'object'
@@ -4377,20 +4405,16 @@
         };
         if (state.cur !== src.cur) {
             state.hist = [];
+            state.histSides = [];
             state.ended = false;
+            state.endSides = null;
         }
-        route.sides.forEach(side => {
-            const item = src.sides && src.sides[side.id] && typeof src.sides[side.id] === 'object' ? src.sides[side.id] : {};
-            const inSide = id => route.nodes[id] && route.nodes[id].side === side.id;
-            const entry = {
-                status: ['idle', 'on', 'done', 'skip'].includes(item.status) ? item.status : 'idle',
-                cur: inSide(item.cur) ? item.cur : null,
-                hist: (Array.isArray(item.hist) ? item.hist : []).filter(inSide),
-            };
-            if (entry.status === 'on' && !entry.cur) Object.assign(entry, { status: 'idle', hist: [] });
-            state.sides[side.id] = entry;
-        });
+        state.sides = normSides(src.sides);
         return state;
+    }
+
+    function routeSidesSnapshot(state) {
+        return JSON.parse(JSON.stringify(state.sides || {}));
     }
 
     function routeSideState(route, state, sideId) {
@@ -4500,6 +4524,7 @@
     // 主线走到 to。返回这一步让哪些支线结束了（「主线到了某一段就结束」）。
     function routeMainGo(route, state, to) {
         const from = state.cur;
+        const before = routeSidesSnapshot(state);
         route.sides.forEach(side => {
             const ss = routeSideState(route, state, side.id);
             if (side.host === from && ss.status === 'idle') ss.status = 'skip';
@@ -4511,11 +4536,14 @@
                 if (ss.status !== 'on') Object.assign(ss, { status: 'idle', cur: null, hist: [] });
             });
             state.hist = [];
+            state.histSides = [];
         } else {
             state.hist.push(from);
+            (state.histSides = state.histSides || []).push(before);
         }
         state.cur = to;
         state.ended = false;
+        state.endSides = null;
         const closed = [];
         route.sides.forEach(side => {
             const ss = routeSideState(route, state, side.id);
@@ -4535,6 +4563,7 @@
         const node = route.nodes[state.cur];
         if (!node) return { kind: 'none' };
         if (!node.next.length) {
+            state.endSides = routeSidesSnapshot(state);
             route.sides.forEach(side => {
                 const ss = routeSideState(route, state, side.id);
                 if (side.host === state.cur && ss.status === 'idle') ss.status = 'skip';
@@ -4548,9 +4577,16 @@
         return { kind: 'moved', to: node.next[0].to, closed };
     }
 
+    // 主线退一段：支线放回离开那一段时的样子（被「主线到了某一段就结束」关掉的、走完的都回来）。
+    // 旧存档没记下样子时，只把「主线到了刚才那一段才结束」的支线接着走、挂在退回这一段上没开始的支线重新可以开始。
     function routeMainBack(route, state) {
         if (state.ended) {
             state.ended = false;
+            if (state.endSides) {
+                state.sides = state.endSides;
+                state.endSides = null;
+                return true;
+            }
             route.sides.forEach(side => {
                 const ss = routeSideState(route, state, side.id);
                 if (ss.status === 'done' && ss.cur) ss.status = 'on';
@@ -4558,10 +4594,17 @@
             return true;
         }
         if (!state.hist.length) return false;
+        const left = state.cur;
         state.cur = state.hist.pop();
+        const saved = (state.histSides || []).pop();
+        if (saved) {
+            state.sides = saved;
+            return true;
+        }
         route.sides.forEach(side => {
             const ss = routeSideState(route, state, side.id);
             if (side.host === state.cur && ss.status === 'skip') ss.status = 'idle';
+            if (side.until === left && ss.status === 'done' && ss.cur) ss.status = 'on';
         });
         return true;
     }
@@ -4607,8 +4650,10 @@
         if (!node.side) {
             const path = routePathTo(route, route.root, id, '');
             state.hist = path.slice(0, -1);
+            state.histSides = state.hist.map(() => null);
             state.cur = id;
             state.ended = false;
+            state.endSides = null;
             route.sides.forEach(side => {
                 const ss = routeSideState(route, state, side.id);
                 if (ss.status === 'on') return;

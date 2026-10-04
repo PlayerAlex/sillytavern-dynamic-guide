@@ -919,6 +919,46 @@ test('路线图：支线和主线同时走，等它、主线到了某段就结�
     assert.equal(R.offeredSides(skipCase.route, skipped).length, 0);
 });
 
+test('路线图：主线退回去，支线回到离开那一段时的样子（被主线关掉的、走完的都回来，存档读回也一样）', () => {
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.side.until = t.fork;
+    const state = R.normalizeRouteState(null, t.route);
+    R.sideStart(t.route, state, t.side);
+    R.sideStep(t.route, state, t.side);
+    const sideAt = state.sides[t.side.id].cur;
+    R.mainStep(t.route, state);
+    assert.equal(state.sides[t.side.id].status, 'done', '主线到了那一段，支线结束');
+    const saved = R.normalizeRouteState(JSON.parse(JSON.stringify(state)), t.route);
+    assert.equal(R.mainBack(t.route, saved), true);
+    assert.equal(saved.cur, t.start);
+    assert.equal(saved.sides[t.side.id].status, 'on', '退回去，支线接着走');
+    assert.equal(saved.sides[t.side.id].cur, sideAt, '停在离开时走到的那一段');
+
+    // 支线在后面那一段才走完：退回去也回来。
+    const later = demoRoute(R);
+    const st = R.normalizeRouteState(null, later.route);
+    R.sideStart(later.route, st, later.side);
+    R.mainStep(later.route, st);
+    R.sideStep(later.route, st, later.side);
+    assert.equal(R.sideStep(later.route, st, later.side).kind, 'ended');
+    R.mainBack(later.route, st);
+    assert.equal(st.sides[later.side.id].status, 'on', '支线在后面走完的，退回挂它的那一段时回来');
+    assert.equal(st.sides[later.side.id].cur, later.side.root);
+
+    // 旧存档没记下支线的样子：主线到了某段才关掉的支线也接着走。
+    const old = demoRoute(R);
+    old.side.until = old.fork;
+    const os = R.normalizeRouteState(null, old.route);
+    R.sideStart(old.route, os, old.side);
+    R.mainStep(old.route, os);
+    const legacy = JSON.parse(JSON.stringify(os));
+    delete legacy.histSides;
+    const back = R.normalizeRouteState(legacy, old.route);
+    R.mainBack(old.route, back);
+    assert.equal(back.sides[old.side.id].status, 'on', '旧存档退回去，被主线关掉的支线也回来');
+});
+
 test('路线图：分块模板一直发 / 走到某几段时发，空格子整行不发', () => {
     const R = load().core.routes;
     const t = demoRoute(R);
