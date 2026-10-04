@@ -1836,7 +1836,7 @@ test('提示词引用：缺失时拒绝模型请求，导入导出只携带提�
     assert.throws(() => P.import({ format: 'dynamic-guide-prompt', version: 99, segments: imported.segments }), /不支持/);
 });
 
-test('提示词界面：侧边栏只选一套，复制成专用后在设置页编辑，存到角色且不改通用库', async () => {
+test('提示词界面：侧边栏选一套再绑定至角色卡，下拉锁住；绑定的那套在设置页编辑，不改通用库', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const world = routeWorld();
     const route = demoRoute(core.routes).route;
@@ -1858,16 +1858,21 @@ test('提示词界面：侧边栏只选一套，复制成专用后在设置页�
     const pick = () => nodes(drawer(), 'SELECT').find(item => item.textContent.includes('共用规则'));
     pick().listeners.change[0]({ target: { value: id } });
     assert.equal(nodes(drawer(), 'TEXTAREA').length, 0, '侧边栏里不放提示词编辑');
-    pick().listeners.change[0]({ target: { value: '@copy' } });
-    assert.equal(typeof flushRouteSave, 'function', '选了专用触发真实延迟保存入口');
+    findButton(drawer(), '绑定').listeners.click[0]();
+    assert.equal(typeof flushRouteSave, 'function', '绑定触发真实延迟保存入口');
     flushRouteSave();
     await new Promise(setImmediate);
-    assert.equal(characterRoot(world).routes.list[0].promptLocal.segments[0].content, '共用正文', '专用的从当前那套复制');
-    assert.match(pick().textContent, /这张图专用/);
+    const bound = characterRoot(world).routes.list[0].promptLocal;
+    assert.equal(bound.segments[0].content, '共用正文', '绑定的是下拉里选中的那套');
+    assert.equal(bound.name, '共用规则');
+    assert.equal(bound.from, id);
+    const locked = nodes(drawer(), 'SELECT').find(item => item.textContent.includes('共用规则'));
+    assert.equal(locked.disabled, true, '绑定后上面的下拉锁住');
+    assert.ok(findButton(drawer(), '解除绑定'));
     assert.equal(nodes(drawer(), 'TEXTAREA').length, 0);
     // 专用的那套到设置页「判断提示词」里改，和通用的同一套编辑器。
     findButton(panel().querySelector('.dga-rail'), '设置').listeners.click[0]();
-    const editor = () => nodes(panel(), 'SELECT').find(item => item.textContent.includes('专用'));
+    const editor = () => nodes(panel(), 'SELECT').find(item => item.textContent.includes('角色卡里的'));
     editor().listeners.change[0]({ target: { value: `local:${route.id}` } });
     nodes(panel(), 'TEXTAREA')[0].listeners.input[0]({ target: { value: '专属剧情要求', selectionStart: 0, selectionEnd: 0 } });
     await findButton(panel(), '保存当前提示词').listeners.click[0]();
@@ -1876,6 +1881,18 @@ test('提示词界面：侧边栏只选一套，复制成专用后在设置页�
     assert.equal(stored.promptLocal.segments[0].content, '专属剧情要求');
     assert.equal(stored.promptId, undefined);
     assert.equal(run.promptStorage.resolve({ promptId: id }).segments[0].content, '共用正文', '不改通用库');
+    // 解除绑定：删掉角色卡里那份，回到绑定前选的那套，下拉能选了。
+    sandbox.confirm = () => true;
+    findButton(panel().querySelector('.dga-rail'), route.name).listeners.click[0]();
+    // 回到路线图页时侧边栏还开着。
+    if (!drawer()) findButton(panel().querySelector(`.dga-rt-card-${route.id}`).querySelector('.dga-rt-head'), '设置').listeners.click[0]();
+    findButton(drawer(), '解除绑定').listeners.click[0]();
+    flushRouteSave();
+    await new Promise(setImmediate);
+    const after = characterRoot(world).routes.list[0];
+    assert.equal(after.promptLocal, undefined);
+    assert.equal(after.promptId, id);
+    assert.equal(nodes(drawer(), 'SELECT').find(item => item.textContent.includes('共用规则')).disabled, false);
     assert.deepEqual(errors, []);
 });
 
@@ -1891,4 +1908,22 @@ test('提示词：「默认」可以改，改过的存进通用库；改回原�
     await assert.rejects(P.save({ name: '默认', segments: [{ role: 'user', content: 'x' }] }), /已经有叫「默认」/);
     await P.saveDefault(core.routes.promptPresets()[0].segments);
     assert.equal(P.read().defaultSegments, undefined, '和内置一样就不存');
+});
+
+test('路线图：左栏「新建路线图」能新建，世界书里多一个条目', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    const run = sandbox.DynamicGuideAssistantCore;
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await run.refresh();
+    const panel = documentRef.getElementById(PANEL_ID);
+    await findButton(panel.querySelector('.dga-rail'), '＋ 新建路线图').listeners.click[0]();
+    for (let i = 0; i < 5; i += 1) await new Promise(setImmediate);
+    const list = characterRoot(world).routes.list;
+    assert.equal(list.length, 1);
+    assert.equal(list[0].worldbookName, '书A');
+    assert.ok(world.state.books.书A.some(entry => /（动态指导）$/.test(entry.name || entry.comment || '')), '世界书里有路线图条目');
+    assert.doesNotMatch(documentRef.getElementById(PANEL_ID).textContent, /is not defined/);
+    assert.deepEqual(errors, []);
 });

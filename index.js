@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3';
+    const VERSION = '4.3.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -837,7 +837,8 @@
 
     function localPromptCopy(route) {
         const preset = resolveRoutePrompt(route);
-        return { name: preset.name, segments: cloneData(preset.segments) };
+        // from：从哪一套复制来的，解除绑定时回到它。
+        return { name: preset.name, segments: cloneData(preset.segments), from: route.promptId || PROMPT_BUILTIN_ID };
     }
 
 
@@ -1852,6 +1853,15 @@
     }
 
     // 调用处传进来的都是当前角色卡，所以一次动作里可以直接复用上一次的结果。
+    // 当前角色绑的世界书；读不到就当没有（新建路线图、同步条目时用）。
+    async function currentBoundWorldbooks() {
+        try {
+            return await boundWorldbookNames(await currentCharacter());
+        } catch (error) {
+            return [];
+        }
+    }
+
     async function boundWorldbookNames(card) {
         if (ioCache.depth > 0 && ioCache.bound) return ioCache.bound.slice();
         const epoch = ioCache.epoch;
@@ -3396,7 +3406,7 @@
                 // 路线图专用的那套存在路线图上，跟角色卡走。
                 const route = routeById(draft.local);
                 if (!route || !route.promptLocal) throw new Error('这张路线图已经不用专用提示词了。');
-                route.promptLocal = { name: name || route.name, segments };
+                route.promptLocal = { ...route.promptLocal, segments };
                 await saveRoutesNow();
                 id = from;
             } else if (draft.builtin) {
@@ -3413,18 +3423,17 @@
     function deletePromptPreset(id) {
         const local = ui.prompt.draft && ui.prompt.draft.local ? routeById(ui.prompt.draft.local) : null;
         if (local) {
-            openRouteModal(`删掉「${local.name}」专用的提示词？`,
-                el('p', { class: 'dga-rt-p', text: '删掉以后这张路线图改用「默认」。' }), [
+            openRouteModal(`解除「${local.name}」的绑定？`,
+                el('p', { class: 'dga-rt-p', text: '角色卡里的这份提示词会删掉，路线图改回绑定前选的那套。' }), [
                     rtBtn('取消', closeRouteModal, 'ghost'),
-                    rtBtn('删掉', () => {
+                    rtBtn('解除绑定', () => {
                         ui.rt.modal = null;
-                        runAction('删掉判断提示词', async () => {
-                            delete local.promptLocal;
-                            local.promptId = PROMPT_BUILTIN_ID;
+                        runAction('解除绑定', async () => {
+                            unbindRoutePrompt(local);
                             await saveRoutesNow();
                             openPromptPreset(PROMPT_BUILTIN_ID);
                             return true;
-                        }, { refresh: false, success: '删掉了' });
+                        }, { refresh: false, success: '解除了' });
                     }, 'danger'),
                 ]);
             return;
@@ -3540,8 +3549,8 @@
         const nameInput = el('input', { type: 'text', class: 'dga-input', maxlength: '40', oninput: event => { draft.name = event.target.value; } });
         nameInput.value = draft.name;
         return setSection(el('h3', { class: 'dga-set-title' }, '判断提示词', infoTip('promptStore', [
-            ['通用的', '「默认」和自己建的几套跟酒馆用户走，换角色卡也能选。'],
-            ['专用的', '「某张路线图」专用的那套存在路线图上，跟角色卡一起导出。在路线图「设置」里选「复制一份给这张图专用」就有了。'],
+            ['默认和自己建的', '跟酒馆用户走，换角色卡也能选。'],
+            ['角色卡里的', '在路线图「设置」里点「绑定」，选中的那套就复制进角色卡，跟卡一起导出。在这里改它不影响原来那套。'],
         ])), null,
             el('div', { class: 'dga-set-pad' }, pickRow),
             el('div', { class: 'dga-set-pad dga-pseg-body' },
@@ -4292,7 +4301,7 @@
             // prompt 仅用于旧名称迁移；新引用使用稳定 ID，专用副本随角色携带。
             prompt: oneLine(src.prompt || ''),
             ...(src.promptId ? { promptId: String(src.promptId) } : {}),
-            ...(src.promptLocal ? { promptLocal: { name: oneLine(src.promptLocal.name), segments: normalizeRouteJudgeSegments(src.promptLocal.segments) } } : {}),
+            ...(src.promptLocal ? { promptLocal: { name: oneLine(src.promptLocal.name), segments: normalizeRouteJudgeSegments(src.promptLocal.segments), ...(src.promptLocal.from ? { from: String(src.promptLocal.from) } : {}) } } : {}),
             // 提取 / 排除规则（v4.0.1）：发给判断 AI 的最近正文、它写回来的回答，都先过一遍。
             extractRules: routeRuleList(src.extractRules),
             excludeRules: routeRuleList(src.excludeRules),
@@ -5060,7 +5069,7 @@
         const list = routePromptPresets();
         (ui.routes || []).forEach(route => {
             if (!route.promptLocal) return;
-            list.push({ id: `local:${route.id}`, name: `「${route.name}」专用`, segments: normalizeRouteJudgeSegments(route.promptLocal.segments), local: route.id });
+            list.push({ id: `local:${route.id}`, name: `${oneLine(route.promptLocal.name) || ROUTE_PROMPT_DEFAULT_NAME}（「${route.name}」角色卡里的）`, segments: normalizeRouteJudgeSegments(route.promptLocal.segments), local: route.id });
         });
         return list;
     }
@@ -5788,33 +5797,52 @@
 
     // 这张路线图自己的设置（标题栏「设置」打开）：和设置页同一套小卡片。
     // 「AI 判断」那一组只有这张图实际用 AI 判断时才出现。
+    // 判断提示词：下拉选一套；下面「绑定至角色卡」把选中的那套复制进路线图（跟角色卡走），
+    // 绑定后下拉锁住，要换先解除绑定。绑进去的那套到设置页「判断提示词」里改。
+    function unbindRoutePrompt(route) {
+        const from = route.promptLocal && route.promptLocal.from;
+        delete route.promptLocal;
+        let back = PROMPT_BUILTIN_ID;
+        try { if (from && routePromptPresets().some(item => item.id === from)) back = from; } catch (error) { /* 读不到通用库就回默认 */ }
+        route.promptId = back;
+        route.prompt = '';
+    }
+
     function renderRoutePromptControl(route) {
         let presets = [];
         let error = '';
         try { presets = routePromptPresets(); } catch (cause) { error = cause.message; }
         let available = false;
         try { resolveRoutePrompt(route); available = true; } catch (cause) { error = cause.message; }
-        const selected = route.promptLocal ? '@local' : (route.promptId || (route.prompt ? `missing:${route.prompt}` : PROMPT_BUILTIN_ID));
-        const options = presets.map(item => [item.id, item.name]);
-        if (route.promptLocal) options.push(['@local', '这张图专用']);
-        else if (available) options.push(['@copy', '复制一份给这张图专用']);
+        const bound = Boolean(route.promptLocal);
+        const selected = bound ? '@local' : (route.promptId || (route.prompt ? `missing:${route.prompt}` : PROMPT_BUILTIN_ID));
+        const options = bound ? [['@local', route.promptLocal.name || '默认']] : presets.map(item => [item.id, item.name]);
         if (!options.some(item => item[0] === selected)) options.push([selected, '（找不到了，重选一套）']);
-        // 只选一套；专用的那套到设置页「判断提示词」里改。
-        return el('div', {},
-            setRow('判断提示词', rtSelect(options, selected, value => {
-                if (value === selected) return;
-                if (value === '@copy') {
-                    route.promptLocal = localPromptCopy(route);
-                    delete route.promptId;
-                } else {
-                    if (route.promptLocal && !hostWindow.confirm('换成别的提示词，这张图专用的那套就删掉了，确定？')) { render(); return; }
-                    delete route.promptLocal;
-                    route.promptId = value;
-                }
+        const pick = rtSelect(options, selected, value => {
+            if (value === selected) return;
+            route.promptId = value;
+            route.prompt = '';
+            routeEdited(route, false);
+            render();
+        });
+        if (bound) pick.disabled = true;
+        const bind = bound
+            ? rtBtn('解除绑定', () => {
+                if (!hostWindow.confirm('解除绑定后，角色卡里的这份提示词会删掉（在里面改过的也没了），确定？')) return;
+                unbindRoutePrompt(route);
+                routeEdited(route, false);
+                render();
+            }, 'small')
+            : rtBtn('绑定', () => {
+                route.promptLocal = localPromptCopy(route);
+                delete route.promptId;
                 route.prompt = '';
                 routeEdited(route, false);
                 render();
-            })),
+            }, 'small', { disabled: !available });
+        return el('div', {},
+            setRow('判断提示词', pick),
+            setRow('绑定至角色卡', bind),
             error ? messageBar({ type: 'error', text: error }) : null);
     }
 
@@ -7549,6 +7577,7 @@ ${P} .dga-pseg { display: flex; flex-direction: column; gap: 8px; padding: 12px;
 ${P} .dga-pseg-head { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
 ${P} .dga-pseg-head select { flex: 0 1 auto; max-width: none; width: auto; min-height: 28px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
 ${P} .dga-pseg-on { display: inline-flex; align-items: center; gap: 6px; color: var(--dga-text-2); font-size: 12px; }
+${P} .dga-rs select:disabled { opacity: .7; cursor: not-allowed; }
 ${P} .dga-pseg-n { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--dga-text-3); font-size: 12px; }
 ${P} .dga-pseg-text { min-height: 0; font: 13px/1.6 var(--dga-font-mono); }
 ${P} .dga-pseg.is-off textarea, ${P} .dga-pseg.is-off select { opacity: .45; }
