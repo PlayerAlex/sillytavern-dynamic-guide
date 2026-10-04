@@ -1140,6 +1140,21 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     const saved = world.state.variables.chat.$dynamicGuideAssistant.routeState.routes[t.route.id];
     assert.equal(saved.cur, t.fork, '进度存进聊天变量');
     assert.match(documentRef.getElementById('dynamic-guide-assistant-style').textContent, /\.dga-rt-drawer \{/, '带上路线图的样式');
+
+    // 看的时候点一段：小卡片只放正文；点「改这一段」，侧边栏只有正文、完成条件、下一段。
+    const nodeEl = findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场'));
+    nodeEl.listeners.click[0]();
+    const peek = panel().querySelector('.dga-rt-peek');
+    assert.ok(peek, '点一段弹出小卡片');
+    assert.match(peek.textContent, /开场正文/, '卡片里是这一段的正文');
+    assert.doesNotMatch(peek.textContent, /完成条件|下一段|路口|支线/, '卡片里不放完成条件、下一段、支线');
+    findButton(peek, '改这一段').listeners.click[0]();
+    const drawer = panel().querySelector('.dga-rt-drawer');
+    assert.ok(drawer, '点「改这一段」打开侧边栏');
+    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口)/) || ['?'])[0]);
+    assert.deepEqual(labels, ['正文', '完成条件', '下一段'], '侧边栏只有正文、完成条件、下一段');
+    assert.doesNotMatch(drawer.textContent, /更多|额外发|笔记|怎么走到这里/, '不再有更多、额外发的块、笔记');
+    assert.equal(panel().querySelector('.dga-rt-peek'), null, '改的时候小卡片收起');
     assert.deepEqual(errors, []);
 });
 

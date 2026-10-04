@@ -1,6 +1,6 @@
 # 动态指导助手
 
-当前版本：**v4.3.6**
+当前版本：**v4.3.7**
 
 在酒馆里给角色画一张「路线图」：剧情（也可以是时间、关系变化……）一段一段排好，分出路口，挂上支线。动态指导助手只把**现在走到的这一段**写进世界书，AI 每次回复看到的就是当下该演的内容；走完一段就往下一段走，可以自己点，也可以交给判断用的 AI。
 
@@ -8,8 +8,8 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 
 ## 安装
 
-- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.6/dynamic-guide-offline-v4.3.6.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
-- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.6/dynamic-guide-online-v4.3.6.json)：每次打开酒馆时从网上下载脚本。**不会自己升级**，想更新时改一下里面的版本号就行（见下面「在线加载」）。
+- [离线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.7/dynamic-guide-offline-v4.3.7.json)：内置完整脚本，导入后运行不依赖远程脚本下载。
+- [在线版 JSON](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases/download/v4.3.7/dynamic-guide-online-v4.3.7.json)：每次打开酒馆时从网上下载脚本。**不会自己升级**，想更新时改一下里面的版本号就行（见下面「在线加载」）。
 
 在酒馆助手里导入并启用，点酒馆左下角魔法棒里的「动态指导助手」打开。
 
@@ -65,10 +65,10 @@ v4.0 是重做的版本，和 v3 的「绑定世界书条目」不兼容，升�
 在线版的脚本内容只有一小段，最上面一行是版本号：
 
 ```js
-const VERSION = 'v4.3.6';
+const VERSION = 'v4.3.7';
 ```
 
-- **想更新**：在酒馆助手里打开这个脚本，把引号里的版本号改成新版本（比如 `v4.3.6`），保存后刷新酒馆页面。有哪些版本看[发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases)。不改就一直用这个版本，不会自动升级。
+- **想更新**：在酒馆助手里打开这个脚本，把引号里的版本号改成新版本（比如 `v4.3.7`），保存后刷新酒馆页面。有哪些版本看[发布页](https://github.com/PlayerAlex/sillytavern-dynamic-guide/releases)。不改就一直用这个版本，不会自动升级。
 - **下载地址**：同时向 testingcf / fastly / cdn / gcore 这几个 jsDelivr 节点和 GitHub 原地址要文件，谁先给对就用谁，所以其中一两个连不上也能用。只认版本号对得上的文件，下错了不运行。
 - **全都连不上**（或者版本号写错了）：右上角会弹提示，按 F12 在控制台能看到每个地址失败的原因。这时换离线版就行。
 - v4.3.2 及以前的在线版只认 `cdn.jsdelivr.net` 一个地址，连不上就什么都没有。想用新的在线版，重新导入一次 v4.3.3 或更新的在线版 JSON。新的在线版里把版本号改成更早的版本（v4.0 起）也能用。
@@ -113,6 +113,11 @@ const VERSION = 'v4.3.6';
 - 改过再发布的版本也要用同样的协议。
 
 ## 更新日志
+
+### v4.3.7（2026-10-05）
+
+- 看路线图时点一段，弹出的小卡片贴在这一段旁边，不再盖住整张图；卡片里只放这一段的正文，往后怎么走看图就行。点别处收起。
+- 改一段的侧边栏只留正文、完成条件、下一段。下一段点一下就去改那一段；路口每条路下面写条件。往后接一段、挂支线在图上点「＋」；「走到某几段时发」的块到「发给 AI 的内容」里管。
 
 ### v4.3.6（2026-10-05）
 

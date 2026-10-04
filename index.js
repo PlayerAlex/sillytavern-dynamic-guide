@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.6';
+    const VERSION = '4.3.7';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -3131,6 +3131,12 @@
             const modal = renderRouteModal();
             if (modal) shell.appendChild(modal);
             restoreRouteScroll(shell);
+            const peek = renderRoutePeek();
+            if (peek) {
+                shell.appendChild(peek);
+                placeRoutePeek(shell);
+            }
+            watchRoutePeek(shell);
         }
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
         // 左栏抽屉开着时重画（比如点了里面的按钮）不再播一遍滑入。
@@ -6133,6 +6139,7 @@
             const selected = edit && ui.rt.sel[route.id] === id;
             const nodeEl = el('div', {
                 class: `dga-rt-node is-${state}${selected ? ' is-sel' : ''}`,
+                'data-node': id,
                 style: side && state === 'cur' ? `width:${b.w}px;border-color:${side.color};background:${side.color}33;box-shadow:0 0 0 3px ${side.color}22` : `width:${b.w}px`,
                 title: [node.content, node.next.length > 1 ? `路口：${node.next.length} 条路` : '', side ? `支线「${side.name}」 开始的条件：${side.cond || '（没写）'}` : ''].filter(Boolean).join('\n'),
                 onclick: () => {
@@ -6154,49 +6161,96 @@
         const sizer = el('div', { class: 'dga-rt-sizer', style: `width:${Math.ceil(width * zoom)}px;height:${Math.ceil(height * zoom)}px` }, graph);
         return el('div', {
             class: 'dga-rt-graph-wrap',
-            onscroll: event => { ui.rt.scroll[route.id] = [event.target.scrollLeft, event.target.scrollTop]; },
+            onscroll: event => {
+                ui.rt.scroll[route.id] = [event.target.scrollLeft, event.target.scrollTop];
+                // 图滚动时，贴在段旁边的小卡片跟着挪。
+                if (ui.rt.peek && typeof event.target.closest === 'function') placeRoutePeek(event.target.closest('.dga-shell'));
+            },
         }, sizer);
     }
 
     // ---- 弹窗：看一段 / 接一段 / 挂支线 / 删一段 ----
 
+    // 「看」的时候点一段：贴在这一段旁边的小卡片，只放这一段的正文（v4.3.7 用户定：往后怎么走看路线图就行）。
+    // 手机上从底下出来。点卡片和段以外的地方、或者按 Esc，卡片收起。
     function routeNodeInfoDialog(route, id) {
-        const node = route.nodes[id];
+        ui.rt.peek = { route: route.id, id };
+        render();
+    }
+
+    function dropRoutePeek() {
+        if (!ui.rt.peek) return;
+        ui.rt.peek = null;
+        const doc = hostDocument();
+        if (!doc || typeof doc.querySelectorAll !== 'function') return;
+        doc.querySelectorAll('.dga-rt-peek').forEach(item => item.remove());
+        doc.querySelectorAll('.dga-rt-node.is-peek').forEach(item => item.classList.remove('is-peek'));
+    }
+
+    function renderRoutePeek() {
+        const peek = ui.rt.peek;
+        const route = peek && ui.routes.find(item => item.id === peek.route);
+        const node = route && route.nodes[peek.id];
+        if (!node || ui.routeCurrent !== route.id || ui.rt.mode[route.id] === 'edit' || ui.rt.modal) {
+            if (!ui.rt.modal) ui.rt.peek = null;
+            return null;
+        }
+        const id = node.id;
         const side = node.side ? routeSideById(route, node.side) : null;
         const state = classifyRoute(route, routeStateOf(route))[id] || 'open';
         const STATE_TEXT = { cur: '现在在这', past: '走过了', open: '还没走到', dead: '这次走不到了' };
-        const doneText = node.doneMode === 'ai' ? '交给 AI 自己看' : (node.doneMode === 'manual' ? '只能手动点「下一段」' : (node.done || '（还没写）'));
-        const hosted = route.sides.filter(item => item.host === id);
-        const color = side ? side.color : ROUTE_MAIN_COLOR;
-        const body = el('div', { class: 'dga-rt-ni', style: `--cc:${color}` },
-            el('div', { class: 'dga-rt-ni-top' },
-                el('span', { class: 'dga-rt-line' }, el('i'), side ? `支线 · ${side.name}` : '主线'),
-                el('span', { class: `dga-rt-ni-state is-${state}`, text: STATE_TEXT[state] || '' }),
-                el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: closeRouteModal }, '×')),
-            el('div', { class: 'dga-rt-ni-title', text: node.name }),
-            el('div', { class: 'dga-rt-ni-text', text: node.content || '（这一段还没写内容）' }),
-            el('div', { class: 'dga-rt-ni-rows' },
-                el('div', { class: 'dga-rt-ni-row' }, el('span', { class: 'dga-rt-ni-k', text: '完成条件' }), el('span', { text: doneText })),
-                node.next.length
-                    ? el('div', { class: 'dga-rt-ni-row' }, el('span', { class: 'dga-rt-ni-k', text: node.next.length > 1 ? '路口' : '下一段' }),
-                        el('div', { class: 'dga-rt-ni-list' }, ...node.next.map(edge => el('div', {},
-                            el('b', { text: route.nodes[edge.to].name }),
-                            node.next.length > 1 ? el('span', { class: 'dga-rt-muted', text: edge.cond ? ` · ${edge.cond}` : ' · 还没写条件' }) : null))))
-                    : el('div', { class: 'dga-rt-ni-row' }, el('span', { class: 'dga-rt-ni-k', text: '下一段' }), el('span', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点' })),
-                hosted.length ? el('div', { class: 'dga-rt-ni-row' }, el('span', { class: 'dga-rt-ni-k', text: '支线' }),
-                    el('div', { class: 'dga-rt-ni-list' }, ...hosted.map(item => el('div', {},
-                        el('b', { style: `color:${item.color}`, text: item.name }),
-                        el('span', { class: 'dga-rt-muted', text: item.cond ? ` · ${item.cond}` : '' }))))) : null));
-        openRouteModal('', body, [
-            rtBtn('改这一段', () => { ui.rt.modal = null; selectRouteNode(route, id); }, 'ghost'),
-            state === 'cur'
-                ? rtBtn('现在就在这一段', () => {}, 'primary', { disabled: true })
-                : rtBtn('从这里接着走', () => {
-                    ui.rt.modal = null;
+        const phone = typeof hostWindow.matchMedia === 'function' && hostWindow.matchMedia('(max-width: 700px)').matches;
+        return el('div', { class: `dga-rt-peek${phone ? ' is-sheet' : ''}`, role: 'dialog', 'data-node': id, style: `--cc:${side ? side.color : ROUTE_MAIN_COLOR}` },
+            el('div', { class: 'dga-rt-peek-top' },
+                el('i'),
+                el('span', { text: side ? `支线 · ${side.name}` : '主线' }),
+                STATE_TEXT[state] ? el('span', { class: `dga-rt-peek-state is-${state}`, text: `· ${STATE_TEXT[state]}` }) : null,
+                el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: dropRoutePeek }, '×')),
+            el('div', { class: 'dga-rt-peek-title', text: node.name }),
+            el('div', { class: `dga-rt-peek-text${node.content ? '' : ' is-none'}`, text: node.content || '这一段还没写内容' }),
+            el('div', { class: 'dga-rt-peek-foot' },
+                rtBtn('改这一段', () => { ui.rt.peek = null; selectRouteNode(route, id); }, 'small ghost'),
+                state === 'cur' ? null : rtBtn('从这里接着走', () => {
+                    ui.rt.peek = null;
                     routeJumpTo(route, routeStateOf(route), id);
                     commitRouteWalk(route, `从「${node.name}」接着走`);
-                }, 'primary'),
-        ], 'is-info');
+                }, 'small primary')));
+    }
+
+    // 电脑上贴在这一段右边，放不下放左边，再放不下放下面。位置按面板算。
+    function placeRoutePeek(shell) {
+        const box = shell && typeof shell.querySelector === 'function' ? shell.querySelector('.dga-rt-peek') : null;
+        if (!box || box.classList.contains('is-sheet') || typeof box.getBoundingClientRect !== 'function') return;
+        const target = shell.querySelector(`.dga-rt-node[data-node="${box.getAttribute('data-node')}"]`);
+        if (!target) return;
+        target.classList.add('is-peek');
+        const r = target.getBoundingClientRect();
+        const s = shell.getBoundingClientRect();
+        const w = box.offsetWidth;
+        const h = box.offsetHeight;
+        const gap = 12;
+        let left = r.right - s.left + gap;
+        let top = r.top - s.top - 10;
+        if (left + w > s.width - gap) left = r.left - s.left - w - gap;
+        if (left < gap) {
+            left = Math.min(s.width - w - gap, Math.max(gap, r.left - s.left));
+            top = r.bottom - s.top + gap;
+        }
+        box.style.left = `${Math.max(gap, left)}px`;
+        box.style.top = `${Math.max(gap, Math.min(top, s.height - h - gap))}px`;
+    }
+
+    // 点卡片和段以外的地方收起卡片：只拿掉卡片，不整页重画（免得点的那个按钮被换掉）。装一次。
+    function watchRoutePeek(shell) {
+        if (!shell || shell.__dgaPeekWatch || typeof shell.addEventListener !== 'function') return;
+        shell.__dgaPeekWatch = true;
+        shell.addEventListener('pointerdown', event => {
+            const hit = event.target && typeof event.target.closest === 'function' ? event.target : null;
+            if (ui.rt.peek && !(hit && hit.closest('.dga-rt-peek, .dga-rt-node'))) dropRoutePeek();
+        });
+        shell.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && ui.rt.peek) dropRoutePeek();
+        });
     }
 
     // 点「＋」：先选接什么（新的一段 / 接回已有的一段），中间一张小图画出接上以后的样子，
@@ -6404,13 +6458,10 @@
         const side = node.side ? routeSideById(route, node.side) : null;
         const layout = layoutRoute(route);
         const live = () => { routeLive(route); scheduleRouteSave(600); };
-        const hosted = route.sides.filter(item => item.host === id);
         const close = () => { ui.rt.sel[route.id] = ''; render(); };
         const isFork = node.next.length > 1;
-        const kind = id === route.root ? '起点' : (isFork ? '路口' : (!node.next.length ? '终点' : '段'));
         const page = side && ui.rt.tab === 'side' ? 'side' : 'node';
         const color = side ? side.color : ROUTE_MAIN_COLOR;
-        const toSidePage = () => { ui.rt.tab = 'side'; render(); };
         const removeSide = item => {
             Object.values(route.nodes).forEach(other => { if (other.side === item.id) delete route.nodes[other.id]; });
             route.sides = route.sides.filter(other => other !== item);
@@ -6421,8 +6472,7 @@
             el('span', { class: 'dga-rt-dot', style: `--cc:${color}` }),
             el('span', { text: route.name }),
             el('span', { text: '›' }),
-            side ? el('button', { type: 'button', class: 'dga-rt-crumb-link', title: '改整条支线', onclick: toSidePage }, `支线 · ${side.name}`) : el('span', { text: '主线' }),
-            page === 'node' ? el('span', { class: 'dga-rt-kind', text: kind }) : null,
+            side ? el('button', { type: 'button', class: 'dga-rt-crumb-link', title: '改整条支线', onclick: () => { ui.rt.tab = page === 'side' ? 'node' : 'side'; render(); } }, `支线 · ${side.name}`) : el('span', { text: '主线' }),
             el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: close }, '×'));
         if (page === 'side') {
             const hostNode = route.nodes[side.host];
@@ -6482,33 +6532,9 @@
                 el('div', { class: 'dga-rt-drawer-title', text: '整条支线的设置' }),
             ], bodyKids, null, close);
         }
-        // 这一段：从上往下一条时间线——怎么走到这里 → 要发生什么 → 完成条件 → 走完以后。
-        const parents = Object.values(route.nodes).filter(item => item.next.some(edge => edge.to === id));
-        const entry = [];
-        if (side && side.root === id) {
-            entry.push(el('div', { class: 'dga-rt-tl-note' },
-                '支线开始的地方。开始的条件：',
-                el('b', { text: side.cond || '（还没写）' }),
-                el('button', { type: 'button', class: 'dga-rt-link', onclick: toSidePage }, '改')));
-        } else if (!side && id === route.root) {
-            entry.push(el('div', { class: 'dga-rt-tl-note', text: '故事从这里开始。' }));
-        }
-        parents.forEach(parent => {
-            const edge = parent.next.find(item => item.to === id);
-            const fork = parent.next.length > 1;
-            const isLink = !layout.treeEdge.has(`${parent.id}>${id}`);
-            entry.push(el('div', { class: 'dga-rt-tl-from' },
-                el('div', { class: 'dga-rt-tl-from-head' },
-                    el('span', { text: '从' }),
-                    el('button', { type: 'button', class: 'dga-rt-chip-btn', onclick: () => selectRouteNode(route, parent.id) }, parent.name),
-                    el('span', { text: fork ? '这个路口走到这里' : (isLink ? '接回到这里' : '走完以后到这里') })),
-                fork ? el('input', { type: 'text', value: edge.cond, placeholder: '走这条路的条件，比如：{{user}}决定自己去送信', oninput: event => { edge.cond = event.target.value; live(); } }) : null));
-        });
-        const step = (n, title, sub, ...kids) => el('div', { class: 'dga-rt-tl-step' },
-            el('div', { class: 'dga-rt-tl-dot', text: String(n) }),
-            el('div', { class: 'dga-rt-tl-body' },
-                el('div', { class: 'dga-rt-tl-title dga-tip-host' }, title, sub ? el('span', { class: 'dga-rt-muted', text: sub }) : null),
-                ...kids));
+        // 这一段：只有正文、完成条件、下一段（v4.3.7 用户定）。往后接一段、挂支线在图上点「＋」；
+        // 「走到某几段时发」的块在「发给 AI 的内容」里管，不在这里列。
+        const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
             const to = index + delta;
             if (to < 0 || to >= node.next.length) return;
@@ -6518,94 +6544,42 @@
             routeEdited(route, true);
             render();
         };
-        const nextList = node.next.map((edge, index) => {
+        const nexts = node.next.map((edge, index) => {
             const isLink = !layout.treeEdge.has(`${id}>${edge.to}`);
-            return el('div', { class: 'dga-rt-tl-next' },
-                el('button', { type: 'button', class: 'dga-rt-chip-btn', title: '去改这一段', onclick: () => selectRouteNode(route, edge.to) }, route.nodes[edge.to].name),
-                el('span', { class: 'dga-rt-tl-next-cond', text: `${isLink ? '接回 · ' : ''}${isFork ? (edge.cond || '还没写条件') : ''}${isFork && node.fallback === index ? ' · 都对不上就走这条' : ''}` }),
-                isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', onclick: () => moveRoute(index, -1) }, '↑') : null,
-                isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', onclick: () => moveRoute(index, 1) }, '↓') : null,
-                el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '断开这条（后面没别处接着的段会一起删掉）', onclick: () => { node.next.splice(index, 1); routeEdited(route, true); render(); } }, '×'));
+            return el('div', { class: 'dga-rt-nd-next' },
+                el('div', { class: 'dga-rt-nd-next-top' },
+                    el('button', { type: 'button', class: 'dga-rt-nd-go', title: '去改这一段', onclick: () => selectRouteNode(route, edge.to) },
+                        el('span', { text: route.nodes[edge.to].name }),
+                        isLink ? el('span', { class: 'dga-rt-nd-tag', text: '接回' }) : null,
+                        el('span', { class: 'dga-rt-nd-arrow', text: '改 ›' })),
+                    isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: () => moveRoute(index, -1) }, '↑') : null,
+                    isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === node.next.length - 1, onclick: () => moveRoute(index, 1) }, '↓') : null,
+                    el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '断开这条（后面没别处接着的段会一起删掉）', onclick: () => { node.next.splice(index, 1); routeEdited(route, true); render(); } }, '×')),
+                isFork ? el('input', { type: 'text', class: 'dga-rt-mt', value: edge.cond, placeholder: '什么情况下走这条，比如：{{user}}决定自己去送信', oninput: event => { edge.cond = event.target.value; live(); } }) : null);
         });
-        const banner = side ? (() => {
-            const members = routeOrderedNodes(route, side.root, side.id);
-            const at = members.findIndex(item => item.id === id) + 1;
-            const STATUS = { on: '正在走', done: '已经结束', skip: '这次没走', idle: '还没开始' };
-            return el('div', { class: 'dga-rt-side-banner', style: `--sc:${side.color}` },
-                el('div', { class: 'dga-rt-sb-text' },
-                    el('div', { class: 'dga-rt-sb-name', text: `支线 · ${side.name}` }),
-                    el('div', { class: 'dga-rt-sb-sub', text: `第 ${at} 段，共 ${members.length} 段 · ${STATUS[routeSideState(route, routeStateOf(route), side.id).status] || ''}` })),
-                rtBtn('整条支线设置 ›', toSidePage, 'small'));
-        })() : null;
-        const rangeBlocks = route.blocks.filter(block => block.when === 'nodes');
-        const extraOn = rangeBlocks.filter(block => (block.nodes || []).includes(id)).length;
-        const more = el('div', { class: `dga-rt-more${ui.rt.more ? ' is-open' : ''}` },
-            el('button', { type: 'button', class: 'dga-rt-more-head', onclick: () => { ui.rt.more = !ui.rt.more; render(); } },
-                el('span', { text: ui.rt.more ? '▾' : '▸' }), '更多',
-                el('span', { class: 'dga-rt-muted', text: [hosted.length ? `${hosted.length} 条支线` : '', extraOn ? `额外发 ${extraOn} 块` : '', node.note ? '有笔记' : ''].filter(Boolean).join(' · ') })),
-            ui.rt.more ? el('div', {},
-                el('div', { class: 'dga-rt-f' },
-                    el('div', { class: 'dga-rt-fl dga-tip-host' }, '挂在这一段的支线', infoTip(`hosted-${route.id}`, [
-                        ['支线', '走到这一段以后可以开始的另一条小故事，和主线同时进行。'],
-                    ]), el('button', { type: 'button', class: 'dga-rt-link', onclick: () => routeSideDialog(route, id) }, '＋ 挂一条')),
-                    hosted.length ? hosted.map(item => el('div', { class: 'dga-rt-r2', style: `--sc:${item.color}` },
-                        el('span', { class: 'dga-rt-dot', style: `--cc:${item.color}` }),
-                        el('button', { type: 'button', class: 'dga-rt-r2-name', style: `color:${item.color}`, title: '去改这条支线', onclick: () => { selectRouteNode(route, item.root, true); ui.rt.tab = 'side'; render(); } },
-                            item.name, el('small', { text: item.cond ? ` · ${item.cond}` : ' · 还没写开始的条件' })),
-                        el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '删掉这条支线', onclick: () => removeSide(item) }, '×')))
-                        : el('div', { class: 'dga-rt-muted', text: '没有。' })),
-                el('div', { class: 'dga-rt-f' },
-                    el('div', { class: 'dga-rt-fl dga-tip-host' }, '走到这一段时额外发', infoTip(`extra-${route.id}`, [
-                        ['额外发', '「发给 AI 的内容」里「走到某几段时发」的块会列在这里，点亮的那块走到这一段时就会发出去。'],
-                    ])),
-                    rangeBlocks.length
-                        ? el('div', { class: 'dga-rt-chips' }, ...rangeBlocks.map(block => el('button', {
-                            type: 'button', class: `dga-rt-chip${(block.nodes || []).includes(id) ? ' is-on' : ''}`, title: block.text.replace(ROUTE_TOKEN_RE, '〔格子〕'),
-                            onclick: () => {
-                                block.nodes = (block.nodes || []).includes(id) ? block.nodes.filter(item => item !== id) : (block.nodes || []).concat(id);
-                                routeEdited(route, false);
-                                render();
-                            },
-                        }, routeBlockPeek(block))))
-                        : el('div', { class: 'dga-rt-muted', text: '没有。' })),
-                el('div', { class: 'dga-rt-f' },
-                    el('div', { class: 'dga-rt-fl' }, '笔记', el('span', { class: 'dga-rt-muted', text: '只给自己看' })),
-                    el('textarea', { class: 'dga-rt-note', placeholder: '写给自己的提醒', oninput: event => { node.note = event.target.value; scheduleRouteSave(600); } }, node.note || ''))) : null);
-        const hasEntry = entry.length > 0;
         const bodyKids = [
-            banner,
-            el('div', { class: 'dga-rt-tl', style: `--cc:${color}` },
-                hasEntry ? step(1, '怎么走到这里', '', ...entry) : null,
-                step(hasEntry ? 2 : 1, '这一段要发生什么', '',
-                    el('textarea', { placeholder: '写下这一段要演的事', oninput: event => { node.content = event.target.value; live(); } }, node.content)),
-                step(hasEntry ? 3 : 2, el('span', {}, '完成条件', infoTip(`done-${route.id}`, [
-                    ['写一句', '写一件看得见的事，比如「两人交换了真名」。AI 判断时就看这件事发生了没有。'],
-                    ['交给 AI 看', '不写条件，让 AI 自己看这一段演完了没有。'],
-                    ['只能手动点', 'AI 判断不会动它，要你自己点「下一段」。'],
-                ])), '',
-                    rtSeg([['text', '写一句'], ['ai', '交给 AI 看'], ['manual', '只能手动点']], node.doneMode, value => { node.doneMode = value; routeEdited(route, false); render(); }),
-                    node.doneMode === 'text' ? el('input', { type: 'text', class: 'dga-rt-mt', value: node.done, placeholder: '写成一件看得见的事，比如：两人交换了真名', oninput: event => { node.done = event.target.value; scheduleRouteSave(600); } }) : null),
-                step(hasEntry ? 4 : 3, el('span', {}, isFork ? `走完以后：路口，${node.next.length} 条路` : '走完以后', infoTip(`next-${route.id}`, [
-                    ['接一段', '这一段演完，接着演哪一段。'],
-                    ['路口', '接了两段以上就是路口。每条路写一句条件，AI 按剧情挑一条走；哪条都对不上时，可以指定走一条，或者停在路口等你选。'],
-                    ['接回', '接到图上已经有的段，用来让几条路汇到一起，或者绕回去循环。'],
-                ])), '',
-                    nextList.length ? el('div', { class: 'dga-rt-tl-nexts' }, ...nextList)
-                        : el('span', { class: 'dga-rt-end-chip', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
-                    isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
-                        rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null,
-                    el('button', { type: 'button', class: 'dga-rt-link dga-rt-tl-add', onclick: () => routePlusDialog(route, id) }, '＋ 在后面接一段'))),
-            more,
+            sec('正文', el('textarea', { class: 'dga-rt-nd-body', placeholder: '写下这一段要演的事', oninput: event => { node.content = event.target.value; live(); } }, node.content)),
+            sec(['完成条件', infoTip(`done-${route.id}`, [
+                ['写一句', '写一件看得见的事，比如「两人交换了真名」。AI 判断时就看这件事发生了没有。'],
+                ['交给 AI 看', '不写条件，让 AI 自己看这一段演完了没有。'],
+                ['只能手动点', 'AI 判断不会动它，要你自己点「下一段」。'],
+            ])],
+                rtSeg([['text', '写一句'], ['ai', '交给 AI 看'], ['manual', '只能手动点']], node.doneMode, value => { node.doneMode = value; routeEdited(route, false); render(); }),
+                node.doneMode === 'text' ? el('input', { type: 'text', class: 'dga-rt-mt', value: node.done, placeholder: '写成一件看得见的事，比如：两人交换了真名', oninput: event => { node.done = event.target.value; scheduleRouteSave(600); } }) : null),
+            sec([isFork ? `路口 · ${node.next.length} 条路` : '下一段', infoTip(`next-${route.id}`, [
+                ['下一段', '这一段演完，接着演哪一段。点一下就去改那一段。往后再接一段，在图上点这一段右边的「＋」。'],
+                ['路口', '接了两段以上就是路口。每条路写一句条件，AI 按剧情挑一条走；哪条都对不上时，可以指定走一条，或者停在路口等你选。'],
+                ['接回', '接到图上已经有的段，用来让几条路汇到一起，或者绕回去循环。'],
+            ])],
+                nexts.length ? el('div', { class: 'dga-rt-nd-nexts' }, ...nexts)
+                    : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
+                isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
+                    rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
         ];
         return routeDrawerShell(route, color, [
             crumb,
             el('input', { type: 'text', class: 'dga-rt-drawer-name', value: node.name, title: '这一段的名字', oninput: event => { node.name = oneLine(event.target.value) || '未命名'; live(); } }),
         ], bodyKids, rtBtn('删掉这一段', () => routeDeleteNode(route, id), 'small danger'), close);
-    }
-
-    function routeBlockPeek(block) {
-        const text = String(block.text || '').replace(ROUTE_TOKEN_RE, '〔格子〕').replace(/\s+/g, ' ').trim();
-        return text.length > 18 ? `${text.slice(0, 18)}…` : (text || '（空的一块）');
     }
 
     function renderRoutePanelDrawer(route, key) {
@@ -7871,6 +7845,32 @@ ${P} .dga-rt-ni-rows { margin-top: 14px; border-top: 1px solid var(--dga-border)
 ${P} .dga-rt-ni-row { display: grid; grid-template-columns: 56px 1fr; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--dga-border); font-size: 13px; }
 ${P} .dga-rt-ni-k { color: var(--dga-text-3); font-size: 12px; padding-top: 1px; }
 ${P} .dga-rt-ni-list { display: flex; flex-direction: column; gap: 4px; }
+/* 看的时候点一段：贴在段旁边的小卡片，只放正文（v4.3.7） */
+${P} .dga-rt-peek { position: absolute; z-index: 45; width: min(340px, calc(100% - 24px)); max-height: calc(100% - 24px); display: flex; flex-direction: column; border-radius: 16px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-1); box-shadow: 0 16px 48px rgba(0, 0, 0, .55); animation: dga-rt-pk .12s ease-out; }
+@keyframes dga-rt-pk { from { opacity: 0; transform: translateY(4px); } }
+${P} .dga-rt-peek.is-sheet { left: 0; right: 0; bottom: 0; top: auto; width: auto; max-height: 75%; border-radius: 18px 18px 0 0; }
+${P} .dga-rt-peek-top { display: flex; align-items: center; gap: 8px; padding: 12px 16px 0; color: var(--dga-text-3); font-size: 12px; }
+${P} .dga-rt-peek-top i { width: 8px; height: 8px; border-radius: 50%; background: var(--cc); }
+${P} .dga-rt-peek-state.is-cur { color: var(--dga-accent); }
+${P} .dga-rt-peek-top .dga-rt-x { margin-left: auto; }
+${P} .dga-rt-peek-title { padding: 2px 16px 0; font-size: 18px; font-weight: 700; }
+${P} .dga-rt-peek-text { flex: 1; overflow: auto; margin: 10px 16px 14px; padding: 10px 12px; border-radius: 10px; background: var(--dga-bg-2); color: var(--dga-text-1); font-size: 14px; line-height: 1.8; white-space: pre-wrap; word-break: break-word; }
+${P} .dga-rt-peek-text.is-none { color: var(--dga-text-3); }
+${P} .dga-rt-peek-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--dga-border); }
+${P} .dga-rt-peek-foot .dga-primary { margin-left: auto; }
+${P} .dga-rt-node.is-peek { outline: 2px solid var(--dga-accent); outline-offset: 3px; }
+/* 改一段：正文、完成条件、下一段，标签在上、框在下（v4.3.7） */
+${P} .dga-rt-nd-sec { margin-bottom: 20px; }
+${P} .dga-rt-nd-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
+${P} textarea.dga-rt-nd-body { min-height: 120px; line-height: 1.8; }
+${P} .dga-rt-nd-nexts { display: flex; flex-direction: column; gap: 10px; }
+${P} .dga-rt-nd-next-top { display: flex; align-items: center; gap: 6px; }
+${P} .dga-rt-nd-go { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-weight: 600; text-align: left; cursor: pointer; }
+${P} .dga-rt-nd-go:hover { border-color: var(--dga-accent); }
+${P} .dga-rt-nd-tag { flex: 0 0 auto; padding: 0 8px; border-radius: 999px; border: 1px solid var(--dga-border-2); color: var(--dga-text-3); font-size: 11.5px; font-weight: 400; line-height: 20px; }
+${P} .dga-rt-nd-arrow { margin-left: auto; color: var(--dga-text-3); font-size: 12.5px; font-weight: 400; }
+${P} .dga-rt-nd-go:hover .dga-rt-nd-arrow { color: var(--dga-accent); }
+${P} .dga-rt-icon[disabled] { opacity: .3; cursor: default; }
 /* 位置和顺序 */
 ${P} .dga-rt-place-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
 ${P} .dga-rt-pf-row { display: grid; grid-template-columns: 44px 1fr; gap: 12px; align-items: start; margin-bottom: 16px; }
