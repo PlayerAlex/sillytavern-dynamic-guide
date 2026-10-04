@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.3';
+    const VERSION = '4.3.4';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -7440,8 +7440,10 @@ ${P} .dga-rule-add { display: flex; }
 ${P} .dga-rule-add .dga-btn { min-height: 34px; padding: 6px 12px; font-size: 13px; }
 ${P} .dga-log-bar { position: sticky; top: -14px; z-index: 5; display: flex; flex-direction: column; gap: 10px; margin: -14px 0 0; padding: 14px 0 12px; background: var(--dga-bg-0); }
 ${P} .dga-log-bar-top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-${P} .dga-log-search { flex: 1 1 220px; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 12px; border: 1px solid var(--dga-border-2); border-radius: 999px; background: var(--dga-bg-1); color: var(--dga-text-3); }
-${P} .dga-log-search input { flex: 1; min-width: 0; padding: 6px 0; border: 0; background: transparent; color: var(--dga-text-1); font: inherit; font-size: 13px; outline: none; box-shadow: none; }
+${P} .dga-log-search { flex: 1 1 220px; display: flex; align-items: center; gap: 8px; min-width: 0; height: 36px; padding: 0 14px; border: 1px solid var(--dga-border-2); border-radius: 999px; background: var(--dga-bg-1); color: var(--dga-text-3); }
+${P} .dga-log-search input { width: auto !important; min-width: 0 !important; max-width: none !important; height: auto !important; min-height: 0 !important; margin: 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; outline: none !important; flex: 1 1 auto; width: 100% !important; padding: 0 !important; color: var(--dga-text-1) !important; font: 13px/34px var(--dga-font-ui) !important; }
+${P} .dga-log-search input::placeholder { color: var(--dga-text-3); opacity: 1; }
+${P} .dga-log-search:focus-within { border-color: var(--dga-accent); box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-log-bar-top select { width: auto; flex: 0 0 auto; min-height: 32px; padding: 4px 12px; border-radius: 999px; background: var(--dga-bg-1); font-size: 13px; }
 ${P} .dga-log-acts { display: flex; gap: 6px; align-items: center; margin-left: auto; }
 ${P} .dga-live { display: inline-flex; align-items: center; gap: 6px; padding: 3px 12px; border-radius: 999px; border: 1px solid var(--dga-border-2); background: transparent; color: var(--dga-text-2); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
@@ -7601,12 +7603,13 @@ ${P} .dga-sw.is-on::after { left: 18px; background: #EAF6ED; }
 ${P} .dga-sw.is-sm { display: inline-block; width: 30px; height: 18px; }
 ${P} .dga-sw.is-sm::after { width: 12px; height: 12px; }
 ${P} .dga-sw.is-sm.is-on::after { left: 14px; }
-${P} .dga-step { display: inline-flex; align-items: center; gap: 7px; color: var(--dga-text-2); font-size: 13px; }
-${P} .dga-step-box { display: inline-flex; align-items: center; border: 1px solid var(--dga-border-2); border-radius: 999px; background: var(--dga-bg-0); }
-${P} .dga-step-box button { width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--dga-text-1); font: inherit; font-size: 15px; cursor: pointer; }
-${P} .dga-step-box button:hover { background: var(--dga-bg-2); }
-${P} .dga-step-box button[disabled] { opacity: .3; cursor: not-allowed; background: none; }
-${P} .dga-step-box input[type="number"] { width: 40px; min-height: 0; padding: 0; border: 0; background: transparent; box-shadow: none; text-align: center; font-weight: 600; -moz-appearance: textfield; }
+${P} .dga-step { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; white-space: nowrap; color: var(--dga-text-2); font-size: 13px; }
+${P} .dga-step-box { display: inline-flex; align-items: center; flex: 0 0 auto; height: 32px; padding: 2px; border: 1px solid var(--dga-border-2); border-radius: 999px; background: var(--dga-bg-0); }
+${P} .dga-step-box:focus-within { border-color: var(--dga-accent); box-shadow: 0 0 0 2px var(--dga-accent-glow); }
+${P} .dga-step-box button { display: grid; place-items: center; flex: 0 0 26px; width: 26px !important; height: 26px !important; min-width: 0 !important; min-height: 0 !important; padding: 0 !important; margin: 0 !important; border: 0 !important; border-radius: 50% !important; background: var(--dga-bg-2) !important; box-shadow: none !important; color: var(--dga-text-1); font: 600 15px/1 var(--dga-font-ui); cursor: pointer; }
+${P} .dga-step-box button:hover:not([disabled]) { background: var(--dga-bg-3) !important; }
+${P} .dga-step-box button[disabled] { opacity: .35; cursor: not-allowed; background: transparent !important; }
+${P} .dga-step-box input[type="number"] { width: auto !important; min-width: 0 !important; max-width: none !important; height: auto !important; min-height: 0 !important; margin: 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; outline: none !important; flex: 0 0 auto; width: 38px !important; padding: 0 !important; color: var(--dga-text-1) !important; text-align: center; font: 600 14px/26px var(--dga-font-ui) !important; -moz-appearance: textfield; appearance: textfield; }
 ${P} .dga-step-box input::-webkit-inner-spin-button, ${P} .dga-step-box input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 /* 小标题旁边的「!」：鼠标移上去 / 点一下，弹出一小块说明 */
 ${P} .dga-info { position: relative; display: inline-flex; }
