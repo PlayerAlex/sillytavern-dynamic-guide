@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.7';
+    const VERSION = '4.3.8';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2948,7 +2948,7 @@
         routeStates: {},
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, openBlock: {}, tab: 'node', more: false, sendView: 'tpl', modal: null, size: {}, book: {}, scroll: {} },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, openBlock: {}, tab: 'node', more: false, sendView: 'tpl', modal: null, size: {}, book: {}, scroll: {}, snap: {} },
     };
 
     function el(tag, attrs, ...children) {
@@ -5680,9 +5680,65 @@
         Object.keys(ui.rt.sel).forEach(key => { ui.rt.sel[key] = ''; });
         Object.keys(ui.rt.panel).forEach(key => { ui.rt.panel[key] = ''; });
         ui.rt.sel[route.id] = id;
-        ui.rt.mode[route.id] = 'edit';
+        enterRouteEdit(route);
         ui.rt.tab = 'node';
         if (!silent) render();
+    }
+
+    // 进「编辑路线」时记下这张图和进度原来的样子，「放弃修改」就回到这里。
+    function enterRouteEdit(route) {
+        if (ui.rt.mode[route.id] !== 'edit' || !ui.rt.snap[route.id]) {
+            ui.rt.snap[route.id] = { route: cloneData(route), state: cloneData(routeStateOf(route)) };
+        }
+        ui.rt.mode[route.id] = 'edit';
+    }
+
+    function leaveRouteEdit(route) {
+        ui.rt.mode[route.id] = 'view';
+        ui.rt.sel[route.id] = '';
+        delete ui.rt.snap[route.id];
+    }
+
+    function routeEditChanged(route) {
+        const snap = ui.rt.snap[route.id];
+        return Boolean(snap) && JSON.stringify(normalizeRoute(snap.route)) !== JSON.stringify(normalizeRoute(route));
+    }
+
+    function discardRouteEdit(route) {
+        const snap = ui.rt.snap[route.id];
+        if (!snap) {
+            leaveRouteEdit(route);
+            render();
+            return;
+        }
+        // 条目编号、位置是跟世界书对上的，不跟着退回去。
+        const keep = { worldbookName: route.worldbookName, entryUid: route.entryUid, placement: route.placement };
+        const back = normalizeRoute(cloneData(snap.route));
+        Object.keys(route).forEach(key => { delete route[key]; });
+        Object.assign(route, back, keep);
+        // 进度：编辑时走过的步照留；改结构把进度挪动过（现在这段被删了之类），就回到编辑前的进度。
+        const now = routeStateOf(route);
+        const fit = normalizeRouteState(cloneData(now), route);
+        ui.routeStates[route.id] = JSON.stringify(fit) === JSON.stringify(now) ? fit : normalizeRouteState(cloneData(snap.state), route);
+        writeRouteState(route.id, ui.routeStates[route.id]).catch(() => {});
+        Object.keys(ui.rt.panel).forEach(key => { ui.rt.panel[key] = ''; });
+        ui.rt.peek = null;
+        leaveRouteEdit(route);
+        scheduleRouteSave(0);
+        LogModule.info('路线图', `「${route.name}」放弃了这次编辑的修改`);
+        render();
+        notify('已放弃修改，回到编辑前的样子', 'info');
+    }
+
+    function discardRouteEditDialog(route) {
+        if (!routeEditChanged(route)) {
+            discardRouteEdit(route);
+            return;
+        }
+        openRouteModal('放弃这次的修改？', el('p', { class: 'dga-rt-p', text: '路线图会回到点「编辑路线」之前的样子。' }), [
+            rtBtn('接着改', closeRouteModal, 'ghost'),
+            rtBtn('放弃修改', () => { ui.rt.modal = null; discardRouteEdit(route); }, 'danger'),
+        ]);
     }
 
     function openRoutePanel(route, key) {
@@ -5756,6 +5812,7 @@
     const ROUTE_HEAD_ICONS = {
         edit: [['path', { d: 'M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z' }], ['path', { d: 'M13.5 8.5l3 3' }]],
         done: [['path', { d: 'M5 12.5l4.5 4.5L19 7.5' }]],
+        undo: [['path', { d: 'M9 14L4 9l5-5' }], ['path', { d: 'M4 9h10.5a5.5 5.5 0 0 1 0 11H11' }]],
         place: [['path', { d: 'M5 7h14M5 12h9M5 17h5' }], ['path', { d: 'M17 14v6M14.5 17.5L17 20l2.5-2.5' }]],
         send: [['path', { d: 'M4 11.5L20 4l-6.5 16-2.5-6.5L4 11.5z' }], ['path', { d: 'M11 13.5L20 4' }]],
         gear: [['circle', { cx: 12, cy: 12, r: 3 }], ['path', { d: 'M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8' }]],
@@ -5786,9 +5843,10 @@
                     ? el('input', { type: 'text', class: 'dga-rt-name-input', value: route.name, title: '路线图的名字，也是世界书条目的名字', onchange: event => renameRoute(route, event.target.value) })
                     : el('span', { class: 'dga-rt-name', text: route.name }),
                 el('div', { class: 'dga-rt-tools' },
+                    edit ? routeHeadBtn('undo', '放弃修改', () => discardRouteEditDialog(route)) : null,
                     edit
-                        ? routeHeadBtn('done', '完成编辑', () => { ui.rt.mode[route.id] = 'view'; ui.rt.sel[route.id] = ''; render(); }, 'is-primary')
-                        : routeHeadBtn('edit', '编辑路线', () => { ui.rt.mode[route.id] = 'edit'; render(); }),
+                        ? routeHeadBtn('done', '完成编辑', () => { leaveRouteEdit(route); render(); }, 'is-primary')
+                        : routeHeadBtn('edit', '编辑路线', () => { enterRouteEdit(route); render(); }),
                     panelBtn('place', 'place', '位置和顺序'),
                     panelBtn('send', 'send', '发给 AI 的内容'),
                     panelBtn('settings', 'gear', '设置'))),
@@ -6207,14 +6265,7 @@
                 STATE_TEXT[state] ? el('span', { class: `dga-rt-peek-state is-${state}`, text: `· ${STATE_TEXT[state]}` }) : null,
                 el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: dropRoutePeek }, '×')),
             el('div', { class: 'dga-rt-peek-title', text: node.name }),
-            el('div', { class: `dga-rt-peek-text${node.content ? '' : ' is-none'}`, text: node.content || '这一段还没写内容' }),
-            el('div', { class: 'dga-rt-peek-foot' },
-                rtBtn('改这一段', () => { ui.rt.peek = null; selectRouteNode(route, id); }, 'small ghost'),
-                state === 'cur' ? null : rtBtn('从这里接着走', () => {
-                    ui.rt.peek = null;
-                    routeJumpTo(route, routeStateOf(route), id);
-                    commitRouteWalk(route, `从「${node.name}」接着走`);
-                }, 'small primary')));
+            el('div', { class: `dga-rt-peek-text${node.content ? '' : ' is-none'}`, text: node.content || '这一段还没写内容' }));
     }
 
     // 电脑上贴在这一段右边，放不下放左边，再放不下放下面。位置按面板算。
@@ -6548,10 +6599,9 @@
             const isLink = !layout.treeEdge.has(`${id}>${edge.to}`);
             return el('div', { class: 'dga-rt-nd-next' },
                 el('div', { class: 'dga-rt-nd-next-top' },
-                    el('button', { type: 'button', class: 'dga-rt-nd-go', title: '去改这一段', onclick: () => selectRouteNode(route, edge.to) },
-                        el('span', { text: route.nodes[edge.to].name }),
-                        isLink ? el('span', { class: 'dga-rt-nd-tag', text: '接回' }) : null,
-                        el('span', { class: 'dga-rt-nd-arrow', text: '改 ›' })),
+                    el('div', { class: 'dga-rt-nd-go' },
+                        el('span', { class: 'dga-rt-nd-go-name', text: route.nodes[edge.to].name }),
+                        isLink ? el('span', { class: 'dga-rt-nd-tag', text: '接回' }) : null),
                     isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: () => moveRoute(index, -1) }, '↑') : null,
                     isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === node.next.length - 1, onclick: () => moveRoute(index, 1) }, '↓') : null,
                     el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '断开这条（后面没别处接着的段会一起删掉）', onclick: () => { node.next.splice(index, 1); routeEdited(route, true); render(); } }, '×')),
@@ -6567,7 +6617,7 @@
                 rtSeg([['text', '写一句'], ['ai', '交给 AI 看'], ['manual', '只能手动点']], node.doneMode, value => { node.doneMode = value; routeEdited(route, false); render(); }),
                 node.doneMode === 'text' ? el('input', { type: 'text', class: 'dga-rt-mt', value: node.done, placeholder: '写成一件看得见的事，比如：两人交换了真名', oninput: event => { node.done = event.target.value; scheduleRouteSave(600); } }) : null),
             sec([isFork ? `路口 · ${node.next.length} 条路` : '下一段', infoTip(`next-${route.id}`, [
-                ['下一段', '这一段演完，接着演哪一段。点一下就去改那一段。往后再接一段，在图上点这一段右边的「＋」。'],
+                ['下一段', '这一段演完，接着演哪一段。要改那一段，在图上点它。往后再接一段，在图上点这一段右边的「＋」。'],
                 ['路口', '接了两段以上就是路口。每条路写一句条件，AI 按剧情挑一条走；哪条都对不上时，可以指定走一条，或者停在路口等你选。'],
                 ['接回', '接到图上已经有的段，用来让几条路汇到一起，或者绕回去循环。'],
             ])],
@@ -7685,11 +7735,12 @@ ${P} .dga-rt-zoomf button { width: 26px; height: 26px; padding: 0; border: 0; bo
 ${P} .dga-rt-zoomf button:hover { background: var(--dga-bg-2); color: var(--dga-text-1); }
 ${P} .dga-rt-zoomf button[disabled] { opacity: .3; cursor: not-allowed; background: none; }
 ${P} .dga-rt-zoomf .dga-rt-zoomf-val { width: 46px; border-radius: 999px; font-size: 11.5px; }
-${P} .dga-rt-graph-wrap { position: relative; overflow: auto; background: #1A1B1E; border-top: 1px solid var(--dga-border); max-height: 560px; -webkit-overflow-scrolling: touch; scrollbar-color: var(--dga-border-2) #1A1B1E; }
+${P} .dga-rt-graph-wrap { position: relative; display: flex; overflow: auto; background: #1A1B1E; border-top: 1px solid var(--dga-border); max-height: 560px; -webkit-overflow-scrolling: touch; scrollbar-color: var(--dga-border-2) #1A1B1E; }
 ${P} .dga-rt-graph-wrap::-webkit-scrollbar { height: 8px; width: 8px; }
 ${P} .dga-rt-graph-wrap::-webkit-scrollbar-track { background: #1A1B1E; }
 ${P} .dga-rt-graph-wrap::-webkit-scrollbar-thumb { background: var(--dga-border-2); border-radius: 4px; }
-${P} .dga-rt-sizer { position: relative; }
+/* 图比框小时站在正中间；比框大时照常从左上角开始滚（auto 外边距放不下时就是 0，不会被裁掉）。 */
+${P} .dga-rt-sizer { position: relative; flex: 0 0 auto; margin: auto; }
 ${P} .dga-rt-graph { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 ${P} .dga-rt-svg { position: absolute; left: 0; top: 0; overflow: visible; }
 ${P} .dga-rt-ng { position: absolute; }
@@ -7856,8 +7907,6 @@ ${P} .dga-rt-peek-top .dga-rt-x { margin-left: auto; }
 ${P} .dga-rt-peek-title { padding: 2px 16px 0; font-size: 18px; font-weight: 700; }
 ${P} .dga-rt-peek-text { flex: 1; overflow: auto; margin: 10px 16px 14px; padding: 10px 12px; border-radius: 10px; background: var(--dga-bg-2); color: var(--dga-text-1); font-size: 14px; line-height: 1.8; white-space: pre-wrap; word-break: break-word; }
 ${P} .dga-rt-peek-text.is-none { color: var(--dga-text-3); }
-${P} .dga-rt-peek-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--dga-border); }
-${P} .dga-rt-peek-foot .dga-primary { margin-left: auto; }
 ${P} .dga-rt-node.is-peek { outline: 2px solid var(--dga-accent); outline-offset: 3px; }
 /* 改一段：正文、完成条件、下一段，标签在上、框在下（v4.3.7） */
 ${P} .dga-rt-nd-sec { margin-bottom: 20px; }
@@ -7865,11 +7914,10 @@ ${P} .dga-rt-nd-label { display: flex; align-items: center; gap: 6px; margin-bot
 ${P} textarea.dga-rt-nd-body { min-height: 120px; line-height: 1.8; }
 ${P} .dga-rt-nd-nexts { display: flex; flex-direction: column; gap: 10px; }
 ${P} .dga-rt-nd-next-top { display: flex; align-items: center; gap: 6px; }
-${P} .dga-rt-nd-go { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); color: var(--dga-text-1); font: inherit; font-weight: 600; text-align: left; cursor: pointer; }
-${P} .dga-rt-nd-go:hover { border-color: var(--dga-accent); }
+${P} .dga-rt-nd-go { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border); background: var(--dga-bg-2); color: var(--dga-text-1); font-weight: 600; }
+${P} .dga-rt-nd-go-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 ${P} .dga-rt-nd-tag { flex: 0 0 auto; padding: 0 8px; border-radius: 999px; border: 1px solid var(--dga-border-2); color: var(--dga-text-3); font-size: 11.5px; font-weight: 400; line-height: 20px; }
-${P} .dga-rt-nd-arrow { margin-left: auto; color: var(--dga-text-3); font-size: 12.5px; font-weight: 400; }
-${P} .dga-rt-nd-go:hover .dga-rt-nd-arrow { color: var(--dga-accent); }
+${P} .dga-rt-nd-next-top .dga-rt-icon { width: 30px !important; height: 30px !important; min-width: 0 !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; line-height: 1 !important; }
 ${P} .dga-rt-icon[disabled] { opacity: .3; cursor: default; }
 /* 位置和顺序 */
 ${P} .dga-rt-place-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }

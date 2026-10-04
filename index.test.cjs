@@ -1141,19 +1141,21 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     assert.equal(saved.cur, t.fork, '进度存进聊天变量');
     assert.match(documentRef.getElementById('dynamic-guide-assistant-style').textContent, /\.dga-rt-drawer \{/, '带上路线图的样式');
 
-    // 看的时候点一段：小卡片只放正文；点「改这一段」，侧边栏只有正文、完成条件、下一段。
+    // 看的时候点一段：小卡片只放正文，没有按钮；编辑时点一段，侧边栏只有正文、完成条件、下一段。
     const nodeEl = findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场'));
     nodeEl.listeners.click[0]();
     const peek = panel().querySelector('.dga-rt-peek');
     assert.ok(peek, '点一段弹出小卡片');
     assert.match(peek.textContent, /开场正文/, '卡片里是这一段的正文');
-    assert.doesNotMatch(peek.textContent, /完成条件|下一段|路口|支线/, '卡片里不放完成条件、下一段、支线');
-    findButton(peek, '改这一段').listeners.click[0]();
+    assert.doesNotMatch(peek.textContent, /完成条件|下一段|路口|支线|改这一段|从这里接着走/, '卡片里不放完成条件、下一段、支线，也没有按钮');
+    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
+    findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场')).listeners.click[0]();
     const drawer = panel().querySelector('.dga-rt-drawer');
-    assert.ok(drawer, '点「改这一段」打开侧边栏');
+    assert.ok(drawer, '编辑时点一段打开侧边栏');
     const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口)/) || ['?'])[0]);
     assert.deepEqual(labels, ['正文', '完成条件', '下一段'], '侧边栏只有正文、完成条件、下一段');
     assert.doesNotMatch(drawer.textContent, /更多|额外发|笔记|怎么走到这里/, '不再有更多、额外发的块、笔记');
+    assert.ok(!drawer.querySelector('.dga-rt-nd-go').listeners.click, '下一段那一行点了不跳');
     assert.equal(panel().querySelector('.dga-rt-peek'), null, '改的时候小卡片收起');
     assert.deepEqual(errors, []);
 });
@@ -1242,6 +1244,43 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 发给 AI �
     assert.equal(findButton(seg, '走到某几段时').getAttribute('disabled'), '', '也改不成别的发法');
     findButton(card().querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
     assert.match(card().querySelector('.dga-rt-head').textContent, /完成编辑/);
+    assert.deepEqual(errors, []);
+});
+
+test('路线图：编辑时能「放弃修改」，名字和发的内容都回到点编辑之前的样子', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
+    const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const head = () => panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head');
+    const settle = async () => { for (let i = 0; i < 10; i += 1) await new Promise(setImmediate); };
+    const saved = () => world.state.variables.character.$dynamicGuideAssistant.routes.list[0];
+    assert.doesNotMatch(head().textContent, /放弃修改/, '不在编辑时没有这个按钮');
+    findButton(head(), '编辑路线').listeners.click[0]();
+    assert.match(head().textContent, /放弃修改.*完成编辑/);
+    findButton(head(), '放弃修改').listeners.click[0]();
+    assert.ok(!panel().querySelector('.dga-rt-modal'), '什么都没改就直接退出编辑，不问');
+    assert.match(head().textContent, /编辑路线/);
+    findButton(head(), '编辑路线').listeners.click[0]();
+    head().querySelector('.dga-rt-name-input').listeners.change[0]({ target: { value: '改过的名字' } });
+    await settle();
+    assert.equal(saved().name, '改过的名字');
+    assert.ok(world.state.books.书A.some(item => item.name === '改过的名字（动态指导）'));
+    findButton(head(), '放弃修改').listeners.click[0]();
+    const modal = panel().querySelector('.dga-rt-modal');
+    assert.match(modal.textContent, /放弃这次的修改/);
+    findButton(modal, '放弃修改').listeners.click[0]();
+    await settle();
+    assert.equal(saved().name, '海边书店', '角色变量里回到原来的名字');
+    assert.ok(world.state.books.书A.some(item => item.name === '海边书店（动态指导）'), '世界书条目也改回来');
+    assert.equal(world.state.books.书A.filter(item => /（动态指导）$/.test(item.name)).length, 1, '没有多建条目');
+    assert.match(head().textContent, /编辑路线/, '退出了编辑');
     assert.deepEqual(errors, []);
 });
 
