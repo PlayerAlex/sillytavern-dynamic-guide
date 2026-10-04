@@ -1179,8 +1179,8 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场')).listeners.click[0]();
     const drawer = panel().querySelector('.dga-rt-drawer');
     assert.ok(drawer, '编辑时点一段打开侧边栏');
-    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口)/) || ['?'])[0]);
-    assert.deepEqual(labels, ['正文', '完成条件', '下一段'], '侧边栏只有正文、完成条件、下一段');
+    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|预览)/) || ['?'])[0]);
+    assert.deepEqual(labels, ['正文', '完成条件', '下一段', '预览'], '侧边栏只有正文、完成条件、下一段，最下面常驻预览');
     assert.doesNotMatch(drawer.textContent, /更多|额外发|笔记|怎么走到这里/, '不再有更多、额外发的块、笔记');
     assert.ok(!drawer.querySelector('.dga-rt-nd-go').listeners.click, '下一段那一行点了不跳');
     assert.equal(panel().querySelector('.dga-rt-peek'), null, '改的时候小卡片收起');
@@ -1265,8 +1265,9 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 资料 / �
     assert.doesNotMatch(drawer().textContent, /›/, '判断提示词右边不放跳转箭头');
     findButton(card().querySelector('.dga-rt-head'), '资料').listeners.click[0]();
     const groups = () => findAllClass(drawer(), 'dga-rt-zl-group');
-    assert.deepEqual(groups().map(node => String(node.querySelector('.dga-rt-zl-head').textContent).replace('＋ 加一张', '')), ['正文前', '正文后'], '资料分正文前 / 正文后两组');
-    assert.match(drawer().querySelector('.dga-rt-zl').textContent, /正文前.*这一段的正文.*正文后/, '中间一行是这一段的正文');
+    assert.equal(groups().length, 2, '资料分正文前 / 正文后两组');
+    assert.deepEqual(groups().map(node => String(node.querySelector('.dga-rt-zl-head').textContent)), ['＋ 加一张', '＋ 加一张'], '两组不写组名');
+    assert.match(drawer().querySelector('.dga-rt-zl').textContent, /加一张这一段的正文.*加一张/, '中间一行是这一段的正文');
     assert.equal(findAllClass(drawer(), 'dga-rt-zl-row').length, 0, '新图没有资料卡');
     findButton(groups()[1], '＋ 加一张').listeners.click[0]();
     assert.ok(drawer().querySelector('.dga-rt-zl-edit'), '加一张就进去改');
@@ -1279,12 +1280,11 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 资料 / �
     const row = findAllClass(drawer(), 'dga-rt-zl-row')[0];
     assert.match(row.textContent, /信的内容.*开场/, '一张卡一行：名字 + 在哪发');
     assert.doesNotMatch(row.textContent, /等这个夏天结束/, '内容不铺在列表里');
-    findButton(card().querySelector('.dga-rt-head'), '预览').listeners.click[0]();
-    assert.match(drawer().querySelector('.dga-rt-preview').textContent, /开场正文等这个夏天结束。/, '预览在标题栏：正文在前，正文后的资料在后');
+    assert.equal(findButton(card().querySelector('.dga-rt-head'), '预览'), null, '标题栏没有预览按钮');
     findButton(card().querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
     assert.match(card().querySelector('.dga-rt-head').textContent, /完成编辑/);
     findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场')).listeners.click[0]();
-    assert.equal(findButton(drawer(), '预览'), null, '改一段里不再放预览');
+    assert.match(drawer().querySelector('.dga-rt-nd-pv').textContent, /开场正文等这个夏天结束。/, '改一段最下面常驻预览：正文在前，正文后的资料在后');
     assert.deepEqual(errors, []);
 });
 

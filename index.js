@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.4.1';
+    const VERSION = '4.4.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2948,7 +2948,7 @@
         routeStates: {},
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {}, pvAt: {} },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {} },
     };
 
     function el(tag, attrs, ...children) {
@@ -5615,6 +5615,9 @@
             if (rows) rows.replaceChildren(renderRouteRows(route));
             restoreRouteScroll(card);
         }
+        const pv = doc.querySelector('.dga-rt-nd-pv');
+        const pvNode = pv && pv.getAttribute('data-node');
+        if (pv && route.nodes[pvNode]) pv.replaceChildren(renderRoutePreview(route, routeStateAt(route, routeStateOf(route), pvNode)));
     }
 
     function restoreRouteScroll(root) {
@@ -5829,7 +5832,6 @@
         done: [['path', { d: 'M5 12.5l4.5 4.5L19 7.5' }]],
         undo: [['path', { d: 'M9 14L4 9l5-5' }], ['path', { d: 'M4 9h10.5a5.5 5.5 0 0 1 0 11H11' }]],
         place: [['path', { d: 'M5 7h14M5 12h9M5 17h5' }], ['path', { d: 'M17 14v6M14.5 17.5L17 20l2.5-2.5' }]],
-        eye: [['path', { d: 'M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12z' }], ['circle', { cx: 12, cy: 12, r: 2.8 }]],
         cards: [['rect', { x: 4, y: 5, width: 16, height: 14, rx: 2.5 }], ['path', { d: 'M8 10h8M8 14h5' }]],
         gear: [['circle', { cx: 12, cy: 12, r: 3 }], ['path', { d: 'M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8' }]],
     };
@@ -5865,7 +5867,6 @@
                         : routeHeadBtn('edit', '编辑路线', () => { enterRouteEdit(route); render(); }),
                     panelBtn('place', 'place', '位置和顺序'),
                     panelBtn('cards', 'cards', '资料'),
-                    panelBtn('preview', 'eye', '预览'),
                     panelBtn('settings', 'gear', '设置'))),
             el('div', { class: 'dga-rt-graph-slot' }, renderRouteGraph(route), routeZoomFloat(route)),
             el('div', { class: 'dga-rt-legend' },
@@ -6275,7 +6276,7 @@
         const state = classifyRoute(route, routeStateOf(route))[id] || 'open';
         const STATE_TEXT = { cur: '现在在这', past: '走过了', open: '还没走到', dead: '这次走不到了' };
         const phone = typeof hostWindow.matchMedia === 'function' && hostWindow.matchMedia('(max-width: 700px)').matches;
-        return el('div', { class: `dga-rt-peek${phone ? ' is-sheet' : ''}`, role: 'dialog', 'data-node': id, style: `--cc:${side ? side.color : ROUTE_MAIN_COLOR}` },
+        return el('div', { class: `dga-rt-peek${phone ? ' is-phone' : ''}`, role: 'dialog', 'data-node': id, style: `--cc:${side ? side.color : ROUTE_MAIN_COLOR}` },
             el('div', { class: 'dga-rt-peek-top' },
                 el('i'),
                 el('span', { text: side ? `支线 · ${side.name}` : '主线' }),
@@ -6288,7 +6289,7 @@
     // 电脑上贴在这一段右边，放不下放左边，再放不下放下面。位置按面板算。
     function placeRoutePeek(shell) {
         const box = shell && typeof shell.querySelector === 'function' ? shell.querySelector('.dga-rt-peek') : null;
-        if (!box || box.classList.contains('is-sheet') || typeof box.getBoundingClientRect !== 'function') return;
+        if (!box || typeof box.getBoundingClientRect !== 'function') return;
         const target = shell.querySelector(`.dga-rt-node[data-node="${box.getAttribute('data-node')}"]`);
         if (!target) return;
         target.classList.add('is-peek');
@@ -6297,6 +6298,14 @@
         const w = box.offsetWidth;
         const h = box.offsetHeight;
         const gap = 12;
+        // 手机上卡片和屏幕一样宽（左右各留一点），贴在这一段下面；下面放不下就放上面（v4.4.2，原来从屏幕最底下出来，离段太远）。
+        if (box.classList.contains('is-phone')) {
+            let top = r.bottom - s.top + gap;
+            if (top + h > s.height - gap && r.top - s.top - h - gap >= gap) top = r.top - s.top - h - gap;
+            box.style.left = `${gap}px`;
+            box.style.top = `${Math.max(gap, Math.min(top, s.height - h - gap))}px`;
+            return;
+        }
         let left = r.right - s.left + gap;
         let top = r.top - s.top - 10;
         if (left + w > s.width - gap) left = r.left - s.left - w - gap;
@@ -6599,7 +6608,7 @@
             ], bodyKids, null, close);
         }
         // 这一段：只有正文、完成条件、下一段（v4.3.7 用户定）。往后接一段、挂支线在图上点「＋」；
-        // 资料卡在标题栏「资料」里管，不在这里列；发出去的样子看标题栏「预览」。
+        // 资料卡在标题栏「资料」里管，不在这里列；最下面常驻「预览」：走到这一段时发出去的样子。
         const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
             const to = index + delta;
@@ -6640,6 +6649,7 @@
                     : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
                 isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
                     rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
+            sec('预览', routeNodePreview(route, id)),
         ];
         return routeDrawerShell(route, color, [
             crumb,
@@ -6649,9 +6659,8 @@
 
     function renderRoutePanelDrawer(route, key) {
         const close = () => { ui.rt.panel[route.id] = ''; render(); };
-        const title = { place: '位置和顺序', cards: '资料', preview: '预览', settings: '设置' }[key] || '';
-        const body = key === 'place' ? renderRoutePlacement(route)
-            : (key === 'settings' ? renderRouteSettings(route) : (key === 'preview' ? renderRoutePreviewPanel(route) : renderRouteCardsPanel(route)));
+        const title = { place: '位置和顺序', cards: '资料', settings: '设置' }[key] || '';
+        const body = key === 'place' ? renderRoutePlacement(route) : (key === 'settings' ? renderRouteSettings(route) : renderRouteCardsPanel(route));
         return routeDrawerShell(route, ROUTE_MAIN_COLOR, [
             el('div', { class: 'dga-rt-crumb' },
                 el('span', { class: 'dga-rt-dot', style: `--cc:${ROUTE_MAIN_COLOR}` }),
@@ -6661,7 +6670,7 @@
                 ? el('div', { class: 'dga-rt-drawer-title dga-tip-host' }, title, infoTip(`cards-${route.id}`, [
                     ['资料是什么', '写给 AI 看的补充内容，比如写作风格、一封信写了什么。每张卡起个名字，好找。'],
                     ['在哪发', '「每段都发」不管走到哪都发；「只在某几段发」只有走到勾上的段才发。'],
-                    ['放在正文前 / 正文后', '列表就是发出去的先后：上面「正文前」的资料，中间是这一段的正文，下面「正文后」的资料。用 ↑ ↓ 挪，挪过中间那一行就换到另一边。想看真正发出去的样子，点标题栏的「预览」。'],
+                    ['放在正文前 / 正文后', '列表就是发出去的先后：中间那一行是这一段的正文，它上面的资料在正文前面发，下面的在正文后面发。用 ↑ ↓ 挪，挪过中间那一行就换到另一边。想看真正发出去的样子，编辑时点一段，侧边栏最下面就是。'],
                 ]))
                 : el('div', { class: 'dga-rt-drawer-title', text: title }),
         ], [body], null, close, key === 'place');
@@ -6818,17 +6827,18 @@
                     el('button', { type: 'button', class: 'dga-rt-icon', title: card.at === 'before' && index === list.length - 1 ? '挪到正文后' : '往下挪', disabled: card.at === 'after' && index === list.length - 1, onclick: stop(() => move(card, 1)) }, '↓')),
                 el('span', { class: 'dga-rt-zl-caret', text: '›' }));
         };
-        const group = (at, label) => {
+        // 两组不写组名（v4.4.2 用户删的），中间那一行「这一段的正文」就把前后分开了。
+        const group = at => {
             const list = route.cards.filter(card => card.at === at);
             return el('div', { class: 'dga-rt-zl-group' },
-                el('div', { class: 'dga-rt-zl-head' }, el('span', { text: label }),
+                el('div', { class: 'dga-rt-zl-head' },
                     el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: () => add(at) }, '＋ 加一张')),
                 list.length ? el('div', { class: 'dga-rt-zl-list' }, ...list.map(row)) : null);
         };
         return el('div', { class: 'dga-rt-zl' },
-            group('before', '正文前'),
+            group('before'),
             el('div', { class: 'dga-rt-zl-body' }, el('span', { text: '这一段的正文' }), route.sides.length ? el('small', { text: '和在走的支线' }) : null),
-            group('after', '正文后'));
+            group('after'));
     }
 
     function renderRouteCardEdit(route, card) {
@@ -6890,17 +6900,9 @@
         return box;
     }
 
-    // 标题栏「预览」（v4.4.1 用户要从改一段里拿出来）：默认看现在发出去的；下拉选「走到某一段时」的样子。
-    function renderRoutePreviewPanel(route) {
-        const state = routeStateOf(route);
-        const at = route.nodes[ui.rt.pvAt[route.id]] ? ui.rt.pvAt[route.id] : '';
-        const cur = route.nodes[state.cur];
-        const options = [['', state.ended ? '现在（走完了）' : `现在（${cur ? cur.name : ''}）`]]
-            .concat(routeOrderedNodes(route, route.root, '').map(node => [node.id, `走到「${node.name}」时`]))
-            .concat(...route.sides.map(side => routeOrderedNodes(route, side.root, side.id).map(node => [node.id, `走到「${side.name} · ${node.name}」时`])));
-        return el('div', { class: 'dga-rt-pv-panel' },
-            rtSelect(options, at, value => { ui.rt.pvAt[route.id] = value; render(); }),
-            renderRoutePreview(route, at ? routeStateAt(route, state, at) : state));
+    // 改一段侧边栏最下面常驻的「预览」（v4.4.2 用户定位置）：走到这一段时真正发出去的字，改正文时跟着变。
+    function routeNodePreview(route, id) {
+        return el('div', { class: 'dga-rt-nd-pv', 'data-node': id }, renderRoutePreview(route, routeStateAt(route, routeStateOf(route), id)));
     }
 
     // ---------------------------------------------------------------
@@ -7813,7 +7815,7 @@ ${P} .dga-rt-ni-list { display: flex; flex-direction: column; gap: 4px; }
 /* 看的时候点一段：贴在段旁边的小卡片，只放正文（v4.3.7） */
 ${P} .dga-rt-peek { position: absolute; z-index: 45; width: min(340px, calc(100% - 24px)); max-height: calc(100% - 24px); display: flex; flex-direction: column; border-radius: 16px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-1); box-shadow: 0 16px 48px rgba(0, 0, 0, .55); animation: dga-rt-pk .12s ease-out; }
 @keyframes dga-rt-pk { from { opacity: 0; transform: translateY(4px); } }
-${P} .dga-rt-peek.is-sheet { left: 0; right: 0; bottom: 0; top: auto; width: auto; max-height: 75%; border-radius: 18px 18px 0 0; }
+${P} .dga-rt-peek.is-phone { right: 12px; width: auto; max-height: 50%; }
 ${P} .dga-rt-peek-top { display: flex; align-items: center; gap: 8px; padding: 12px 16px 0; color: var(--dga-text-3); font-size: 12px; }
 ${P} .dga-rt-peek-top i { width: 8px; height: 8px; border-radius: 50%; background: var(--cc); }
 ${P} .dga-rt-peek-state.is-cur { color: var(--dga-accent); }
@@ -7859,7 +7861,7 @@ ${P} .dga-rt-slot { display: block; width: 100%; height: 6px; margin: 1px 0; pad
 ${P} .dga-rt-slot:hover { height: 22px; background: color-mix(in srgb, var(--dga-accent) 14%, transparent); color: var(--dga-accent); outline: 1px dashed color-mix(in srgb, var(--dga-accent) 60%, transparent); }
 /* 资料（v4.4）：两组，每张卡一行 */
 ${P} .dga-rt-zl-group + .dga-rt-zl-group { margin-top: 20px; }
-${P} .dga-rt-zl-head { display: flex; align-items: center; gap: 8px; margin: 0 2px 8px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
+${P} .dga-rt-zl-head { display: flex; align-items: center; justify-content: flex-end; margin: 0 2px 8px; }
 ${P} .dga-rt-zl-add { margin-left: auto; font-size: 12.5px; font-weight: 600; }
 ${P} .dga-rt-zl-list { border-radius: var(--dga-radius-md); background: var(--dga-bg-2); overflow: hidden; }
 ${P} .dga-rt-zl-row { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 12px; cursor: pointer; }
@@ -7883,7 +7885,7 @@ ${P} .dga-rt-zl-edit .dga-rt-pickset { margin-top: 12px; }
 ${P} .dga-rt-pickset { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-rt-pick-line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: start; }
 ${P} .dga-rt-pick-label { padding-top: 3px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-${P} .dga-rt-pv-panel { display: flex; flex-direction: column; gap: 12px; }
+${P} .dga-rt-nd-pv .dga-rt-preview { min-height: 0; }
 ${P} .dga-rt-preview { min-height: 200px; padding: 10px 12px; border-radius: var(--dga-radius-sm); background: var(--dga-bg-0); border: 1px solid var(--dga-border); color: var(--dga-text-1); font-size: 12.5px; line-height: 1.8; white-space: pre-wrap; }
 ${P} .dga-rt-fill { background: color-mix(in srgb, var(--cc) 16%, transparent); border-bottom: 1px solid var(--cc); border-radius: 3px; }
 ${P} .dga-rt-fill-empty { color: var(--dga-text-3); font-style: italic; }
@@ -7902,6 +7904,19 @@ ${P} .dga-rt-pv-gap { height: 14px; }
     /* 手机上路线图区域跟着图的高度走，底下只留一条放缩放；「主线」后面不留固定宽度（v4.0.1） */
     ${P} .dga-rt-single .dga-rt-graph-wrap { min-height: 0; padding-bottom: 46px; }
     ${P} .dga-rt-rows .dga-rt-line { min-width: 0; }
+    /* 手机上标题栏按钮排成一排小工具条：图标在上、字在下，几个按钮一样宽，不再挤成两行大胶囊（v4.4.2） */
+    ${P} .dga-rt-head { padding: 10px 12px; }
+    ${P} .dga-rt-name-input { width: 100%; }
+    ${P} .dga-rt-tools, ${P} .dga-rt-single .dga-rt-tools { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 6px; width: 100%; margin-left: 0; }
+    ${P} .dga-rt-hbtn { flex-direction: column; justify-content: center; gap: 3px; height: auto; min-width: 0; padding: 7px 0 6px; border-radius: 12px; font-size: 11px; letter-spacing: -.2px; }
+    ${P} .dga-rt-hbtn span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+    ${P} .dga-rt-hbtn svg { width: 17px; height: 17px; }
+    /* 图例小一号；主线 / 支线那几行：名字、现在在哪、上一段 / 下一段排在同一行 */
+    ${P} .dga-rt-legend { gap: 2px 12px; padding: 6px 12px; font-size: 11px; }
+    ${P} .dga-rt-rows .dga-rt-row { flex-wrap: nowrap; gap: 8px; padding: 8px 12px; }
+    ${P} .dga-rt-now { flex: 1 1 auto; }
+    ${P} .dga-rt-now > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    ${P} .dga-rt-acts .dga-btn { height: 30px; min-height: 30px; padding: 0 12px; font-size: 12.5px; }
 }
 /* 触屏上手指拖得动，路线图底下不显示那条滚动条 */
 @media (hover: none) {
