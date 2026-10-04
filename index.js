@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.4.0';
+    const VERSION = '4.4.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2948,7 +2948,7 @@
         routeStates: {},
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {} },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {}, pvAt: {} },
     };
 
     function el(tag, attrs, ...children) {
@@ -4286,43 +4286,41 @@
             text: String(card.text || ''),
             when: card.when === 'nodes' ? 'nodes' : 'always',
             nodes: card.when === 'nodes' && Array.isArray(card.nodes) ? Array.from(new Set(card.nodes.map(String))) : [],
+            // 放在正文前还是正文后（v4.4.1）：before / after。
+            at: card.at === 'after' ? 'after' : 'before',
         };
     }
 
     // 旧的分块模板换成资料卡：格子拿掉（段的正文、支线现在自动发）；格子前面的小标题（「现在的剧情：」）拿掉，
     // 长的、带着要求的（「夏日祭这条线（不要写得太直白）：」）留下、去掉末尾冒号。
+    // 第一个「主线当前段」格子之前的字放正文前，之后的放正文后（同一块里格子后面还有字，就拆成两张）。
     // 什么都不剩的块不要了。「某条支线在走时发」= 走到这条支线里任何一段时发。
     function routeCardsFromBlocks(blocks, route) {
         const isLabel = line => /[：:]$/.test(line);
         const short = line => line.replace(/^\d+[.、．]\s*/, '').length <= 12;
+        const unlabel = entry => {
+            if (short(entry.text.trim())) return false;
+            entry.text = entry.text.replace(/[：:]\s*$/, '');
+            return true;
+        };
         const cards = [];
+        let after = false;
         (Array.isArray(blocks) ? blocks : []).forEach(item => {
             const block = item && typeof item === 'object' ? item : {};
-            const lines = String(block.text || '').split('\n');
-            const keep = [];
-            const unlabel = entry => {
-                const text = entry.text.trim();
-                if (short(text)) return false;
-                entry.text = entry.text.replace(/[：:]\s*$/, '');
-                return true;
-            };
-            lines.forEach((line, index) => {
-                const hasTok = (line.match(ROUTE_TOKEN_RE) || []).length > 0;
+            const parts = { before: [], after: [] };
+            String(block.text || '').split('\n').forEach((line, index) => {
+                const keep = parts[after ? 'after' : 'before'];
+                const toks = line.match(ROUTE_TOKEN_RE) || [];
                 const rest = line.replace(ROUTE_TOKEN_RE, '').trim();
-                if (hasTok && !rest) {
+                if (toks.length && !rest) {
                     const prev = keep[keep.length - 1];
                     if (prev && prev.index === index - 1 && isLabel(prev.text.trim()) && !unlabel(prev)) keep.pop();
-                    return;
-                }
-                if (hasTok && isLabel(rest)) {
+                } else if (toks.length && isLabel(rest)) {
                     const entry = { index, text: rest };
                     if (unlabel(entry)) keep.push(entry);
-                    return;
-                }
-                keep.push({ index, text: line.replace(ROUTE_TOKEN_RE, '') });
+                } else keep.push({ index, text: line.replace(ROUTE_TOKEN_RE, '') });
+                if (toks.includes('⟦main⟧')) after = true;
             });
-            const text = keep.map(item => item.text).join('\n').replace(/\n{3,}/g, '\n\n').trim();
-            if (!text) return;
             let when = 'always';
             let nodes = [];
             if (block.when === 'nodes') {
@@ -4333,10 +4331,15 @@
                 const sideId = String(block.when).slice(5);
                 nodes = Object.values(route.nodes).filter(node => node.side === sideId).map(node => node.id);
             }
-            const head = text.split('\n')[0].replace(/^\d+[.、．]\s*/, '');
-            const cut = head.search(/[：:（(]/);
-            const name = cut > 0 && cut <= 12 ? head.slice(0, cut) : (head.length > 12 ? `${head.slice(0, 12)}…` : head);
-            cards.push(normalizeRouteCard({ id: block.id, name, text, when, nodes }));
+            ['before', 'after'].forEach(at => {
+                const text = parts[at].map(entry => entry.text).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+                if (!text) return;
+                const head = text.split('\n')[0].replace(/^\d+[.、．]\s*/, '');
+                const cut = head.search(/[：:（(]/);
+                const name = cut > 0 && cut <= 12 ? head.slice(0, cut) : (head.length > 12 ? `${head.slice(0, 12)}…` : head);
+                const id = at === 'after' && parts.before.length ? `${block.id || ''}b` : block.id;
+                cards.push(normalizeRouteCard({ id, name, text, when, nodes, at }));
+            });
         });
         return cards;
     }
@@ -4403,8 +4406,6 @@
             route.cards = routeCardsFromBlocks(src.blocks, route);
             route.legacyBlocks = cloneData(src.blocks);
         }
-        // 「每段都发」一组在前、「只在某几段发」在后，发出去也是这个先后。
-        route.cards = route.cards.filter(card => card.when === 'always').concat(route.cards.filter(card => card.when === 'nodes'));
         return cleanupRoute(route);
     }
 
@@ -4754,19 +4755,20 @@
         return routeLiveNodes(route, state).some(id => card.nodes.includes(id));
     }
 
-    // 发出去的几样东西，按先后：在发的资料卡 → 主线这一段的正文 → 在走的支线（「支线名：正文」）。空的不发。
+    // 发出去的几样东西，按先后：「正文前」的资料卡 → 主线这一段的正文 → 在走的支线（「支线名：正文」）→ 「正文后」的资料卡。
+    // 资料卡在各自那一组里从上到下排；空的不发。
     function routeSendParts(route, state) {
         if (state.ended) return [];
-        const parts = route.cards.filter(card => card.when === 'always').concat(route.cards.filter(card => card.when === 'nodes'))
-            .filter(card => routeCardActive(route, state, card) && card.text.trim())
+        const cards = at => route.cards.filter(card => (card.at === 'after' ? 'after' : 'before') === at && routeCardActive(route, state, card) && card.text.trim())
             .map(card => ({ kind: 'card', card, text: card.text.trim() }));
+        const parts = cards('before');
         const main = String((route.nodes[state.cur] || {}).content || '').trim();
         if (main) parts.push({ kind: 'main', text: main, color: ROUTE_MAIN_COLOR });
         routeRunningSides(route, state).forEach(side => {
             const text = String((route.nodes[routeSideState(route, state, side.id).cur] || {}).content || '').trim();
             if (text) parts.push({ kind: 'side', side, label: `${side.name}：`, text, color: side.color });
         });
-        return parts;
+        return parts.concat(cards('after'));
     }
 
     function composeRoute(route, state) {
@@ -5827,6 +5829,7 @@
         done: [['path', { d: 'M5 12.5l4.5 4.5L19 7.5' }]],
         undo: [['path', { d: 'M9 14L4 9l5-5' }], ['path', { d: 'M4 9h10.5a5.5 5.5 0 0 1 0 11H11' }]],
         place: [['path', { d: 'M5 7h14M5 12h9M5 17h5' }], ['path', { d: 'M17 14v6M14.5 17.5L17 20l2.5-2.5' }]],
+        eye: [['path', { d: 'M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12z' }], ['circle', { cx: 12, cy: 12, r: 2.8 }]],
         cards: [['rect', { x: 4, y: 5, width: 16, height: 14, rx: 2.5 }], ['path', { d: 'M8 10h8M8 14h5' }]],
         gear: [['circle', { cx: 12, cy: 12, r: 3 }], ['path', { d: 'M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8' }]],
     };
@@ -5862,6 +5865,7 @@
                         : routeHeadBtn('edit', '编辑路线', () => { enterRouteEdit(route); render(); }),
                     panelBtn('place', 'place', '位置和顺序'),
                     panelBtn('cards', 'cards', '资料'),
+                    panelBtn('preview', 'eye', '预览'),
                     panelBtn('settings', 'gear', '设置'))),
             el('div', { class: 'dga-rt-graph-slot' }, renderRouteGraph(route), routeZoomFloat(route)),
             el('div', { class: 'dga-rt-legend' },
@@ -6595,7 +6599,7 @@
             ], bodyKids, null, close);
         }
         // 这一段：只有正文、完成条件、下一段（v4.3.7 用户定）。往后接一段、挂支线在图上点「＋」；
-        // 资料卡在标题栏「资料」里管，不在这里列。最下面「预览」看走到这一段时发出去的样子（v4.4 用户要的）。
+        // 资料卡在标题栏「资料」里管，不在这里列；发出去的样子看标题栏「预览」。
         const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
             const to = index + delta;
@@ -6636,7 +6640,6 @@
                     : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
                 isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
                     rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
-            el('div', { class: 'dga-rt-nd-sec' }, rtBtn('预览', () => routePreviewDialog(route, id), 'small')),
         ];
         return routeDrawerShell(route, color, [
             crumb,
@@ -6646,8 +6649,9 @@
 
     function renderRoutePanelDrawer(route, key) {
         const close = () => { ui.rt.panel[route.id] = ''; render(); };
-        const title = { place: '位置和顺序', cards: '资料', settings: '设置' }[key] || '';
-        const body = key === 'place' ? renderRoutePlacement(route) : (key === 'settings' ? renderRouteSettings(route) : renderRouteCardsPanel(route));
+        const title = { place: '位置和顺序', cards: '资料', preview: '预览', settings: '设置' }[key] || '';
+        const body = key === 'place' ? renderRoutePlacement(route)
+            : (key === 'settings' ? renderRouteSettings(route) : (key === 'preview' ? renderRoutePreviewPanel(route) : renderRouteCardsPanel(route)));
         return routeDrawerShell(route, ROUTE_MAIN_COLOR, [
             el('div', { class: 'dga-rt-crumb' },
                 el('span', { class: 'dga-rt-dot', style: `--cc:${ROUTE_MAIN_COLOR}` }),
@@ -6657,7 +6661,7 @@
                 ? el('div', { class: 'dga-rt-drawer-title dga-tip-host' }, title, infoTip(`cards-${route.id}`, [
                     ['资料是什么', '写给 AI 看的补充内容，比如写作风格、一封信写了什么。每张卡起个名字，好找。'],
                     ['在哪发', '「每段都发」不管走到哪都发；「只在某几段发」只有走到勾上的段才发。'],
-                    ['发出去的先后', '先发「每段都发」，再发「只在某几段发」，最后是这一段的正文和在走的支线。想看真正发出去的样子，编辑时点一段，点「预览」。'],
+                    ['放在正文前 / 正文后', '列表就是发出去的先后：上面「正文前」的资料，中间是这一段的正文，下面「正文后」的资料。用 ↑ ↓ 挪，挪过中间那一行就换到另一边。想看真正发出去的样子，点标题栏的「预览」。'],
                 ]))
                 : el('div', { class: 'dga-rt-drawer-title', text: title }),
         ], [body], null, close, key === 'place');
@@ -6752,7 +6756,8 @@
     }
 
     // ---- 资料（v4.4）：「发给 AI 的内容」拆开以后，只在某几段发的、每段都发的话都放这里 ----
-    // 列表每张卡一行：名字 + 在哪发；分「每段都发」「只在某几段发」两组，发出去也是这个先后。点一行进去改。
+    // 列表照发出去的先后排（v4.4.1）：「正文前」一组 → 中间一行「这一段的正文」→「正文后」一组。
+    // 每张卡一行：名字 + 在哪发（每段都发 / 哪几段）。上下挪就是改先后，挪过「正文」那一行就换到另一边。点一行进去改。
 
     function routeCardWhere(route, card) {
         if (card.when === 'always') return '每段都发';
@@ -6767,47 +6772,63 @@
         return open ? renderRouteCardEdit(route, open) : renderRouteCardList(route);
     }
 
+    // 把一张卡放到 at 那一组的最前 / 最后（first = true 放最前）。
+    function routePutCard(route, card, at, first) {
+        route.cards = route.cards.filter(item => item !== card);
+        card.at = at;
+        const same = route.cards.filter(item => item.at === at);
+        const anchor = first ? same[0] : same[same.length - 1];
+        const index = anchor ? route.cards.indexOf(anchor) + (first ? 0 : 1) : (at === 'before' ? 0 : route.cards.length);
+        route.cards.splice(index, 0, card);
+    }
+
     function renderRouteCardList(route) {
         const state = routeStateOf(route);
-        const add = when => {
-            const card = normalizeRouteCard({ when, nodes: when === 'nodes' && !state.ended ? [state.cur] : [] });
-            const at = when === 'always' ? route.cards.filter(item => item.when === 'always').length : route.cards.length;
-            route.cards.splice(at, 0, card);
+        const stop = fn => event => { event.stopPropagation(); fn(); };
+        const changed = () => { routeEdited(route, true); render(); };
+        const add = at => {
+            const card = normalizeRouteCard({ at });
+            routePutCard(route, card, at, false);
             ui.rt.card[route.id] = card.id;
-            routeEdited(route, true);
-            render();
+            changed();
         };
-        const group = (when, label) => {
-            const list = route.cards.filter(card => card.when === when);
-            const move = (card, delta) => {
-                const other = list[list.indexOf(card) + delta];
-                if (!other) return;
+        const move = (card, delta) => {
+            const list = route.cards.filter(item => item.at === card.at);
+            const other = list[list.indexOf(card) + delta];
+            if (other) {
                 const from = route.cards.indexOf(card);
                 const to = route.cards.indexOf(other);
                 route.cards[from] = other;
                 route.cards[to] = card;
-                routeEdited(route, true);
-                render();
-            };
-            const stop = fn => event => { event.stopPropagation(); fn(); };
+            } else if (card.at === 'before' && delta > 0) routePutCard(route, card, 'after', true);
+            else if (card.at === 'after' && delta < 0) routePutCard(route, card, 'before', false);
+            else return;
+            changed();
+        };
+        const row = card => {
+            const on = routeCardActive(route, state, card) && card.text.trim();
+            const list = route.cards.filter(item => item.at === card.at);
+            const index = list.indexOf(card);
+            return el('div', { class: 'dga-rt-zl-row', title: '点开来改', onclick: () => { ui.rt.card[route.id] = card.id; render(); } },
+                el('span', { class: `dga-rt-zl-dot${on ? ' is-on' : ''}`, title: on ? '现在在发' : '现在不发' }),
+                el('span', { class: `dga-rt-zl-name${card.name ? '' : ' is-none'}`, text: card.name || '没起名' }),
+                el('span', { class: 'dga-rt-zl-where', text: routeCardWhere(route, card) }),
+                el('span', { class: 'dga-rt-zl-ops' },
+                    el('button', { type: 'button', class: 'dga-rt-icon', title: card.at === 'after' && index === 0 ? '挪到正文前' : '往上挪', disabled: card.at === 'before' && index === 0, onclick: stop(() => move(card, -1)) }, '↑'),
+                    el('button', { type: 'button', class: 'dga-rt-icon', title: card.at === 'before' && index === list.length - 1 ? '挪到正文后' : '往下挪', disabled: card.at === 'after' && index === list.length - 1, onclick: stop(() => move(card, 1)) }, '↓')),
+                el('span', { class: 'dga-rt-zl-caret', text: '›' }));
+        };
+        const group = (at, label) => {
+            const list = route.cards.filter(card => card.at === at);
             return el('div', { class: 'dga-rt-zl-group' },
                 el('div', { class: 'dga-rt-zl-head' }, el('span', { text: label }),
-                    el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: () => add(when) }, '＋ 加一张')),
-                list.length ? el('div', { class: 'dga-rt-zl-list' }, ...list.map((card, index) => {
-                    const on = routeCardActive(route, state, card) && card.text.trim();
-                    return el('div', { class: 'dga-rt-zl-row', title: '点开来改', onclick: () => { ui.rt.card[route.id] = card.id; render(); } },
-                        el('span', { class: `dga-rt-zl-dot${on ? ' is-on' : ''}`, title: on ? '现在在发' : '现在不发' }),
-                        el('span', { class: `dga-rt-zl-name${card.name ? '' : ' is-none'}`, text: card.name || '没起名' }),
-                        card.when === 'nodes' ? el('span', { class: 'dga-rt-zl-where', text: routeCardWhere(route, card) }) : null,
-                        el('span', { class: 'dga-rt-zl-ops' },
-                            el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: stop(() => move(card, -1)) }, '↑'),
-                            el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === list.length - 1, onclick: stop(() => move(card, 1)) }, '↓')),
-                        el('span', { class: 'dga-rt-zl-caret', text: '›' }));
-                })) : null);
+                    el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: () => add(at) }, '＋ 加一张')),
+                list.length ? el('div', { class: 'dga-rt-zl-list' }, ...list.map(row)) : null);
         };
         return el('div', { class: 'dga-rt-zl' },
-            group('always', '每段都发'),
-            group('nodes', '只在某几段发'));
+            group('before', '正文前'),
+            el('div', { class: 'dga-rt-zl-body' }, el('span', { text: '这一段的正文' }), route.sides.length ? el('small', { text: '和在走的支线' }) : null),
+            group('after', '正文后'));
     }
 
     function renderRouteCardEdit(route, card) {
@@ -6827,13 +6848,18 @@
             el('button', { type: 'button', class: 'dga-rt-link dga-rt-back', onclick: () => { ui.rt.card[route.id] = ''; render(); } }, '‹ 资料'),
             sec('名字', el('input', { type: 'text', class: 'dga-rt-mt dga-rt-zl-name-in', value: card.name, placeholder: '比如：信的内容', oninput: event => { card.name = oneLine(event.target.value); scheduleRouteSave(600); } })),
             sec('内容', el('textarea', { class: 'dga-rt-nd-body dga-rt-zl-text', placeholder: '写给 AI 看的', oninput: event => { card.text = event.target.value; live(); } }, card.text)),
+            sec('放在', rtSeg([['before', '正文前'], ['after', '正文后']], card.at, value => {
+                // 换到另一边：放在那一组的最后。
+                routePutCard(route, card, value, false);
+                routeEdited(route, true);
+                render();
+            })),
             sec('在哪发',
                 rtSeg([['always', '每段都发'], ['nodes', '只在某几段发']], card.when, value => {
                     card.when = value;
-                    // 换组：挪到那一组的最后，先后跟着组走。
-                    route.cards = route.cards.filter(item => item !== card);
-                    const at = value === 'always' ? route.cards.filter(item => item.when === 'always').length : route.cards.length;
-                    route.cards.splice(at, 0, card);
+                    // 刚换成「只在某几段发」、一段都没勾：先勾上现在这一段。
+                    const state = routeStateOf(route);
+                    if (value === 'nodes' && !card.nodes.length && !state.ended) card.nodes = [state.cur];
                     routeEdited(route, true);
                     render();
                 }),
@@ -6864,12 +6890,17 @@
         return box;
     }
 
-    function routePreviewDialog(route, id) {
-        const node = route.nodes[id];
-        if (!node) return;
-        openRouteModal(`走到「${node.name}」时发出去的`, renderRoutePreview(route, routeStateAt(route, routeStateOf(route), id)), [
-            rtBtn('关上', closeRouteModal, 'primary'),
-        ], 'dga-rt-pv-modal');
+    // 标题栏「预览」（v4.4.1 用户要从改一段里拿出来）：默认看现在发出去的；下拉选「走到某一段时」的样子。
+    function renderRoutePreviewPanel(route) {
+        const state = routeStateOf(route);
+        const at = route.nodes[ui.rt.pvAt[route.id]] ? ui.rt.pvAt[route.id] : '';
+        const cur = route.nodes[state.cur];
+        const options = [['', state.ended ? '现在（走完了）' : `现在（${cur ? cur.name : ''}）`]]
+            .concat(routeOrderedNodes(route, route.root, '').map(node => [node.id, `走到「${node.name}」时`]))
+            .concat(...route.sides.map(side => routeOrderedNodes(route, side.root, side.id).map(node => [node.id, `走到「${side.name} · ${node.name}」时`])));
+        return el('div', { class: 'dga-rt-pv-panel' },
+            rtSelect(options, at, value => { ui.rt.pvAt[route.id] = value; render(); }),
+            renderRoutePreview(route, at ? routeStateAt(route, state, at) : state));
     }
 
     // ---------------------------------------------------------------
@@ -7844,12 +7875,15 @@ ${P} .dga-rt-zl-row:hover .dga-rt-zl-ops { opacity: 1; }
 ${P} .dga-rt-zl-ops .dga-rt-icon { width: 24px; height: 24px; }
 ${P} .dga-rt-zl-caret { color: var(--dga-text-3); font-size: 16px; }
 ${P} .dga-rt-zl-edit .dga-rt-back { margin: 0 0 14px; }
+${P} .dga-rt-zl-body { display: flex; align-items: baseline; gap: 8px; margin: 14px 0; padding: 10px 14px; border-radius: var(--dga-radius-md); border: 1px dashed color-mix(in srgb, var(--dga-accent) 55%, transparent); background: color-mix(in srgb, var(--dga-accent) 7%, transparent); color: var(--dga-accent); font-size: 13px; font-weight: 600; }
+${P} .dga-rt-zl-body small { color: var(--dga-text-3); font-size: 12px; font-weight: 400; }
+${P} .dga-rt-zl-body + .dga-rt-zl-group { margin-top: 0; }
 ${P} .dga-rt-zl-edit .dga-rt-pickset { margin-top: 12px; }
 @media (hover: none) { ${P} .dga-rt-zl-ops { opacity: 1; } ${P} .dga-rt-slot { height: 22px; color: var(--dga-text-3); outline: 1px dashed var(--dga-border-2); } }
 ${P} .dga-rt-pickset { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-rt-pick-line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: start; }
 ${P} .dga-rt-pick-label { padding-top: 3px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-${P} .dga-rt-modal.dga-rt-pv-modal { width: min(560px, 100%); }
+${P} .dga-rt-pv-panel { display: flex; flex-direction: column; gap: 12px; }
 ${P} .dga-rt-preview { min-height: 200px; padding: 10px 12px; border-radius: var(--dga-radius-sm); background: var(--dga-bg-0); border: 1px solid var(--dga-border); color: var(--dga-text-1); font-size: 12.5px; line-height: 1.8; white-space: pre-wrap; }
 ${P} .dga-rt-fill { background: color-mix(in srgb, var(--cc) 16%, transparent); border-bottom: 1px solid var(--cc); border-radius: 3px; }
 ${P} .dga-rt-fill-empty { color: var(--dga-text-3); font-style: italic; }
