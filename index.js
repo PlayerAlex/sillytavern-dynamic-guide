@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.8';
+    const VERSION = '4.3.9';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -7739,8 +7739,8 @@ ${P} .dga-rt-graph-wrap { position: relative; display: flex; overflow: auto; bac
 ${P} .dga-rt-graph-wrap::-webkit-scrollbar { height: 8px; width: 8px; }
 ${P} .dga-rt-graph-wrap::-webkit-scrollbar-track { background: #1A1B1E; }
 ${P} .dga-rt-graph-wrap::-webkit-scrollbar-thumb { background: var(--dga-border-2); border-radius: 4px; }
-/* 图比框小时站在正中间；比框大时照常从左上角开始滚（auto 外边距放不下时就是 0，不会被裁掉）。 */
-${P} .dga-rt-sizer { position: relative; flex: 0 0 auto; margin: auto; }
+/* 图比框矮时上下居中、靠左放；比框大时照常从左上角开始滚（auto 外边距放不下时就是 0，不会被裁掉）。 */
+${P} .dga-rt-sizer { position: relative; flex: 0 0 auto; margin: auto 0; }
 ${P} .dga-rt-graph { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 ${P} .dga-rt-svg { position: absolute; left: 0; top: 0; overflow: visible; }
 ${P} .dga-rt-ng { position: absolute; }
