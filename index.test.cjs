@@ -888,15 +888,13 @@ test('路线图：支线和主线同时走，等它、主线到了某段就结�
     const state = R.normalizeRouteState(null, t.route);
     assert.deepEqual(plain(R.offeredSides(t.route, state).map(side => side.name)), ['夏日祭'], '主线在挂支线的那段时可以开始');
     R.sideStart(t.route, state, t.side);
-    assert.equal(R.compose(t.route, state), '开场正文', '没放支线格子时，模板只发主线');
-    t.route.blocks.push({ id: 'k1', when: `side:${t.side.id}`, text: `祭典：⟦side:${t.side.id}⟧` });
-    assert.equal(R.compose(t.route, state), '开场正文\n\n祭典：邀约正文', '支线开始以后和主线一起发');
+    assert.equal(R.compose(t.route, state), '开场正文\n\n夏日祭：邀约正文', '支线开始以后自动和主线一起发，不用设');
     R.mainStep(t.route, state);
     assert.equal(state.cur, t.fork, '主线照常往下走');
     assert.equal(R.sideStep(t.route, state, t.side).kind, 'moved');
-    assert.equal(R.compose(t.route, state), '路口正文\n\n祭典：烟火正文');
+    assert.equal(R.compose(t.route, state), '路口正文\n\n夏日祭：烟火正文');
     assert.equal(R.sideStep(t.route, state, t.side).kind, 'ended', '支线走完自己的最后一段就结束');
-    assert.equal(R.compose(t.route, state), '路口正文', '支线结束以后这一块不发');
+    assert.equal(R.compose(t.route, state), '路口正文', '支线结束以后不发');
 
     const waitCase = demoRoute(R);
     waitCase.side.wait = true;
@@ -959,22 +957,53 @@ test('路线图：主线退回去，支线回到离开那一段时的样子（�
     assert.equal(back.sides[old.side.id].status, 'on', '旧存档退回去，被主线关掉的支线也回来');
 });
 
-test('路线图：分块模板一直发 / 走到某几段时发，空格子整行不发', () => {
+test('路线图：资料卡每段都发 / 只在某几段发，先资料、再正文、再支线；预览能看走到某一段时的样子', () => {
     const R = load().core.routes;
     const t = demoRoute(R);
-    t.route.blocks = [
-        { id: 'a', when: 'always', text: '写作风格：慢节奏。\n\n现在：\n⟦main⟧' },
-        { id: 'b', when: 'nodes', nodes: [t.fork], text: '信的内容：等这个夏天结束。' },
-        { id: 'c', when: 'always', text: '⟦sides⟧' },
+    t.route.cards = [
+        { id: 'b', name: '信', when: 'nodes', nodes: [t.fork], text: '信的内容：等这个夏天结束。' },
+        { id: 'a', name: '风格', when: 'always', nodes: [], text: '写作风格：慢节奏。' },
+        { id: 'c', name: '空的', when: 'always', nodes: [], text: '  ' },
+        { id: 'd', name: '烟火', when: 'nodes', nodes: [t.fireworks], text: '烟火很大。' },
     ];
     const state = R.normalizeRouteState(null, t.route);
-    assert.equal(R.compose(t.route, state), '写作风格：慢节奏。\n\n现在：\n开场正文', '支线没开始时「其余支线」那一行整行不发');
+    assert.equal(R.compose(t.route, state), '写作风格：慢节奏。\n\n开场正文', '每段都发的在前，空卡不发，没勾的段不发');
     R.mainStep(t.route, state);
-    assert.match(R.compose(t.route, state), /信的内容/, '走到选中的段才发');
-    R.sideStart(t.route, state, t.side);
-    assert.match(R.compose(t.route, state), /夏日祭：邀约正文/, '没单独放格子的支线进「其余正在走的支线」');
+    assert.equal(R.compose(t.route, state), '写作风格：慢节奏。\n\n信的内容：等这个夏天结束。\n\n路口正文', '走到勾上的段才发，排在���段都发的后面');
     R.mainGo(t.route, state, t.stay);
     assert.doesNotMatch(R.compose(t.route, state), /信的内容/, '离开那几段就不发');
+    const atFork = R.stateAt(t.route, state, t.fork);
+    assert.match(R.compose(t.route, atFork), /信的内容[\s\S]*路口正文/, '预览：主线走到那一段的样子');
+    assert.equal(state.cur, t.stay, '预览不动真的进度');
+    const atFire = R.stateAt(t.route, state, t.fireworks);
+    assert.equal(R.compose(t.route, atFire), '写作风格：慢节奏。\n\n烟火很大。\n\n留下正文\n\n夏日祭：烟火正文', '预览支线的段：主线照现在，这条支线走到那里');
+});
+
+test('路线图：旧的分块模板读进来换成资料卡——格子和只剩小标题的行拿掉，支线块换成那条支线的段', () => {
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    const raw = JSON.parse(JSON.stringify(t.route));
+    delete raw.cards;
+    raw.blocks = [
+        { id: 'ka', when: 'always', text: '写作风格：慢节奏。\n\n现在的剧情：\n⟦main⟧' },
+        { id: 'kb', when: 'nodes', nodes: [t.fork], text: '信的内容：等这个夏天结束。' },
+        { id: 'kc', when: `side:${t.side.id}`, text: `夏日祭：⟦side:${t.side.id}⟧` },
+        { id: 'kd', when: `side:${t.side.id}`, text: `祭典上不要下雨。\n⟦side:${t.side.id}⟧` },
+        { id: 'kf', when: `side:${t.side.id}`, text: `2. 夏日祭这条线（不要写得太直白，慢慢来）：\n⟦side:${t.side.id}⟧` },
+        { id: 'ke', when: 'always', text: '⟦sides⟧' },
+    ];
+    const route = R.normalizeRoute(raw);
+    const cards = plain(route.cards);
+    assert.deepEqual(cards.map(card => [card.name, card.when, card.text]), [
+        ['写作风格', 'always', '写作风格：慢节奏。'],
+        ['信的内容', 'nodes', '信的内容：等这个夏天结束。'],
+        ['祭典上不要下雨。', 'nodes', '祭典上不要下雨。'],
+        ['夏日祭这条线', 'nodes', '2. 夏日祭这条线（不要写得太直白，慢慢来）'],
+    ], '短的小标题去掉；带要求的长标题留下、去掉末尾冒号');
+    assert.deepEqual([...cards[2].nodes].sort(), [t.side.root, t.fireworks].sort(), '「支线在走时发」= 走到这条支线的段时发');
+    assert.equal(plain(route.legacyBlocks).length, 6, '旧块原样留一份');
+    const again = R.normalizeRoute(JSON.parse(JSON.stringify(route)));
+    assert.deepEqual(plain(again.cards), cards, '再读一次不会重复换算');
 });
 
 test('路线图：读回时清掉断掉的线和没用的块，顺序数字算在两条中间', () => {
@@ -987,17 +1016,13 @@ test('路线图：读回时清掉断掉的线和没用的块，顺序数字算�
             n9: { id: 'n9', name: '孤儿', next: [] },
         },
         sides: [{ id: 'sx', name: '没宿主', host: 'nope', root: 'n2' }],
-        blocks: [{ id: 'k1', when: 'side:sx', text: '⟦side:sx⟧' }, { id: 'k2', when: 'nodes', nodes: ['n2', 'gone'], text: 'x' }],
+        cards: [{ id: 'k2', name: 'x', when: 'nodes', nodes: ['n2', 'gone'], text: 'x' }],
     });
     assert.deepEqual(plain(route.nodes.n1.next), [{ to: 'n2', cond: '' }], '指向不存在的段、重复的线都去掉');
     assert.equal(route.nodes.n1.fallback, -1);
     assert.equal(route.nodes.n9, undefined, '走不到的段去掉');
     assert.equal(route.sides.length, 0, '宿主没了的支线去掉');
-    const kept = plain(route.blocks);
-    assert.equal(kept.length, 2, '支线没了，它那一块也去掉');
-    assert.deepEqual([kept[0].when, kept[0].text], ['always', '⟦main⟧'], '没有「一直发：主线当前段」那一块时补在最前面');
-    assert.equal(kept[1].id, 'k2');
-    assert.deepEqual(plain(route.blocks[1].nodes), ['n2']);
+    assert.deepEqual(plain(route.cards[0].nodes), ['n2'], '资料卡里删掉的段去掉');
     const list = [
         { uid: 1, name: '人物', placement: { pos: 'after_character_definition', depth: 4, order: 100 } },
         { uid: 2, name: '地点', placement: { pos: 'after_character_definition', depth: 4, order: 200 } },
@@ -1205,7 +1230,7 @@ test('路线图：左栏是标志、路线图列表、API / 运行日志 / 设�
     assert.deepEqual(errors, []);
 });
 
-test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 发给 AI 的内容 / 设置，往下走在设置里', async () => {
+test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 资料 / 设置，往下走在设置里', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const world = routeWorld();
     const R = load().core.routes;
@@ -1218,7 +1243,8 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 发给 AI �
     const panel = () => documentRef.getElementById(PANEL_ID);
     const card = () => panel().querySelector(`.dga-rt-card-${t.route.id}`);
     const head = card().querySelector('.dga-rt-head');
-    assert.match(head.textContent, /编辑路线.*位置和顺序.*发给 AI 的内容.*设置/);
+    assert.match(head.textContent, /编辑路线.*位置和顺序.*资料.*设置/);
+    assert.doesNotMatch(head.textContent, /发给 AI 的内容/, '「发给 AI 的内容」按钮去掉了');
     assert.doesNotMatch(card().textContent, /往下走|现在检查|上次（第/, '卡片上没有往下走那一行');
     assert.match(card().querySelector('.dga-rt-rows').textContent, /可以开始支线 · 夏日祭进入条件/, '进入条件写在支线名后面');
     assert.ok(card().querySelector('.dga-rt-zoomf'), '缩放在图的右下角');
@@ -1235,15 +1261,26 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 发给 AI �
     findButton(drawer(), '＋ 加一条').listeners.click[0]();
     assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 1, '点「加一条」多一行开始 / 结束');
     assert.doesNotMatch(drawer().textContent, /›/, '判断提示词右边不放跳转箭头');
-    findButton(card().querySelector('.dga-rt-head'), '发给 AI 的内容').listeners.click[0]();
-    const first = () => findAllClass(drawer(), 'dga-rt-blk')[0];
-    assert.match(first().textContent, /一直发/);
-    assert.ok(!findAllClass(first(), 'dga-rt-icon').some(node => node.getAttribute('title') === '删掉这一块'), '发主线当前段的那一块没有删除');
-    first().querySelector('.dga-rt-blk-row').listeners.click[0]();
-    const seg = first().querySelector('.dga-rt-seg');
-    assert.equal(findButton(seg, '走到某几段时').getAttribute('disabled'), '', '也改不成别的发法');
+    findButton(card().querySelector('.dga-rt-head'), '资料').listeners.click[0]();
+    const groups = () => findAllClass(drawer(), 'dga-rt-zl-group');
+    assert.deepEqual(groups().map(node => String(node.querySelector('.dga-rt-zl-head').textContent).replace('＋ 加一张', '')), ['每段都发', '只在某几段发'], '资料分两组');
+    assert.equal(findAllClass(drawer(), 'dga-rt-zl-row').length, 0, '新图没有资料卡');
+    findButton(groups()[1], '＋ 加一张').listeners.click[0]();
+    assert.ok(drawer().querySelector('.dga-rt-zl-edit'), '加一张就进去改');
+    assert.ok(findAllClass(drawer(), 'dga-rt-chip').find(node => node.textContent === '开场').classList.contains('is-on'), '默认勾上现在这一段');
+    drawer().querySelector('.dga-rt-zl-name-in').listeners.input[0]({ target: { value: '信的内容' } });
+    drawer().querySelector('.dga-rt-zl-text').listeners.input[0]({ target: { value: '等这个夏天结束。' } });
+    findButton(drawer(), '‹ 资料').listeners.click[0]();
+    const row = findAllClass(drawer(), 'dga-rt-zl-row')[0];
+    assert.match(row.textContent, /信的内容.*开场/, '一张卡一行：名字 + 在哪发');
+    assert.doesNotMatch(row.textContent, /等这个夏天结束/, '内容不铺在列表里');
     findButton(card().querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
     assert.match(card().querySelector('.dga-rt-head').textContent, /完成编辑/);
+    findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场')).listeners.click[0]();
+    findButton(drawer(), '预览').listeners.click[0]();
+    const modal = panel().querySelector('.dga-rt-modal');
+    assert.match(modal.textContent, /走到「开场」时发出去的/);
+    assert.match(modal.querySelector('.dga-rt-preview').textContent, /等这个夏天结束。开场正文/, '预览：资料卡在前，正文在后');
     assert.deepEqual(errors, []);
 });
 
@@ -1324,31 +1361,42 @@ test('路线图：位置和顺序不列数据库和 MVU 的条目；放到顺序
     assert.deepEqual(errors, []);
 });
 
-test('路线图：一直发里至少留一块主线当前段——有两块时都能删，剩最后一块才拦住', async () => {
+test('路线图：资料卡能上下挪、换组、删掉，发出去的先后跟着变', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const world = routeWorld();
     const R = load().core.routes;
     const t = demoRoute(R);
     t.route.worldbookName = '书A';
-    t.route.blocks = [
-        { id: 'ka', when: 'always', text: '开头 ⟦main⟧' },
-        { id: 'kb', when: 'always', text: '只是一句提醒' },
-        { id: 'kc', when: 'always', text: '⟦main⟧ 结尾' },
+    t.route.cards = [
+        { id: 'ka', name: '甲', when: 'always', nodes: [], text: '甲字' },
+        { id: 'kb', name: '乙', when: 'always', nodes: [], text: '乙字' },
+        { id: 'kc', name: '丙', when: 'nodes', nodes: [t.start], text: '丙字' },
     ];
     world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
     const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
     await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
     await sandbox.DynamicGuideAssistantCore.refresh();
     const panel = () => documentRef.getElementById(PANEL_ID);
-    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '发给 AI 的内容').listeners.click[0]();
-    const blocks = () => findAllClass(panel().querySelector('.dga-rt-drawer'), 'dga-rt-blk');
-    const deleteBtn = node => findAllClass(node, 'dga-rt-icon').find(item => item.getAttribute('title') === '删掉这一块');
-    assert.equal(blocks().length, 3);
-    assert.ok(blocks().every(node => deleteBtn(node)), '两块都放着主线当前段时，哪块都能删；不放的一直发也能删');
-    deleteBtn(blocks()[0]).listeners.click[0]({ stopPropagation() {} });
-    assert.equal(blocks().length, 2);
-    assert.ok(deleteBtn(blocks()[0]), '不放主线的那块照样能删');
-    assert.ok(!deleteBtn(blocks()[1]), '剩最后一块放着主线当前段的，不能删');
+    const drawer = () => panel().querySelector('.dga-rt-drawer');
+    const settle = async () => { for (let i = 0; i < 10; i += 1) await new Promise(setImmediate); };
+    const entry = () => world.state.books.书A.find(item => item.name === '海边书店（动态指导）');
+    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '资料').listeners.click[0]();
+    const rows = () => findAllClass(drawer(), 'dga-rt-zl-row');
+    assert.deepEqual(rows().map(node => node.querySelector('.dga-rt-zl-name').textContent), ['甲', '乙', '丙']);
+    assert.ok(rows().every(node => node.querySelector('.dga-rt-zl-dot').classList.contains('is-on')), '现在在发的亮绿点');
+    const up = node => findAllClass(node, 'dga-rt-icon').find(item => item.getAttribute('title') === '往上挪');
+    assert.equal(up(rows()[2]).getAttribute('disabled'), '', '组里第一张不能再往上');
+    up(rows()[1]).listeners.click[0]({ stopPropagation() {} });
+    await settle();
+    assert.deepEqual(rows().map(node => node.querySelector('.dga-rt-zl-name').textContent), ['乙', '甲', '丙']);
+    assert.equal(entry().content, '乙字\n\n甲字\n\n丙字\n\n开场正文', '世界书条目跟着换先后');
+    rows()[0].listeners.click[0]();
+    findButton(drawer().querySelector('.dga-rt-seg'), '只在某几段发').listeners.click[0]();
+    await settle();
+    assert.doesNotMatch(entry().content, /乙字/, '改成只在某几段发、还没勾段，就不发了');
+    findButton(drawer(), '删掉这张').listeners.click[0]();
+    await settle();
+    assert.deepEqual(rows().map(node => node.querySelector('.dga-rt-zl-name').textContent), ['甲', '丙'], '删掉以后回到列表');
     assert.deepEqual(errors, []);
 });
 
@@ -2039,14 +2087,14 @@ test('界面：难懂的地方都有感叹号，说明不用专业词', async ()
     seen.push(pops());
     findButton(head(), '位置和顺序').listeners.click[0]();
     seen.push(pops());
-    findButton(head(), '发给 AI 的内容').listeners.click[0]();
+    findButton(head(), '资料').listeners.click[0]();
     seen.push(pops());
     findButton(panel().querySelector('.dga-rail'), '设置').listeners.click[0]();
     seen.push(pops());
     findButton(panel().querySelector('.dga-rail'), 'API').listeners.click[0]();
     seen.push(pops());
     const all = seen.join('\n');
-    for (const word of ['只手动', '判断用的 API', '绑定至角色卡', '这是干嘛的', '按深度插入', '数字小的排前面', '格子', 'SYSTEM', '酒馆主 API']) {
+    for (const word of ['只手动', '判断用的 API', '绑定至角色卡', '这是干嘛的', '按深度插入', '数字小的排前面', '每段都发', 'SYSTEM', '酒馆主 API']) {
         assert.ok(all.includes(word), `说明里讲到「${word}」`);
     }
     assert.doesNotMatch(all, /请求体|payload|endpoint|token|宏|正则|注入|上下文/i, '说明不用专业词');

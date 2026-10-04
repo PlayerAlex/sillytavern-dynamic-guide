@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.3.9';
+    const VERSION = '4.4.0';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2948,7 +2948,7 @@
         routeStates: {},
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, openBlock: {}, tab: 'node', more: false, sendView: 'tpl', modal: null, size: {}, book: {}, scroll: {}, snap: {} },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {} },
     };
 
     function el(tag, attrs, ...children) {
@@ -4066,8 +4066,9 @@
     // 一张路线图是一棵树：段（node）往后接段，接了两段以上就是路口；走进哪条路，哪条就是主线。
     // 任意一段上可以挂支线（side）：开始以后和主线同时走，走完自己的最后一段就结束；
     // 也可以设成「主线停下来等它」或者「主线到了某一段就结束」。
-    // 发给 AI 的内容是分块模板（blocks）：每块选「一直发 / 走到某几段时发 / 某条支线在走时发」，
-    // 块里的格子 ⟦main⟧ ⟦side:id⟧ ⟦sides⟧ 发送时换成当时那一段的内容。
+    // 发给 AI 的（v4.4 起）：在发的「资料」卡 → 主线现在这一段的正文 → 在走的支线那一段的正文（「支线名：正文」）。
+    // 资料卡每张选「每段都发」或者「只在某几段发」（cards）；段的正文和支线不用设，自动发。
+    // 旧版的分块模板（blocks，带 ⟦main⟧ ⟦side:id⟧ ⟦sides⟧ 格子）读进来时换成资料卡，原样另存在 legacyBlocks。
     // 这一节只有纯函数，不碰酒馆接口，测试直接调。
     // ---------------------------------------------------------------
 
@@ -4086,8 +4087,6 @@
     const ROUTE_ROLE_LABEL = Object.fromEntries(ROUTE_ROLES);
     const ROUTE_TOKEN_RE = /⟦(main|sides|side:[a-z0-9]+)⟧/g;
     const ROUTE_MAIN_COLOR = '#E8C15A';
-    const ROUTE_NODES_COLOR = '#8FA8C8';
-    const ROUTE_SIDES_COLOR = '#A3A8AE';
     const ROUTE_ID_RE = /^[a-z0-9]+$/;
 
     function routeId(prefix) {
@@ -4181,7 +4180,7 @@
             root: '',
             nodes: {},
             sides: [],
-            blocks: [{ id: routeId('k'), when: 'always', text: '⟦main⟧' }],
+            cards: [],
             placement: routeDefaultPlacement(),
             advance: '',
             prompt: '',
@@ -4238,7 +4237,7 @@
         return path;
     }
 
-    // 删段、断线以后收拾：去掉指向不存在的段的线、走不到的段、宿主没了的支线、没用的模板块。
+    // 删段、断线以后收拾：去掉指向不存在的段的线、走不到的段、宿主没了的支线、资料卡里删掉的段。
     function cleanupRoute(route) {
         const ids = Object.keys(route.nodes);
         if (!route.nodes[route.root] || route.nodes[route.root].side) {
@@ -4271,24 +4270,75 @@
         route.sides.forEach(side => {
             if (side.until && (!route.nodes[side.until] || route.nodes[side.until].side)) side.until = '';
         });
-        route.blocks = route.blocks.filter(block => block.when === 'always' || block.when === 'nodes'
-            || route.sides.some(side => `side:${side.id}` === block.when));
-        route.blocks.forEach(block => {
-            if (block.when === 'nodes') block.nodes = (block.nodes || []).filter(id => route.nodes[id]);
+        route.cards.forEach(card => {
+            if (card.when === 'nodes') card.nodes = card.nodes.filter(id => route.nodes[id]);
         });
-        if (!routeMainBlocks(route).length) route.blocks.unshift({ id: routeId('k'), when: 'always', text: '⟦main⟧' });
         return route;
     }
 
-    // 「一直发」的块里至少要有一块放着主线当前段（v4.0.2）：保证这一段的内容每次都发得出去。
-    // 不要求每块「一直发」都放；只有剩最后一块这样的时，它才不能删、不能改发法、不能拿掉主线那一格（v4.0.3）。
-    function routeMainBlocks(route) {
-        return route.blocks.filter(block => block.when === 'always' && String(block.text || '').includes('⟦main⟧'));
+    // ---- 资料卡 ----
+
+    function normalizeRouteCard(raw) {
+        const card = raw && typeof raw === 'object' ? raw : {};
+        return {
+            id: ROUTE_ID_RE.test(String(card.id || '')) ? String(card.id) : routeId('c'),
+            name: oneLine(card.name || ''),
+            text: String(card.text || ''),
+            when: card.when === 'nodes' ? 'nodes' : 'always',
+            nodes: card.when === 'nodes' && Array.isArray(card.nodes) ? Array.from(new Set(card.nodes.map(String))) : [],
+        };
     }
 
-    function routeLastMainBlock(route, block) {
-        const list = routeMainBlocks(route);
-        return list.length === 1 && list[0] === block;
+    // 旧的分块模板换成资料卡：格子拿掉（段的正文、支线现在自动发）；格子前面的小标题（「现在的剧情：」）拿掉，
+    // 长的、带着要求的（「夏日祭这条线（不要写得太直白）：」）留下、去掉末尾冒号。
+    // 什么都不剩的块不要了。「某条支线在走时发」= 走到这条支线里任何一段时发。
+    function routeCardsFromBlocks(blocks, route) {
+        const isLabel = line => /[：:]$/.test(line);
+        const short = line => line.replace(/^\d+[.、．]\s*/, '').length <= 12;
+        const cards = [];
+        (Array.isArray(blocks) ? blocks : []).forEach(item => {
+            const block = item && typeof item === 'object' ? item : {};
+            const lines = String(block.text || '').split('\n');
+            const keep = [];
+            const unlabel = entry => {
+                const text = entry.text.trim();
+                if (short(text)) return false;
+                entry.text = entry.text.replace(/[：:]\s*$/, '');
+                return true;
+            };
+            lines.forEach((line, index) => {
+                const hasTok = (line.match(ROUTE_TOKEN_RE) || []).length > 0;
+                const rest = line.replace(ROUTE_TOKEN_RE, '').trim();
+                if (hasTok && !rest) {
+                    const prev = keep[keep.length - 1];
+                    if (prev && prev.index === index - 1 && isLabel(prev.text.trim()) && !unlabel(prev)) keep.pop();
+                    return;
+                }
+                if (hasTok && isLabel(rest)) {
+                    const entry = { index, text: rest };
+                    if (unlabel(entry)) keep.push(entry);
+                    return;
+                }
+                keep.push({ index, text: line.replace(ROUTE_TOKEN_RE, '') });
+            });
+            const text = keep.map(item => item.text).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+            if (!text) return;
+            let when = 'always';
+            let nodes = [];
+            if (block.when === 'nodes') {
+                when = 'nodes';
+                nodes = (Array.isArray(block.nodes) ? block.nodes : []).map(String);
+            } else if (/^side:/.test(String(block.when || ''))) {
+                when = 'nodes';
+                const sideId = String(block.when).slice(5);
+                nodes = Object.values(route.nodes).filter(node => node.side === sideId).map(node => node.id);
+            }
+            const head = text.split('\n')[0].replace(/^\d+[.、．]\s*/, '');
+            const cut = head.search(/[：:（(]/);
+            const name = cut > 0 && cut <= 12 ? head.slice(0, cut) : (head.length > 12 ? `${head.slice(0, 12)}…` : head);
+            cards.push(normalizeRouteCard({ id: block.id, name, text, when, nodes }));
+        });
+        return cards;
     }
 
     function normalizeRoute(raw) {
@@ -4301,7 +4351,7 @@
             root: String(src.root || ''),
             nodes: {},
             sides: [],
-            blocks: [],
+            cards: [],
             placement: normalizeRoutePlacement(src.placement),
             // 怎么往下走：'' 跟随设置页 / 'off' 只能手动 / 'judge' 让 AI 判断。
             advance: src.advance === 'off' || src.advance === 'judge' ? src.advance : '',
@@ -4346,16 +4396,15 @@
             };
         }).filter(side => side.id);
         route.sides.forEach(side => { if (!side.color) side.color = routeNextSideColor(route); });
-        route.blocks = Array.isArray(src.blocks)
-            ? src.blocks.map(item => {
-                const block = item && typeof item === 'object' ? item : {};
-                const when = block.when === 'nodes' || block.when === 'always' || /^side:[a-z0-9]+$/.test(String(block.when || ''))
-                    ? block.when : 'always';
-                const out = { id: ROUTE_ID_RE.test(String(block.id || '')) ? String(block.id) : routeId('k'), when, text: String(block.text || '') };
-                if (when === 'nodes') out.nodes = (Array.isArray(block.nodes) ? block.nodes : []).map(String);
-                return out;
-            })
-            : [{ id: routeId('k'), when: 'always', text: '⟦main⟧' }];
+        if (Array.isArray(src.cards)) {
+            route.cards = src.cards.map(normalizeRouteCard);
+            if (Array.isArray(src.legacyBlocks)) route.legacyBlocks = cloneData(src.legacyBlocks);
+        } else if (Array.isArray(src.blocks)) {
+            route.cards = routeCardsFromBlocks(src.blocks, route);
+            route.legacyBlocks = cloneData(src.blocks);
+        }
+        // 「每段都发」一组在前、「只在某几段发」在后，发出去也是这个先后。
+        route.cards = route.cards.filter(card => card.when === 'always').concat(route.cards.filter(card => card.when === 'nodes'));
         return cleanupRoute(route);
     }
 
@@ -4692,91 +4741,56 @@
         });
     }
 
-    // ---- 发给 AI 的内容：分块模板 ----
-
-    function routeTokenInfo(route, tok) {
-        if (tok === 'main') return { label: '主线当前段', color: ROUTE_MAIN_COLOR };
-        if (tok === 'sides') return { label: '其余正在走的支线', color: ROUTE_SIDES_COLOR };
-        if (tok.startsWith('side:')) {
-            const side = routeSideById(route, tok.slice(5));
-            return side ? { label: `支线 · ${side.name}`, color: side.color } : null;
-        }
-        return null;
-    }
-
-    function routeTokenFill(route, state, tok) {
-        if (state.ended) return '';
-        if (tok === 'main') return (route.nodes[state.cur] || {}).content || '';
-        if (tok.startsWith('side:')) {
-            const side = routeSideById(route, tok.slice(5));
-            if (!side || routeSideState(route, state, side.id).status !== 'on') return '';
-            return (route.nodes[routeSideState(route, state, side.id).cur] || {}).content || '';
-        }
-        if (tok === 'sides') {
-            const own = new Set(route.blocks.flatMap(block => block.text.match(ROUTE_TOKEN_RE) || [])
-                .filter(item => item.startsWith('⟦side:')).map(item => item.slice(6, -1)));
-            return routeRunningSides(route, state).filter(side => !own.has(side.id))
-                .map(side => `${side.name}：${(route.nodes[routeSideState(route, state, side.id).cur] || {}).content || ''}`)
-                .join('\n');
-        }
-        return '';
-    }
+    // ---- 发给 AI 的：资料卡 + 正文 ----
 
     function routeLiveNodes(route, state) {
         if (state.ended) return [];
         return [state.cur].concat(routeRunningSides(route, state).map(side => routeSideState(route, state, side.id).cur));
     }
 
-    function routeBlockActive(route, state, block) {
+    function routeCardActive(route, state, card) {
         if (state.ended) return false;
-        if (block.when === 'always') return true;
-        if (block.when === 'nodes') return routeLiveNodes(route, state).some(id => (block.nodes || []).includes(id));
-        const side = routeSideById(route, String(block.when).slice(5));
-        return Boolean(side) && routeSideState(route, state, side.id).status === 'on';
+        if (card.when === 'always') return true;
+        return routeLiveNodes(route, state).some(id => card.nodes.includes(id));
     }
 
-    function routeBlockColor(route, block) {
-        if (block.when === 'always') return ROUTE_MAIN_COLOR;
-        if (block.when === 'nodes') return ROUTE_NODES_COLOR;
-        return (routeSideById(route, String(block.when).slice(5)) || {}).color || ROUTE_SIDES_COLOR;
-    }
-
-    // 一块模板按行拆开填格子。一行里只有格子、格子又都是空的，这一行整行不发。
-    function routeComposeParts(route, state, text) {
+    // 发出去的几样东西，按先后：在发的资料卡 → 主线这一段的正文 → 在走的支线（「支线名：正文」）。空的不发。
+    function routeSendParts(route, state) {
         if (state.ended) return [];
-        return String(text || '').split('\n').map(line => {
-            const pieces = [];
-            let last = 0;
-            let hasTok = false;
-            line.replace(ROUTE_TOKEN_RE, (match, tok, offset) => {
-                if (offset > last) pieces.push({ text: line.slice(last, offset) });
-                const info = routeTokenInfo(route, tok);
-                if (info) {
-                    hasTok = true;
-                    const fill = routeTokenFill(route, state, tok);
-                    pieces.push({ text: fill, tok, info, empty: !fill });
-                }
-                last = offset + match.length;
-                return match;
-            });
-            if (last < line.length) pieces.push({ text: line.slice(last) });
-            const plain = pieces.filter(piece => !piece.tok).map(piece => piece.text).join('').trim();
-            pieces.dropped = hasTok && !plain && !pieces.some(piece => piece.tok && !piece.empty);
-            return pieces;
+        const parts = route.cards.filter(card => card.when === 'always').concat(route.cards.filter(card => card.when === 'nodes'))
+            .filter(card => routeCardActive(route, state, card) && card.text.trim())
+            .map(card => ({ kind: 'card', card, text: card.text.trim() }));
+        const main = String((route.nodes[state.cur] || {}).content || '').trim();
+        if (main) parts.push({ kind: 'main', text: main, color: ROUTE_MAIN_COLOR });
+        routeRunningSides(route, state).forEach(side => {
+            const text = String((route.nodes[routeSideState(route, state, side.id).cur] || {}).content || '').trim();
+            if (text) parts.push({ kind: 'side', side, label: `${side.name}：`, text, color: side.color });
         });
-    }
-
-    function routeComposeBlock(route, state, block) {
-        return routeComposeParts(route, state, block.text).filter(line => !line.dropped)
-            .map(line => line.map(piece => piece.text).join(''))
-            .join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        return parts;
     }
 
     function composeRoute(route, state) {
-        return route.blocks.filter(block => routeBlockActive(route, state, block))
-            .map(block => routeComposeBlock(route, state, block))
-            .filter(Boolean)
-            .join('\n\n');
+        return routeSendParts(route, state).map(part => `${part.label || ''}${part.text}`).join('\n\n');
+    }
+
+    // 「走到这一段时」的样子（预览用）：主线的段 = 主线走到这里（不是现在这段时，支线都当没在走）；
+    // 支线的段 = 主线照现在，这条支线走到这里。
+    function routeStateAt(route, state, id) {
+        const node = route.nodes[id];
+        const at = cloneData(state);
+        if (!node) return at;
+        at.ended = false;
+        if (!node.side) {
+            if (id !== state.cur || state.ended) {
+                at.cur = id;
+                Object.keys(at.sides || {}).forEach(key => { at.sides[key] = { status: 'idle', cur: null, hist: [] }; });
+            }
+        } else {
+            const ss = routeSideState(route, at, node.side);
+            ss.status = 'on';
+            ss.cur = id;
+        }
+        return at;
     }
 
     // ---------------------------------------------------------------
@@ -5599,8 +5613,6 @@
             if (rows) rows.replaceChildren(renderRouteRows(route));
             restoreRouteScroll(card);
         }
-        const preview = doc.querySelector('.dga-rt-preview-slot');
-        if (preview) preview.replaceChildren(renderRoutePreview(route));
     }
 
     function restoreRouteScroll(root) {
@@ -5746,6 +5758,7 @@
         Object.keys(ui.rt.sel).forEach(item => { ui.rt.sel[item] = ''; });
         Object.keys(ui.rt.panel).forEach(item => { ui.rt.panel[item] = ''; });
         ui.rt.panel[route.id] = same ? '' : key;
+        ui.rt.card[route.id] = '';
         render();
         if (!same && key === 'place') loadRouteBook(route);
     }
@@ -5814,7 +5827,7 @@
         done: [['path', { d: 'M5 12.5l4.5 4.5L19 7.5' }]],
         undo: [['path', { d: 'M9 14L4 9l5-5' }], ['path', { d: 'M4 9h10.5a5.5 5.5 0 0 1 0 11H11' }]],
         place: [['path', { d: 'M5 7h14M5 12h9M5 17h5' }], ['path', { d: 'M17 14v6M14.5 17.5L17 20l2.5-2.5' }]],
-        send: [['path', { d: 'M4 11.5L20 4l-6.5 16-2.5-6.5L4 11.5z' }], ['path', { d: 'M11 13.5L20 4' }]],
+        cards: [['rect', { x: 4, y: 5, width: 16, height: 14, rx: 2.5 }], ['path', { d: 'M8 10h8M8 14h5' }]],
         gear: [['circle', { cx: 12, cy: 12, r: 3 }], ['path', { d: 'M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8' }]],
     };
 
@@ -5848,7 +5861,7 @@
                         ? routeHeadBtn('done', '完成编辑', () => { leaveRouteEdit(route); render(); }, 'is-primary')
                         : routeHeadBtn('edit', '编辑路线', () => { enterRouteEdit(route); render(); }),
                     panelBtn('place', 'place', '位置和顺序'),
-                    panelBtn('send', 'send', '发给 AI 的内容'),
+                    panelBtn('cards', 'cards', '资料'),
                     panelBtn('settings', 'gear', '设置'))),
             el('div', { class: 'dga-rt-graph-slot' }, renderRouteGraph(route), routeZoomFloat(route)),
             el('div', { class: 'dga-rt-legend' },
@@ -6389,8 +6402,6 @@
                 rtBtn('挂上，去写第一段', () => {
                     ui.rt.modal = null;
                     const side = routeAddSide(route, hostId, draft.name, draft.cond.trim(), draft.first.trim(), { wait: draft.wait, until: draft.until });
-                    // 新支线自动加一块「这条支线在走时发」，里面放它的格子，这样它的内容走着的时候就会发出去。
-                    route.blocks.push({ id: routeId('k'), when: `side:${side.id}`, text: `${side.name}：⟦side:${side.id}⟧` });
                     routeEdited(route, true);
                     selectRouteNode(route, side.root);
                 }, 'primary'),
@@ -6584,7 +6595,7 @@
             ], bodyKids, null, close);
         }
         // 这一段：只有正文、完成条件、下一段（v4.3.7 用户定）。往后接一段、挂支线在图上点「＋」；
-        // 「走到某几段时发」的块在「发给 AI 的内容」里管，不在这里列。
+        // 资料卡在标题栏「资料」里管，不在这里列。最下面「预览」看走到这一段时发出去的样子（v4.4 用户要的）。
         const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
             const to = index + delta;
@@ -6625,6 +6636,7 @@
                     : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
                 isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
                     rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
+            el('div', { class: 'dga-rt-nd-sec' }, rtBtn('预览', () => routePreviewDialog(route, id), 'small')),
         ];
         return routeDrawerShell(route, color, [
             crumb,
@@ -6634,15 +6646,21 @@
 
     function renderRoutePanelDrawer(route, key) {
         const close = () => { ui.rt.panel[route.id] = ''; render(); };
-        const title = { place: '位置和顺序', send: '发给 AI 的内容', settings: '设置' }[key] || '';
-        const body = key === 'place' ? renderRoutePlacement(route) : (key === 'settings' ? renderRouteSettings(route) : renderRouteSendPanel(route));
+        const title = { place: '位置和顺序', cards: '资料', settings: '设置' }[key] || '';
+        const body = key === 'place' ? renderRoutePlacement(route) : (key === 'settings' ? renderRouteSettings(route) : renderRouteCardsPanel(route));
         return routeDrawerShell(route, ROUTE_MAIN_COLOR, [
             el('div', { class: 'dga-rt-crumb' },
                 el('span', { class: 'dga-rt-dot', style: `--cc:${ROUTE_MAIN_COLOR}` }),
                 el('span', { text: route.name }),
                 el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: close }, '×')),
-            el('div', { class: 'dga-rt-drawer-title', text: title }),
-        ], [body], null, close, key !== 'settings');
+            key === 'cards'
+                ? el('div', { class: 'dga-rt-drawer-title dga-tip-host' }, title, infoTip(`cards-${route.id}`, [
+                    ['资料是什么', '写给 AI 看的补充内容，比如写作风格、一封信写了什么。每张卡起个名字，好找。'],
+                    ['在哪发', '「每段都发」不管走到哪都发；「只在某几段发」只有走到勾上的段才发。'],
+                    ['发出去的先后', '先发「每段都发」，再发「只在某几段发」，最后是这一段的正文和在走的支线。想看真正发出去的样子，编辑时点一段，点「预览」。'],
+                ]))
+                : el('div', { class: 'dga-rt-drawer-title', text: title }),
+        ], [body], null, close, key === 'place');
     }
 
     // ---- 位置和顺序 ----
@@ -6733,260 +6751,125 @@
             orderList);
     }
 
-    // ---- 发给 AI 的内容：分块模板 ----
+    // ---- 资料（v4.4）：「发给 AI 的内容」拆开以后，只在某几段发的、每段都发的话都放这里 ----
+    // 列表每张卡一行：名字 + 在哪发；分「每段都发」「只在某几段发」两组，发出去也是这个先后。点一行进去改。
 
-    function routeWhenSentence(route, block) {
-        if (block.when === 'always') return '一直发';
-        if (block.when === 'nodes') {
-            const names = (block.nodes || []).filter(id => route.nodes[id]).map(id => route.nodes[id].name);
-            if (!names.length) return '走到某几段时发（还没选段）';
-            return names.length === 1 ? `走到「${names[0]}」时发` : `走到「${names[0]}」等 ${names.length} 段时发`;
-        }
-        const side = routeSideById(route, String(block.when).slice(5));
-        return side ? `「${side.name}」在走时发` : '支线已删';
+    function routeCardWhere(route, card) {
+        if (card.when === 'always') return '每段都发';
+        const names = card.nodes.filter(id => route.nodes[id]).map(id => route.nodes[id].name);
+        if (!names.length) return '还没选段';
+        return names.length === 1 ? names[0] : `${names[0]} 等 ${names.length} 段`;
     }
 
-    function routeBlockSummary(route, block) {
-        const text = String(block.text || '').replace(ROUTE_TOKEN_RE, (match, tok) => {
-            const info = routeTokenInfo(route, tok);
-            return info ? `〔${info.label}〕` : '';
-        }).replace(/\s+/g, ' ').trim();
-        return text || '（还没写）';
+    function renderRouteCardsPanel(route) {
+        const openId = ui.rt.card[route.id];
+        const open = route.cards.find(card => card.id === openId);
+        return open ? renderRouteCardEdit(route, open) : renderRouteCardList(route);
     }
 
-    let tplFocus = { blockId: '', range: null };
-
-    function tplChip(route, tok, onchange) {
-        const info = routeTokenInfo(route, tok);
-        if (!info) return null;
-        return el('span', { class: 'dga-rt-tchip', contenteditable: 'false', 'data-tok': tok, style: `--cc:${info.color}` },
-            info.label,
-            el('b', {
-                class: 'dga-rt-tchip-x', title: '去掉这个格子',
-                onmousedown: event => event.preventDefault(),
-                onclick: event => {
-                    const chip = event.target.closest('.dga-rt-tchip');
-                    if (chip) chip.remove();
-                    onchange();
-                },
-            }, '×'));
-    }
-
-    function serializeTpl(root) {
-        let out = '';
-        const walk = parent => Array.from(parent.childNodes || []).forEach(child => {
-            if (child.nodeType === 3) out += String(child.nodeValue || '').split('​').join('');
-            else if (child.nodeName === 'BR') out += '\n';
-            else if (child.classList && child.classList.contains('dga-rt-tchip')) out += `⟦${child.getAttribute('data-tok')}⟧`;
-            else if (child.nodeName === 'DIV' || child.nodeName === 'P') {
-                if (out && !out.endsWith('\n')) out += '\n';
-                walk(child);
-            } else walk(child);
-        });
-        walk(root);
-        return out.replace(/\n+$/, '');
-    }
-
-    function fillTpl(route, editor, text, onchange) {
-        const doc = hostDocument();
-        String(text || '').split(ROUTE_TOKEN_RE).forEach((part, index) => {
-            if (index % 2 === 1) {
-                const chip = tplChip(route, part, onchange);
-                if (chip) editor.append(chip);
-                return;
-            }
-            part.split('\n').forEach((line, i) => {
-                if (i) editor.append(el('br'));
-                if (line) editor.append(doc.createTextNode(line));
-            });
-        });
-    }
-
-    function insertTplChip(route, tok, block) {
-        const doc = hostDocument();
-        const editor = doc && typeof doc.querySelector === 'function' ? doc.querySelector(`.dga-rt-tpl-${block.id}`) : null;
-        if (!editor) return;
-        const sync = () => { block.text = serializeTpl(editor); routeLive(route); scheduleRouteSave(600); };
-        const chip = tplChip(route, tok, sync);
-        const win = hostWindow;
-        let range = tplFocus.blockId === block.id ? tplFocus.range : null;
-        if (!range || !editor.contains(range.startContainer)) {
-            range = doc.createRange();
-            range.selectNodeContents(editor);
-            range.collapse(false);
-        }
-        range.deleteContents();
-        range.insertNode(chip);
-        range.setStartAfter(chip);
-        range.collapse(true);
-        const sel = win.getSelection();
-        sel.removeAllRanges();
-        sel.addRange(range);
-        tplFocus = { blockId: block.id, range: range.cloneRange() };
-        editor.focus();
-        sync();
-    }
-
-    function renderTplBlock(route, block, index) {
+    function renderRouteCardList(route) {
         const state = routeStateOf(route);
-        const open = ui.rt.openBlock[route.id] === block.id;
-        const active = routeBlockActive(route, state, block);
-        const guard = routeLastMainBlock(route, block);
-        const stop = fn => event => { event.stopPropagation(); fn(); };
-        const move = delta => {
-            const to = index + delta;
-            if (to < 0 || to >= route.blocks.length) return;
-            route.blocks.splice(to, 0, route.blocks.splice(index, 1)[0]);
-            routeEdited(route, false);
+        const add = when => {
+            const card = normalizeRouteCard({ when, nodes: when === 'nodes' && !state.ended ? [state.cur] : [] });
+            const at = when === 'always' ? route.cards.filter(item => item.when === 'always').length : route.cards.length;
+            route.cards.splice(at, 0, card);
+            ui.rt.card[route.id] = card.id;
+            routeEdited(route, true);
             render();
         };
-        const row = el('div', { class: 'dga-rt-blk-row', title: open ? '收起' : '展开来改', onclick: () => { ui.rt.openBlock[route.id] = open ? '' : block.id; render(); } },
-            el('span', { class: `dga-rt-blk-state${active ? ' is-on' : ''}`, title: active ? '现在在发' : '现在不发' }),
-            el('div', { class: 'dga-rt-blk-main' },
-                el('div', { class: 'dga-rt-blk-when', text: routeWhenSentence(route, block) }),
-                open ? null : el('div', { class: 'dga-rt-blk-peek', text: routeBlockSummary(route, block) })),
-            el('span', { class: 'dga-rt-blk-ops' },
-                el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', onclick: stop(() => move(-1)) }, '↑'),
-                el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', onclick: stop(() => move(1)) }, '↓'),
-                guard ? null : el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '删掉这一块', onclick: stop(() => { route.blocks.splice(index, 1); routeEdited(route, false); render(); }) }, '×')),
-            el('span', { class: 'dga-rt-blk-caret', text: open ? '▾' : '▸' }));
-        const box = el('div', { class: `dga-rt-blk${open ? ' is-open' : ''}${active ? '' : ' is-idle'}`, style: `--cc:${routeBlockColor(route, block)}` }, row);
-        if (!open) return box;
-        const editor = el('div', { class: `dga-rt-tpl dga-rt-tpl-${block.id}`, contenteditable: 'true', spellcheck: 'false' });
-        const sync = () => {
-            const text = serializeTpl(editor);
-            if (guard && !text.includes('⟦main⟧')) {
-                notify('至少要有一块「一直发」放着主线当前段，这是最后一块了', 'info');
-                render();
-                return;
-            }
-            block.text = text;
-            routeLive(route);
-            scheduleRouteSave(600);
-        };
-        const remember = () => {
-            const sel = hostWindow.getSelection ? hostWindow.getSelection() : null;
-            if (sel && sel.rangeCount && editor.contains(sel.anchorNode)) tplFocus = { blockId: block.id, range: sel.getRangeAt(0).cloneRange() };
-        };
-        fillTpl(route, editor, block.text, sync);
-        editor.addEventListener('input', () => { remember(); sync(); });
-        editor.addEventListener('keyup', remember);
-        editor.addEventListener('mouseup', remember);
-        editor.addEventListener('keydown', event => {
-            if (event.key === 'Enter') {
-                event.preventDefault();
-                hostDocument().execCommand('insertLineBreak');
-            }
-        });
-        editor.addEventListener('paste', event => {
-            event.preventDefault();
-            const text = event.clipboardData ? event.clipboardData.getData('text') : '';
-            hostDocument().execCommand('insertText', false, text);
-        });
-        const kind = block.when === 'always' ? 'always' : (block.when === 'nodes' ? 'nodes' : 'side');
-        const setKind = next => {
-            if (next === 'always') block.when = 'always';
-            else if (next === 'nodes') {
-                block.when = 'nodes';
-                if (!block.nodes) block.nodes = [];
-            } else if (route.sides.length) block.when = `side:${route.sides[0].id}`;
-            routeEdited(route, false);
-            render();
-        };
-        let picker = null;
-        if (kind === 'nodes') {
-            const toggleNode = nodeId => {
-                block.nodes = (block.nodes || []).includes(nodeId) ? block.nodes.filter(item => item !== nodeId) : (block.nodes || []).concat(nodeId);
-                routeEdited(route, false);
+        const group = (when, label) => {
+            const list = route.cards.filter(card => card.when === when);
+            const move = (card, delta) => {
+                const other = list[list.indexOf(card) + delta];
+                if (!other) return;
+                const from = route.cards.indexOf(card);
+                const to = route.cards.indexOf(other);
+                route.cards[from] = other;
+                route.cards[to] = card;
+                routeEdited(route, true);
                 render();
             };
-            const line = (label, color, nodes) => el('div', { class: 'dga-rt-pick-line' },
-                el('span', { class: 'dga-rt-pick-label', style: `color:${color}`, text: label }),
-                el('div', { class: 'dga-rt-chips' }, ...nodes.map(node => el('button', {
-                    type: 'button', class: `dga-rt-chip${(block.nodes || []).includes(node.id) ? ' is-on' : ''}`,
-                    onclick: () => toggleNode(node.id),
-                }, node.name))));
-            picker = el('div', { class: 'dga-rt-pickset' },
-                line('主线', ROUTE_MAIN_COLOR, routeOrderedNodes(route, route.root, '')),
-                ...route.sides.map(side => line(side.name, side.color, routeOrderedNodes(route, side.root, side.id))));
-        } else if (kind === 'side') {
-            picker = el('div', { class: 'dga-rt-pickset' }, el('div', { class: 'dga-rt-chips' }, ...route.sides.map(side => el('button', {
-                type: 'button', class: `dga-rt-chip${block.when === `side:${side.id}` ? ' is-on' : ''}`, style: `color:${side.color}`,
-                onclick: () => { block.when = `side:${side.id}`; routeEdited(route, false); render(); },
-            }, side.name))));
-        }
-        const ins = tok => {
-            const info = routeTokenInfo(route, tok);
-            return el('button', { type: 'button', class: 'dga-rt-ins', style: `--cc:${info.color}`, onmousedown: event => event.preventDefault(), onclick: () => insertTplChip(route, tok, block) }, `＋ ${info.label}`);
+            const stop = fn => event => { event.stopPropagation(); fn(); };
+            return el('div', { class: 'dga-rt-zl-group' },
+                el('div', { class: 'dga-rt-zl-head' }, el('span', { text: label }),
+                    el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: () => add(when) }, '＋ 加一张')),
+                list.length ? el('div', { class: 'dga-rt-zl-list' }, ...list.map((card, index) => {
+                    const on = routeCardActive(route, state, card) && card.text.trim();
+                    return el('div', { class: 'dga-rt-zl-row', title: '点开来改', onclick: () => { ui.rt.card[route.id] = card.id; render(); } },
+                        el('span', { class: `dga-rt-zl-dot${on ? ' is-on' : ''}`, title: on ? '现在在发' : '现在不发' }),
+                        el('span', { class: `dga-rt-zl-name${card.name ? '' : ' is-none'}`, text: card.name || '没起名' }),
+                        card.when === 'nodes' ? el('span', { class: 'dga-rt-zl-where', text: routeCardWhere(route, card) }) : null,
+                        el('span', { class: 'dga-rt-zl-ops' },
+                            el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: stop(() => move(card, -1)) }, '↑'),
+                            el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === list.length - 1, onclick: stop(() => move(card, 1)) }, '↓')),
+                        el('span', { class: 'dga-rt-zl-caret', text: '›' }));
+                })) : null);
         };
-        box.append(el('div', { class: 'dga-rt-blk-body' },
-            el('div', { class: 'dga-rt-blk-q', text: '什么时候发' }),
-            rtSeg([['always', '一直发'], ['nodes', '走到某几段时', guard], ['side', '某条支线在走时', guard || !route.sides.length]], kind, setKind),
-            picker,
-            el('div', { class: 'dga-rt-blk-q' }, '写什么'),
-            editor,
-            el('div', { class: 'dga-rt-ins-row' },
-                el('span', { class: 'dga-rt-muted', text: '放一个格子：' }),
-                ins('main'),
-                ...route.sides.map(side => ins(`side:${side.id}`)),
-                route.sides.length > 1 ? ins('sides') : null)));
+        return el('div', { class: 'dga-rt-zl' },
+            group('always', '每段都发'),
+            group('nodes', '只在某几段发'));
+    }
+
+    function renderRouteCardEdit(route, card) {
+        const live = () => { routeLive(route); scheduleRouteSave(600); };
+        const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label', text: label }), ...kids);
+        const toggle = id => {
+            card.nodes = card.nodes.includes(id) ? card.nodes.filter(item => item !== id) : card.nodes.concat(id);
+            routeEdited(route, true);
+            render();
+        };
+        const line = (label, color, nodes) => el('div', { class: 'dga-rt-pick-line' },
+            el('span', { class: 'dga-rt-pick-label', style: `color:${color}`, text: label }),
+            el('div', { class: 'dga-rt-chips' }, ...nodes.map(node => el('button', {
+                type: 'button', class: `dga-rt-chip${card.nodes.includes(node.id) ? ' is-on' : ''}`, onclick: () => toggle(node.id),
+            }, node.name))));
+        return el('div', { class: 'dga-rt-zl-edit' },
+            el('button', { type: 'button', class: 'dga-rt-link dga-rt-back', onclick: () => { ui.rt.card[route.id] = ''; render(); } }, '‹ 资料'),
+            sec('名字', el('input', { type: 'text', class: 'dga-rt-mt dga-rt-zl-name-in', value: card.name, placeholder: '比如：信的内容', oninput: event => { card.name = oneLine(event.target.value); scheduleRouteSave(600); } })),
+            sec('内容', el('textarea', { class: 'dga-rt-nd-body dga-rt-zl-text', placeholder: '写给 AI 看的', oninput: event => { card.text = event.target.value; live(); } }, card.text)),
+            sec('在哪发',
+                rtSeg([['always', '每段都发'], ['nodes', '只在某几段发']], card.when, value => {
+                    card.when = value;
+                    // 换组：挪到那一组的最后，先后跟着组走。
+                    route.cards = route.cards.filter(item => item !== card);
+                    const at = value === 'always' ? route.cards.filter(item => item.when === 'always').length : route.cards.length;
+                    route.cards.splice(at, 0, card);
+                    routeEdited(route, true);
+                    render();
+                }),
+                card.when === 'nodes' ? el('div', { class: 'dga-rt-pickset' },
+                    line('主线', ROUTE_MAIN_COLOR, routeOrderedNodes(route, route.root, '')),
+                    ...route.sides.map(side => line(side.name, side.color, routeOrderedNodes(route, side.root, side.id)))) : null),
+            el('div', { class: 'dga-rt-nd-sec' }, rtBtn('删掉这张', () => {
+                route.cards = route.cards.filter(item => item !== card);
+                ui.rt.card[route.id] = '';
+                routeEdited(route, true);
+                render();
+            }, 'small danger')));
+    }
+
+    // 预览：走到这一段时真正发出去的字。段的正文、支线的正文用各自的颜色底标出来。
+    function renderRoutePreview(route, state) {
+        const box = el('div', { class: 'dga-rt-preview' });
+        const parts = routeSendParts(route, state);
+        parts.forEach((part, index) => {
+            if (index) box.append(el('div', { class: 'dga-rt-pv-gap' }));
+            if (part.kind === 'card') box.append(part.text);
+            else {
+                if (part.label) box.append(part.label);
+                box.append(el('span', { class: 'dga-rt-fill', style: `--cc:${part.color}`, text: part.text }));
+            }
+        });
+        if (!parts.length) box.append(el('span', { class: 'dga-rt-fill-empty', text: state.ended ? '走到终点了，什么都不发。' : '这里什么都不发。' }));
         return box;
     }
 
-    // 预览只放真正发出去的字；没在发的块在最后用一行带过。
-    function renderRoutePreview(route) {
-        const state = routeStateOf(route);
-        const box = el('div', { class: 'dga-rt-preview' });
-        if (state.ended) {
-            box.append(el('span', { class: 'dga-rt-fill-empty', text: '走到终点了，这个条目现在关着，什么都不发。' }));
-            return box;
-        }
-        const on = route.blocks.filter(block => routeBlockActive(route, state, block));
-        const off = route.blocks.filter(block => !routeBlockActive(route, state, block));
-        on.forEach((block, index) => {
-            if (index) box.append(el('div', { class: 'dga-rt-pv-gap' }));
-            routeComposeParts(route, state, block.text).filter(line => !line.dropped).forEach((pieces, i) => {
-                if (i) box.append(el('br'));
-                pieces.forEach(piece => {
-                    if (!piece.tok) box.append(piece.text);
-                    else if (!piece.empty) box.append(el('span', { class: 'dga-rt-fill', style: `--cc:${piece.info.color}`, title: `这里是「${piece.info.label}」`, text: piece.text }));
-                });
-            });
-        });
-        if (!on.length) box.append(el('span', { class: 'dga-rt-fill-empty', text: '现在没有要发的内容。' }));
-        return el('div', {}, box,
-            off.length ? el('div', { class: 'dga-rt-pv-off', text: `另外 ${off.length} 块现在不发：${off.map(block => routeWhenSentence(route, block)).join('；')}` }) : null);
-    }
-
-    function renderRouteSendPanel(route) {
-        const add = when => {
-            const block = { id: routeId('k'), when, text: '' };
-            if (when === 'nodes') block.nodes = [routeStateOf(route).cur];
-            route.blocks.push(block);
-            ui.rt.openBlock[route.id] = block.id;
-            routeEdited(route, false);
-            render();
-        };
-        const view = ui.rt.sendView === 'pv' ? 'pv' : 'tpl';
-        return el('div', { class: 'dga-rt-send' },
-            rtSeg([['tpl', '改内容'], ['pv', '看实际发出去的']], view, value => { ui.rt.sendView = value; render(); }, 'dga-rt-send-switch'),
-            el('div', { class: 'dga-rt-send-split', 'data-view': view },
-                el('div', { class: 'dga-rt-col-tpl' },
-                    el('div', { class: 'dga-rt-col-title dga-tip-host' }, `分成 ${route.blocks.length} 块，点一块展开来改`, infoTip(`send-${route.id}`, [
-                        ['这是什么', '这张路线图在世界书里有一个条目，发给 AI 的就是这里写的字。'],
-                        ['块', '分成几块，每块自己定什么时候发：一直发、走到某几段时才发、某条支线在走时才发。'],
-                        ['格子', '写的时候放一个格子，发出去会换成真内容。比如「主线」会换成主线现在这一段写的东西。'],
-                        ['看实际发出去的', '能看到现在真正发给 AI 的是什么。'],
-                    ])),
-                    el('div', { class: 'dga-rt-blk-list' }, ...route.blocks.map((block, index) => renderTplBlock(route, block, index))),
-                    el('div', { class: 'dga-rt-ins-row' },
-                        el('span', { class: 'dga-rt-muted', text: '加一块：' }),
-                        rtBtn('一直发', () => add('always'), 'small'),
-                        rtBtn('走到某几段时发', () => add('nodes'), 'small'),
-                        route.sides.length ? rtBtn('某条支线在走时发', () => add(`side:${route.sides[0].id}`), 'small') : null)),
-                el('div', { class: 'dga-rt-col-pv' },
-                    el('div', { class: 'dga-rt-col-title', text: '现在实际发出去的样子' }),
-                    el('div', { class: 'dga-rt-preview-slot' }, renderRoutePreview(route)))));
+    function routePreviewDialog(route, id) {
+        const node = route.nodes[id];
+        if (!node) return;
+        openRouteModal(`走到「${node.name}」时发出去的`, renderRoutePreview(route, routeStateAt(route, routeStateOf(route), id)), [
+            rtBtn('关上', closeRouteModal, 'primary'),
+        ], 'dga-rt-pv-modal');
     }
 
     // ---------------------------------------------------------------
@@ -7943,50 +7826,36 @@ ${P} .dga-rt-nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellips
 ${P} .dga-rt-role { color: var(--dga-text-3); font-size: 11px; }
 ${P} .dga-rt-slot { display: block; width: 100%; height: 6px; margin: 1px 0; padding: 0; border: 0; border-radius: 6px; background: transparent; color: transparent; font-size: 11px; cursor: pointer; transition: height .1s, background .1s; }
 ${P} .dga-rt-slot:hover { height: 22px; background: color-mix(in srgb, var(--dga-accent) 14%, transparent); color: var(--dga-accent); outline: 1px dashed color-mix(in srgb, var(--dga-accent) 60%, transparent); }
-/* 发给 AI 的内容 */
-${P} .dga-rt-send-switch { display: none; margin-bottom: 12px; }
-${P} .dga-rt-send-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
-${P} .dga-rt-col-title { margin-bottom: 8px; color: var(--dga-text-2); font-size: 12px; }
-${P} .dga-rt-blk-list { display: flex; flex-direction: column; gap: 6px; }
-${P} .dga-rt-blk { border-radius: var(--dga-radius-md); border: 1px solid var(--dga-border); border-left: 3px solid var(--cc); background: #19191C; }
-${P} .dga-rt-blk.is-idle { border-left-color: color-mix(in srgb, var(--cc) 40%, var(--dga-bg-1)); }
-${P} .dga-rt-blk.is-open { border-color: var(--dga-border-2); border-left-color: var(--cc); background: #1B1C1F; }
-${P} .dga-rt-blk-row { display: flex; align-items: center; gap: 10px; padding: 9px 10px; cursor: pointer; }
-${P} .dga-rt-blk-state { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--dga-text-3); }
-${P} .dga-rt-blk-state.is-on { border-color: var(--dga-success); background: var(--dga-success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dga-success) 18%, transparent); }
-${P} .dga-rt-blk-main { flex: 1; min-width: 0; }
-${P} .dga-rt-blk-when { font-size: 13px; font-weight: 600; color: var(--cc); }
-${P} .dga-rt-blk.is-idle .dga-rt-blk-when { color: var(--dga-text-2); }
-${P} .dga-rt-blk-peek { margin-top: 1px; color: var(--dga-text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-${P} .dga-rt-blk-ops { display: flex; gap: 4px; opacity: 0; transition: opacity .12s; }
-${P} .dga-rt-blk-row:hover .dga-rt-blk-ops, ${P} .dga-rt-blk.is-open .dga-rt-blk-ops { opacity: 1; }
-@media (hover: none) { ${P} .dga-rt-blk-ops { opacity: 1; } ${P} .dga-rt-slot { height: 22px; color: var(--dga-text-3); outline: 1px dashed var(--dga-border-2); } }
-${P} .dga-rt-blk-ops .dga-rt-icon { width: 24px; height: 24px; }
-${P} .dga-rt-blk-caret { color: var(--dga-text-3); font-size: 12px; width: 12px; text-align: center; }
-${P} .dga-rt-blk-body { padding: 2px 12px 12px 29px; }
-${P} .dga-rt-blk-q { display: flex; gap: 8px; align-items: baseline; margin: 10px 0 6px; color: var(--dga-text-2); font-size: 12px; font-weight: 600; }
-${P} .dga-rt-blk-q .dga-rt-muted { font-weight: 400; font-size: 11.5px; }
+/* 资料（v4.4）：两组，每张卡一行 */
+${P} .dga-rt-zl-group + .dga-rt-zl-group { margin-top: 20px; }
+${P} .dga-rt-zl-head { display: flex; align-items: center; gap: 8px; margin: 0 2px 8px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
+${P} .dga-rt-zl-add { margin-left: auto; font-size: 12.5px; font-weight: 600; }
+${P} .dga-rt-zl-list { border-radius: var(--dga-radius-md); background: var(--dga-bg-2); overflow: hidden; }
+${P} .dga-rt-zl-row { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 12px; cursor: pointer; }
+${P} .dga-rt-zl-row + .dga-rt-zl-row { border-top: 1px solid color-mix(in srgb, var(--dga-text-1) 7%, transparent); }
+${P} .dga-rt-zl-row:hover { background: var(--dga-hover); }
+${P} .dga-rt-zl-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--dga-text-3); }
+${P} .dga-rt-zl-dot.is-on { border-color: var(--dga-success); background: var(--dga-success); }
+${P} .dga-rt-zl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+${P} .dga-rt-zl-name.is-none { color: var(--dga-text-3); font-weight: 400; }
+${P} .dga-rt-zl-where { flex: 0 1 auto; min-width: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dga-text-3); font-size: 12.5px; }
+${P} .dga-rt-zl-ops { display: flex; gap: 4px; opacity: 0; transition: opacity .12s; }
+${P} .dga-rt-zl-row:hover .dga-rt-zl-ops { opacity: 1; }
+${P} .dga-rt-zl-ops .dga-rt-icon { width: 24px; height: 24px; }
+${P} .dga-rt-zl-caret { color: var(--dga-text-3); font-size: 16px; }
+${P} .dga-rt-zl-edit .dga-rt-back { margin: 0 0 14px; }
+${P} .dga-rt-zl-edit .dga-rt-pickset { margin-top: 12px; }
+@media (hover: none) { ${P} .dga-rt-zl-ops { opacity: 1; } ${P} .dga-rt-slot { height: 22px; color: var(--dga-text-3); outline: 1px dashed var(--dga-border-2); } }
 ${P} .dga-rt-pickset { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-rt-pick-line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: start; }
 ${P} .dga-rt-pick-label { padding-top: 3px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-${P} .dga-rt-tpl { min-height: 90px; white-space: pre-wrap; word-break: break-word; padding: 10px 12px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-0); color: var(--dga-text-1); line-height: 1.95; outline: none; }
-${P} .dga-rt-tpl:focus { border-color: var(--dga-accent); }
-${P} .dga-rt-tchip { display: inline-flex; align-items: center; gap: 2px; margin: 0 2px; padding: 0 2px 0 8px; border-radius: 6px; border: 1px dashed var(--cc); color: var(--cc); background: color-mix(in srgb, var(--cc) 14%, transparent); font-size: 12.5px; line-height: 21px; user-select: none; }
-${P} .dga-rt-tchip-x { cursor: pointer; opacity: .55; font-weight: 400; padding: 0 5px; }
-${P} .dga-rt-tchip-x:hover { opacity: 1; }
-${P} .dga-rt-ins-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
-${P} .dga-rt-ins { padding: 2px 10px; border-radius: 999px; border: 1px dashed var(--cc); background: transparent; color: var(--cc); font: inherit; font-size: 12px; cursor: pointer; }
-${P} .dga-rt-ins:hover { background: color-mix(in srgb, var(--cc) 14%, transparent); }
+${P} .dga-rt-modal.dga-rt-pv-modal { width: min(560px, 100%); }
 ${P} .dga-rt-preview { min-height: 200px; padding: 10px 12px; border-radius: var(--dga-radius-sm); background: var(--dga-bg-0); border: 1px solid var(--dga-border); color: var(--dga-text-1); font-size: 12.5px; line-height: 1.8; white-space: pre-wrap; }
 ${P} .dga-rt-fill { background: color-mix(in srgb, var(--cc) 16%, transparent); border-bottom: 1px solid var(--cc); border-radius: 3px; }
 ${P} .dga-rt-fill-empty { color: var(--dga-text-3); font-style: italic; }
 ${P} .dga-rt-pv-gap { height: 14px; }
-${P} .dga-rt-pv-off { margin-top: 8px; color: var(--dga-text-3); font-size: 12px; }
 @container (max-width: 620px) {
     ${P} .dga-rt-place-grid { grid-template-columns: minmax(0, 1fr); }
-    ${P} .dga-rt-send-switch { display: inline-flex; }
-    ${P} .dga-rt-send-split { grid-template-columns: minmax(0, 1fr); }
-    ${P} .dga-rt-send-split[data-view="tpl"] .dga-rt-col-pv, ${P} .dga-rt-send-split[data-view="pv"] .dga-rt-col-tpl { display: none; }
 }
 @media (max-width: 700px) {
     ${P} .dga-pseg-n { font-size: 0; }
@@ -8202,6 +8071,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             jumpTo: routeJumpTo,
             offeredSides: routeOfferedSides,
             compose: composeRoute,
+            stateAt: routeStateAt,
             orderAfter: routeOrderAfter,
             makeRoom: routeMakeRoom,
             entryName: routeEntryName,
