@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.6.1';
+    const VERSION = '4.6.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -7093,7 +7093,7 @@
                 el('div', { class: 'dga-rt-drawer-title', text: '整条支线的设置' }),
             ], bodyKids, null, close);
         }
-        // 这一段：只有正文、完成条件、下一段（v4.3.7 用户定）。往后接一段、挂支线在图上点「＋」；
+        // 这一段：正文、完成条件，路口时再加每条路（v4.3.7 用户定，v4.6.2 删了「下一段」）。往后接一段、挂支线在图上点「＋」；
         // 资料在标题栏「资料」里写，正文上面的资料按钮把它放进正文（v4.6）；最下面常驻「预览」：走到这一段时发出去的样子。
         const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
@@ -7136,15 +7136,14 @@
                         scheduleRouteSave(600);
                     },
                 })),
-            sec([isFork ? `路口 · ${node.next.length} 条路` : '下一段', infoTip(`next-${route.id}`, [
-                ['下一段', '这一段演完，接着演哪一段。要改那一段，在图上点它。往后再接一段，在图上点这一段右边的「＋」。'],
+            // 只接一段 / 终点时不放「下一段」这一节（v4.6.2 用户删的，图上看得到）；路口要写每条路的条件，留着。
+            isFork ? sec([`路口 · ${node.next.length} 条路`, infoTip(`next-${route.id}`, [
                 ['路口', '接了两段以上就是路口。每条路写一句条件，AI 按剧情挑一条走；哪条都对不上时，可以指定走一条，或者停在路口等你选。'],
                 ['接回', '接到图上已经有的段，用来让几条路汇到一起，或者绕回去循环。'],
             ])],
-                nexts.length ? el('div', { class: 'dga-rt-nd-nexts' }, ...nexts)
-                    : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
-                isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
-                    rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
+                el('div', { class: 'dga-rt-nd-nexts' }, ...nexts),
+                el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
+                    rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); }))) : null,
             sec('预览', routeNodePreview(route, id)),
         ];
         return routeDrawerShell(route, color, [

@@ -1206,9 +1206,13 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     const drawer = panel().querySelector('.dga-rt-drawer');
     assert.ok(drawer, '编辑时点一段打开侧边栏');
     const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|开新聊天|预览)/) || ['?'])[0]);
-    assert.deepEqual(labels, ['正文', '完成条件', '下一段', '预览'], '侧边栏只有正文、完成条件、下一段，最下面常驻预览（开新聊天在设置里）');
+    assert.deepEqual(labels, ['正文', '完成条件', '预览'], '只接一段时没有「下一段」那一节（v4.6.2），最下面常驻预览');
     assert.doesNotMatch(drawer.textContent, /更多|额外发|笔记|怎么走到这里/, '不再有更多、额外发的块、笔记');
-    assert.ok(!drawer.querySelector('.dga-rt-nd-go').listeners.click, '下一段那一行点了不跳');
+    findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('夹在') || item.textContent.startsWith('路口')).listeners.click[0]();
+    const forkDrawer = panel().querySelector('.dga-rt-drawer');
+    const forkLabels = findAllClass(forkDrawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|预览)/) || ['?'])[0]);
+    assert.deepEqual(forkLabels, ['正文', '完成条件', '路口', '预览'], '路口还要写每条路的条件，留着');
+    assert.ok(!forkDrawer.querySelector('.dga-rt-nd-go').listeners.click, '路口的每条路点了不跳');
     assert.equal(panel().querySelector('.dga-rt-peek'), null, '改的时候小卡片收起');
     assert.deepEqual(errors, []);
 });
