@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.5.0';
+    const VERSION = '4.6.0';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2948,7 +2948,7 @@
         routeStates: {},
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {} },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, cardFrom: '', folderShut: {}, folderEdit: '', bodyFocus: null, bodyRefocus: false, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {} },
     };
 
     function el(tag, attrs, ...children) {
@@ -4184,6 +4184,7 @@
             nodes: {},
             sides: [],
             cards: [],
+            folders: [],
             placement: routeDefaultPlacement(),
             advance: '',
             prompt: '',
@@ -4274,13 +4275,28 @@
             if (side.until && (!route.nodes[side.until] || route.nodes[side.until].side)) side.until = '';
         });
         if (route.start && (route.start === route.root || !route.nodes[route.start] || route.nodes[route.start].side)) route.start = '';
-        route.cards.forEach(card => {
-            if (card.when === 'nodes') card.nodes = card.nodes.filter(id => route.nodes[id]);
+        // 正文里放着的资料卡没了（删掉了），把那一块拿掉。
+        const cardIds = new Set(route.cards.map(card => card.id));
+        Object.values(route.nodes).forEach(node => {
+            if (!node.content.includes('⟦资料')) return;
+            const items = routeBodyItems(node.content);
+            if (items.some(item => item.card && !cardIds.has(item.card))) node.content = routeBodyJoin(items.filter(item => !item.card || cardIds.has(item.card)));
         });
+        // 文件夹没了的资料挪出来（不进文件夹）。
+        if (!Array.isArray(route.folders)) route.folders = [];
+        const folderIds = new Set(route.folders.map(folder => folder.id));
+        route.cards.forEach(card => { if (card.folder && !folderIds.has(card.folder)) card.folder = ''; });
         return route;
     }
 
     // ---- 资料卡 ----
+    // v4.6：资料卡只有名字和内容（还有一个颜色）。改一段时点正文上面的资料按钮，正文里放一个「⟦资料:卡的 id⟧」，
+    // 编辑时显示成一行带颜色的小标题，发出去时换成卡的内容——跟着资料走：资料页里改了，放了它的段都跟着变。
+    // 资料可以放进文件夹（一层，route.folders = [{ id, name }]，卡上记 folder）；正文上面的按钮按文件夹分行。
+
+    const ROUTE_CARD_MARK_RE = /⟦资料[:：]([^⟧\n]+)⟧/g;
+    // 资料的颜色里不放黄 / 橙（黄色是主线的颜色），免得和正文看混。
+    const CARD_COLORS = ['#6FB3D9', '#C49BE0', '#7FBF8E', '#E07FA8', '#8FA3E8', '#5FC4C0'];
 
     function normalizeRouteCard(raw) {
         const card = raw && typeof raw === 'object' ? raw : {};
@@ -4288,11 +4304,137 @@
             id: ROUTE_ID_RE.test(String(card.id || '')) ? String(card.id) : routeId('c'),
             name: oneLine(card.name || ''),
             text: String(card.text || ''),
-            when: card.when === 'nodes' ? 'nodes' : 'always',
-            nodes: card.when === 'nodes' && Array.isArray(card.nodes) ? Array.from(new Set(card.nodes.map(String))) : [],
-            // 放在正文前还是正文后（v4.4.1）：before / after。
-            at: card.at === 'after' ? 'after' : 'before',
+            color: /^#[0-9a-f]{6}$/i.test(String(card.color || '')) ? card.color : '',
+            folder: ROUTE_ID_RE.test(String(card.folder || '')) ? String(card.folder) : '',
         };
+    }
+
+    function normalizeRouteFolders(raw) {
+        const seen = new Set();
+        return (Array.isArray(raw) ? raw : []).map(item => {
+            const folder = item && typeof item === 'object' ? item : {};
+            let id = ROUTE_ID_RE.test(String(folder.id || '')) ? String(folder.id) : routeId('f');
+            if (seen.has(id)) id = routeId('f');
+            seen.add(id);
+            return { id, name: oneLine(folder.name || '') || '文件夹' };
+        });
+    }
+
+    function routeFolderName(route, id) {
+        const folder = (route.folders || []).find(item => item.id === id);
+        return folder ? folder.name : '';
+    }
+
+    function routeNextCardColor(route) {
+        const used = route.cards.map(card => card.color);
+        return CARD_COLORS.find(color => !used.includes(color)) || CARD_COLORS[route.cards.length % CARD_COLORS.length];
+    }
+
+    function routeCardMark(id) {
+        return `⟦资料:${id}⟧`;
+    }
+
+    // 正文拆成一串 { text } / { card }：开头、结尾、两块资料中间总有一个 text（可以是空的）。
+    // 资料在正文里单占一行，它前后各吃掉一个换行。
+    function routeBodyItems(content) {
+        const raw = String(content || '');
+        const items = [];
+        const re = new RegExp(ROUTE_CARD_MARK_RE.source, 'g');
+        let last = 0;
+        let match;
+        while ((match = re.exec(raw))) {
+            items.push({ text: raw.slice(last, match.index) });
+            items.push({ card: match[1].trim() });
+            last = match.index + match[0].length;
+        }
+        items.push({ text: raw.slice(last) });
+        items.forEach((item, index) => {
+            if (item.card) return;
+            if (index > 0) item.text = item.text.replace(/^\n/, '');
+            if (index < items.length - 1) item.text = item.text.replace(/\n$/, '');
+        });
+        return items;
+    }
+
+    // routeBodyItems 倒过来：挨着的两段字用换行接上，两块资料挨着时中间补一个空的。
+    function routeBodyJoin(list) {
+        const items = [];
+        list.forEach(item => {
+            const prev = items[items.length - 1];
+            if (item.card) {
+                if (!prev || prev.card) items.push({ text: '' });
+                items.push({ card: item.card });
+            } else if (prev && !prev.card) prev.text += prev.text && item.text ? `\n${item.text}` : item.text;
+            else items.push({ text: String(item.text || '') });
+        });
+        if (!items.length || items[items.length - 1].card) items.push({ text: '' });
+        return items.map((item, index) => {
+            if (item.card) return `${index === 1 && items[0].text === '' ? '' : '\n'}${routeCardMark(item.card)}`;
+            if (index === 0) return item.text;
+            return item.text === '' ? '' : `\n${item.text}`;
+        }).join('');
+    }
+
+    function routeBodyCardIds(content) {
+        return routeBodyItems(content).filter(item => item.card).map(item => item.card);
+    }
+
+    // 发出去的样子：字和资料一块一块，每块去掉首尾空白，空的不要，资料换成卡的内容。
+    // used 记着这一次已经发过的卡，同一张卡（主线、支线里都放了）只发一次。
+    function routeBodyPieces(route, content, used) {
+        const out = [];
+        routeBodyItems(content).forEach(item => {
+            if (!item.card) {
+                if (item.text.trim()) out.push({ text: item.text.trim() });
+                return;
+            }
+            const card = route.cards.find(other => other.id === item.card);
+            if (!card || !card.text.trim() || (used && used.has(card.id))) return;
+            if (used) used.add(card.id);
+            out.push({ card, text: card.text.trim() });
+        });
+        return out;
+    }
+
+    function routeBodyText(route, content) {
+        return routeBodyPieces(route, content).map(piece => piece.text).join('\n\n');
+    }
+
+    // 把正文里第 index 块资料往上 / 往下挪过一行字（空行跳过）或者一块资料。挪不动返回 null。
+    function routeBodyMove(items, index, delta) {
+        const units = [];
+        items.forEach((item, i) => {
+            if (item.card) units.push({ card: item.card, self: i === index });
+            else item.text.split('\n').forEach(line => units.push({ line }));
+        });
+        const from = units.findIndex(unit => unit.self);
+        if (from < 0) return null;
+        let to = from + delta;
+        while (to >= 0 && to < units.length && !units[to].card && !units[to].line.trim()) to += delta;
+        if (to < 0 || to >= units.length) return null;
+        units.splice(to, 0, units.splice(from, 1)[0]);
+        const out = [];
+        let lines = [];
+        const flush = () => { out.push({ text: lines.join('\n').replace(/^\n+|\n+$/g, '') }); lines = []; };
+        units.forEach(unit => {
+            if (!unit.card) { lines.push(unit.line); return; }
+            flush();
+            out.push({ card: unit.card });
+        });
+        flush();
+        return out;
+    }
+
+    // 旧的资料卡（v4.4–v4.5 带「每段都发 / 只在某几段发」「正文前 / 正文后」）放进对应那几段的正文里：
+    // 每段都发的放进主线每一段，只在某几段发的放进勾上的段；正文前的放最前面，正文后的放最后面。
+    function routePlaceLegacyCards(route, legacy) {
+        if (!legacy.length) return;
+        Object.values(route.nodes).forEach(node => {
+            const hit = at => legacy.filter(item => item.at === at && (item.when === 'always' ? !node.side : item.nodes.includes(node.id))).map(item => ({ card: item.id }));
+            const before = hit('before');
+            const after = hit('after');
+            if (before.length || after.length) node.content = routeBodyJoin(before.concat(node.content ? routeBodyItems(node.content) : [], after));
+        });
     }
 
     // 旧的分块模板换成资料卡：格子拿掉（段的正文、支线现在自动发）；格子前面的小标题（「现在的剧情：」）拿掉，
@@ -4342,7 +4484,7 @@
                 const cut = head.search(/[：:（(]/);
                 const name = cut > 0 && cut <= 12 ? head.slice(0, cut) : (head.length > 12 ? `${head.slice(0, 12)}…` : head);
                 const id = at === 'after' && parts.before.length ? `${block.id || ''}b` : block.id;
-                cards.push(normalizeRouteCard({ id, name, text, when, nodes, at }));
+                cards.push({ id, name, text, when, nodes, at });
             });
         });
         return cards;
@@ -4361,6 +4503,8 @@
             nodes: {},
             sides: [],
             cards: [],
+            // 资料的文件夹（v4.6）：一层，[{ id, name }]。
+            folders: normalizeRouteFolders(src.folders),
             placement: normalizeRoutePlacement(src.placement),
             // 怎么往下走：'' 跟随设置页 / 'off' 只能手动 / 'judge' 让 AI 判断。
             advance: src.advance === 'off' || src.advance === 'judge' ? src.advance : '',
@@ -4405,20 +4549,38 @@
             };
         }).filter(side => side.id);
         route.sides.forEach(side => { if (!side.color) side.color = routeNextSideColor(route); });
-        if (Array.isArray(src.cards)) {
-            route.cards = src.cards.map(normalizeRouteCard);
-            if (Array.isArray(src.legacyBlocks)) route.legacyBlocks = cloneData(src.legacyBlocks);
-        } else if (Array.isArray(src.blocks)) {
-            route.cards = routeCardsFromBlocks(src.blocks, route);
-            route.legacyBlocks = cloneData(src.blocks);
-        }
+        // 资料卡：v4.4 前是分块模板（blocks），v4.4–v4.5 的卡带「在哪发 / 放在正文前后」，读到都放进对应段的正文里。
+        const rawCards = Array.isArray(src.cards) ? src.cards : (Array.isArray(src.blocks) ? routeCardsFromBlocks(src.blocks, route) : []);
+        const seenCards = new Set();
+        const legacy = [];
+        rawCards.forEach(raw => {
+            const card = normalizeRouteCard(raw);
+            if (seenCards.has(card.id)) card.id = routeId('c');
+            seenCards.add(card.id);
+            route.cards.push(card);
+            if (raw && typeof raw === 'object' && raw.when) {
+                legacy.push({
+                    id: card.id,
+                    when: raw.when === 'nodes' ? 'nodes' : 'always',
+                    nodes: Array.isArray(raw.nodes) ? raw.nodes.map(String) : [],
+                    at: raw.at === 'after' ? 'after' : 'before',
+                });
+            }
+        });
+        route.cards.forEach(card => { if (!card.color) card.color = routeNextCardColor(route); });
+        routePlaceLegacyCards(route, legacy);
+        if (Array.isArray(src.legacyBlocks)) route.legacyBlocks = cloneData(src.legacyBlocks);
+        else if (!Array.isArray(src.cards) && Array.isArray(src.blocks)) route.legacyBlocks = cloneData(src.blocks);
         return cleanupRoute(route);
     }
 
     // ---- 导入 / 导出（v4.5）----
     // 文件格式写给人和 AI 看（写法说明是仓库里单独的「路线图写法-给AI看.md」，不放进插件）：段用自己起的代号互相指，主线的段排成一列、第一个是起点，
-    // 支线把自己的段装在里面，资料卡用段的代号。导入时代号全换成新的，所以同一份文件导几次都不会撞。
+    // 支线把自己的段装在里面；资料卡也有自己的代号，段的正文里写「⟦资料:代号⟧」就是把那张资料放在这里。
+    // 导入时代号全换成新的，所以同一份文件导几次都不会撞。
+    // version 2（v4.6）：资料卡放进正文；version 1 的卡带 when / nodes / at，导入时照旧换算进正文。
     const ROUTE_FILE_FORMAT = 'dynamic-guide-route';
+    const ROUTE_FILE_VERSION = 2;
 
     function exportRouteData(route) {
         const code = {};
@@ -4431,15 +4593,18 @@
         mainNodes.forEach(node => codeOf(node.id));
         const sideNodes = route.sides.map(side => routeOrderedNodes(route, side.root, side.id));
         sideNodes.forEach(list => list.forEach(node => codeOf(node.id)));
+        const cardCode = {};
+        route.cards.forEach((card, index) => { cardCode[card.id] = `z${index + 1}`; });
+        const contentOut = content => String(content || '').replace(new RegExp(ROUTE_CARD_MARK_RE.source, 'g'), (all, id) => (cardCode[id.trim()] ? routeCardMark(cardCode[id.trim()]) : ''));
         const nodeOut = node => {
-            const out = { id: codeOf(node.id), name: node.name, content: node.content, doneMode: node.doneMode };
+            const out = { id: codeOf(node.id), name: node.name, content: contentOut(node.content), doneMode: node.doneMode };
             if (node.done) out.done = node.done;
             out.next = node.next.map(edge => (node.next.length > 1 || edge.cond ? { to: codeOf(edge.to), cond: edge.cond } : codeOf(edge.to)));
             if (node.fallback >= 0 && node.next[node.fallback]) out.fallback = codeOf(node.next[node.fallback].to);
             if (node.note) out.note = node.note;
             return out;
         };
-        const data = { format: ROUTE_FILE_FORMAT, version: 1, name: route.name };
+        const data = { format: ROUTE_FILE_FORMAT, version: ROUTE_FILE_VERSION, name: route.name };
         if (route.start && route.nodes[route.start]) data.start = codeOf(route.start);
         data.nodes = mainNodes.map(nodeOut);
         data.sides = route.sides.map((side, index) => {
@@ -4449,9 +4614,12 @@
             out.nodes = sideNodes[index].map(nodeOut);
             return out;
         });
+        const folderCode = {};
+        route.folders.forEach((folder, index) => { folderCode[folder.id] = `f${index + 1}`; });
+        if (route.folders.length) data.folders = route.folders.map(folder => ({ id: folderCode[folder.id], name: folder.name }));
         data.cards = route.cards.map(card => {
-            const out = { name: card.name, text: card.text, at: card.at, when: card.when };
-            if (card.when === 'nodes') out.nodes = card.nodes.filter(id => route.nodes[id]).map(codeOf);
+            const out = { id: cardCode[card.id], name: card.name, text: card.text, color: card.color };
+            if (folderCode[card.folder]) out.folder = folderCode[card.folder];
             return out;
         });
         data.settings = { advance: route.advance, extractRules: route.extractRules, excludeRules: route.excludeRules, placement: route.placement };
@@ -4482,7 +4650,7 @@
     function importOneRoute(raw, prefix) {
         const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
         if (!src) throw new Error(`${prefix}格式不对：一张路线图应该是 { } 包起来的一项。`);
-        if (src.version != null && Number(src.version) > 1) throw new Error(`${prefix}这份文件是更新版本的插件导出的，先把插件升级到最新版再导入。`);
+        if (src.version != null && Number(src.version) > ROUTE_FILE_VERSION) throw new Error(`${prefix}这份文件是更新版本的插件导出的，先把插件升级到最新版再导入。`);
         const mainList = Array.isArray(src.nodes) ? src.nodes : [];
         if (!mainList.length) throw new Error(`${prefix}没有段：nodes 里至少要有一段（第一段是起点）。`);
         const warnings = [];
@@ -4524,6 +4692,54 @@
             nodes.slice(1).forEach(node => register(node, id, `支线「${name}」的段`));
             sides.push({ side, id, name, root: first });
         });
+        // 资料的文件夹：代号或名字 → 新 id；卡上写了找不到的文件夹，就照名字新建一个。
+        const folders = [];
+        const folderFind = new Map();
+        const addFolder = (code, name) => {
+            const folder = { id: routeId('f'), name: oneLine(name) || oneLine(code) || '文件夹' };
+            folders.push(folder);
+            if (code) folderFind.set(code, folder.id);
+            if (!folderFind.has(folder.name)) folderFind.set(folder.name, folder.id);
+            return folder.id;
+        };
+        (Array.isArray(src.folders) ? src.folders : []).forEach(item => {
+            const folder = item && typeof item === 'object' ? item : { name: text(item) };
+            addFolder(oneLine(text(folder.id)), text(folder.name));
+        });
+        const folderOf = value => {
+            const key = oneLine(text(value));
+            if (!key) return '';
+            return folderFind.get(key) || addFolder('', key);
+        };
+        // 资料卡：代号 → 新 id（找不到代号再按名字找）。旧格式（version 1）的卡带 when / nodes / at，交给 normalizeRoute 放进正文。
+        const cardByCode = new Map();
+        const cardByName = new Map();
+        const cards = (Array.isArray(src.cards) ? src.cards : []).map(item => {
+            const card = item && typeof item === 'object' ? item : { text: text(item) };
+            const name = oneLine(text(card.name));
+            const id = routeId('c');
+            const code = oneLine(text(card.id));
+            if (code && !cardByCode.has(code)) cardByCode.set(code, id);
+            if (name && !cardByName.has(name)) cardByName.set(name, id);
+            const out = { id, name, text: text(card.text), color: text(card.color), folder: folderOf(card.folder) };
+            if (card.when == null && card.nodes == null && card.at == null) return out;
+            const picked = [];
+            (Array.isArray(card.nodes) ? card.nodes : []).forEach(value => {
+                const nodeId = find(value);
+                if (nodeId) picked.push(nodeId);
+                else warn(`资料「${name || '没名字'}」写着在「${text(value)}」发，找不到这一段，这一项去掉了。`);
+            });
+            const when = card.when === 'always' ? 'always' : (card.when === 'nodes' || picked.length ? 'nodes' : 'always');
+            if (when === 'nodes' && !picked.length) warn(`资料「${name || '没名字'}」是「只在某几段发」，可一段都没选上，现在哪一段都不会发它。`);
+            return { ...out, when, nodes: picked, at: card.at === 'after' ? 'after' : 'before' };
+        });
+        const contentIn = (value, name) => text(value).replace(new RegExp(ROUTE_CARD_MARK_RE.source, 'g'), (all, key) => {
+            const id = cardByCode.get(key.trim()) || cardByName.get(key.trim());
+            if (id) return routeCardMark(id);
+            warn(`「${name}」的正文里放了资料「${key.trim()}」，找不到这张资料，拿掉了。`);
+            // 换成一个不存在的卡，cleanupRoute 连同前后的换行一起拿掉。
+            return routeCardMark('gone');
+        });
         const nodes = {};
         entries.forEach(({ node, id, name, sideId }) => {
             const rawNext = node.next == null ? [] : (Array.isArray(node.next) ? node.next : [node.next]);
@@ -4551,7 +4767,7 @@
             }
             const done = text(node.done);
             const mode = ['text', 'ai', 'manual'].includes(node.doneMode) ? node.doneMode : (done.trim() ? 'text' : 'ai');
-            nodes[id] = { id, name, content: text(node.content), doneMode: mode, done, next, fallback, note: text(node.note), side: sideId };
+            nodes[id] = { id, name, content: contentIn(node.content, name), doneMode: mode, done, next, fallback, note: text(node.note), side: sideId };
         });
         const outSides = [];
         sides.forEach(({ side, id, name, root: sideRoot }) => {
@@ -4570,19 +4786,6 @@
             }
             outSides.push({ id, name, cond: text(side.cond), host, root: sideRoot, wait: side.wait === true || side.wait === 'true', until, color: text(side.color) });
         });
-        const cards = (Array.isArray(src.cards) ? src.cards : []).map(item => {
-            const card = item && typeof item === 'object' ? item : { text: text(item) };
-            const name = oneLine(text(card.name));
-            const picked = [];
-            (Array.isArray(card.nodes) ? card.nodes : []).forEach(value => {
-                const id = find(value);
-                if (id) picked.push(id);
-                else warn(`资料「${name || '没名字'}」写着在「${text(value)}」发，找不到这一段，这一项去掉了。`);
-            });
-            const when = card.when === 'always' ? 'always' : (card.when === 'nodes' || picked.length ? 'nodes' : 'always');
-            if (when === 'nodes' && !picked.length) warn(`资料「${name || '没名字'}」是「只在某几段发」，可一段都没选上，现在哪一段都不会发它。`);
-            return { name, text: text(card.text), when, nodes: picked, at: card.at === 'after' ? 'after' : 'before' };
-        });
         let start = '';
         if (src.start != null && src.start !== '') {
             start = find(src.start);
@@ -4599,6 +4802,7 @@
             nodes,
             sides: outSides,
             cards,
+            folders,
             placement: settings.placement,
             advance: settings.advance,
             extractRules: settings.extractRules,
@@ -4946,37 +5150,25 @@
         });
     }
 
-    // ---- 发给 AI 的：资料卡 + 正文 ----
+    // ---- 发给 AI 的：正文（里面放着资料卡）----
 
-    function routeLiveNodes(route, state) {
-        if (state.ended) return [];
-        return [state.cur].concat(routeRunningSides(route, state).map(side => routeSideState(route, state, side.id).cur));
-    }
-
-    function routeCardActive(route, state, card) {
-        if (state.ended) return false;
-        if (card.when === 'always') return true;
-        return routeLiveNodes(route, state).some(id => card.nodes.includes(id));
-    }
-
-    // 发出去的几样东西，按先后：「正文前」的资料卡 → 主线这一段的正文 → 在走的支线（「支线名：正文」）→ 「正文后」的资料卡。
-    // 资料卡在各自那一组里从上到下排；空的不发。
+    // 发出去的几样东西，按先后：主线这一段的正文 → 在走的支线这一段的正文（v4.6 起不再加「支线名：」，用户要的）。
+    // 正文里放的资料（v4.6）换成资料卡的内容；同一张卡这一次只发一次。空的不发。
     function routeSendParts(route, state) {
         if (state.ended) return [];
-        const cards = at => route.cards.filter(card => (card.at === 'after' ? 'after' : 'before') === at && routeCardActive(route, state, card) && card.text.trim())
-            .map(card => ({ kind: 'card', card, text: card.text.trim() }));
-        const parts = cards('before');
-        const main = String((route.nodes[state.cur] || {}).content || '').trim();
-        if (main) parts.push({ kind: 'main', text: main, color: ROUTE_MAIN_COLOR });
+        const used = new Set();
+        const parts = [];
+        const main = routeBodyPieces(route, (route.nodes[state.cur] || {}).content, used);
+        if (main.length) parts.push({ kind: 'main', pieces: main, text: main.map(piece => piece.text).join('\n\n'), color: ROUTE_MAIN_COLOR });
         routeRunningSides(route, state).forEach(side => {
-            const text = String((route.nodes[routeSideState(route, state, side.id).cur] || {}).content || '').trim();
-            if (text) parts.push({ kind: 'side', side, label: `${side.name}：`, text, color: side.color });
+            const pieces = routeBodyPieces(route, (route.nodes[routeSideState(route, state, side.id).cur] || {}).content, used);
+            if (pieces.length) parts.push({ kind: 'side', side, pieces, text: pieces.map(piece => piece.text).join('\n\n'), color: side.color });
         });
-        return parts.concat(cards('after'));
+        return parts;
     }
 
     function composeRoute(route, state) {
-        return routeSendParts(route, state).map(part => `${part.label || ''}${part.text}`).join('\n\n');
+        return routeSendParts(route, state).map(part => part.text).join('\n\n');
     }
 
     // 「走到这一段时」的样子（预览用）：主线的段 = 主线走到这里（不是现在这段时，支线都当没在走）；
@@ -5404,7 +5596,7 @@
     function routeJudgeSlots(route, item, history, host) {
         const lines = [];
         item.lines.forEach((line, index) => {
-            lines.push(`<line n="${index + 1}">`, `【${line.label}】现在这一段：${line.node.name}`, line.node.content || '（这一段没写内容）', `【完成条件】${routeDoneText(line.node)}`);
+            lines.push(`<line n="${index + 1}">`, `【${line.label}】现在这一段：${line.node.name}`, routeBodyText(route, line.node.content) || '（这一段没写内容）', `【完成条件】${routeDoneText(line.node)}`);
             if (line.roads.length > 1) {
                 lines.push('【走完以后是路口，几条路】');
                 line.roads.forEach((road, i) => lines.push(`${i + 1}. ${road.name}${road.cond ? `：${road.cond}` : '（没写条件）'}`));
@@ -6045,6 +6237,7 @@
         Object.keys(ui.rt.panel).forEach(item => { ui.rt.panel[item] = ''; });
         ui.rt.panel[route.id] = same ? '' : key;
         ui.rt.card[route.id] = '';
+        ui.rt.cardFrom = '';
         render();
         if (!same && key === 'place') loadRouteBook(route);
     }
@@ -6263,13 +6456,17 @@
         const apiList = readJudgeApiPresets();
         const apiOptions = [['', '跟随当前活动API']].concat(apiList.map(item => [item.name, item.name]));
         if (apiName && !apiList.some(item => item.name === apiName)) apiOptions.push([apiName, `${apiName}（预设不可用）`]);
+        // v4.6 整理（用户嫌乱）：「怎么走」（往下走 + 开新聊天）→「AI 判断」→「提取 / 排除规则」（这两组只有用 AI 判断时才有；
+        // 规则用户要单独一组、直接列出来）→「这张路线图」（导出 + 删掉）。
         return el('div', { class: 'dga-rs' },
-            setSection(el('h3', { class: 'dga-set-title' }, '往下走', infoTip(`advance-${route.id}`, [
+            setSection(el('h3', { class: 'dga-set-title' }, '怎么走', infoTip(`advance-${route.id}`, [
                 ['跟随设置', '用设置页里选的那个。'],
                 ['只手动', '要你自己点「下一段」才走。'],
                 ['AI 判断', '每次 AI 回复完，另外问一个 AI 这一段演完没有，演完就自动走。'],
+                ['开新聊天从', '开一个新聊天时，路线图从这里选的那一段开始走，前面的段算已经走过了。平时就是第一段。已经走过几段的聊天不受影响。'],
             ])), null,
                 el('div', { class: 'dga-set-row is-col' },
+                    el('div', { class: 'dga-set-label', text: '往下走' }),
                     rtSeg([
                         ['', `跟随设置（${globalMode === 'judge' ? 'AI 判断' : '手动'}）`],
                         ['off', '只手动'],
@@ -6278,7 +6475,10 @@
                         route.advance = value;
                         routeEdited(route, false);
                         render();
-                    }, 'is-fill'))),
+                    }, 'is-fill')),
+                setRow('开新聊天从',
+                    rtSelect(routeOrderedNodes(route, route.root, '').map(node => [node.id === route.root ? '' : node.id, node.name]),
+                        route.start || '', value => routeSetStart(route, value)))),
             judging ? setSection(el('h3', { class: 'dga-set-title' }, 'AI 判断', infoTip(`judge-${route.id}`, [
                 ['判断用的 API', '用哪个 AI 来判断。「跟随当前活动API」就是你现在聊天用的那个；也可以在「API」页加一个便宜的，专门用来判断。'],
                 ['判断提示词', '问它的时候发什么话，一般用「默认」。'],
@@ -6294,12 +6494,11 @@
             ])), null,
                 routeRuleGroup(route, 'extractRules', '提取'),
                 routeRuleGroup(route, 'excludeRules', '排除')) : null,
-            el('section', { class: 'dga-set-sec' },
-                el('div', { class: 'dga-set-box' },
-                    setRow('导出这张路线图', rtBtn('导出', () => exportRoute(route), 'small')))),
-            el('section', { class: 'dga-set-sec' },
-                el('div', { class: 'dga-set-box is-danger' },
-                    setRow('删掉这张路线图', rtBtn('删掉', () => deleteRouteDialog(route), 'small danger')))));
+            setSection(el('h3', { class: 'dga-set-title' }, '这张路线图'), null,
+                setRow('导出成文件', rtBtn('导出', () => exportRoute(route), 'small')),
+                el('div', { class: 'dga-set-row is-danger' },
+                    el('div', { class: 'dga-set-label', text: '删掉这张路线图' }),
+                    el('div', { class: 'dga-set-ctl' }, rtBtn('删掉', () => deleteRouteDialog(route), 'small danger')))));
     }
 
     // 一组规则：每条一行「开始标记 → 结束标记 ✕」，标题右边「＋ 加一条」。没有规则时只有标题这一行。
@@ -6501,7 +6700,7 @@
                 class: `dga-rt-node is-${state}${selected ? ' is-sel' : ''}`,
                 'data-node': id,
                 style: side && state === 'cur' ? `width:${b.w}px;border-color:${side.color};background:${side.color}33;box-shadow:0 0 0 3px ${side.color}22` : `width:${b.w}px`,
-                title: [node.content, node.next.length > 1 ? `路口：${node.next.length} 条路` : '', side ? `支线「${side.name}」 开始的条件：${side.cond || '（没写）'}` : ''].filter(Boolean).join('\n'),
+                title: [routeBodyText(route, node.content), node.next.length > 1 ? `路口：${node.next.length} 条路` : '', side ? `支线「${side.name}」 开始的条件：${side.cond || '（没写）'}` : ''].filter(Boolean).join('\n'),
                 onclick: () => {
                     if (edit) selectRouteNode(route, id);
                     else routeNodeInfoDialog(route, id);
@@ -6568,7 +6767,7 @@
                 STATE_TEXT[state] ? el('span', { class: `dga-rt-peek-state is-${state}`, text: `· ${STATE_TEXT[state]}` }) : null,
                 el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: dropRoutePeek }, '×')),
             el('div', { class: 'dga-rt-peek-title', text: node.name }),
-            el('div', { class: `dga-rt-peek-text${node.content ? '' : ' is-none'}`, text: node.content || '这一段还没写内容' }));
+            routeBodyView(route, node.content, 'dga-rt-peek-text', '这一段还没写内容'));
     }
 
     // 电脑上贴在这一段右边，放不下放左边，再放不下放下面。位置按面板算。
@@ -6896,7 +7095,7 @@
             ], bodyKids, null, close);
         }
         // 这一段：只有正文、完成条件、下一段（v4.3.7 用户定）。往后接一段、挂支线在图上点「＋」；
-        // 资料卡在标题栏「资料」里管，不在这里列；最下面常驻「预览」：走到这一段时发出去的样子。
+        // 资料在标题栏「资料」里写，正文上面的资料按钮把它放进正文（v4.6）；最下面常驻「预览」：走到这一段时发出去的样子。
         const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
             const to = index + delta;
@@ -6920,7 +7119,7 @@
                 isFork ? routeCondLine(edge, live) : null);
         });
         const bodyKids = [
-            sec('正文', el('textarea', { class: 'dga-rt-nd-body', placeholder: '写下这一段要演的事', oninput: event => { node.content = event.target.value; live(); } }, node.content)),
+            sec('正文', ...routeBodyEditor(route, node, live)),
             sec(['完成条件', infoTip(`done-${route.id}`, [
                 ['写一句', '写一件看得见的事，比如「两人交换了真名」。AI 判断时就看这件事发生了没有。'],
                 ['交给 AI 看', '不写条件，让 AI 自己看这一段演完了没有。'],
@@ -6937,7 +7136,6 @@
                     : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
                 isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
                     rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
-            side ? null : routeStartSection(route, id, sec),
             sec('预览', routeNodePreview(route, id)),
         ];
         return routeDrawerShell(route, color, [
@@ -6961,29 +7159,17 @@
         return line;
     }
 
-    // 「开新聊天从这一段开始」（v4.5）：路线图上记一段，新聊天的进度从那里起。
+    // 「开新聊天从哪一段开始」（v4.5 起，v4.6 挪进路线图设置）：路线图上记一段，新聊天的进度从那里起。
     // 现在这个聊天要是还没动过（就停在原来的开头），跟着挪过去；已经走过的聊天不动。
-    function routeStartSection(route, id, sec) {
-        const startId = route.start || route.root;
-        const on = startId === id;
-        const set = value => {
-            const now = routeStateOf(route);
-            const untouched = JSON.stringify(now) === JSON.stringify(normalizeRouteState(null, route));
-            route.start = value && id !== route.root ? id : '';
-            ui.routeStates[route.id] = untouched ? normalizeRouteState(null, route) : now;
-            writeRouteState(route.id, ui.routeStates[route.id]).catch(() => {});
-            routeEdited(route, true);
-            render();
-            notify(route.start ? `开新聊天会从「${route.nodes[id].name}」开始` : '开新聊天会从起点开始', 'info');
-        };
-        return sec(['开新聊天', infoTip(`start-${route.id}`, [
-            ['从这一段开始', '平时开一个新聊天，路线图从起点开始走。打开以后，新聊天直接从这一段开始，前面的段算已经走过了。'],
-            ['已经在聊的', '已经走过几段的聊天不受影响，还在原来的地方。'],
-            ['改回去', '在起点上打开，或者把这里关掉，就回到从起点开始。'],
-        ])],
-            el('div', { class: 'dga-rt-nd-start' },
-                el('span', { text: '从这一段开始' }),
-                Object.assign(switchBtn(on, set, '开新聊天从这一段开始'), on && id === route.root ? { disabled: true } : {})));
+    function routeSetStart(route, id) {
+        const now = routeStateOf(route);
+        const untouched = JSON.stringify(now) === JSON.stringify(normalizeRouteState(null, route));
+        route.start = id && id !== route.root && route.nodes[id] && !route.nodes[id].side ? id : '';
+        ui.routeStates[route.id] = untouched ? normalizeRouteState(null, route) : now;
+        writeRouteState(route.id, ui.routeStates[route.id]).catch(() => {});
+        routeEdited(route, true);
+        render();
+        notify(`开新聊天会从「${route.nodes[route.start || route.root].name}」开始`, 'info');
     }
 
     function renderRoutePanelDrawer(route, key) {
@@ -6997,9 +7183,9 @@
                 el('button', { type: 'button', class: 'dga-rt-x', title: '关闭', onclick: close }, '×')),
             key === 'cards'
                 ? el('div', { class: 'dga-rt-drawer-title dga-tip-host' }, title, infoTip(`cards-${route.id}`, [
-                    ['资料是什么', '写给 AI 看的补充内容，比如写作风格、一封信写了什么。每张卡起个名字，好找。'],
-                    ['在哪发', '「每段都发」不管走到哪都发；「只在某几段发」只有走到勾上的段才发。'],
-                    ['放在正文前 / 正文后', '列表就是发出去的先后：中间那一行是这一段的正文，它上面的资料在正文前面发，下面的在正文后面发。用 ↑ ↓ 挪，挪过中间那一行就换到另一边。想看真正发出去的样子，编辑时点一段，侧边栏最下面就是。'],
+                    ['资料是什么', '写给 AI 看的补充内容，比如写作风格、一封信写了什么。每张起个名字，好找。'],
+                    ['怎么发出去', '点「编辑路线」再点一段，正文上面有每张资料的按钮。点一下，这张资料就放进正文里（光标在哪放哪），显示成一块带颜色的框，可以上下挪、点 × 拿掉。放进哪段，走到那段时就发。'],
+                    ['改内容', '在这里改，放了它的段都跟着变。'],
                 ]))
                 : el('div', { class: 'dga-rt-drawer-title', text: title }),
         ], [body], null, close, key === 'place');
@@ -7093,14 +7279,16 @@
             orderList);
     }
 
-    // ---- 资料（v4.4）：「发给 AI 的内容」拆开以后，只在某几段发的、每段都发的话都放这里 ----
-    // 列表照发出去的先后排（v4.4.1）：「正文前」一组 → 中间一行「这一段的正文」→「正文后」一组。
-    // 每张卡一行：名字 + 在哪发（每段都发 / 哪几段）。上下挪就是改先后，挪过「正文」那一行就换到另一边。点一行进去改。
+    // ---- 资料（v4.6 大改）：资料页只管写资料（名字 + 内容），每张一行 ----
+    // 发不发、放在哪，看改一段时有没有把它放进正文（正文上面的资料按钮）。正文里放的是一块带颜色的框，跟着资料走。
+
+    function routeCardUses(route, card) {
+        return Object.values(route.nodes).filter(node => routeBodyCardIds(node.content).includes(card.id));
+    }
 
     function routeCardWhere(route, card) {
-        if (card.when === 'always') return '每段都发';
-        const names = card.nodes.filter(id => route.nodes[id]).map(id => route.nodes[id].name);
-        if (!names.length) return '还没选段';
+        const names = routeCardUses(route, card).map(node => node.name);
+        if (!names.length) return '还没放进正文';
         return names.length === 1 ? names[0] : `${names[0]} 等 ${names.length} 段`;
     }
 
@@ -7110,123 +7298,285 @@
         return open ? renderRouteCardEdit(route, open) : renderRouteCardList(route);
     }
 
-    // 把一张卡放到 at 那一组的最前 / 最后（first = true 放最前）。
-    function routePutCard(route, card, at, first) {
-        route.cards = route.cards.filter(item => item !== card);
-        card.at = at;
-        const same = route.cards.filter(item => item.at === at);
-        const anchor = first ? same[0] : same[same.length - 1];
-        const index = anchor ? route.cards.indexOf(anchor) + (first ? 0 : 1) : (at === 'before' ? 0 : route.cards.length);
-        route.cards.splice(index, 0, card);
-    }
-
+    // 资料列表：没进文件夹的排最上面，下面一个文件夹一组（标题行能收起、点名字改名，悬停出现 ＋ ↑ ↓ ×）。
     function renderRouteCardList(route) {
-        const state = routeStateOf(route);
         const stop = fn => event => { event.stopPropagation(); fn(); };
         const changed = () => { routeEdited(route, true); render(); };
-        const add = at => {
-            const card = normalizeRouteCard({ at });
-            routePutCard(route, card, at, false);
+        const add = folder => {
+            const card = normalizeRouteCard({ folder });
+            card.color = routeNextCardColor(route);
+            route.cards.push(card);
+            if (folder) ui.rt.folderShut[folder] = false;
             ui.rt.card[route.id] = card.id;
             changed();
         };
-        const move = (card, delta) => {
-            const list = route.cards.filter(item => item.at === card.at);
-            const other = list[list.indexOf(card) + delta];
-            if (other) {
-                const from = route.cards.indexOf(card);
-                const to = route.cards.indexOf(other);
-                route.cards[from] = other;
-                route.cards[to] = card;
-            } else if (card.at === 'before' && delta > 0) routePutCard(route, card, 'after', true);
-            else if (card.at === 'after' && delta < 0) routePutCard(route, card, 'before', false);
-            else return;
+        const addFolder = () => {
+            const folder = { id: routeId('f'), name: '新文件夹' };
+            route.folders.push(folder);
+            ui.rt.folderEdit = folder.id;
             changed();
         };
-        const row = card => {
-            const on = routeCardActive(route, state, card) && card.text.trim();
-            const list = route.cards.filter(item => item.at === card.at);
+        // 上下挪只是改先后（正文上面那排按钮也照这个排），只在同一个文件夹里挪。
+        const move = (card, delta) => {
+            const list = route.cards.filter(item => item.folder === card.folder);
+            const other = list[list.indexOf(card) + delta];
+            if (!other) return;
+            const from = route.cards.indexOf(card);
+            const to = route.cards.indexOf(other);
+            route.cards[from] = other;
+            route.cards[to] = card;
+            changed();
+        };
+        const moveFolder = (index, delta) => {
+            const to = index + delta;
+            if (to < 0 || to >= route.folders.length) return;
+            route.folders.splice(to, 0, route.folders.splice(index, 1)[0]);
+            changed();
+        };
+        const dropFolder = folder => {
+            const inside = route.cards.filter(card => card.folder === folder.id);
+            inside.forEach(card => { card.folder = ''; });
+            route.folders = route.folders.filter(item => item !== folder);
+            changed();
+            if (inside.length) notify(`文件夹里的 ${inside.length} 张资料挪到了最上面`, 'info');
+        };
+        const row = (card, list) => {
             const index = list.indexOf(card);
             return el('div', { class: 'dga-rt-zl-row', title: '点开来改', onclick: () => { ui.rt.card[route.id] = card.id; render(); } },
-                el('span', { class: `dga-rt-zl-dot${on ? ' is-on' : ''}`, title: on ? '现在在发' : '现在不发' }),
+                el('span', { class: 'dga-rt-zl-dot', style: `--cc:${card.color}` }),
                 el('span', { class: `dga-rt-zl-name${card.name ? '' : ' is-none'}`, text: card.name || '没起名' }),
                 el('span', { class: 'dga-rt-zl-where', text: routeCardWhere(route, card) }),
                 el('span', { class: 'dga-rt-zl-ops' },
-                    el('button', { type: 'button', class: 'dga-rt-icon', title: card.at === 'after' && index === 0 ? '挪到正文前' : '往上挪', disabled: card.at === 'before' && index === 0, onclick: stop(() => move(card, -1)) }, '↑'),
-                    el('button', { type: 'button', class: 'dga-rt-icon', title: card.at === 'before' && index === list.length - 1 ? '挪到正文后' : '往下挪', disabled: card.at === 'after' && index === list.length - 1, onclick: stop(() => move(card, 1)) }, '↓')),
+                    el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: stop(() => move(card, -1)) }, '↑'),
+                    el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === list.length - 1, onclick: stop(() => move(card, 1)) }, '↓')),
                 el('span', { class: 'dga-rt-zl-caret', text: '›' }));
         };
-        // 两组不写组名（v4.4.2 用户删的），中间那一行「这一段的正文」就把前后分开了。
-        const group = at => {
-            const list = route.cards.filter(card => card.at === at);
-            return el('div', { class: 'dga-rt-zl-group' },
-                el('div', { class: 'dga-rt-zl-head' },
-                    el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: () => add(at) }, '＋ 加一张')),
-                list.length ? el('div', { class: 'dga-rt-zl-list' }, ...list.map(row)) : null);
+        const listOf = folder => {
+            const list = route.cards.filter(card => card.folder === folder);
+            return list.length ? el('div', { class: 'dga-rt-zl-list' }, ...list.map(card => row(card, list))) : null;
+        };
+        const folderName = folder => {
+            if (ui.rt.folderEdit !== folder.id) {
+                return el('button', { type: 'button', class: 'dga-rt-zl-fname', title: '点一下改名字', onclick: () => { ui.rt.folderEdit = folder.id; render(); } }, folder.name);
+            }
+            const input = el('input', { type: 'text', class: 'dga-rt-mt dga-rt-zl-fname-in', value: folder.name, placeholder: '文件夹名字' });
+            const done = () => {
+                if (ui.rt.folderEdit !== folder.id) return;
+                folder.name = oneLine(input.value) || folder.name || '文件夹';
+                ui.rt.folderEdit = '';
+                changed();
+            };
+            input.addEventListener('blur', done);
+            input.addEventListener('keydown', event => { if (event.key === 'Enter') done(); });
+            if (hostWindow && typeof hostWindow.setTimeout === 'function') {
+                hostWindow.setTimeout(() => { try { if (input.isConnected) { input.focus(); input.select(); } } catch (error) { /* 测试环境 */ } }, 0);
+            }
+            return input;
+        };
+        const folderGroup = (folder, index) => {
+            const shut = Boolean(ui.rt.folderShut[folder.id]);
+            const count = route.cards.filter(card => card.folder === folder.id).length;
+            return el('div', { class: `dga-rt-zl-fgroup${shut ? ' is-shut' : ''}` },
+                el('div', { class: 'dga-rt-zl-folder' },
+                    el('button', { type: 'button', class: 'dga-rt-zl-fold', title: shut ? '展开' : '收起', onclick: () => { ui.rt.folderShut[folder.id] = !shut; render(); } }, shut ? '▸' : '▾'),
+                    folderName(folder),
+                    el('span', { class: 'dga-rt-zl-fcount', text: String(count) }),
+                    el('span', { class: 'dga-rt-zl-ops' },
+                        el('button', { type: 'button', class: 'dga-rt-icon', title: '在这个文件夹里加一张', onclick: () => add(folder.id) }, '＋'),
+                        el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: () => moveFolder(index, -1) }, '↑'),
+                        el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === route.folders.length - 1, onclick: () => moveFolder(index, 1) }, '↓'),
+                        el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '删掉文件夹（里面的资料留着，挪到最上面）', onclick: () => dropFolder(folder) }, '×'))),
+                shut ? null : listOf(folder.id));
         };
         return el('div', { class: 'dga-rt-zl' },
-            group('before'),
-            el('div', { class: 'dga-rt-zl-body' }, el('span', { text: '这一段的正文' }), route.sides.length ? el('small', { text: '和在走的支线' }) : null),
-            group('after'));
+            el('div', { class: 'dga-rt-zl-head' },
+                el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: addFolder }, '＋ 文件夹'),
+                el('button', { type: 'button', class: 'dga-rt-link dga-rt-zl-add', onclick: () => add('') }, '＋ 加一张')),
+            listOf(''),
+            ...route.folders.map(folderGroup));
     }
 
     function renderRouteCardEdit(route, card) {
         const live = () => { routeLive(route); scheduleRouteSave(600); };
         const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label', text: label }), ...kids);
-        const toggle = id => {
-            card.nodes = card.nodes.includes(id) ? card.nodes.filter(item => item !== id) : card.nodes.concat(id);
-            routeEdited(route, true);
+        const uses = routeCardUses(route, card);
+        // 从改一段的颜色框点进来的，返回时回到那一段。
+        const from = ui.rt.cardFrom && route.nodes[ui.rt.cardFrom] && ui.rt.mode[route.id] === 'edit' ? route.nodes[ui.rt.cardFrom] : null;
+        const back = () => {
+            ui.rt.card[route.id] = '';
+            if (from) {
+                ui.rt.panel[route.id] = '';
+                ui.rt.sel[route.id] = from.id;
+            }
+            ui.rt.cardFrom = '';
             render();
         };
-        const line = (label, color, nodes) => el('div', { class: 'dga-rt-pick-line' },
-            el('span', { class: 'dga-rt-pick-label', style: `color:${color}`, text: label }),
-            el('div', { class: 'dga-rt-chips' }, ...nodes.map(node => el('button', {
-                type: 'button', class: `dga-rt-chip${card.nodes.includes(node.id) ? ' is-on' : ''}`, onclick: () => toggle(node.id),
-            }, node.name))));
         return el('div', { class: 'dga-rt-zl-edit' },
-            el('button', { type: 'button', class: 'dga-rt-link dga-rt-back', onclick: () => { ui.rt.card[route.id] = ''; render(); } }, '‹ 资料'),
+            el('button', { type: 'button', class: 'dga-rt-link dga-rt-back', onclick: back }, from ? `‹ 回到「${from.name}」` : '‹ 资料'),
             sec('名字', el('input', { type: 'text', class: 'dga-rt-mt dga-rt-zl-name-in', value: card.name, placeholder: '比如：信的内容', oninput: event => { card.name = oneLine(event.target.value); scheduleRouteSave(600); } })),
             sec('内容', el('textarea', { class: 'dga-rt-nd-body dga-rt-zl-text', placeholder: '写给 AI 看的', oninput: event => { card.text = event.target.value; live(); } }, card.text)),
-            sec('放在', rtSeg([['before', '正文前'], ['after', '正文后']], card.at, value => {
-                // 换到另一边：放在那一组的最后。
-                routePutCard(route, card, value, false);
+            route.folders.length ? sec('文件夹', rtSelect([['', '不放进文件夹']].concat(route.folders.map(folder => [folder.id, folder.name])), card.folder, value => {
+                card.folder = value;
+                if (value) ui.rt.folderShut[value] = false;
                 routeEdited(route, true);
                 render();
-            })),
-            sec('在哪发',
-                rtSeg([['always', '每段都发'], ['nodes', '只在某几段发']], card.when, value => {
-                    card.when = value;
-                    // 刚换成「只在某几段发」、一段都没勾：先勾上现在这一段。
-                    const state = routeStateOf(route);
-                    if (value === 'nodes' && !card.nodes.length && !state.ended) card.nodes = [state.cur];
-                    routeEdited(route, true);
-                    render();
-                }),
-                card.when === 'nodes' ? el('div', { class: 'dga-rt-pickset' },
-                    line('主线', ROUTE_MAIN_COLOR, routeOrderedNodes(route, route.root, '')),
-                    ...route.sides.map(side => line(side.name, side.color, routeOrderedNodes(route, side.root, side.id)))) : null),
+            })) : null,
+            uses.length ? sec('放在', el('div', { class: 'dga-rt-chips' }, ...uses.map(node => el('span', { class: 'dga-rt-chip is-static', text: node.name })))) : null,
             el('div', { class: 'dga-rt-nd-sec' }, rtBtn('删掉这张', () => {
                 route.cards = route.cards.filter(item => item !== card);
+                cleanupRoute(route);
                 ui.rt.card[route.id] = '';
                 routeEdited(route, true);
-                render();
+                if (from) back();
+                else render();
+                if (uses.length) notify(`也从 ${uses.length} 段的正文里拿掉了`, 'info');
             }, 'small danger')));
     }
 
-    // 预览：走到这一段时真正发出去的字。段的正文、支线的正文用各自的颜色底标出来。
+    // 走到这一段时发进世界书的字，一字不差（v4.6 用户：和上面正文一样包起来，但不能多出发不出去的标题）：
+    // 正文的字照常；资料只是一块带资料颜色的淡框，框里就是它的内容（不写名字）。
     function renderRoutePreview(route, state) {
         const box = el('div', { class: 'dga-rt-preview' });
         const parts = routeSendParts(route, state);
-        parts.forEach((part, index) => {
-            if (index) box.append(el('div', { class: 'dga-rt-pv-gap' }));
-            if (part.kind === 'card') box.append(part.text);
-            else {
-                if (part.label) box.append(part.label);
-                box.append(el('span', { class: 'dga-rt-fill', style: `--cc:${part.color}`, text: part.text }));
-            }
+        parts.forEach(part => {
+            const group = el('div', { class: 'dga-rt-pv-part' });
+            part.pieces.forEach(piece => group.append(piece.card
+                ? el('div', { class: 'dga-rt-bc is-view is-pv', style: `--cc:${piece.card.color}`, title: `资料：${piece.card.name || '没起名'}` },
+                    el('div', { class: 'dga-rt-bc-text', text: piece.text }))
+                : el('div', { class: 'dga-rt-bv-text', text: piece.text })));
+            box.append(group);
         });
         if (!parts.length) box.append(el('span', { class: 'dga-rt-fill-empty', text: state.ended ? '走到终点了，什么都不发。' : '这里什么都不发。' }));
         return box;
+    }
+
+    // 只看不改的正文（点一段的小卡片里）：放进来的资料显示成带颜色的框。
+    function routeBodyView(route, content, className, emptyText) {
+        const pieces = routeBodyPieces(route, content);
+        if (!pieces.length) return el('div', { class: `${className} is-none`, text: emptyText });
+        return el('div', { class: className }, ...pieces.map(piece => (piece.card
+            ? el('div', { class: 'dga-rt-bc is-view', style: `--cc:${piece.card.color}` },
+                el('div', { class: 'dga-rt-bc-head' }, el('span', { class: 'dga-rt-bc-name', text: piece.card.name || '资料' })),
+                el('div', { class: 'dga-rt-bc-text', text: piece.text }))
+            : el('div', { class: 'dga-rt-bv-text', text: piece.text }))));
+    }
+
+    // 改一段的正文（v4.6）：上面一排资料按钮（像判断提示词的「放一个格子」），点一下把那张资料放到光标在的地方
+    // （没点过正文就放最后）。放进来的是一行带资料颜色的小标题：名字（点了到资料里改）、↑ ↓ 挪、× 拿掉；
+    // 内容不铺出来（用户：下面有预览），跟着资料走。没放资料时还是原来那一个大框。
+    function routeBodyEditor(route, node, live) {
+        const items = routeBodyItems(node.content);
+        // 光标在哪（点按钮那一刻读，打字、点正文时记下）。
+        const caret = () => {
+            const at = ui.rt.bodyFocus;
+            return at && at.node === node.id && items[at.index] && !items[at.index].card ? at : null;
+        };
+        const commit = (next, nextFocus) => {
+            node.content = routeBodyJoin(next);
+            ui.rt.bodyFocus = nextFocus || null;
+            ui.rt.bodyRefocus = Boolean(nextFocus);
+            routeEdited(route, true);
+            render();
+        };
+        const placed = new Set(items.filter(item => item.card).map(item => item.card));
+        const insert = card => {
+            const last = items.length - 1;
+            const at = caret() || { index: last, start: items[last].text.length, end: items[last].text.length };
+            const text = items[at.index].text;
+            const start = Math.min(at.start, text.length);
+            const end = Math.min(Math.max(at.end, start), text.length);
+            const before = text.slice(0, start).replace(/\n$/, '');
+            const after = text.slice(end).replace(/^\n/, '');
+            commit(items.slice(0, at.index).concat([{ text: before }, { card: card.id }, { text: after }], items.slice(at.index + 1)),
+                { node: node.id, index: at.index + 2, start: 0, end: 0 });
+        };
+        const openCard = card => {
+            Object.keys(ui.rt.sel).forEach(key => { ui.rt.sel[key] = ''; });
+            Object.keys(ui.rt.panel).forEach(key => { ui.rt.panel[key] = ''; });
+            ui.rt.panel[route.id] = 'cards';
+            ui.rt.card[route.id] = card.id;
+            ui.rt.cardFrom = node.id;
+            render();
+        };
+        // 按钮按文件夹分行：没进文件夹的一行「放资料：」，每个文件夹一行（行首是文件夹名）。
+        const chip = card => el('button', {
+            type: 'button',
+            class: 'dga-slot-chip dga-rt-bc-chip',
+            style: `--cc:${card.color}`,
+            disabled: placed.has(card.id),
+            title: placed.has(card.id) ? '已经放进正文了' : (card.text.trim().slice(0, 80) || '这张资料还没写内容'),
+            onclick: () => insert(card),
+        }, card.name || '没起名');
+        const loose = route.cards.filter(card => !card.folder);
+        const barRows = [];
+        if (loose.length) barRows.push(el('div', { class: 'dga-slot-bar' }, el('span', { class: 'dga-slot-label', text: '放资料：' }), ...loose.map(chip)));
+        route.folders.forEach(folder => {
+            const list = route.cards.filter(card => card.folder === folder.id);
+            if (list.length) barRows.push(el('div', { class: 'dga-slot-bar' }, el('span', { class: 'dga-slot-label dga-rt-bc-folder', text: `${folder.name}：` }), ...list.map(chip)));
+        });
+        const bar = barRows.length ? el('div', { class: 'dga-rt-bc-bar' }, ...barRows) : null;
+        const areas = [];
+        const remember = (index, event) => {
+            ui.rt.bodyFocus = { node: node.id, index, start: event.target.selectionStart, end: event.target.selectionEnd };
+        };
+        const textArea = (item, index, className, placeholder) => {
+            const area = el('textarea', {
+                class: className,
+                placeholder,
+                oninput: event => {
+                    item.text = event.target.value;
+                    node.content = routeBodyJoin(items);
+                    remember(index, event);
+                    if (className !== 'dga-rt-nd-body') fitArea(event.target);
+                    live();
+                },
+                onclick: event => remember(index, event),
+                onkeyup: event => remember(index, event),
+            });
+            area.value = item.text;
+            areas[index] = area;
+            return area;
+        };
+        let box;
+        if (items.length === 1) box = textArea(items[0], 0, 'dga-rt-nd-body', '写下这一段要演的事');
+        else {
+            box = el('div', { class: 'dga-rt-bed' }, ...items.map((item, index) => {
+                if (!item.card) {
+                    const area = textArea(item, index, 'dga-rt-bt', '');
+                    area.rows = String(Math.max(1, item.text.split('\n').length));
+                    return area;
+                }
+                const card = route.cards.find(other => other.id === item.card);
+                if (!card) return null;
+                const up = routeBodyMove(items, index, -1);
+                const down = routeBodyMove(items, index, 1);
+                return el('div', { class: 'dga-rt-bc is-slim', style: `--cc:${card.color}`, title: card.text.trim().slice(0, 120) || '这张资料还没写内容' },
+                    el('div', { class: 'dga-rt-bc-head' },
+                        card.folder && routeFolderName(route, card.folder) ? el('span', { class: 'dga-rt-bc-fname', text: routeFolderName(route, card.folder) }) : null,
+                        el('button', { type: 'button', class: 'dga-rt-bc-name', title: '到资料里改', onclick: () => openCard(card) }, card.name || '没起名'),
+                        el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: !up, onclick: () => up && commit(up) }, '↑'),
+                        el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: !down, onclick: () => down && commit(down) }, '↓'),
+                        el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '从正文里拿掉（资料还在）', onclick: () => commit(items.filter((other, i) => i !== index)) }, '×')));
+            }));
+        }
+        // 重画以后：小框按内容撑高；刚放了资料的话，光标放到资料下面那一格。
+        if (hostWindow && typeof hostWindow.setTimeout === 'function') {
+            hostWindow.setTimeout(() => {
+                areas.forEach(area => { if (area && area.className === 'dga-rt-bt') fitArea(area); });
+                const want = ui.rt.bodyRefocus && ui.rt.bodyFocus && ui.rt.bodyFocus.node === node.id ? ui.rt.bodyFocus : null;
+                ui.rt.bodyRefocus = false;
+                const area = want ? areas[want.index] : null;
+                if (!area || !area.isConnected) return;
+                try { area.focus(); area.setSelectionRange(want.start, want.end); } catch (error) { /* 测试环境 */ }
+            }, 0);
+        }
+        return [bar, box];
+    }
+
+    function fitArea(area) {
+        if (!area || !area.style) return;
+        area.style.height = 'auto';
+        if (area.scrollHeight) area.style.height = `${area.scrollHeight}px`;
     }
 
     // 改一段侧边栏最下面常驻的「预览」（v4.4.2 用户定位置）：走到这一段时真正发出去的字，改正文时跟着变。
@@ -7957,6 +8307,9 @@ ${P} .dga-rs .dga-set-row { padding: 11px 14px; gap: 12px; }
 ${P} .dga-rs .dga-set-ctl select { width: 170px; }
 /* 路线图设置里的提取 / 排除规则：每条一行「开始 → 结束 ✕」 */
 ${P} .dga-rs .dga-set-row.dga-rs-rules { gap: 8px; }
+${P} .dga-rs .dga-set-row.is-col .dga-set-label { margin-bottom: 2px; }
+${P} .dga-rs .dga-set-box > div:not([class]) > .dga-set-row:first-child { border-top: 1px solid var(--dga-border); }
+${P} .dga-set-row.is-danger .dga-set-label { color: var(--dga-danger); }
 ${P} .dga-rs-rule-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 ${P} .dga-rs-rule-head b { font-size: 13.5px; font-weight: 600; color: var(--dga-text-1); }
 ${P} .dga-rs-rule { display: flex; align-items: center; gap: 6px; }
@@ -8167,7 +8520,6 @@ ${P} .dga-rt-node.is-peek { outline: 2px solid var(--dga-accent); outline-offset
 /* 改一段：正文、完成条件、下一段，标签在上、框在下（v4.3.7） */
 ${P} .dga-rt-nd-sec { margin-bottom: 20px; }
 ${P} .dga-rt-nd-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
-${P} .dga-rt-nd-start { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; padding: 0 14px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); font-size: 13.5px; }
 ${P} textarea.dga-rt-nd-body { min-height: 120px; line-height: 1.8; }
 ${P} .dga-rt-nd-nexts { display: flex; flex-direction: column; gap: 10px; }
 ${P} .dga-rt-nd-next-top { display: flex; align-items: center; gap: 6px; }
@@ -8214,8 +8566,7 @@ ${P} .dga-rt-zl-list { border-radius: var(--dga-radius-md); background: var(--dg
 ${P} .dga-rt-zl-row { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 12px; cursor: pointer; }
 ${P} .dga-rt-zl-row + .dga-rt-zl-row { border-top: 1px solid color-mix(in srgb, var(--dga-text-1) 7%, transparent); }
 ${P} .dga-rt-zl-row:hover { background: var(--dga-hover); }
-${P} .dga-rt-zl-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--dga-text-3); }
-${P} .dga-rt-zl-dot.is-on { border-color: var(--dga-success); background: var(--dga-success); }
+${P} .dga-rt-zl-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--cc, var(--dga-text-3)); }
 ${P} .dga-rt-zl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 ${P} .dga-rt-zl-name.is-none { color: var(--dga-text-3); font-weight: 400; }
 ${P} .dga-rt-zl-where { flex: 0 1 auto; min-width: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dga-text-3); font-size: 12.5px; }
@@ -8224,10 +8575,47 @@ ${P} .dga-rt-zl-row:hover .dga-rt-zl-ops { opacity: 1; }
 ${P} .dga-rt-zl-ops .dga-rt-icon { width: 24px; height: 24px; }
 ${P} .dga-rt-zl-caret { color: var(--dga-text-3); font-size: 16px; }
 ${P} .dga-rt-zl-edit .dga-rt-back { margin: 0 0 14px; }
-${P} .dga-rt-zl-body { display: flex; align-items: baseline; gap: 8px; margin: 14px 0; padding: 10px 14px; border-radius: var(--dga-radius-md); border: 1px dashed color-mix(in srgb, var(--dga-accent) 55%, transparent); background: color-mix(in srgb, var(--dga-accent) 7%, transparent); color: var(--dga-accent); font-size: 13px; font-weight: 600; }
-${P} .dga-rt-zl-body small { color: var(--dga-text-3); font-size: 12px; font-weight: 400; }
-${P} .dga-rt-zl-body + .dga-rt-zl-group { margin-top: 0; }
-${P} .dga-rt-zl-edit .dga-rt-pickset { margin-top: 12px; }
+${P} .dga-rt-chip.is-static { cursor: default; }
+${P} .dga-rt-zl-head { gap: 16px; }
+${P} .dga-rt-zl-head .dga-rt-zl-add:first-child { margin-left: auto; }
+${P} .dga-rt-zl-head .dga-rt-zl-add + .dga-rt-zl-add { margin-left: 0; }
+${P} .dga-rt-zl > .dga-rt-zl-list + .dga-rt-zl-fgroup, ${P} .dga-rt-zl-fgroup + .dga-rt-zl-fgroup { margin-top: 14px; }
+${P} .dga-rt-zl-folder { display: flex; align-items: center; gap: 6px; min-height: 34px; margin: 0 2px 6px; }
+${P} .dga-rt-zl-fgroup.is-shut .dga-rt-zl-folder { margin-bottom: 0; }
+${P} .dga-rt-zl-fold { width: 20px; height: 22px; padding: 0; border: 0; background: none; color: var(--dga-text-3); font-size: 12px; cursor: pointer; }
+${P} .dga-rt-zl-fname { min-width: 0; padding: 0; border: 0; background: none; color: var(--dga-text-2); font: inherit; font-size: 13px; font-weight: 600; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text; }
+${P} .dga-rt-zl-fname:hover { color: var(--dga-text-1); }
+${P} input.dga-rt-zl-fname-in { flex: 0 1 220px; min-height: 28px; padding: 2px 8px; font-size: 13px; }
+${P} .dga-rt-zl-fcount { color: var(--dga-text-3); font-size: 12px; }
+${P} .dga-rt-zl-folder .dga-rt-zl-ops { margin-left: auto; }
+${P} .dga-rt-zl-folder:hover .dga-rt-zl-ops { opacity: 1; }
+${P} .dga-rt-bc-bar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+${P} .dga-rt-bc-folder { color: var(--dga-text-2); }
+${P} .dga-rt-bc-fname { flex: 0 0 auto; color: var(--dga-text-3); font-size: 11.5px; }
+${P} .dga-rt-bc-fname::after { content: ' ·'; }
+${P} .dga-rt-bc-chip { border-color: color-mix(in srgb, var(--cc) 60%, transparent); color: var(--cc); background: color-mix(in srgb, var(--cc) 8%, var(--dga-bg-2)); }
+${P} .dga-rt-bc-chip:hover:not(:disabled) { border-style: solid; border-color: var(--cc); color: var(--cc); }
+${P} .dga-rt-bc-chip:disabled { opacity: .4; cursor: default; }
+${P} .dga-rt-bed { display: flex; flex-direction: column; gap: 6px; min-height: 120px; padding: 6px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
+${P} .dga-rt-bed:focus-within { border-color: var(--dga-accent); box-shadow: 0 0 0 2px var(--dga-accent-glow); }
+${P} .dga-rt-drawer textarea.dga-rt-bt { display: block; min-height: 28px !important; height: auto; padding: 2px 6px !important; border: 0 !important; background: transparent !important; box-shadow: none !important; outline: none; resize: none; overflow: hidden; line-height: 1.8; font-size: 13.5px; color: var(--dga-text-1); }
+${P} .dga-rt-bc { padding: 4px 10px 6px; border-radius: 8px; border: 1px solid color-mix(in srgb, var(--cc) 32%, transparent); background: color-mix(in srgb, var(--cc) 5%, transparent); }
+${P} .dga-rt-bc-head { display: flex; align-items: center; gap: 4px; min-height: 22px; }
+${P} .dga-rt-bc-name { flex: 1; min-width: 0; padding: 0; border: 0; background: none; color: color-mix(in srgb, var(--cc) 80%, var(--dga-text-3)); font: inherit; font-size: 11.5px; font-weight: 600; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+${P} button.dga-rt-bc-name { cursor: pointer; }
+${P} button.dga-rt-bc-name:hover { text-decoration: underline; }
+${P} .dga-rt-bc-head .dga-rt-icon { width: 20px; height: 20px; opacity: 0; transition: opacity .12s; }
+${P} .dga-rt-bc:hover .dga-rt-bc-head .dga-rt-icon { opacity: .6; }
+${P} .dga-rt-bc-head .dga-rt-icon:hover:not(:disabled) { opacity: 1; }
+${P} .dga-rt-bc.is-slim { padding: 2px 6px 2px 10px; }
+${P} .dga-rt-bc.is-slim .dga-rt-bc-name { font-size: 12px; }
+${P} .dga-rt-bc-text { margin-top: 1px; color: var(--dga-text-2); font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+@media (hover: none) { ${P} .dga-rt-bc-head .dga-rt-icon { opacity: .6; } }
+${P} .dga-rt-bc-text.is-none { color: var(--dga-text-3); }
+${P} .dga-rt-bc.is-view { margin: 8px 0; }
+${P} .dga-rt-bc.is-view:first-child { margin-top: 0; }
+${P} .dga-rt-bc.is-view:last-child { margin-bottom: 0; }
+${P} .dga-rt-bv-text + .dga-rt-bv-text { margin-top: 1em; }
 @media (hover: none) { ${P} .dga-rt-zl-ops { opacity: 1; } ${P} .dga-rt-slot { height: 22px; color: var(--dga-text-3); outline: 1px dashed var(--dga-border-2); } }
 ${P} .dga-rt-pickset { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 ${P} .dga-rt-pick-line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: start; }
@@ -8235,6 +8623,13 @@ ${P} .dga-rt-pick-label { padding-top: 3px; font-size: 12px; font-weight: 600; w
 ${P} .dga-rt-nd-pv .dga-rt-preview { min-height: 0; }
 ${P} .dga-rt-preview { min-height: 200px; padding: 10px 12px; border-radius: var(--dga-radius-sm); background: var(--dga-bg-0); border: 1px solid var(--dga-border); color: var(--dga-text-1); font-size: 12.5px; line-height: 1.8; white-space: pre-wrap; }
 ${P} .dga-rt-fill { background: color-mix(in srgb, var(--cc) 16%, transparent); border-bottom: 1px solid var(--cc); border-radius: 3px; }
+${P} .dga-rt-pv-part + .dga-rt-pv-part { margin-top: 1em; }
+${P} .dga-rt-bc.is-pv { padding: 4px 10px; }
+${P} .dga-rt-bc.is-pv .dga-rt-bc-text { margin-top: 0; }
+${P} .dga-rt-preview .dga-rt-bv-text + .dga-rt-bv-text { margin-top: 1em; }
+${P} .dga-rt-preview .dga-rt-bc.is-view { margin: 8px 0; }
+${P} .dga-rt-preview .dga-rt-pv-part > .dga-rt-bc.is-view:first-child, ${P} .dga-rt-preview .dga-rt-pv-label + .dga-rt-bc.is-view { margin-top: 0; }
+${P} .dga-rt-preview .dga-rt-pv-part > .dga-rt-bc.is-view:last-child { margin-bottom: 0; }
 ${P} .dga-rt-fill-empty { color: var(--dga-text-3); font-style: italic; }
 ${P} .dga-rt-pv-gap { height: 14px; }
 @container (max-width: 620px) {
@@ -8470,6 +8865,9 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             parseImport: parseRouteImportText,
             offeredSides: routeOfferedSides,
             compose: composeRoute,
+            bodyItems: routeBodyItems,
+            bodyJoin: routeBodyJoin,
+            bodyMove: routeBodyMove,
             stateAt: routeStateAt,
             orderAfter: routeOrderAfter,
             makeRoom: routeMakeRoom,
