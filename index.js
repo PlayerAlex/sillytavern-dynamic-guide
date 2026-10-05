@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.6.0';
+    const VERSION = '4.6.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -3788,9 +3788,6 @@
                         ['温度', '越低回答越稳定，越高越随意。判断建议低一点。'],
                     ])),
                 el('div', { class: 'dga-af-sep' }),
-                el('div', { class: 'dga-af-label' }, '下面几项一般不用填', infoTip('api-advanced', [
-                    ['什么时候要填', '有的 API 要特别的设置才能用，网站说明里会写。没说就都空着；出错时「运行日志」里会告诉你要不要改这里。'],
-                ])),
                 af('附加主体参数', area('bodyParams', 3, 'response_format:\n  type: json_object\ntop_k: 50')),
                 af('排除主体参数', area('excludeBodyParams', 2, 'top_p, reasoning_effort')),
                 af('提示词后处理', rtSelect(postProcessingOptions, draft.promptPostProcessing, value => { draft.promptPostProcessing = value; refreshApiButtons(); })),
@@ -3834,8 +3831,7 @@
                             else apiStoreNotice = '这台浏览器里没有旧配置。到原来存过 API 的浏览器里打开一次就会搬过去。';
                         }
                         enterApiPage();
-                    }), 'small', { disabled: Boolean(ui.busy) }) : null,
-                    el('p', { class: 'dga-pg-foot', text: '密钥以明文存在酒馆的用户设置里。' }))),
+                    }), 'small', { disabled: Boolean(ui.busy) }) : null)),
         ];
     }
 
@@ -4125,7 +4121,7 @@
             id,
             name: oneLine(name) || '未命名',
             content: String(content || ''),
-            doneMode: done === '@ai' ? 'ai' : (done === '@manual' ? 'manual' : 'text'),
+            doneMode: done && done[0] !== '@' ? 'text' : 'ai',
             done: done && done[0] !== '@' ? String(done) : '',
             next: [],
             fallback: -1,
@@ -4525,7 +4521,8 @@
                 id,
                 name: oneLine(item.name) || '未命名',
                 content: String(item.content || ''),
-                doneMode: item.doneMode === 'ai' || item.doneMode === 'manual' ? item.doneMode : 'text',
+                // 完成条件：text 按写的那句判断 / ai 让 AI 自己看。v4.6.1 删了「只能手动点」，旧的 manual 换回这两种。
+                doneMode: item.doneMode === 'text' || (item.doneMode !== 'ai' && String(item.done || '').trim()) ? 'text' : 'ai',
                 done: String(item.done || ''),
                 next: (Array.isArray(item.next) ? item.next : [])
                     .map(edge => ({ to: String((edge && edge.to) || ''), cond: String((edge && edge.cond) || '') }))
@@ -4766,7 +4763,8 @@
                 if (fallback < 0) warn(`「${name}」的「都对不上时走」写的是「${text(node.fallback)}」，它不是这一段的下一段，改成了停在路口等。`);
             }
             const done = text(node.done);
-            const mode = ['text', 'ai', 'manual'].includes(node.doneMode) ? node.doneMode : (done.trim() ? 'text' : 'ai');
+            // 完成条件：写了按那句判断（text），没写 AI 自己看（ai）；v4.6.1 起没有「只能手动点」，文件里写 manual 也照这个换。
+            const mode = node.doneMode === 'ai' ? 'ai' : (done.trim() ? 'text' : 'ai');
             nodes[id] = { id, name, content: contentIn(node.content, name), doneMode: mode, done, next, fallback, note: text(node.note), side: sideId };
         });
         const outSides = [];
@@ -5588,8 +5586,8 @@
     }
 
     function routeDoneText(node) {
-        if (node.doneMode === 'ai') return '（没写，按这一段的内容自己判断这一段演够了没有）';
-        return node.done || '（没写，按这一段的内容判断）';
+        if (node.doneMode !== 'ai' && node.done.trim()) return node.done;
+        return '（没写，按这一段的内容自己判断这一段演够了没有）';
     }
 
     // 格子里要换进去的内容。
@@ -5682,7 +5680,7 @@
             if (basisTag != null) basisParts.push(`${line.label}：${judgeFieldBody(basisTag)}`);
             const doneTag = lastTagInner(answer, 'done');
             const yes = doneTag != null && /^\s*YES\b/i.test(judgeFieldBody(doneTag)) && !/\bNO\b/i.test(judgeFieldBody(doneTag));
-            if (!yes || line.node.doneMode === 'manual') return;
+            if (!yes) return;
             // 判断期间这条线已经被挪走了（比如上面刚开始的支线就是这一条），不动。
             const curNow = line.sideId ? routeSideState(route, state, line.sideId).cur : state.cur;
             if (curNow !== line.node.id) return;
@@ -6709,7 +6707,8 @@
             side ? el('span', { class: 'dga-rt-badge', style: `color:${side.color}${side.root === id ? '' : ';opacity:.75'}`, text: '支线' }) : null,
             !side && !node.next.length ? el('span', { class: 'dga-rt-badge is-end', text: '终点' }) : null,
             node.next.length > 1 ? el('span', { class: 'dga-rt-badge is-fork', text: '路口' }) : null,
-            route.start === id ? el('span', { class: `dga-rt-badge is-start${node.next.length > 1 ? ' is-alt' : ''}`, title: '开新聊天从这一段开始', text: '新聊天' }) : null);
+            // 开新聊天从哪一段开始，哪一段就挂「新聊天」；没设就是第一段（v4.6.1 用户：第一段也要有）。
+            (route.start || route.root) === id ? el('span', { class: `dga-rt-badge is-start${node.next.length > 1 ? ' is-alt' : ''}`, title: '开新聊天从这一段开始', text: '新聊天' }) : null);
             // 「＋」和「＋支线」平时藏着：鼠标移到这一段上、或者这一段被选中时才出来。
             graph.append(el('div', {
                 class: `dga-rt-ng${edit ? ' is-edit' : ''}${selected ? ' is-sel' : ''}`,
@@ -7120,13 +7119,23 @@
         });
         const bodyKids = [
             sec('正文', ...routeBodyEditor(route, node, live)),
-            sec(['完成条件', infoTip(`done-${route.id}`, [
-                ['写一句', '写一件看得见的事，比如「两人交换了真名」。AI 判断时就看这件事发生了没有。'],
-                ['交给 AI 看', '不写条件，让 AI 自己看这一段演完了没有。'],
-                ['只能手动点', 'AI 判断不会动它，要你自己点「下一段」。'],
+            // 完成条件（v4.6.1 用户定）：一个可以不填的框——填了 AI 就看这件事发生没有（text），不填 AI 自己看（ai）。
+            // 「只能手动点」用户要删掉了。
+            sec(['完成条件（可选）', infoTip(`done-${route.id}`, [
+                ['写了', '写一件看得见的事，比如「两人交换了真名」。AI 判断时就看这件事发生了没有。'],
+                ['不写', '让 AI 自己看这一段演完了没有。'],
             ])],
-                rtSeg([['text', '写一句'], ['ai', '交给 AI 看'], ['manual', '只能手动点']], node.doneMode, value => { node.doneMode = value; routeEdited(route, false); render(); }),
-                node.doneMode === 'text' ? el('input', { type: 'text', class: 'dga-rt-mt', value: node.done, placeholder: '写成一件看得见的事，比如：两人交换了真名', oninput: event => { node.done = event.target.value; scheduleRouteSave(600); } }) : null),
+                el('input', {
+                    type: 'text',
+                    class: 'dga-rt-mt dga-rt-nd-done',
+                    value: node.doneMode === 'ai' ? '' : node.done,
+                    placeholder: '写一件看得见的事，比如：两人交换了真名；不填就让 AI 自己看演完没有',
+                    oninput: event => {
+                        node.done = event.target.value;
+                        node.doneMode = node.done.trim() ? 'text' : 'ai';
+                        scheduleRouteSave(600);
+                    },
+                })),
             sec([isFork ? `路口 · ${node.next.length} 条路` : '下一段', infoTip(`next-${route.id}`, [
                 ['下一段', '这一段演完，接着演哪一段。要改那一段，在图上点它。往后再接一段，在图上点这一段右边的「＋」。'],
                 ['路口', '接了两段以上就是路口。每条路写一句条件，AI 按剧情挑一条走；哪条都对不上时，可以指定走一条，或者停在路口等你选。'],
@@ -8222,7 +8231,6 @@ ${P} .dga-rt-seg.is-fill button { flex: 1 1 0; padding: 5px 8px; font-size: 12.5
 /* 设置页、路线图设置、API 页共用：内容不铺满宽度，一组一张卡，一行一项，左边名字右边控件 */
 ${P} .dga-pg { width: 100%; max-width: 760px; margin: 0 auto; padding-bottom: 32px; }
 ${P} .dga-pg.is-wide { max-width: 1040px; }
-${P} .dga-pg-foot { margin: 22px 4px 0; color: var(--dga-text-3); font-size: 12px; }
 ${P} .dga-set-sec { margin-top: 22px; }
 ${P} .dga-set-sec:first-child { margin-top: 4px; }
 ${P} .dga-set-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 4px 8px; }

@@ -2273,7 +2273,8 @@ test('路线图导出再导入：段、路口、接回、支线、资料、开�
     t.route.start = t.fork;
     t.route.nodes[t.fork].fallback = 1;
     t.route.nodes[t.stay].note = '笔记';
-    t.route.nodes[t.stay].doneMode = 'manual';
+    t.route.nodes[t.stay].done = '{{user}}决定留下';
+    t.route.nodes[t.stay].doneMode = 'text';
     t.side.until = t.meet;
     t.route.cards = [
         { id: 'c1', name: '世界观', text: '海边小镇', color: '#6FB3D9' },
@@ -2306,7 +2307,11 @@ test('路线图导出再导入：段、路口、接回、支线、资料、开�
     assert.deepEqual(names(byName('留下').next.map(edge => edge.to)), ['重逢']);
     assert.deepEqual(names(byName('离开').next.map(edge => edge.to)), ['重逢'], '接回保留');
     assert.equal(byName('留下').note, '笔记');
-    assert.equal(byName('留下').doneMode, 'manual');
+    assert.equal(byName('留下').doneMode, 'text');
+    assert.equal(byName('留下').done, '{{user}}决定留下');
+    assert.equal(byName('离开').doneMode, 'ai', '没写完成条件 = AI 自己看');
+    const manual = R.normalizeRoute({ ...plain(t.route), nodes: { ...plain(t.route.nodes), [t.stay]: { ...plain(t.route.nodes[t.stay]), doneMode: 'manual', done: '' } } });
+    assert.equal(manual.nodes[t.stay].doneMode, 'ai', '旧的「只能手动点」读进来换成 AI 自己看（v4.6.1 删了这一项）');
     assert.equal(route.sides.length, 1);
     const side = route.sides[0];
     assert.equal(side.name, '夏日祭');
@@ -2417,6 +2422,10 @@ test('路线图：设置里「开新聊天从」默认第一段，选别的存�
     const selects = node => [node, ...(node.children || []).flatMap(selects)].filter(item => item.tagName === 'SELECT');
     const startSelect = () => selects(findAllClass(panel().querySelector('.dga-rt-drawer'), 'dga-set-row')
         .find(row => row.textContent.includes('开新聊天从')))[0];
+    const startNodes = () => findAllClass(panel(), 'dga-rt-node')
+        .filter(node => findAllClass(node, 'dga-rt-badge').some(item => item.textContent === '新聊天'))
+        .map(node => node.getAttribute('data-node'));
+    assert.deepEqual(startNodes(), [t.route.root], '没选过时「新聊天」挂在第一段');
     findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '设置').listeners.click[0]();
     const select = startSelect();
     assert.ok(select, '设置里有「开新聊天从」');
@@ -2428,7 +2437,7 @@ test('路线图：设置里「开新聊天从」默认第一段，选别的存�
     for (let i = 0; i < 10; i += 1) await new Promise(setImmediate);
     assert.equal(world.state.variables.character.$dynamicGuideAssistant.routes.list[0].start, t.fork, '存进角色卡');
     assert.equal(world.state.variables.chat.$dynamicGuideAssistant.routeState.routes[t.route.id].cur, t.fork, '这个聊天还没动过，跟着挪过去');
-    assert.ok(findAllClass(panel(), 'dga-rt-badge').some(item => item.textContent === '新聊天'), '图上那一段挂「新聊天」');
+    assert.deepEqual(startNodes(), [t.fork], '「新聊天」挪到选的那一段，第一段上不再挂');
     assert.equal(startSelect().value, t.fork);
     assert.deepEqual(errors, []);
 });
