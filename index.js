@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.4.2';
+    const VERSION = '4.5.0';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -3262,7 +3262,9 @@
                     el('div', { class: 'dga-rail-state', text: `v${VERSION}` }))),
             el('div', { class: 'dga-rail-sec' }, '路线图', el('span', { text: String(ui.routes.length) })),
             el('div', { class: 'dga-rail-trees' }, ...trees),
-            el('button', { type: 'button', class: 'dga-rail-new', onclick: () => { ui.navOpen = false; ui.view = 'route'; createRoute(); } }, '＋ 新建路线图'),
+            el('div', { class: 'dga-rail-new-row' },
+                el('button', { type: 'button', class: 'dga-rail-new', onclick: () => { ui.navOpen = false; ui.view = 'route'; createRoute(); } }, '＋ 新建路线图'),
+                el('button', { type: 'button', class: 'dga-rail-new is-import', title: '导入路线图（插件导出的文件，或者 AI 写的）', onclick: () => { ui.navOpen = false; ui.view = 'route'; importRouteDialog(); } }, '导入')),
             el('div', { class: 'dga-rail-foot' },
                 item('api', '◎', 'API', presets ? `${presets} 个预设` : ''),
                 item('logs', '≡', '运行日志', errors ? `${errors} 条报错` : ''),
@@ -3278,7 +3280,7 @@
             ui.routeError ? messageBar({ type: 'error', text: ui.routeError }) : null,
             route ? renderRouteCard(route) : el('div', { class: 'dga-rt-empty' },
                 el('b', { text: '还没有路线图' }),
-                el('div', { class: 'dga-rt-add-row' }, rtBtn('＋ 新建路线图', () => createRoute(), 'primary'))));
+                el('div', { class: 'dga-rt-add-row' }, rtBtn('＋ 新建路线图', () => createRoute(), 'primary'), rtBtn('导入路线图', () => importRouteDialog()))));
         return [header(route ? route.name : '路线图', '', closePanel, '×'), body];
     }
 
@@ -4178,6 +4180,7 @@
             worldbookName: '',
             entryUid: null,
             root: '',
+            start: '',
             nodes: {},
             sides: [],
             cards: [],
@@ -4270,6 +4273,7 @@
         route.sides.forEach(side => {
             if (side.until && (!route.nodes[side.until] || route.nodes[side.until].side)) side.until = '';
         });
+        if (route.start && (route.start === route.root || !route.nodes[route.start] || route.nodes[route.start].side)) route.start = '';
         route.cards.forEach(card => {
             if (card.when === 'nodes') card.nodes = card.nodes.filter(id => route.nodes[id]);
         });
@@ -4352,6 +4356,8 @@
             worldbookName: oneLine(src.worldbookName || ''),
             entryUid: src.entryUid == null ? null : src.entryUid,
             root: String(src.root || ''),
+            // 开新聊天从哪一段开始（v4.5）：'' = 从起点。只能是主线的段。
+            start: String(src.start || ''),
             nodes: {},
             sides: [],
             cards: [],
@@ -4409,7 +4415,203 @@
         return cleanupRoute(route);
     }
 
-    // 只填了一半的规则也留着（可能还在填）；真正用的时候 RuleModule 只认开始、结束都填了的。
+    // ---- 导入 / 导出（v4.5）----
+    // 文件格式写给人和 AI 看（写法说明是仓库里单独的「路线图写法-给AI看.md」，不放进插件）：段用自己起的代号互相指，主线的段排成一列、第一个是起点，
+    // 支线把自己的段装在里面，资料卡用段的代号。导入时代号全换成新的，所以同一份文件导几次都不会撞。
+    const ROUTE_FILE_FORMAT = 'dynamic-guide-route';
+
+    function exportRouteData(route) {
+        const code = {};
+        let count = 0;
+        const codeOf = id => {
+            if (!code[id]) code[id] = `n${count += 1}`;
+            return code[id];
+        };
+        const mainNodes = routeOrderedNodes(route, route.root, '');
+        mainNodes.forEach(node => codeOf(node.id));
+        const sideNodes = route.sides.map(side => routeOrderedNodes(route, side.root, side.id));
+        sideNodes.forEach(list => list.forEach(node => codeOf(node.id)));
+        const nodeOut = node => {
+            const out = { id: codeOf(node.id), name: node.name, content: node.content, doneMode: node.doneMode };
+            if (node.done) out.done = node.done;
+            out.next = node.next.map(edge => (node.next.length > 1 || edge.cond ? { to: codeOf(edge.to), cond: edge.cond } : codeOf(edge.to)));
+            if (node.fallback >= 0 && node.next[node.fallback]) out.fallback = codeOf(node.next[node.fallback].to);
+            if (node.note) out.note = node.note;
+            return out;
+        };
+        const data = { format: ROUTE_FILE_FORMAT, version: 1, name: route.name };
+        if (route.start && route.nodes[route.start]) data.start = codeOf(route.start);
+        data.nodes = mainNodes.map(nodeOut);
+        data.sides = route.sides.map((side, index) => {
+            const out = { id: `s${index + 1}`, name: side.name, host: codeOf(side.host), cond: side.cond, wait: side.wait };
+            if (side.until) out.until = codeOf(side.until);
+            out.color = side.color;
+            out.nodes = sideNodes[index].map(nodeOut);
+            return out;
+        });
+        data.cards = route.cards.map(card => {
+            const out = { name: card.name, text: card.text, at: card.at, when: card.when };
+            if (card.when === 'nodes') out.nodes = card.nodes.filter(id => route.nodes[id]).map(codeOf);
+            return out;
+        });
+        data.settings = { advance: route.advance, extractRules: route.extractRules, excludeRules: route.excludeRules, placement: route.placement };
+        return data;
+    }
+
+    // AI 常把 JSON 包在 ```json 代码块里、前后再说几句话：从第一个 { 或 [ 截到最后一个 } 或 ]。
+    function parseRouteImportText(text) {
+        const raw = String(text || '').trim();
+        if (!raw) throw new Error('没有内容：把路线图的 JSON 贴进来，或者选一个文件。');
+        const begin = raw.search(/[[{]/);
+        const end = Math.max(raw.lastIndexOf('}'), raw.lastIndexOf(']'));
+        if (begin < 0 || end < begin) throw new Error('这不是路线图的 JSON：找不到 { 开头的内容。');
+        try {
+            return JSON.parse(raw.slice(begin, end + 1));
+        } catch (error) {
+            throw new Error(`JSON 格式有错，没法读：${error.message || String(error)}。常见原因：少了逗号或引号、最后一项后面多了逗号、用了中文引号。`);
+        }
+    }
+
+    // 读一份导入的数据，返回 [{ route, warnings }]。一份文件可以是一张图，也可以是几张图的数组（或 { routes: [...] }）。
+    function importRouteData(data) {
+        const list = Array.isArray(data) ? data : (data && Array.isArray(data.routes) ? data.routes : [data]);
+        if (!list.length) throw new Error('文件里没有路线图。');
+        return list.map((item, index) => importOneRoute(item, list.length > 1 ? `第 ${index + 1} 张：` : ''));
+    }
+
+    function importOneRoute(raw, prefix) {
+        const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+        if (!src) throw new Error(`${prefix}格式不对：一张路线图应该是 { } 包起来的一项。`);
+        if (src.version != null && Number(src.version) > 1) throw new Error(`${prefix}这份文件是更新版本的插件导出的，先把插件升级到最新版再导入。`);
+        const mainList = Array.isArray(src.nodes) ? src.nodes : [];
+        if (!mainList.length) throw new Error(`${prefix}没有段：nodes 里至少要有一段（第一段是起点）。`);
+        const warnings = [];
+        const warn = text => warnings.push(text);
+        const text = value => (value == null ? '' : (typeof value === 'string' ? value : String(value)));
+        // 代号 → 新 id。找段时先按代号找，找不到再按名字找（AI 有时直接写段名）。
+        const byCode = new Map();
+        const byName = new Map();
+        const entries = [];
+        const register = (item, sideId, where) => {
+            const node = item && typeof item === 'object' ? item : {};
+            const name = oneLine(text(node.name)) || oneLine(text(node.id)) || '未命名';
+            const id = routeId('n');
+            const code = oneLine(text(node.id)) || name;
+            if (byCode.has(code)) warn(`${where}「${name}」的代号「${code}」和前面的段重复了，别处写「${code}」时指的是前面那段。`);
+            else byCode.set(code, id);
+            if (!byName.has(name)) byName.set(name, id);
+            entries.push({ node, id, name, sideId });
+            return id;
+        };
+        const find = value => {
+            const key = oneLine(text(value));
+            if (!key) return '';
+            return byCode.get(key) || byName.get(key) || '';
+        };
+        const root = register(mainList[0], '', '主线');
+        mainList.slice(1).forEach(item => register(item, '', '主线'));
+        const sides = [];
+        (Array.isArray(src.sides) ? src.sides : []).forEach(item => {
+            const side = item && typeof item === 'object' ? item : {};
+            const name = oneLine(text(side.name)) || '支线';
+            const nodes = Array.isArray(side.nodes) ? side.nodes : [];
+            if (!nodes.length) {
+                warn(`支线「${name}」里没有段，没导进来。`);
+                return;
+            }
+            const id = routeId('s');
+            const first = register(nodes[0], id, `支线「${name}」的段`);
+            nodes.slice(1).forEach(node => register(node, id, `支线「${name}」的段`));
+            sides.push({ side, id, name, root: first });
+        });
+        const nodes = {};
+        entries.forEach(({ node, id, name, sideId }) => {
+            const rawNext = node.next == null ? [] : (Array.isArray(node.next) ? node.next : [node.next]);
+            const next = [];
+            rawNext.forEach(edge => {
+                const target = edge && typeof edge === 'object' ? edge.to : edge;
+                const to = find(target);
+                if (!to) {
+                    warn(`「${name}」的下一段写的是「${text(target)}」，找不到这一段，这条没接上。`);
+                    return;
+                }
+                const targetSide = (entries.find(item => item.id === to) || {}).sideId || '';
+                if (targetSide !== sideId) {
+                    warn(`「${name}」接到了「${(entries.find(item => item.id === to) || {}).name}」，可它们不在同一条线上（主线只能接主线的段，支线只能接自己的段），这条没接上。`);
+                    return;
+                }
+                next.push({ to, cond: edge && typeof edge === 'object' ? text(edge.cond) : '' });
+            });
+            let fallback = -1;
+            if (Number.isInteger(node.fallback)) fallback = node.fallback;
+            else if (node.fallback != null && node.fallback !== '') {
+                const to = find(node.fallback);
+                fallback = next.findIndex(edge => edge.to === to);
+                if (fallback < 0) warn(`「${name}」的「都对不上时走」写的是「${text(node.fallback)}」，它不是这一段的下一段，改成了停在路口等。`);
+            }
+            const done = text(node.done);
+            const mode = ['text', 'ai', 'manual'].includes(node.doneMode) ? node.doneMode : (done.trim() ? 'text' : 'ai');
+            nodes[id] = { id, name, content: text(node.content), doneMode: mode, done, next, fallback, note: text(node.note), side: sideId };
+        });
+        const outSides = [];
+        sides.forEach(({ side, id, name, root: sideRoot }) => {
+            const host = find(side.host);
+            if (!host) {
+                warn(`支线「${name}」挂在「${text(side.host)}」上，找不到这一段，整条支线没导进来。`);
+                return;
+            }
+            let until = '';
+            if (side.until != null && side.until !== '') {
+                until = find(side.until);
+                if (!until || nodes[until].side) {
+                    warn(`支线「${name}」写的「主线走到「${text(side.until)}」时结束」找不到主线上的这一段，改成走完自己的最后一段就结束。`);
+                    until = '';
+                }
+            }
+            outSides.push({ id, name, cond: text(side.cond), host, root: sideRoot, wait: side.wait === true || side.wait === 'true', until, color: text(side.color) });
+        });
+        const cards = (Array.isArray(src.cards) ? src.cards : []).map(item => {
+            const card = item && typeof item === 'object' ? item : { text: text(item) };
+            const name = oneLine(text(card.name));
+            const picked = [];
+            (Array.isArray(card.nodes) ? card.nodes : []).forEach(value => {
+                const id = find(value);
+                if (id) picked.push(id);
+                else warn(`资料「${name || '没名字'}」写着在「${text(value)}」发，找不到这一段，这一项去掉了。`);
+            });
+            const when = card.when === 'always' ? 'always' : (card.when === 'nodes' || picked.length ? 'nodes' : 'always');
+            if (when === 'nodes' && !picked.length) warn(`资料「${name || '没名字'}」是「只在某几段发」，可一段都没选上，现在哪一段都不会发它。`);
+            return { name, text: text(card.text), when, nodes: picked, at: card.at === 'after' ? 'after' : 'before' };
+        });
+        let start = '';
+        if (src.start != null && src.start !== '') {
+            start = find(src.start);
+            if (!start || nodes[start].side) {
+                warn(`「开新聊天从哪开始」写的是「${text(src.start)}」，找不到主线上的这一段，改成从起点开始。`);
+                start = '';
+            }
+        }
+        const settings = src.settings && typeof src.settings === 'object' ? src.settings : {};
+        const route = normalizeRoute({
+            name: text(src.name) || '导入的路线图',
+            root,
+            start,
+            nodes,
+            sides: outSides,
+            cards,
+            placement: settings.placement,
+            advance: settings.advance,
+            extractRules: settings.extractRules,
+            excludeRules: settings.excludeRules,
+        });
+        // 整条支线没了的，它的段不再一段段报。
+        const kept = new Set(route.sides.map(side => side.id).concat(['']));
+        const lost = Object.keys(nodes).filter(id => !route.nodes[id] && kept.has(nodes[id].side)).map(id => `「${nodes[id].name}」`);
+        if (lost.length) warn(`${lost.join('、')}从起点顺着「下一段」走不到（支线的段要从支线第一段走到），没导进来。`);
+        const lostSides = outSides.filter(side => !route.sides.some(item => item.id === side.id)).map(side => `「${side.name}」`);
+        if (lostSides.length) warn(`支线${lostSides.join('、')}挂的那一段没导进来，整条支线也没了。`);
+        return { route, warnings: warnings.map(item => prefix + item) };
+    }
     function routeRuleList(raw) {
         return (Array.isArray(raw) ? raw : [])
             .filter(item => item && typeof item === 'object')
@@ -4466,6 +4668,8 @@
             state.endSides = null;
         }
         state.sides = normSides(src.sides);
+        // 这个聊天还没有进度（新聊天）：从路线图设的「开新聊天从这一段开始」那段起，前面的段算走过了。
+        if (!mainNode(src.cur) && route.start && route.start !== route.root && mainNode(route.start)) routeJumpTo(route, state, route.start);
         return state;
     }
 
@@ -5662,6 +5866,83 @@
         }, { refresh: false, success: '新建了一张路线图，世界书里多了一个「（动态指导）」条目。' });
     }
 
+    // 导出：一张图一个文件，格式见 exportRouteData。
+    function exportRoute(route) {
+        downloadLogFile(`动态指导助手-路线图-${route.name}.json`, JSON.stringify(exportRouteData(route), null, 2), 'application/json');
+        LogModule.info('路线图', `导出了路线图「${route.name}」`);
+        notify('已导出，文件在浏览器的下载里', 'info');
+    }
+
+    // 导入：贴 JSON 或选文件。每张图都新建（不盖掉已有的），名字撞了后面加数字。
+    function importRouteDialog() {
+        const area = el('textarea', { class: 'dga-rt-import-text', placeholder: '把路线图的 JSON 贴在这里（插件导出的文件、AI 写的都行），或者点「选文件」' });
+        const error = el('div', { class: 'dga-rt-import-err' });
+        const pickFile = () => {
+            const input = el('input', { type: 'file', accept: '.json,application/json,.txt,text/plain' });
+            input.addEventListener('change', () => {
+                const file = input.files && input.files[0];
+                if (!file) return;
+                file.text().then(text => { area.value = text; error.textContent = ''; })
+                    .catch(err => { error.textContent = `读不了这个文件：${err.message || String(err)}`; });
+            });
+            const doc = hostDocument();
+            if (doc && doc.body) {
+                doc.body.appendChild(input);
+                input.click();
+                input.remove();
+            }
+        };
+        const submit = () => {
+            let results;
+            try {
+                results = importRouteData(parseRouteImportText(area.value));
+            } catch (err) {
+                error.textContent = err.message || String(err);
+                return;
+            }
+            ui.rt.modal = null;
+            importRoutes(results);
+        };
+        openRouteModal('导入路线图', el('div', { class: 'dga-rt-import' },
+            el('div', { class: 'dga-rt-import-tools dga-tip-host' },
+                rtBtn('选文件', pickFile, 'small'),
+                infoTip('route-import', [
+                    ['让 AI 帮你写', '发布页上有一份「路线图写法-给AI看」，整份贴给 AI（哪个 AI 都行），在最后写上你想要的剧情。AI 写好的那一大段贴到下面，点「导入」。'],
+                    ['导入到哪', '每张都新建成一张路线图，写进这个角色绑的世界书，不会盖掉已有的路线图。'],
+                    ['有地方不对', '比如下一段写了一个不存在的段，能导的照样导进来，没接上的地方会告诉你，导完在「编辑路线」里补上就行。'],
+                ])),
+            area,
+            error), [
+            rtBtn('取消', closeRouteModal, 'ghost'),
+            rtBtn('导入', submit, 'primary'),
+        ], 'is-import');
+    }
+
+    function importRoutes(results) {
+        return runAction('导入路线图', async () => {
+            const book = (await currentBoundWorldbooks())[0];
+            if (!book) throw new Error('这个角色还没有绑定世界书。先在酒馆里给角色绑一本世界书，再导入路线图。');
+            const warnings = [];
+            results.forEach(({ route, warnings: list }) => {
+                route.name = uniqueRouteName(route.name);
+                route.worldbookName = book;
+                ui.routes.push(route);
+                ui.routeStates[route.id] = normalizeRouteState(null, route);
+                list.forEach(text => warnings.push(text));
+                LogModule.info('路线图', `导入了路线图「${route.name}」，${Object.keys(route.nodes).length} 段，条目写在「${book}」`);
+            });
+            warnings.forEach(text => LogModule.warn('路线图', `导入：${text}`));
+            await saveRoutesNow();
+            ui.routeCurrent = results[results.length - 1].route.id;
+            ui.view = 'route';
+            if (warnings.length) {
+                openRouteModal('导入了，有几处没接上', el('ul', { class: 'dga-rt-import-warn' }, ...warnings.map(text => el('li', { text }))),
+                    [rtBtn('知道了', closeRouteModal, 'primary')]);
+            }
+            return true;
+        }, { refresh: false, success: results.length > 1 ? `导入了 ${results.length} 张路线图。` : `导入了「${results[0].route.name}」。` });
+    }
+
     function renameRoute(route, value) {
         const next = uniqueRouteName(value, route.id);
         if (next === route.name) return;
@@ -6014,6 +6295,9 @@
                 routeRuleGroup(route, 'extractRules', '提取'),
                 routeRuleGroup(route, 'excludeRules', '排除')) : null,
             el('section', { class: 'dga-set-sec' },
+                el('div', { class: 'dga-set-box' },
+                    setRow('导出这张路线图', rtBtn('导出', () => exportRoute(route), 'small')))),
+            el('section', { class: 'dga-set-sec' },
                 el('div', { class: 'dga-set-box is-danger' },
                     setRow('删掉这张路线图', rtBtn('删掉', () => deleteRouteDialog(route), 'small danger')))));
     }
@@ -6225,7 +6509,8 @@
             }, node.name,
             side ? el('span', { class: 'dga-rt-badge', style: `color:${side.color}${side.root === id ? '' : ';opacity:.75'}`, text: '支线' }) : null,
             !side && !node.next.length ? el('span', { class: 'dga-rt-badge is-end', text: '终点' }) : null,
-            node.next.length > 1 ? el('span', { class: 'dga-rt-badge is-fork', text: '路口' }) : null);
+            node.next.length > 1 ? el('span', { class: 'dga-rt-badge is-fork', text: '路口' }) : null,
+            route.start === id ? el('span', { class: `dga-rt-badge is-start${node.next.length > 1 ? ' is-alt' : ''}`, title: '开新聊天从这一段开始', text: '新聊天' }) : null);
             // 「＋」和「＋支线」平时藏着：鼠标移到这一段上、或者这一段被选中时才出来。
             graph.append(el('div', {
                 class: `dga-rt-ng${edit ? ' is-edit' : ''}${selected ? ' is-sel' : ''}`,
@@ -6494,10 +6779,13 @@
             else aside.style.width = ui.rt.size[key] ? `${ui.rt.size[key]}px` : '';
         };
         apply();
+        // 滑进来以后就算「已经开着」：拖完松手时 is-dragging 一拿掉，滑入动画会重播一遍（v4.5 修：拖宽度时闪）。
+        aside.addEventListener('animationend', () => aside.classList.add('is-shown'));
         const grip = el('div', { class: 'dga-rt-grip', title: phone ? '上下拖动改高度，双击恢复' : '左右拖动改宽度，双击恢复' });
         grip.addEventListener('pointerdown', event => {
             event.preventDefault();
             if (typeof grip.setPointerCapture === 'function') grip.setPointerCapture(event.pointerId);
+            aside.classList.add('is-shown');
             aside.classList.add('is-dragging');
             const shell = aside.parentNode;
             const rect = shell && typeof shell.getBoundingClientRect === 'function' ? shell.getBoundingClientRect() : { right: win.innerWidth, bottom: win.innerHeight, width: win.innerWidth, height: win.innerHeight };
@@ -6629,7 +6917,7 @@
                     isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往上挪', disabled: index === 0, onclick: () => moveRoute(index, -1) }, '↑') : null,
                     isFork ? el('button', { type: 'button', class: 'dga-rt-icon', title: '往下挪', disabled: index === node.next.length - 1, onclick: () => moveRoute(index, 1) }, '↓') : null,
                     el('button', { type: 'button', class: 'dga-rt-icon is-danger', title: '断开这条（后面没别处接着的段会一起删掉）', onclick: () => { node.next.splice(index, 1); routeEdited(route, true); render(); } }, '×')),
-                isFork ? el('input', { type: 'text', class: 'dga-rt-mt', value: edge.cond, placeholder: '什么情况下走这条，比如：{{user}}决定自己去送信', oninput: event => { edge.cond = event.target.value; live(); } }) : null);
+                isFork ? routeCondLine(edge, live) : null);
         });
         const bodyKids = [
             sec('正文', el('textarea', { class: 'dga-rt-nd-body', placeholder: '写下这一段要演的事', oninput: event => { node.content = event.target.value; live(); } }, node.content)),
@@ -6649,12 +6937,53 @@
                     : el('div', { class: 'dga-rt-muted', text: side ? '支线到这里结束' : '这是终点，走到这里就算走完' }),
                 isFork ? el('div', { class: 'dga-rt-inline' }, '哪条都对不上时',
                     rtSelect([['-1', '停在路口等']].concat(node.next.map((edge, i) => [String(i), `走「${route.nodes[edge.to].name}」`])), String(node.fallback), value => { node.fallback = Number(value); routeEdited(route, false); render(); })) : null),
+            side ? null : routeStartSection(route, id, sec),
             sec('预览', routeNodePreview(route, id)),
         ];
         return routeDrawerShell(route, color, [
             crumb,
             el('input', { type: 'text', class: 'dga-rt-drawer-name', value: node.name, title: '这一段的名字', oninput: event => { node.name = oneLine(event.target.value) || '未命名'; live(); } }),
         ], bodyKids, rtBtn('删掉这一段', () => routeDeleteNode(route, id), 'small danger'), close);
+    }
+
+    // 路口每条路的条件：平时是一行小字「条件：……」（v4.5 用户：「别像正文」），点一下才变成输入框，离开就变回去。
+    function routeCondLine(edge, live) {
+        const line = el('button', { type: 'button', class: `dga-rt-nd-cond${edge.cond.trim() ? '' : ' is-empty'}`, title: '点一下改条件' },
+            el('span', { class: 'dga-rt-nd-cond-k', text: '条件' }),
+            el('span', { class: 'dga-rt-nd-cond-v', text: edge.cond.trim() || '什么情况下走这条（点一下写）' }));
+        line.addEventListener('click', () => {
+            const input = el('input', { type: 'text', class: 'dga-rt-mt dga-rt-nd-cond-in', value: edge.cond, placeholder: '什么情况下走这条，比如：{{user}}决定自己去送信', oninput: event => { edge.cond = event.target.value; live(); } });
+            input.addEventListener('blur', () => { if (input.parentNode) input.parentNode.replaceChild(routeCondLine(edge, live), input); });
+            input.addEventListener('keydown', event => { if (event.key === 'Enter' && typeof input.blur === 'function') input.blur(); });
+            if (line.parentNode) line.parentNode.replaceChild(input, line);
+            if (typeof input.focus === 'function') input.focus();
+        });
+        return line;
+    }
+
+    // 「开新聊天从这一段开始」（v4.5）：路线图上记一段，新聊天的进度从那里起。
+    // 现在这个聊天要是还没动过（就停在原来的开头），跟着挪过去；已经走过的聊天不动。
+    function routeStartSection(route, id, sec) {
+        const startId = route.start || route.root;
+        const on = startId === id;
+        const set = value => {
+            const now = routeStateOf(route);
+            const untouched = JSON.stringify(now) === JSON.stringify(normalizeRouteState(null, route));
+            route.start = value && id !== route.root ? id : '';
+            ui.routeStates[route.id] = untouched ? normalizeRouteState(null, route) : now;
+            writeRouteState(route.id, ui.routeStates[route.id]).catch(() => {});
+            routeEdited(route, true);
+            render();
+            notify(route.start ? `开新聊天会从「${route.nodes[id].name}」开始` : '开新聊天会从起点开始', 'info');
+        };
+        return sec(['开新聊天', infoTip(`start-${route.id}`, [
+            ['从这一段开始', '平时开一个新聊天，路线图从起点开始走。打开以后，新聊天直接从这一段开始，前面的段算已经走过了。'],
+            ['已经在聊的', '已经走过几段的聊天不受影响，还在原来的地方。'],
+            ['改回去', '在起点上打开，或者把这里关掉，就回到从起点开始。'],
+        ])],
+            el('div', { class: 'dga-rt-nd-start' },
+                el('span', { text: '从这一段开始' }),
+                Object.assign(switchBtn(on, set, '开新聊天从这一段开始'), on && id === route.root ? { disabled: true } : {})));
     }
 
     function renderRoutePanelDrawer(route, key) {
@@ -7503,6 +7832,15 @@ ${P} .dga-rail-badge { flex: 0 0 auto; padding: 0 7px; border-radius: 999px; bor
 ${P} .dga-rail-badge.is-warn { color: #E3B45A; border-color: rgba(227, 180, 90, .45); }
 ${P} .dga-rail-new { padding: 8px 10px; border-radius: 12px; border: 1px dashed var(--dga-border-2); background: transparent; color: var(--dga-text-2); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 ${P} .dga-rail-new:hover { color: var(--dga-accent); border-color: var(--dga-accent); }
+${P} .dga-rail-new-row { display: flex; gap: 6px; }
+${P} .dga-rail-new-row .dga-rail-new { flex: 1; min-width: 0; }
+${P} .dga-rail-new-row .dga-rail-new.is-import { flex: 0 0 auto; text-align: center; }
+${P} .dga-rt-modal.is-import { width: min(640px, 100%); }
+${P} .dga-rt-import-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+${P} textarea.dga-rt-import-text { min-height: 260px; font-family: var(--dga-font-mono); font-size: 12.5px; line-height: 1.5; }
+${P} .dga-rt-import-err { margin-top: 8px; color: var(--dga-danger); font-size: 13px; line-height: 1.6; }
+${P} .dga-rt-import-err:empty { display: none; }
+${P} .dga-rt-import-warn { margin: 0 0 6px; padding-left: 20px; line-height: 1.7; font-size: 13px; color: var(--dga-text-2); }
 ${P} .dga-rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: 4px; padding-top: 10px; border-top: 1px solid var(--dga-border); }
 ${P} .dga-rail-item { display: flex; align-items: center; gap: 12px; min-height: 46px; padding: 9px 12px; border-radius: 12px; border: 0; background: transparent; color: var(--dga-text-2); font: inherit; font-size: 14.5px; text-align: left; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 ${P} .dga-rail-item:hover { background: var(--dga-bg-1); color: var(--dga-text-1); }
@@ -7670,6 +8008,8 @@ ${P} .dga-rt-node.is-sel { outline: 2px solid var(--dga-text-1); outline-offset:
 ${P} .dga-rt-badge { position: absolute; top: -9px; right: -7px; padding: 0 5px; border-radius: 999px; font-size: 9.5px; line-height: 15px; font-weight: 600; background: var(--dga-bg-1); border: 1px solid currentColor; }
 ${P} .dga-rt-badge.is-end { color: var(--dga-text-3); }
 ${P} .dga-rt-badge.is-fork { color: var(--dga-text-2); left: -7px; right: auto; }
+${P} .dga-rt-badge.is-start { color: var(--dga-accent); left: -7px; right: auto; }
+${P} .dga-rt-badge.is-start.is-alt { left: auto; right: -7px; }
 ${P} .dga-rt-plus { position: absolute; z-index: 3; width: 20px; height: 20px; padding: 0; border-radius: 50%; border: 1px solid var(--dga-accent); background: var(--dga-bg-1); color: var(--dga-accent); font-size: 14px; line-height: 17px; text-align: center; cursor: pointer; }
 ${P} .dga-rt-plus:hover { background: var(--dga-accent); color: var(--dga-on-accent); }
 ${P} .dga-rt-side-add { position: absolute; z-index: 3; padding: 0 7px; border-radius: 999px; border: 1px dashed var(--dga-border-2); background: var(--dga-bg-1); color: var(--dga-text-2); font-size: 10.5px; line-height: 16px; cursor: pointer; white-space: nowrap; }
@@ -7827,6 +8167,7 @@ ${P} .dga-rt-node.is-peek { outline: 2px solid var(--dga-accent); outline-offset
 /* 改一段：正文、完成条件、下一段，标签在上、框在下（v4.3.7） */
 ${P} .dga-rt-nd-sec { margin-bottom: 20px; }
 ${P} .dga-rt-nd-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
+${P} .dga-rt-nd-start { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; padding: 0 14px; border: 1px solid var(--dga-border); border-radius: var(--dga-radius-sm); background: var(--dga-bg-2); font-size: 13.5px; }
 ${P} textarea.dga-rt-nd-body { min-height: 120px; line-height: 1.8; }
 ${P} .dga-rt-nd-nexts { display: flex; flex-direction: column; gap: 10px; }
 ${P} .dga-rt-nd-next-top { display: flex; align-items: center; gap: 6px; }
@@ -7835,6 +8176,12 @@ ${P} .dga-rt-nd-go-name { min-width: 0; overflow: hidden; text-overflow: ellipsi
 ${P} .dga-rt-nd-tag { flex: 0 0 auto; padding: 0 8px; border-radius: 999px; border: 1px solid var(--dga-border-2); color: var(--dga-text-3); font-size: 11.5px; font-weight: 400; line-height: 20px; }
 ${P} .dga-rt-nd-next-top .dga-rt-icon { width: 30px !important; height: 30px !important; min-width: 0 !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; line-height: 1 !important; }
 ${P} .dga-rt-icon[disabled] { opacity: .3; cursor: default; }
+${P} .dga-rt-nd-cond { display: flex !important; align-items: baseline; gap: 8px; width: 100% !important; min-height: 0 !important; margin: 4px 0 0 !important; padding: 3px 12px !important; border: 0 !important; border-radius: 8px !important; background: transparent !important; box-shadow: none !important; color: var(--dga-text-3) !important; font: inherit; font-size: 12.5px !important; font-weight: 400 !important; line-height: 1.6 !important; text-align: left !important; cursor: text; }
+${P} .dga-rt-nd-cond:hover { background: var(--dga-hover) !important; color: var(--dga-text-2) !important; }
+${P} .dga-rt-nd-cond-k { flex: 0 0 auto; padding: 0 6px; border-radius: 999px; border: 1px solid var(--dga-border-2); font-size: 11px; line-height: 17px; }
+${P} .dga-rt-nd-cond-v { min-width: 0; overflow-wrap: anywhere; }
+${P} .dga-rt-nd-cond.is-empty .dga-rt-nd-cond-v { font-style: italic; opacity: .75; }
+${P} input.dga-rt-nd-cond-in { margin-top: 4px; font-size: 12.5px; }
 /* 位置和顺序 */
 ${P} .dga-rt-place-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
 ${P} .dga-rt-pf-row { display: grid; grid-template-columns: 44px 1fr; gap: 12px; align-items: start; margin-bottom: 16px; }
@@ -8118,6 +8465,9 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             sideStep: routeSideStep,
             sideBack: routeSideBack,
             jumpTo: routeJumpTo,
+            exportData: exportRouteData,
+            importData: importRouteData,
+            parseImport: parseRouteImportText,
             offeredSides: routeOfferedSides,
             compose: composeRoute,
             stateAt: routeStateAt,

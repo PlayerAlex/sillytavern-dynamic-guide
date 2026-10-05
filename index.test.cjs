@@ -1179,8 +1179,8 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场')).listeners.click[0]();
     const drawer = panel().querySelector('.dga-rt-drawer');
     assert.ok(drawer, '编辑时点一段打开侧边栏');
-    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|预览)/) || ['?'])[0]);
-    assert.deepEqual(labels, ['正文', '完成条件', '下一段', '预览'], '侧边栏只有正文、完成条件、下一段，最下面常驻预览');
+    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|开新聊天|预览)/) || ['?'])[0]);
+    assert.deepEqual(labels, ['正文', '完成条件', '下一段', '开新聊天', '预览'], '侧边栏只有正文、完成条件、下一段、开新聊天从哪开始，最下面常驻预览');
     assert.doesNotMatch(drawer.textContent, /更多|额外发|笔记|怎么走到这里/, '不再有更多、额外发的块、笔记');
     assert.ok(!drawer.querySelector('.dga-rt-nd-go').listeners.click, '下一段那一行点了不跳');
     assert.equal(panel().querySelector('.dga-rt-peek'), null, '改的时候小卡片收起');
@@ -2111,5 +2111,211 @@ test('界面：难懂的地方都有感叹号，说明不用专业词', async ()
         assert.ok(all.includes(word), `说明里讲到「${word}」`);
     }
     assert.doesNotMatch(all, /请求体|payload|endpoint|token|宏|正则|注入|上下文/i, '说明不用专业词');
+    assert.deepEqual(errors, []);
+});
+
+// ---------------------------------------------------------------
+// v4.5：开新聊天从哪一段开始、导入导出
+// ---------------------------------------------------------------
+
+test('路线图：设了「开新聊天从这一段开始」，新聊天从那一段起，已经在走的聊天不动', () => {
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    const walked = R.normalizeRouteState(null, t.route);
+    R.mainStep(t.route, walked);
+    t.route.start = t.stay;
+    R.cleanupRoute(t.route);
+    assert.equal(t.route.start, t.stay);
+    const fresh = R.normalizeRouteState(null, t.route);
+    assert.equal(fresh.cur, t.stay, '新聊天从设的那一段开始');
+    assert.deepEqual(plain(fresh.hist), [t.start, t.fork], '前面的段算走过了，能退回去');
+    assert.equal(fresh.sides[t.side.id].status, 'skip', '挂在前面段上的支线算错过了');
+    assert.equal(R.normalizeRouteState(plain(walked), t.route).cur, t.fork, '已经走过的聊天还在原来的地方');
+    assert.equal(R.normalizeRoute(plain(t.route)).start, t.stay, '存了再读回来还在');
+    t.route.start = t.fireworks;
+    R.cleanupRoute(t.route);
+    assert.equal(t.route.start, '', '支线的段不能当开头');
+    t.route.start = t.route.root;
+    R.cleanupRoute(t.route);
+    assert.equal(t.route.start, '', '设成起点 = 不设');
+    t.route.start = t.meet;
+    delete t.route.nodes[t.meet];
+    R.cleanupRoute(t.route);
+    assert.equal(t.route.start, '', '那一段删掉了就回到从起点开始');
+});
+
+test('路线图导出再导入：段、路口、接回、支线、资料、开头都和原来一样', () => {
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.start = t.fork;
+    t.route.nodes[t.fork].fallback = 1;
+    t.route.nodes[t.stay].note = '笔记';
+    t.route.nodes[t.stay].doneMode = 'manual';
+    t.side.until = t.meet;
+    t.route.cards = [
+        { id: 'c1', name: '世界观', text: '海边小镇', when: 'always', nodes: [], at: 'before' },
+        { id: 'c2', name: '烟火大会', text: '晚上八点', when: 'nodes', nodes: [t.fireworks, t.meet], at: 'after' },
+    ];
+    t.route.advance = 'judge';
+    const data = plain(R.exportData(t.route));
+    assert.equal(data.format, 'dynamic-guide-route');
+    assert.equal(data.nodes[0].name, '开场', '主线第一段是起点');
+    assert.equal(data.nodes.every(node => /^n\d+$/.test(node.id)), true, '代号是好认的 n1、n2');
+    const [{ route, warnings }] = R.importData(JSON.parse(JSON.stringify(data)));
+    assert.deepEqual(plain(warnings), []);
+    assert.notEqual(route.id, t.route.id, '导入是新的一张，id 都是新的');
+    assert.ok(!route.nodes[t.start], '段的 id 也是新的');
+    const byName = name => Object.values(route.nodes).find(node => node.name === name);
+    const names = ids => plain(ids.map(id => route.nodes[id].name));
+    assert.equal(route.nodes[route.root].name, '开场');
+    assert.equal(route.nodes[route.start].name, '路口');
+    assert.deepEqual(names(byName('路口').next.map(edge => edge.to)), ['留下', '离开']);
+    assert.deepEqual(plain(byName('路口').next.map(edge => edge.cond)), ['{{user}}留下', '{{user}}离开']);
+    assert.equal(byName('路口').fallback, 1);
+    assert.deepEqual(names(byName('留下').next.map(edge => edge.to)), ['重逢']);
+    assert.deepEqual(names(byName('离开').next.map(edge => edge.to)), ['重逢'], '接回保留');
+    assert.equal(byName('留下').note, '笔记');
+    assert.equal(byName('留下').doneMode, 'manual');
+    assert.equal(route.sides.length, 1);
+    const side = route.sides[0];
+    assert.equal(side.name, '夏日祭');
+    assert.equal(side.cond, '{{char}}约{{user}}去祭典');
+    assert.equal(route.nodes[side.host].name, '开场');
+    assert.equal(route.nodes[side.root].name, '邀约');
+    assert.equal(route.nodes[side.until].name, '重逢');
+    assert.equal(side.color, t.side.color);
+    assert.equal(byName('烟火').side, side.id);
+    assert.deepEqual(plain(route.cards.map(card => [card.name, card.when, card.at, names(card.nodes)])), [
+        ['世界观', 'always', 'before', []],
+        ['烟火大会', 'nodes', 'after', ['烟火', '重逢']],
+    ]);
+    assert.equal(route.advance, 'judge');
+    const state = R.normalizeRouteState(null, route);
+    assert.equal(R.compose(route, state), R.compose(t.route, R.normalizeRouteState(null, t.route)), '发出去的一样');
+});
+
+test('路线图导入：「路线图写法-给AI看.md」里的例子能原样导入，一处都不报；插件里不带写法说明', () => {
+    const R = load().core.routes;
+    const guide = fs.readFileSync(path.join(__dirname, '..', '..', '..', '路线图写法-给AI看.md'), 'utf8');
+    assert.match(guide, /dynamic-guide-route/);
+    assert.doesNotMatch(source, /路线图的写法（写给 AI 看）|复制给 AI 的写法说明/, '写法说明单独给，不写进插件');
+    const example = guide.slice(guide.indexOf('## 七、完整例子'), guide.indexOf('## 八'));
+    const [{ route, warnings }] = R.importData(R.parseImport(example));
+    assert.deepEqual(plain(warnings), []);
+    assert.equal(route.name, '夏天的约定');
+    assert.equal(Object.keys(route.nodes).length, 7);
+    assert.equal(route.sides[0].name, '夏日祭');
+    assert.equal(route.nodes[route.sides[0].until].name, '暑假结束');
+    const fork = Object.values(route.nodes).find(node => node.name === '帮忙看店');
+    assert.equal(fork.next.length, 2);
+    assert.equal(fork.fallback, 1, '「都对不上时走」按代号对上');
+    assert.equal(Object.values(route.nodes).find(node => node.name === '海边的傍晚').doneMode, 'ai');
+    assert.equal(Object.values(route.nodes).find(node => node.name === '初到小镇').doneMode, 'text', '写了 done 默认按那句判断');
+    assert.equal(route.start, '', '写的开头就是起点 = 不设');
+    assert.deepEqual(plain(route.cards.map(card => card.nodes.length)), [0, 2]);
+});
+
+test('路线图导入：AI 包了代码块也能读；接错的地方照导、告诉用户', () => {
+    const R = load().core.routes;
+    const text = '好的，下面是路线图：\n```json\n' + JSON.stringify({
+        name: '测试',
+        nodes: [
+            { id: 'a', name: '第一段', content: '一', next: '第二段' },
+            { id: 'b', name: '第二段', content: '二', next: ['zz', 'x1'] },
+            { id: 'c', name: '孤零零', content: '没人接' },
+        ],
+        sides: [
+            { name: '小插曲', host: 'a', nodes: [{ id: 'x1', name: '插曲一', next: ['a'] }] },
+            { name: '挂空', host: '不存在', nodes: [{ id: 'y1', name: '挂空一' }] },
+        ],
+        cards: [{ name: '设定', text: '设定内容', nodes: ['b', '没有这段'] }],
+        start: '没有这段',
+    }) + '\n```\n希望你喜欢。';
+    const [{ route, warnings }] = R.importData(R.parseImport(text));
+    const byName = name => Object.values(route.nodes).find(node => node.name === name);
+    assert.deepEqual(plain(byName('第一段').next.map(edge => route.nodes[edge.to].name)), ['第二段'], '下一段可以直接写段名、可以不套数组');
+    assert.equal(byName('第二段').next.length, 0);
+    assert.ok(!byName('孤零零'), '走不到的段不导');
+    assert.equal(route.sides.length, 1);
+    assert.equal(route.cards[0].when, 'nodes');
+    const all = warnings.join('\n');
+    assert.match(all, /「第二段」的下一段写的是「zz」，找不到/);
+    assert.match(all, /不在同一条线上/);
+    assert.match(all, /「孤零零」从起点顺着「下一段」走不到/);
+    assert.match(all, /支线「挂空」挂在「不存在」上/);
+    assert.match(all, /资料「设定」写着在「没有这段」发/);
+    assert.match(all, /开新聊天从哪开始/);
+    assert.throws(() => R.parseImport('{"name": "坏的",}'), /JSON 格式有错/);
+    assert.throws(() => R.parseImport(''), /没有内容/);
+    assert.throws(() => R.importData({ name: '空的', nodes: [] }), /没有段/);
+    assert.equal(R.importData([{ nodes: [{ id: 'a', name: '一' }] }, { nodes: [{ id: 'a', name: '二' }] }]).length, 2, '一个文件可以放几张');
+});
+
+test('路线图：改一段里打开「开新聊天从这一段开始」，存进角色卡，图上挂「新聊天」', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
+    world.helper.getWorldbookNames = () => ['书A'];
+    const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '编辑路线').listeners.click[0]();
+    findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('路口')).listeners.click[0]();
+    const row = panel().querySelector('.dga-rt-nd-start');
+    assert.ok(row, '主线的段有「开新聊天」一项');
+    row.querySelector('.dga-sw').listeners.click[0]();
+    for (let i = 0; i < 10; i += 1) await new Promise(setImmediate);
+    assert.equal(world.state.variables.character.$dynamicGuideAssistant.routes.list[0].start, t.fork, '存进角色卡');
+    assert.equal(world.state.variables.chat.$dynamicGuideAssistant.routeState.routes[t.route.id].cur, t.fork, '这个聊天还没动过，跟着挪过去');
+    assert.ok(findAllClass(panel(), 'dga-rt-badge').some(item => item.textContent === '新聊天'), '图上那一段挂「新聊天」');
+    findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('烟火')).listeners.click[0]();
+    assert.equal(panel().querySelector('.dga-rt-nd-start'), null, '支线的段没有这一项');
+    assert.deepEqual(errors, []);
+});
+
+test('路线图：左栏「导入」贴 JSON 导入成新的一张，设置里能导出', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const downloads = [];
+    const createElement = documentRef.createElement;
+    documentRef.createElement = tag => {
+        const node = createElement(tag);
+        if (String(tag).toLowerCase() === 'a') {
+            node.click = () => downloads.push(node.getAttribute('download'));
+            node.remove = () => { if (node.parentNode) node.parentNode.removeChild(node); };
+        }
+        return node;
+    };
+    const world = routeWorld();
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
+    world.helper.getWorldbookNames = () => ['书A'];
+    const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
+    sandbox.Blob = function Blob(parts, options) { this.parts = parts; this.options = options; };
+    sandbox.URL = { createObjectURL: () => 'blob:dga', revokeObjectURL: () => {} };
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head'), '设置').listeners.click[0]();
+    findButton(panel().querySelector('.dga-rt-drawer'), '导出').listeners.click[0]();
+    assert.deepEqual(downloads, ['动态指导助手-路线图-海边书店.json']);
+    const exported = plain(R.exportData(t.route));
+    panel().querySelector('.dga-nav-toggle').listeners.click[0]();
+    findButton(panel(), '导入').listeners.click[0]();
+    const modal = panel().querySelector('.dga-rt-modal');
+    assert.ok(modal, '弹出导入框');
+    modal.querySelector('.dga-rt-import-text').value = '```json\n' + JSON.stringify(exported) + '\n```';
+    findButton(modal, '导入').listeners.click[0]();
+    for (let i = 0; i < 20; i += 1) await new Promise(setImmediate);
+    const list = world.state.variables.character.$dynamicGuideAssistant.routes.list;
+    assert.equal(list.length, 2, '导入成新的一张');
+    assert.equal(list[1].name, '海边书店 2', '名字撞了后面加数字');
+    assert.equal(Object.keys(list[1].nodes).length, Object.keys(t.route.nodes).length);
+    assert.ok(world.state.books.书A.some(item => item.name === '海边书店 2（动态指导）'), '世界书里多一个条目');
     assert.deepEqual(errors, []);
 });
