@@ -3,7 +3,7 @@
 
     /* ================================================================
      * 动态指导助手 v4.0
-     * 协议：CC BY-NC-SA 4.0（署名-非商业性使用-相同方式共享），全文见仓库里的 LICENSE。
+     * 协议：PolyForm Noncommercial License 1.0.0（禁止商业用途），全文见仓库里的 LICENSE。
      *
      * 这个文件分四部分：
      *   一、核心：常量、运行日志（LogModule）、边界规则（RuleModule）等零依赖的
@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.6.2';
+    const VERSION = '4.6.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
