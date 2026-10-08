@@ -5325,9 +5325,11 @@
             box[col] = have ? [Math.min(have[0], top), Math.max(have[1], bottom)] : [top, bottom];
         };
         // lean：这一块在路口中间那一行的上面（-1）还是下面（1），里面的支线一样近时往外放，不挤进几条路中间。
-        const lay = (id, lean) => {
+        // flat：支线能不能排在挂它那一段的同一行（排了就记下来，上一层两种都试，挑离中间近的）。
+        const lay = (id, lean, flat = true) => {
             const rows = { [id]: 0 };
             const box = {};
+            let flatUsed = false;
             const kids = lkids[id].filter(child => pos[child.id] && !joined.has(child.id));
             mark(box, pos[id].col, 0, 0);
             succ[id].forEach(to => {
@@ -5347,10 +5349,19 @@
                 });
                 return off;
             };
-            const child = (kid, dir) => {
-                const sub = lay(kid, dir);
+            const child = (kid, dir, sameRow = flat) => {
+                const sub = lay(kid, dir, sameRow);
                 for (let col = pos[id].col + 1; col < pos[kid].col; col += 1) mark(sub.box, col, 0, 0);
+                if (sub.flatUsed) flatUsed = true;
                 return sub;
+            };
+            // 上下的路：支线排同一行和不排同一行各排一遍，哪种离中间近用哪种，一样近就排同一行。
+            const branch = (kid, dir) => {
+                const near = sub => (dir < 0 ? -Math.min(-1, free(sub, -1)) : Math.max(1, free(sub, 1)));
+                const sub = lay(kid, dir, flat);
+                if (!sub.flatUsed) return child(kid, dir);
+                const alt = lay(kid, dir, false);
+                return near(alt) < near(sub) ? child(kid, dir, false) : child(kid, dir);
             };
             if (join[id]) put(lay(join[id].to, lean), 0);
             const routes = kids.filter(item => item.kind === 'route').map(item => item.id);
@@ -5363,20 +5374,28 @@
             const above = routes.slice(0, split).reverse();
             const below = routes.slice(mid >= 0 ? mid + 1 : split);
             for (let i = 0; i < Math.max(above.length, below.length); i += 1) {
-                const up = i < above.length ? child(above[i], -1) : null;
-                const down = i < below.length ? child(below[i], 1) : null;
+                const up = i < above.length ? branch(above[i], -1) : null;
+                const down = i < below.length ? branch(below[i], 1) : null;
                 const d = Math.max(up ? -Math.min(-1, free(up, -1)) : 0, down ? Math.max(1, free(down, 1)) : 0);
                 if (up) put(up, -d);
                 if (down) put(down, Math.max(d, free(down, 1)));
             }
-            // 支线不固定排下面：上面、下面哪边离得近放哪边；一样近时往外放（在中间那一行就放下面），两边匀着摊开。
+            // 支线：这一段后面同一行空着，就接着往右排在同一行，线直着出去；
+            // 不然上面、下面哪边离得近放哪边，一样近时往外放（在中间那一行就放下面），两边匀着摊开。
             kids.filter(item => item.kind === 'side').forEach(item => {
                 const sub = child(item.id, lean);
+                if (flat && Object.entries(sub.box).every(([col, [top, bottom]]) => !box[col] || bottom < box[col][0] || top > box[col][1])) {
+                    put(sub, 0);
+                    flatUsed = true;
+                    return;
+                }
+                // 支线的线贴着这一段右边拐上去 / 下去，这一列从这一段到支线那一行都要空着。
+                mark(sub.box, pos[id].col, 0, 0);
                 const up = Math.min(-1, free(sub, -1));
                 const down = Math.max(1, free(sub, 1));
                 put(sub, -up < down || (-up === down && lean < 0) ? up : down);
             });
-            return { rows, box };
+            return { rows, box, flatUsed };
         };
         if (pos[route.root]) {
             const { rows } = lay(route.root, 0);
@@ -7329,10 +7348,15 @@
         // 几条线进同一段时，统一在它前面那道缝汇起来再进去。
         const fanIn = {};
         edges.forEach(e => { if (layout.pos[e.to].col > layout.pos[e.from].col) fanIn[e.to] = (fanIn[e.to] || 0) + 1; });
+        const sideOuts = [];
         edges.forEach(e => {
             const pa = layout.pos[e.from];
             const pb = layout.pos[e.to];
             e.dash = e.kind === 'side' ? '2 3' : (e.kind === 'link' ? '5 4' : null);
+            if (e.kind === 'side') {
+                sideOuts.push(e);
+                return;
+            }
             const forward = pb.col > pa.col;
             const outOk = forward && clear(pb.row, pa.col, pb.col);
             const inOk = forward && clear(pa.row, pa.col, pb.col);
@@ -7440,6 +7464,18 @@
                 seg(all.s.z, `M${x},${hub.cy} H${hub.x - 7}`, all.s, dashOf(ends));
                 paths.push({ z: all.s.z, node: rtArrow(hub.x - 1, hub.cy, 'r', all.s.c) });
             }
+        });
+        // 支线引出：同一行就直着过去；这一段后面那道缝里本来就有它的竖线（分岔 / 汇合），支线顺着那根竖线往上 / 往下接出去，
+        // 看着是一根线；没有就贴着这一段右边拐，虚线从这一段旁边就看得见，不和主线共用一截。
+        sideOuts.forEach(e => {
+            const a = box(e.from);
+            const b = box(e.to);
+            const s = strokeOf(e.from, e.to);
+            const along = [...bundles.values()].find(item => item.gap === a.col && item.hi > item.lo
+                && (item.type === 'out' ? item.id === e.from : item.list.some(other => other.from === e.from)));
+            const x = along ? laneX(along) : a.r + 12;
+            seg(s.z, a.row === b.row ? `M${a.r},${a.cy} H${b.x - 7}` : `M${a.r},${a.cy} H${x} V${b.cy} H${b.x - 7}`, s, e.dash);
+            paths.push({ z: s.z, node: rtArrow(b.x - 1, b.cy, 'r', s.c) });
         });
         loops.forEach(e => {
             const a = box(e.from);
