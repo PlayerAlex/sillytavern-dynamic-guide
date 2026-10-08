@@ -1205,13 +1205,13 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('开场')).listeners.click[0]();
     const drawer = panel().querySelector('.dga-rt-drawer');
     assert.ok(drawer, '编辑时点一段打开侧边栏');
-    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|开新聊天|预览)/) || ['?'])[0]);
-    assert.deepEqual(labels, ['正文', '完成条件', '预览'], '只接一段时没有「下一段」那一节（v4.6.2），最下面常驻预览');
+    const labels = findAllClass(drawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|进入时报幕|下一段|路口|开新聊天|预览)/) || ['?'])[0]);
+    assert.deepEqual(labels, ['正文', '完成条件', '进入时报幕', '预览'], '只接一段时没有「下一段」那一节（v4.6.2），完成条件下面是报幕开关（v4.8.0），最下面常驻预览');
     assert.doesNotMatch(drawer.textContent, /更多|额外发|笔记|怎么走到这里/, '不再有更多、额外发的块、笔记');
     findAllClass(panel(), 'dga-rt-node').find(item => item.textContent.includes('夹在') || item.textContent.startsWith('路口')).listeners.click[0]();
     const forkDrawer = panel().querySelector('.dga-rt-drawer');
-    const forkLabels = findAllClass(forkDrawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|下一段|路口|预览)/) || ['?'])[0]);
-    assert.deepEqual(forkLabels, ['正文', '完成条件', '路口', '预览'], '路口还要写每条路的条件，留着');
+    const forkLabels = findAllClass(forkDrawer, 'dga-rt-nd-label').map(item => (String(item.textContent).match(/^(正文|完成条件|进入时报幕|下一段|路口|预览)/) || ['?'])[0]);
+    assert.deepEqual(forkLabels, ['正文', '完成条件', '进入时报幕', '路口', '预览'], '路口还要写每条路的条件，留着');
     assert.ok(!forkDrawer.querySelector('.dga-rt-nd-go').listeners.click, '路口的每条路点了不跳');
     assert.equal(panel().querySelector('.dga-rt-peek'), null, '改的时候小卡片收起');
     assert.deepEqual(errors, []);
@@ -1764,6 +1764,63 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     const saved = (await R.readStates())[t.route.id];
     assert.equal(saved.cur, t.leave, '路口按 <road>2</road> 走了「离开」');
     assert.deepEqual(run.errors, []);
+});
+
+test('报幕（v4.8.0）：往前走进开了报幕的段才报，往回退不报；AI 判断走到也报；导出导入带着', async () => {
+    const world = routeWorld();
+    world.state.messages = [{ message_id: 4, role: 'assistant', message: '小林提着箱子去了码头。' }];
+    world.state.lastMessageId = 4;
+    const fetchMock = async () => {
+        const content = '<answer n="1"><basis>走了</basis><done>YES</done><road>2</road></answer><start>0</start>';
+        const text = JSON.stringify({ choices: [{ message: { content } }] });
+        return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
+    };
+    const storage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'k', model: 'm' }]),
+    });
+    const run = load(world.helper, { localStorage: storage, fetch: fetchMock });
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const t = demoRoute(R);
+    t.route.nodes[t.fork].announce = true;
+    t.route.nodes[t.leave].announce = true;
+    t.route.nodes[t.leave].announceText = '第二幕 · 远行';
+    t.route.nodes[t.side.root].announce = true;
+
+    const before = R.normalizeRouteState(null, t.route);
+    const step = plain(before);
+    R.mainStep(t.route, step);
+    assert.deepEqual(plain(R.entered(t.route, before, step)), [t.fork], '走进「路口」，它开了报幕');
+    const back = plain(step);
+    R.mainBack(t.route, back);
+    assert.deepEqual(plain(R.entered(t.route, step, back)), [], '往回退不报');
+    const side = plain(before);
+    R.sideStart(t.route, side, t.side);
+    assert.deepEqual(plain(R.entered(t.route, before, side)), [t.side.root], '支线开始，走进它的第一段也报');
+    t.route.nodes[t.fork].announce = false;
+    assert.deepEqual(plain(R.entered(t.route, before, step)), [], '没开报幕的段不报');
+
+    t.route.worldbookName = '书A';
+    t.route.advance = 'judge';
+    await R.write([t.route]);
+    await R.writeState(t.route.id, step);
+    await R.setApi(t.route, '便宜的');
+    await R.judge(t.route, 4);
+    assert.deepEqual(plain(R.announced()), ['第二幕 · 远行'], 'AI 判断走到「离开」，报的是写的字');
+
+    const [{ route: again }] = R.importData(plain(R.exportData(t.route)));
+    const leave = Object.values(again.nodes).find(node => node.name === '离开');
+    assert.equal(leave.announce, true);
+    assert.equal(leave.announceText, '第二幕 · 远行');
+    assert.equal(Object.values(again.nodes).find(node => node.name === '邀约').announce, true, '只开报幕不写字也带着');
+    assert.equal(Object.values(again.nodes).find(node => node.name === '路口').announce, false);
+    assert.deepEqual(run.errors, []);
+
+    // 玩的人在设置里关了「显示报幕」（存酒馆用户设置，不进角色卡）：写卡的人开了也不报。
+    const host = settingsHost({ 'dynamic-guide-assistant': { prefs: { announce: false } } });
+    const quiet = load(world.helper, { SillyTavern: host.SillyTavern }).core.routes;
+    quiet.announce(t.route, [t.leave]);
+    assert.deepEqual(plain(quiet.announced()), [], '玩的人关了报幕就不报');
 });
 
 // v4.7.0：AI 判断看的回复后来被重新生成 / 滑走 / 删掉，那次判断退掉；「每 N 层」只数 AI 回复。
@@ -2397,6 +2454,60 @@ test('路线图：左栏「新建路线图」能新建，世界书里多一个�
     assert.ok(world.state.books.书A.some(entry => /（动态指导）$/.test(entry.name || entry.comment || '')), '世界书里有路线图条目');
     assert.doesNotMatch(documentRef.getElementById(PANEL_ID).textContent, /is not defined/);
     assert.deepEqual(errors, []);
+});
+
+test('星标（v4.8.0）：判断提示词和 API 预设标了星，新建的路线图自动用它们', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    const run = sandbox.DynamicGuideAssistantCore;
+    const promptId = await run.promptStorage.save({ name: '简短', segments: [{ role: 'user', content: '{{作答表}}' }] });
+    await run.apiStorage.writePresets([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'k', model: 'm' }]);
+    const root = sandbox.SillyTavern.getContext().extensionSettings['dynamic-guide-assistant'];
+    root.prefs = { starPrompt: promptId };
+    root.apiStore.overrides.lines['@star'] = '便宜的';
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await run.refresh();
+    await findButton(documentRef.getElementById(PANEL_ID).querySelector('.dga-rail'), '＋ 新建路线图').listeners.click[0]();
+    for (let i = 0; i < 5; i += 1) await new Promise(setImmediate);
+    const route = characterRoot(world).routes.list[0];
+    assert.equal(route.promptId, promptId, '用星标的提示词');
+    assert.equal(run.routes.apiName(route), '便宜的', '用星标的 API');
+    assert.deepEqual(errors, []);
+});
+
+test('回复太短（v4.8.0）：设了「回复至少几个字」，判断 AI 回得太短就带着说明重问一次', async () => {
+    const world = routeWorld();
+    world.state.messages = [{ message_id: 4, role: 'assistant', message: '小林提着箱子去了码头。' }];
+    world.state.lastMessageId = 4;
+    const bodies = [];
+    const fetchMock = async (url, options) => {
+        bodies.push(JSON.parse(options.body));
+        const plan = bodies.length === 1 ? '' : `<judge_plan>${'想一想'.repeat(30)}</judge_plan>`;
+        const content = `${plan}<answer n="1"><basis>走了</basis><done>YES</done><road>2</road></answer><start>0</start>`;
+        const text = JSON.stringify({ choices: [{ message: { content } }] });
+        return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
+    };
+    const storage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'k', model: 'm' }]),
+    });
+    const run = load(world.helper, { localStorage: storage, fetch: fetchMock });
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    t.route.advance = 'judge';
+    world.state.variables.character.$dynamicGuideAssistant.config.settings = { judgeMinChars: 100 };
+    await R.write([t.route]);
+    const state = R.normalizeRouteState(null, t.route);
+    R.mainStep(t.route, state);
+    await R.writeState(t.route.id, state);
+    await R.setApi(t.route, '便宜的');
+    assert.equal(await R.judge(t.route, 4), true);
+    assert.equal(bodies.length, 2, '第一次太短，重问了一次');
+    assert.match(bodies[1].messages[bodies[1].messages.length - 1].content, /上次作答太短/, '重问时告诉它太短了');
+    assert.equal((await R.readStates())[t.route.id].cur, t.leave, '第二次够长，照它的结论走');
+    assert.deepEqual(run.errors, []);
 });
 
 test('界面：难懂的地方都有感叹号，说明不用专业词', async () => {
