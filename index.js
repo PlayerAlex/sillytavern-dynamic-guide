@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.6.3';
+    const VERSION = '4.7.0';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2087,12 +2087,24 @@
     }
 
     // v4.0：同步就是把每棵树现在该发的内容写进它的条目。
+    // v4.7.0：酒馆要「重新生成 / 滑动生成」时，最后那条回复马上要被换掉——先把看过它的判断退掉，这一次就用退回去的那一段。
     function syncMirrors(generationType) {
         return withIoCache(() => syncMirrorsNow(generationType));
     }
 
     async function syncMirrorsNow(generationType) {
         const config = await readConfig();
+        try {
+            let replacedFrom = null;
+            if (generationType === 'regenerate' || generationType === 'swipe') {
+                const getLastMessageId = api('getLastMessageId', false);
+                const last = getLastMessageId ? await Promise.resolve(getLastMessageId()) : null;
+                if (last != null && Number.isFinite(Number(last))) replacedFrom = Number(last);
+            }
+            if (await reconcileRouteJudges(replacedFrom)) refreshOpenPanel();
+        } catch (error) {
+            LogModule.warn('判断AI', `核对重新生成 / 删掉的回复失败：${error.message || String(error)}`);
+        }
         try {
             await syncRouteEntriesNow({ config });
         } catch (error) {
@@ -4160,8 +4172,10 @@
             cond: String(cond || ''),
             host,
             root: '',
-            wait: Boolean(settings.wait),
-            until: String(settings.until || ''),
+            wait: Boolean(settings.wait) && !settings.stay,
+            until: settings.stay ? '' : String(settings.until || ''),
+            // 常驻（v4.7.0）：走到自己最后一段不结束，停在那里一直跟着主线发，主线走到终点才一起停。
+            stay: Boolean(settings.stay),
             color: routeNextSideColor(route),
         };
         side.root = routeAddNode(route, firstName || '支线第一段', '', '', side.id);
@@ -4534,14 +4548,17 @@
         });
         route.sides = (Array.isArray(src.sides) ? src.sides : []).map(item => {
             const side = item && typeof item === 'object' ? item : {};
+            const stay = side.stay === true;
             return {
                 id: ROUTE_ID_RE.test(String(side.id || '')) ? String(side.id) : '',
                 name: oneLine(side.name) || '支线',
                 cond: String(side.cond || ''),
                 host: String(side.host || ''),
                 root: String(side.root || ''),
-                wait: Boolean(side.wait),
-                until: String(side.until || ''),
+                // 常驻的支线不让主线等它（等不到头），也不按主线走到哪结束。
+                wait: Boolean(side.wait) && !stay,
+                until: stay ? '' : String(side.until || ''),
+                stay,
                 color: /^#[0-9a-f]{6}$/i.test(String(side.color || '')) ? side.color : '',
             };
         }).filter(side => side.id);
@@ -4607,6 +4624,7 @@
         data.sides = route.sides.map((side, index) => {
             const out = { id: `s${index + 1}`, name: side.name, host: codeOf(side.host), cond: side.cond, wait: side.wait };
             if (side.until) out.until = codeOf(side.until);
+            if (side.stay) out.stay = true;
             out.color = side.color;
             out.nodes = sideNodes[index].map(nodeOut);
             return out;
@@ -4775,14 +4793,15 @@
                 return;
             }
             let until = '';
-            if (side.until != null && side.until !== '') {
+            const stay = side.stay === true || side.stay === 'true';
+            if (!stay && side.until != null && side.until !== '') {
                 until = find(side.until);
                 if (!until || nodes[until].side) {
                     warn(`支线「${name}」写的「主线走到「${text(side.until)}」时结束」找不到主线上的这一段，改成走完自己的最后一段就结束。`);
                     until = '';
                 }
             }
-            outSides.push({ id, name, cond: text(side.cond), host, root: sideRoot, wait: side.wait === true || side.wait === 'true', until, color: text(side.color) });
+            outSides.push({ id, name, cond: text(side.cond), host, root: sideRoot, wait: side.wait === true || side.wait === 'true', until, stay, color: text(side.color) });
         });
         let start = '';
         if (src.start != null && src.start !== '') {
@@ -4859,9 +4878,8 @@
             endSides: src.ended && src.endSides && typeof src.endSides === 'object' ? normSides(src.endSides) : null,
             sides: {},
             // 上次 AI 判断：问到第几层、它的依据（给小卡看、给「多久检查一次」算层数）。
-            judge: src.judge && typeof src.judge === 'object'
-                ? { lastId: Number.isFinite(Number(src.judge.lastId)) ? Number(src.judge.lastId) : null, basis: String(src.judge.basis || '').slice(0, 500), moved: String(src.judge.moved || '').slice(0, 200) }
-                : null,
+            // prevId = 再上一次问到第几层；undo = 这次判断让进度走了一步时，走之前的样子（重新生成 / 删掉那条回复时退回去用，v4.7.0）。
+            judge: src.judge && typeof src.judge === 'object' ? normalizeRouteJudgeMark(src.judge) : null,
         };
         if (state.cur !== src.cur) {
             state.hist = [];
@@ -4877,6 +4895,180 @@
 
     function routeSidesSnapshot(state) {
         return JSON.parse(JSON.stringify(state.sides || {}));
+    }
+
+    // ---- 重新生成 / 滑动 / 删掉回复（v4.7.0）----
+    // AI 判断看的那条回复后来被重新生成、滑到了另一条、或者删掉了：那次判断就不该算数。
+    // 每问一次记一笔（judge.log，最多留最近 10 笔）：哪一层、第几条滑动、那条回复的指纹、问之前「上次问到第几层」；
+    // 那次让进度走了的，再记下走之前 / 走之后的进度。那一层的回复换了 / 没了，就从最近一笔往回退：
+    // 进度还是那次走完的样子就退回走之前；中间手动点过（对不上了）就不动进度，免得盖掉手动走的。
+    const ROUTE_JUDGE_LOG_MAX = 10;
+
+    function routeProgressOf(state) {
+        return cloneData({ cur: state.cur, hist: state.hist, histSides: state.histSides || [], ended: state.ended, endSides: state.endSides || null, sides: state.sides });
+    }
+
+    function routeProgressKey(state) {
+        return JSON.stringify({ cur: state.cur, hist: state.hist, ended: state.ended, sides: state.sides });
+    }
+
+    // 回复的指纹：现在显示的那条滑动的字。酒馆往右滑生成新的一条时，先改 swipe_id、字还是旧的（swipes 里还没有这一条），
+    // 所以有 swipes 就按 swipes[swipe_id] 取，取不到就是空的（对不上）。
+    function routeMessagePrint(message) {
+        if (!message) return '';
+        if (Array.isArray(message.swipes)) {
+            const text = message.swipes[Number(message.swipe_id) || 0];
+            return typeof text === 'string' ? hashText(text) : '';
+        }
+        return typeof message.message === 'string' ? hashText(message.message) : '';
+    }
+
+    function normalizeRouteJudgeMark(raw) {
+        const num = value => (value != null && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null);
+        const entries = (list, needMove) => (Array.isArray(list) ? list : [])
+            .filter(item => item && typeof item === 'object' && num(item.id) != null)
+            .slice(-ROUTE_JUDGE_LOG_MAX)
+            .map(item => {
+                const out = { id: num(item.id), swipe: num(item.swipe) || 0, print: String(item.print || ''), prev: num(item.prev) };
+                if (item.before && typeof item.before === 'object' && item.after && typeof item.after === 'object') Object.assign(out, { before: item.before, after: item.after });
+                return out;
+            })
+            .filter(item => !needMove || item.before);
+        const log = entries(raw.log, false);
+        // 退掉过的、让进度走了的那几笔：滑回那条回复时照原样放回来（不用再问一次 AI）。
+        const parked = entries(raw.parked, true);
+        return {
+            lastId: num(raw.lastId),
+            basis: String(raw.basis || '').slice(0, 500),
+            moved: String(raw.moved || '').slice(0, 200),
+            ...(log.length ? { log } : {}),
+            ...(parked.length ? { parked } : {}),
+        };
+    }
+
+    // 退掉最近一笔。退了进度返回 true。
+    function routeUndoJudge(route, state) {
+        const log = ((state.judge && state.judge.log) || []).slice();
+        const parked = ((state.judge && state.judge.parked) || []).slice();
+        const top = log.pop();
+        if (!top) return false;
+        let undone = false;
+        if (top.before) {
+            if (routeProgressKey(normalizeRouteState(top.after, route)) === routeProgressKey(state)) {
+                const before = normalizeRouteState(top.before, route);
+                ['cur', 'hist', 'histSides', 'ended', 'endSides', 'sides'].forEach(key => { state[key] = before[key]; });
+                parked.push(top);
+                undone = true;
+            } else {
+                // 手动走过了：更早那几笔也不再退进度，只用来对「上次问到第几层」。
+                log.forEach(item => { delete item.before; delete item.after; });
+                parked.length = 0;
+            }
+        }
+        state.judge = { lastId: top.prev, basis: '', moved: '', ...(log.length ? { log } : {}), ...(parked.length ? { parked: parked.slice(-ROUTE_JUDGE_LOG_MAX) } : {}) };
+        return undone;
+    }
+
+    // 滑回以前那条回复：那条回复判断过、让进度走过一步，而且现在的进度正是那时走之前的样子，就照原样走回去。
+    function routeRedoJudge(route, state, list, replacedFrom) {
+        const parked = ((state.judge && state.judge.parked) || []).slice();
+        const log = ((state.judge && state.judge.log) || []).slice();
+        const topId = log.length ? log[log.length - 1].id : -1;
+        const now = routeProgressKey(state);
+        const index = parked.findIndex(item => item.id > topId
+            && (replacedFrom == null || item.id < Number(replacedFrom))
+            && routeProgressKey(normalizeRouteState(item.before, route)) === now
+            && list.some(message => Number(message.message_id) === item.id && message.role === 'assistant'
+                && (Number(message.swipe_id) || 0) === item.swipe && routeMessagePrint(message) === item.print));
+        if (index < 0) return null;
+        const item = parked.splice(index, 1)[0];
+        const after = normalizeRouteState(item.after, route);
+        ['cur', 'hist', 'histSides', 'ended', 'endSides', 'sides'].forEach(key => { state[key] = after[key]; });
+        log.push(item);
+        state.judge = { lastId: item.id, basis: '', moved: '', log: log.slice(-ROUTE_JUDGE_LOG_MAX), ...(parked.length ? { parked } : {}) };
+        return item.id;
+    }
+
+    // 判断看过的那条回复还在不在，在就返回它（现在的样子）。同一层、还是 AI 的、显示的还是那一条滑动（swipe_id）就算在；
+    // 滑动号变了但那条滑动的字一样（删掉了前面某条滑动，号跟着挪）也算在——这一条要有 swipes 才认，没有 swipes 时
+    // 分不清「删了前面的滑动」和「往右滑正在生成新的一条」（字都还是旧的）。不只看字：别的脚本、用户改错字都会动字。
+    // 这一层对不上时按指纹往前找——前面删了几条，回复整体往前挪了。
+    // 注意：酒馆助手的 getChatMessages 会把超出范围的楼层号夹到最后一层，所以一定要核对 message_id。
+    function routeReplyThere(top, list) {
+        const swipeOf = message => Number(message.swipe_id) || 0;
+        const isReply = message => message && message.role === 'assistant';
+        const samePrint = message => Boolean(top.print) && routeMessagePrint(message) === top.print;
+        const same = list.find(message => Number(message.message_id) === top.id);
+        if (isReply(same) && (swipeOf(same) === top.swipe || (Array.isArray(same.swipes) && samePrint(same)))) return same;
+        return list.filter(message => Number(message.message_id) < top.id && isReply(message) && samePrint(message)
+            && (swipeOf(message) === top.swipe || Array.isArray(message.swipes))).pop() || null;
+    }
+
+    // 每张图从最近一笔判断往回看，回复不在了就退掉那一笔，直到碰到还在的。
+    // replacedFrom：这一层（和后面的）回复马上要被换掉——酒馆开始「重新生成 / 滑动生成」时告诉我们的，这时候旧回复还在。
+    // 有图退了（或者记录要改）返回 true。
+    async function reconcileRouteJudges(replacedFrom) {
+        const getChatMessages = api('getChatMessages', false);
+        if (!getChatMessages) return false;
+        const routes = await readRoutes();
+        const states = await readRouteStates();
+        const getLastMessageId = api('getLastMessageId', false);
+        const lastNow = getLastMessageId ? Number(await Promise.resolve(getLastMessageId())) : NaN;
+        const windows = new Map();
+        // 往前多看 30 层：前面删了几条时，回复挪到了更前面。聊天变短了就从现在的最后一层往前看。
+        const around = async id => {
+            if (!windows.has(id)) {
+                const top = Number.isFinite(lastNow) ? Math.min(id, Math.max(0, lastNow)) : id;
+                const list = await Promise.resolve(getChatMessages(`${Math.max(0, top - 30)}-${top}`, { include_swipes: false }));
+                windows.set(id, Array.isArray(list) ? list : []);
+            }
+            return windows.get(id);
+        };
+        let changed = false;
+        for (const route of routes) {
+            const raw = states[route.id];
+            const judge = raw && raw.judge;
+            if (!judge || !((Array.isArray(judge.log) && judge.log.length) || (Array.isArray(judge.parked) && judge.parked.length))) continue;
+            const state = normalizeRouteState(raw, route);
+            const undone = [];
+            const redone = [];
+            let dirty = false;
+            while (state.judge && state.judge.log && state.judge.log.length) {
+                const top = state.judge.log[state.judge.log.length - 1];
+                const found = replacedFrom != null && top.id >= Number(replacedFrom) ? null : routeReplyThere(top, await around(top.id));
+                if (found) {
+                    // 回复还在。前面删了几条（挪到了前面那层）、或者滑动号跟着挪了：记录跟着改，不退。
+                    const at = Number(found.message_id);
+                    const swipe = Number(found.swipe_id) || 0;
+                    if (at !== top.id || swipe !== top.swipe) {
+                        if (state.judge.lastId === top.id) state.judge.lastId = at;
+                        Object.assign(top, { id: at, swipe });
+                        dirty = true;
+                    }
+                    break;
+                }
+                if (routeUndoJudge(route, state)) undone.push(top.id);
+                dirty = true;
+            }
+            // 滑回到以前判断过的那条回复：照原样走回去（一层一层往后接，接不上就停）。
+            for (let guard = 0; guard < ROUTE_JUDGE_LOG_MAX && state.judge && state.judge.parked && state.judge.parked.length; guard += 1) {
+                const ids = [...new Set(state.judge.parked.map(item => item.id))];
+                const lists = [];
+                for (const id of ids) lists.push(...await around(id));
+                const id = routeRedoJudge(route, state, lists, replacedFrom);
+                if (id == null) break;
+                redone.push(id);
+                dirty = true;
+            }
+            if (!dirty) continue;
+            changed = true;
+            await writeRouteState(route.id, state);
+            if (ui.routeStates) ui.routeStates[route.id] = state;
+            const now = route.nodes[state.cur];
+            if (undone.length) LogModule.info('判断AI', `「${route.name}」第 ${undone.join('、')} 层的回复换了（重新生成、滑到别的回复或删掉了），那次判断不算，退回到「${now ? now.name : ''}」`);
+            if (redone.length) LogModule.info('判断AI', `「${route.name}」滑回了第 ${redone.join('、')} 层原来那条回复，照那次的判断走回「${now ? now.name : ''}」`);
+        }
+        return changed;
     }
 
     function routeSideState(route, state, sideId) {
@@ -5082,17 +5274,27 @@
         ss.cur = to;
     }
 
+    // 支线点「下一段」：moved 走了 / pick 到了路口要选 / ended 走完了 / stay 常驻的走到了最后一段（停着不结束）/ none。
+    // 常驻的支线要提前停，用 routeSideFinish（界面上那一行的「走完」）。
     function routeSideStep(route, state, side) {
         const ss = routeSideState(route, state, side.id);
         const node = route.nodes[ss.cur];
         if (!node) return { kind: 'none' };
         if (!node.next.length) {
+            if (side.stay) return { kind: 'stay', node };
             ss.status = 'done';
             return { kind: 'ended', node };
         }
         if (node.next.length > 1) return { kind: 'pick', node };
         routeSideGo(route, state, side, node.next[0].to);
         return { kind: 'moved', to: node.next[0].to };
+    }
+
+    function routeSideFinish(route, state, side) {
+        const ss = routeSideState(route, state, side.id);
+        if (ss.status !== 'on') return false;
+        ss.status = 'done';
+        return true;
     }
 
     function routeSideBack(route, state, side) {
@@ -5580,7 +5782,12 @@
             lines.push({ label, node, sideId, roads: node.next.map(edge => ({ to: edge.to, cond: edge.cond, name: (route.nodes[edge.to] || {}).name || '' })) });
         };
         pushLine('主线', state.cur, '');
-        routeRunningSides(route, state).forEach(side => pushLine(`支线 · ${side.name}`, routeSideState(route, state, side.id).cur, side.id));
+        // 常驻的支线走到最后一段就停着（v4.7.0），不用问它演完没有。
+        routeRunningSides(route, state).forEach(side => {
+            const node = route.nodes[routeSideState(route, state, side.id).cur];
+            if (side.stay && node && !node.next.length) return;
+            pushLine(`支线 · ${side.name}`, routeSideState(route, state, side.id).cur, side.id);
+        });
         const offers = routeOfferedSides(route, state);
         return { lines, offers };
     }
@@ -5729,14 +5936,28 @@
         return autoAdvanceMode(config);
     }
 
-    function routeJudgeDue(route, state, messageId, settings, force) {
+    // 「多久问一次 · 每 N 层」：一层 = 一条 AI 回复。replies = 上次问过的那层之后（不含）到这一层（含）有几条 AI 回复；
+    // v4.7.0 前直接拿楼层号相减，用户的话也算进去了，「每 2 层」其实每条回复都问。
+    function routeJudgeDue(route, state, messageId, settings, force, replies) {
         if (state.ended) return false;
         if (force) return true;
         const last = state.judge && state.judge.lastId;
         if (last != null && Number(messageId) === Number(last)) return false;
         const interval = judgeCheckInterval(settings);
-        if (interval > 1 && last != null && Number(messageId) > last && Number(messageId) - last < interval) return false;
+        if (interval > 1 && last != null && Number(messageId) > last) {
+            const gap = Number.isFinite(replies) ? replies : Number(messageId) - last;
+            if (gap < interval) return false;
+        }
         return true;
+    }
+
+    // 上次问过的那层之后到 messageId 有几条 AI 回复（用户的话、系统消息不算）。读不到返回 null。
+    async function routeRepliesSince(last, messageId) {
+        const getChatMessages = api('getChatMessages', false);
+        if (!getChatMessages || last == null || messageId == null || Number(messageId) <= Number(last)) return null;
+        const list = await Promise.resolve(getChatMessages(`${Number(last) + 1}-${messageId}`, { include_swipes: false }));
+        if (!Array.isArray(list)) return null;
+        return list.filter(message => message && message.role === 'assistant' && Number(message.message_id) > Number(last) && Number(message.message_id) <= Number(messageId)).length;
     }
 
     // 每张路线图自己选判断用的 API，与预设一起存酒馆用户设置，按路线图 id 区分。
@@ -5761,7 +5982,9 @@
         const force = Boolean(options && options.force);
         const states = await readRouteStates();
         const state = normalizeRouteState(states[route.id], route);
-        if (!routeJudgeDue(route, state, messageId, settings, force)) return false;
+        const last = state.judge && state.judge.lastId;
+        const replies = !force && judgeCheckInterval(settings) > 1 ? await routeRepliesSince(last, messageId) : null;
+        if (!routeJudgeDue(route, state, messageId, settings, force, replies == null ? undefined : replies)) return false;
         const item = routeJudgeCase(route, state);
         if (!item || !item.lines.length) return false;
         // 设置不可读时拒绝判断，不能把读取失败当成「跟随主 API」而发给错误的模型。
@@ -5770,7 +5993,8 @@
         const rules = { extractRules: route.extractRules, excludeRules: route.excludeRules };
         const history = await recentHistoryText(messageId, judgeHistoryCount(settings), rules);
         const messages = routeJudgeMessages(route, item, history, routePromptSegments(route), routeHostTexts());
-        const before = JSON.stringify({ cur: state.cur, hist: state.hist, ended: state.ended, sides: state.sides });
+        const before = routeProgressKey(state);
+        const reply = await routeReplyAt(messageId);
         LogModule.info('判断AI', `「${route.name}」第 ${messageId} 层：问 ${item.lines.length} 条在走的线${item.offers.length ? `、${item.offers.length} 条可以开始的支线` : ''}`);
         let text;
         try {
@@ -5788,29 +6012,58 @@
         judgeRuntime.lastAt = Date.now();
         // 判断期间进度变了（手动点了下一段、切了聊天）：这次结论作废。
         const fresh = normalizeRouteState((await readRouteStates())[route.id], route);
-        if (JSON.stringify({ cur: fresh.cur, hist: fresh.hist, ended: fresh.ended, sides: fresh.sides }) !== before) {
+        if (routeProgressKey(fresh) !== before) {
             LogModule.warn('判断AI', `「${route.name}」判断期间进度变了，这次结论作废`);
             return false;
         }
+        // 判断期间这条回复被重新生成 / 滑走 / 删掉了：这次结论作废，等新的回复再问。
+        // 只看还在不在、滑动号变没变，不看字：别的脚本收到回复后改一下字很常见。
+        const replyNow = await routeReplyAt(messageId);
+        if (reply && (!replyNow || replyNow.swipe !== reply.swipe)) {
+            LogModule.warn('判断AI', `「${route.name}」判断期间第 ${messageId} 层的回复换了，这次结论作废`);
+            return false;
+        }
+        const startedAt = routeProgressOf(fresh);
         const result = applyRouteJudge(route, fresh, item, filtered);
-        fresh.judge = { lastId: messageId == null ? null : Number(messageId), basis: result.basis, moved: result.moves.join('；') };
+        // 记一笔（只记看的是 AI 回复的那几次），以后这条回复换了就能退回去。
+        const mark = { id: messageId == null ? null : Number(messageId), swipe: reply ? reply.swipe : 0, print: reply ? reply.print : '', prev: fresh.judge ? fresh.judge.lastId : null };
+        if (result.moves.length && routeProgressKey(fresh) !== before) Object.assign(mark, { before: startedAt, after: routeProgressOf(fresh) });
+        const log = ((fresh.judge && fresh.judge.log) || []).filter(entry => entry.id !== mark.id);
+        if (mark.id != null && reply) log.push(mark);
+        const parked = (fresh.judge && fresh.judge.parked) || [];
+        fresh.judge = { lastId: mark.id, basis: result.basis, moved: result.moves.join('；'), ...(log.length ? { log: log.slice(-ROUTE_JUDGE_LOG_MAX) } : {}), ...(parked.length ? { parked } : {}) };
         await writeRouteState(route.id, fresh);
         if (ui.routeStates) ui.routeStates[route.id] = fresh;
         LogModule.info('判断AI', `「${route.name}」${result.moves.length ? result.moves.join('；') : '这一层不走'}${result.basis ? `（${result.basis.slice(0, 120)}）` : ''}`);
         return result.moves.length > 0;
     }
 
+    // 第 messageId 层现在显示的那条回复：第几条滑动 + 指纹。不是 AI 的回复 / 读不到返回 null。
+    async function routeReplyAt(messageId) {
+        const getChatMessages = api('getChatMessages', false);
+        if (!getChatMessages || messageId == null) return null;
+        const list = await Promise.resolve(getChatMessages(Number(messageId), { include_swipes: false }));
+        const message = Array.isArray(list) ? list.find(item => item && Number(item.message_id) === Number(messageId)) : null;
+        if (!message || message.role !== 'assistant') return null;
+        return { swipe: Number(message.swipe_id) || 0, print: routeMessagePrint(message) };
+    }
+
     // 每条 AI 回复后：开了 AI 判断的每张图各问一次，排队一个一个来。
     async function checkRoutesFloor(messageId) {
+        // 先把「看的回复已经换了」的判断退掉（重新生成 / 滑动 / 删掉），再问新的这条。
+        let moved = await reconcileRouteJudges();
         const config = await readConfig();
         const routes = (await readRoutes()).filter(route => routeAdvanceMode(route, config) === 'judge');
-        if (!routes.length) return;
+        if (!routes.length) {
+            if (moved) await syncRouteEntriesNow({ config });
+            return;
+        }
         if (modelPauseLeft() > 0) {
             LogModule.info('判断AI', `第 ${messageId} 层：上次请求出错，自动检查暂停到 ${modelPauseClock()}，这一层不问`);
             reportOnce(`model-paused:${modelGate.pausedUntil}`, `判断用的 AI 上次请求出错，自动检查先停到 ${modelPauseClock()}，免得反复请求被限流。到点以后下一条回复会自动再问。`);
+            if (moved) await syncRouteEntriesNow({ config });
             return;
         }
-        let moved = false;
         for (const route of routes) {
             if (modelPauseLeft() > 0) break;
             try {
@@ -5839,9 +6092,10 @@
             let current = messageId;
             while (current != null) {
                 await checkRoutesFloor(current);
-                const next = routeFloor.waiting;
+                // 排队的哪怕是同一层也再看一次：重新生成以后同一层是新的回复（上一次的结论已经作废）；
+                // 真是同一条回复来了两次，judgeRoute 看「上次问到第几层」会跳过，不会多问。
+                current = routeFloor.waiting;
                 routeFloor.waiting = null;
-                current = next != null && String(next) !== String(current) ? next : null;
             }
         })().catch(error => {
             LogModule.error('判断AI', `检查失败：${error && error.message ? error.message : error}`, error);
@@ -6370,14 +6624,18 @@
         routeRunningSides(route, state).forEach(side => {
             const node = route.nodes[routeSideState(route, state, side.id).cur];
             if (!node) return;
+            // 常驻的支线走到最后一段：停着一直发，「走完」由你来点（v4.7.0）。
+            const staying = side.stay && !node.next.length;
             rows.push(el('div', { class: 'dga-rt-row' },
                 el('span', { class: 'dga-rt-line', style: `--cc:${side.color}` }, el('i'), `支线 · ${side.name}`),
                 el('div', { class: 'dga-rt-now' },
-                    el('span', {}, '现在：', el('b', { text: node.name })),
+                    el('span', {}, '现在：', el('b', { text: node.name }), staying ? el('span', { class: 'dga-rt-tag', text: '常驻' }) : null),
                     atFork(node) ? note('到路口了，等着选一条路') : null),
                 el('div', { class: 'dga-rt-acts' },
                     rtBtn('上一段', () => routeSideBackUi(route, side), 'small'),
-                    rtBtn(node.next.length ? '下一段' : '走完', () => routeSideNextUi(route, side), 'small primary'))));
+                    staying
+                        ? rtBtn('走完', () => routeSideFinishUi(route, side), 'small')
+                        : rtBtn(node.next.length ? '下一段' : '走完', () => routeSideNextUi(route, side), 'small primary'))));
         });
         routeOfferedSides(route, state).forEach(side => {
             rows.push(el('div', { class: 'dga-rt-row is-offer' },
@@ -6560,8 +6818,13 @@
             });
             return;
         }
-        if (result.kind === 'none') return;
+        if (result.kind === 'none' || result.kind === 'stay') return;
         commitRouteWalk(route, result.kind === 'ended' ? `支线「${side.name}」走完了` : '');
+    }
+
+    function routeSideFinishUi(route, side) {
+        if (!hostWindow.confirm(`「${side.name}」是常驻的支线，走完以后就不再发了。确定让它走完？`)) return;
+        if (routeSideFinish(route, routeStateOf(route), side)) commitRouteWalk(route, `支线「${side.name}」走完了`);
     }
 
     function routeSideBackUi(route, side) {
@@ -6882,7 +7145,7 @@
 
     function routeSideDialog(route, hostId) {
         const host = route.nodes[hostId];
-        const draft = { name: '', cond: '', first: '', wait: false, until: '' };
+        const draft = { name: '', cond: '', first: '', wait: false, until: '', stay: false };
         const later = host.side ? [] : [...routeReach(route, hostId, '')].filter(id => id !== hostId).map(id => [id, route.nodes[id].name]);
         const field2 = (label, control, hint) => el('div', { class: 'dga-rt-f' }, el('label', { text: label }), control, hint ? el('div', { class: 'dga-rt-muted dga-rt-hint', text: hint }) : null);
         const build = () => {
@@ -6891,13 +7154,20 @@
                 field2('开始的条件', el('input', { type: 'text', value: draft.cond, placeholder: '什么情况下开始这条支线', oninput: event => { draft.cond = event.target.value; } }),
                     '写「触发的那件事」，第一段再写触发以后要演的事。'),
                 field2('第一段叫什么', el('input', { type: 'text', value: draft.first, placeholder: '可以先空着', oninput: event => { draft.first = event.target.value; } })),
-                field2('支线开始以后，主线', rtSeg([['go', '照常往下走'], ['wait', '停下来等支线走完']], draft.wait ? 'wait' : 'go', value => { draft.wait = value === 'wait'; build(); })),
-                later.length ? field2('什么时候结束', rtSelect([['', '走完自己的最后一段']].concat(later.map(([id, name]) => [id, `主线走到「${name}」时（没走完也结束）`])), draft.until, value => { draft.until = value; })) : null);
+                field2('支线开始以后，主线', rtSeg([['go', '照常往下走'], ['wait', '停下来等支线走完', draft.stay]], draft.wait ? 'wait' : 'go', value => { draft.wait = value === 'wait'; build(); })),
+                field2('什么时候结束', rtSelect([['', '走完自己的最后一段']]
+                    .concat(later.map(([id, name]) => [id, `主线走到「${name}」时（没走完也结束）`]))
+                    .concat([['@stay', '不结束（常驻）：停在最后一段一直发']]), draft.stay ? '@stay' : draft.until, value => {
+                    draft.stay = value === '@stay';
+                    draft.until = draft.stay ? '' : value;
+                    if (draft.stay) draft.wait = false;
+                    build();
+                })));
             openRouteModal(`在「${host.name}」上挂一条支线`, body, [
                 rtBtn('取消', closeRouteModal, 'ghost'),
                 rtBtn('挂上，去写第一段', () => {
                     ui.rt.modal = null;
-                    const side = routeAddSide(route, hostId, draft.name, draft.cond.trim(), draft.first.trim(), { wait: draft.wait, until: draft.until });
+                    const side = routeAddSide(route, hostId, draft.name, draft.cond.trim(), draft.first.trim(), { wait: draft.wait, until: draft.until, stay: draft.stay });
                     routeEdited(route, true);
                     selectRouteNode(route, side.root);
                 }, 'primary'),
@@ -7042,7 +7312,7 @@
                 const owner = item.side ? routeSideById(route, item.side) : null;
                 return [item.id, owner ? `${owner.name} · ${item.name}` : `主线 · ${item.name}`];
             });
-            const endByMain = Boolean(side.until);
+            const endByMain = Boolean(side.until) && !side.stay;
             const bodyKids = [
                 el('div', { class: 'dga-rt-f' },
                     el('label', { text: '支线名字' }),
@@ -7065,18 +7335,21 @@
                 el('div', { class: 'dga-rt-grp' },
                     el('div', { class: 'dga-rt-grp-title dga-tip-host' }, '走的时候', infoTip(`side-run-${route.id}`, [
                         ['照常往下走', '支线和主线各走各的，同时进行。'],
-                        ['停下来等支线走完', '主线先停住，等支线演完了再接着往下走。'],
+                        ['停下来等支线走完', '主线先停住，等支线演完了再接着往下走。支线设成常驻时不能选（常驻的支线不会自己走完，主线会一直等）。'],
                     ])),
                     el('div', { class: 'dga-rt-f' },
                         el('label', { text: '主线' }),
-                        rtSeg([['go', '照常往下走'], ['wait', '停下来等支线走完']], side.wait ? 'wait' : 'go', value => { side.wait = value === 'wait'; routeEdited(route, false); render(); }))),
+                        rtSeg([['go', '照常往下走'], ['wait', '停下来等支线走完', side.stay]], side.wait ? 'wait' : 'go', value => { side.wait = value === 'wait'; routeEdited(route, false); render(); }))),
                 el('div', { class: 'dga-rt-grp' },
                     el('div', { class: 'dga-rt-grp-title dga-tip-host' }, '结束', infoTip(`side-end-${route.id}`, [
                         ['走完自己的最后一段', '支线自己演完就结束。'],
                         ['主线到了某一段', '不管支线演到哪，主线走到那一段时支线就结束。'],
+                        ['不结束（常驻）', '走到支线最后一段就停在那里，一直跟着主线发给 AI，直到主线走到终点。比如「她现在和你住在一起」这种开始了就一直算数的事。想提前停，在路线图下面这条支线那一行点「走完」。'],
                     ])),
                     el('div', { class: 'dga-rt-f' },
-                        rtSeg([['self', '走完自己的最后一段'], ['main', '主线到了某一段', !later.length]], endByMain ? 'main' : 'self', value => {
+                        rtSeg([['self', '走完自己的最后一段'], ['main', '主线到了某一段', !later.length], ['stay', '不结束（常驻）']], side.stay ? 'stay' : (endByMain ? 'main' : 'self'), value => {
+                            side.stay = value === 'stay';
+                            if (side.stay) side.wait = false;
                             side.until = value === 'main' && later.length ? (side.until || later[0][0]) : '';
                             routeEdited(route, false);
                             render();
@@ -8865,6 +9138,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             mainBack: routeMainBack,
             sideStart: routeSideStart,
             sideStep: routeSideStep,
+            sideFinish: routeSideFinish,
             sideBack: routeSideBack,
             jumpTo: routeJumpTo,
             exportData: exportRouteData,
@@ -8886,6 +9160,9 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             sync: options => syncRouteEntriesNow(options),
             setPlacement: writeRoutePlacement,
             judge: (route, messageId) => readConfig().then(config => judgeRoute(route, messageId, config, { force: true })),
+            // 和每条回复后自动问的一样：看间隔、先核对换掉的回复（v4.7.0 测试用）。
+            judgeFloor: messageId => checkRoutesFloor(messageId),
+            reconcile: replacedFrom => reconcileRouteJudges(replacedFrom),
             judgeMessages: routeJudgeMessages,
             judgeCase: routeJudgeCase,
             promptPresets: routePromptPresets,
@@ -8933,6 +9210,17 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             runEventTask('判断路线图', () => handleRouteMessage.apply(null, args));
         });
     }
+    // v4.7.0：删掉回复、滑到另一条已经有的回复（不重新生成）时，看过旧回复的判断退掉；滑回来时照原样走回去。条目跟着换。
+    // 正在问的那次判断不用管：问完发现回复换了就不落地。
+    ['MESSAGE_DELETED', 'MESSAGE_SWIPED'].forEach(key => {
+        if (!events[key]) return;
+        eventOn(events[key], () => runEventTask('核对回复', () => withIoCache(async () => {
+            if (await reconcileRouteJudges()) {
+                await syncRouteEntriesNow({});
+                refreshOpenPanel();
+            }
+        })));
+    });
     if (events.CHAT_CHANGED) {
         eventOn(events.CHAT_CHANGED, () => runEventTask('切换聊天', async () => {
             abortModelRequests('切换聊天');

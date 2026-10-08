@@ -1766,6 +1766,197 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     assert.deepEqual(run.errors, []);
 });
 
+// v4.7.0：AI 判断看的回复后来被重新生成 / 滑走 / 删掉，那次判断退掉；「每 N 层」只数 AI 回复。
+// 判断 AI 每次的回答由 answers 决定（按顺序取，用完了一直用最后一个）。
+async function judgeWorld(answers, settings) {
+    const world = routeWorld();
+    world.state.messages = [];
+    world.state.lastMessageId = null;
+    const storage = memoryStorage({
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'k', model: 'm-small' }]),
+    });
+    const asked = [];
+    const fetchMock = async (url, options) => {
+        asked.push(JSON.parse(options.body));
+        const content = answers[Math.min(asked.length - 1, answers.length - 1)];
+        const text = JSON.stringify({ choices: [{ message: { content } }] });
+        return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
+    };
+    const run = load(world.helper, { localStorage: storage, fetch: fetchMock });
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    t.route.advance = 'judge';
+    world.state.variables.character.$dynamicGuideAssistant.config.settings = settings || {};
+    await R.write([t.route]);
+    await R.setApi(t.route, '便宜的');
+    const say = (role, text, swipe) => {
+        const id = world.state.messages.length;
+        world.state.messages.push({ message_id: id, role, message: text, swipe_id: swipe || 0 });
+        world.state.lastMessageId = id;
+        return id;
+    };
+    const cur = async () => (await R.readStates())[t.route.id].cur;
+    const entry = () => world.state.books.书A.find(item => item.name === '海边书店（动态指导）');
+    return { world, run, R, t, asked, say, cur, entry };
+}
+
+const YES = '<answer n="1"><basis>演完了</basis><done>YES</done></answer><start>0</start>';
+const NO = '<answer n="1"><basis>还没</basis><done>NO</done></answer><start>0</start>';
+
+test('路线图：重新生成判断过的回复，那次判断退掉、条目换回去，新回复重新问', async () => {
+    const w = await judgeWorld([YES, NO]);
+    w.say('user', '你好');
+    const reply = w.say('assistant', '开场演完了');
+    await w.R.judgeFloor(reply);
+    assert.equal(await w.cur(), w.t.fork, 'AI 判断说演完了，走到「路口」');
+    await w.R.sync();
+    assert.equal(w.entry().content, '路口正文');
+
+    // 酒馆点「重新生成」：先发 generate('regenerate')，这时旧回复还在，要用退回去的那一段生成。
+    await w.world.state.events.get('generate')('regenerate');
+    assert.equal(await w.cur(), w.t.start, '重新生成：看过那条回复的判断退掉');
+    assert.equal(w.entry().content, '开场正文', '这次生成用的是退回去的那一段');
+
+    // 新回复到了：同一层，重新问。
+    w.world.state.messages[reply].message = '新的开场，还没演完';
+    await w.R.judgeFloor(reply);
+    assert.equal(w.asked.length, 2, '同一层的新回复会再问一次');
+    assert.equal(await w.cur(), w.t.start, '这次说没演完，留在开场');
+    assert.deepEqual(w.run.errors, []);
+});
+
+test('路线图：滑到别的回复退回去，滑回原来那条照原样走回去（不用再问）；删掉回复也退', async () => {
+    const w = await judgeWorld([YES]);
+    w.say('user', '你好');
+    const reply = w.say('assistant', '第一条回复');
+    await w.R.judgeFloor(reply);
+    assert.equal(await w.cur(), w.t.fork);
+
+    // 滑到第二条回复（已经生成过的那条）：MESSAGE_SWIPED 以后核对。
+    Object.assign(w.world.state.messages[reply], { message: '第二条回复', swipe_id: 1 });
+    assert.equal(await w.R.reconcile(), true);
+    assert.equal(await w.cur(), w.t.start, '滑走了：退回开场');
+
+    // 又滑回第一条：照那次的判断走回去，不再花一次请求。
+    Object.assign(w.world.state.messages[reply], { message: '第一条回复', swipe_id: 0 });
+    assert.equal(await w.R.reconcile(), true);
+    assert.equal(await w.cur(), w.t.fork, '滑回来：走回路口');
+    assert.equal(w.asked.length, 1, '没有再问 AI');
+
+    // 删掉这条回复：退回开场。
+    w.world.state.messages.pop();
+    w.world.state.lastMessageId = 0;
+    await w.R.reconcile();
+    assert.equal(await w.cur(), w.t.start, '删掉回复：退回开场');
+
+    // 手动走过以后再删回复：不动手动走的。
+    const again = w.say('assistant', '又一条回复');
+    await w.R.judgeFloor(again);
+    assert.equal(await w.cur(), w.t.fork);
+    const state = w.R.normalizeRouteState((await w.R.readStates())[w.t.route.id], w.t.route);
+    w.R.mainGo(w.t.route, state, w.t.stay);
+    await w.R.writeState(w.t.route.id, state);
+    w.world.state.messages.pop();
+    w.world.state.lastMessageId = 0;
+    await w.R.reconcile();
+    assert.equal(await w.cur(), w.t.stay, '中间手动点过：不退，免得盖掉手动的');
+    assert.deepEqual(w.run.errors, []);
+});
+
+test('路线图：往右滑生成新回复（酒馆先改滑动号、字还没变），再滑回原来那条，照原样走回去', async () => {
+    const w = await judgeWorld([YES, NO]);
+    w.say('user', '你好');
+    const reply = w.say('assistant', '第一条回复');
+    await w.R.judgeFloor(reply);
+    assert.equal(await w.cur(), w.t.fork);
+    // 酒馆往右滑到新的一条：先把 swipe_id 改成 1、发 MESSAGE_SWIPED（字还是旧的），再 generate('swipe')。
+    w.world.state.messages[reply].swipe_id = 1;
+    await w.R.reconcile();
+    await w.world.state.events.get('generate')('swipe');
+    assert.equal(await w.cur(), w.t.start, '要生成新的一条：退回开场');
+    w.world.state.messages[reply].message = '新的一条';
+    await w.R.judgeFloor(reply);
+    assert.equal(await w.cur(), w.t.start, '新的一条说没演完');
+    // 滑回第一条。
+    Object.assign(w.world.state.messages[reply], { message: '第一条回复', swipe_id: 0 });
+    await w.R.reconcile();
+    assert.equal(await w.cur(), w.t.fork, '滑回原来那条：照那次的结论走回路口');
+    assert.equal(w.asked.length, 2);
+});
+
+test('路线图：前面删了几条，判断过的回复挪到前面那层，不算换了；别的脚本改了回复的字也不算', async () => {
+    const w = await judgeWorld([YES]);
+    w.say('user', '甲');
+    w.say('assistant', '旧的');
+    w.say('user', '乙');
+    const reply = w.say('assistant', '要判断的这条');
+    await w.R.judgeFloor(reply);
+    assert.equal(await w.cur(), w.t.fork);
+    w.world.state.messages[reply].message = '要判断的这条（状态栏脚本加了一行）';
+    await w.R.reconcile();
+    assert.equal(await w.cur(), w.t.fork, '字变了、滑动号没变：不退');
+    w.world.state.messages[reply].message = '要判断的这条';
+    // 删掉第 1、2 层（旧的回复和「乙」），后面的往前挪。
+    w.world.state.messages.splice(1, 2);
+    w.world.state.messages.forEach((message, index) => { message.message_id = index; });
+    w.world.state.lastMessageId = w.world.state.messages.length - 1;
+    await w.R.reconcile();
+    assert.equal(await w.cur(), w.t.fork, '回复还在，只是挪到了第 1 层：不退');
+    assert.equal((await w.R.readStates())[w.t.route.id].judge.lastId, 1, '记录跟着挪');
+});
+
+test('路线图：「多久问一次 · 每 2 层」只数 AI 回复，用户说的话不算', async () => {
+    const w = await judgeWorld([NO], { judgeInterval: 2 });
+    w.say('user', '一');
+    await w.R.judgeFloor(w.say('assistant', '回复一'));
+    assert.equal(w.asked.length, 1, '第一条回复就问');
+    w.say('user', '二');
+    await w.R.judgeFloor(w.say('assistant', '回复二'));
+    assert.equal(w.asked.length, 1, '中间隔了一条用户的话，但只是第 1 条回复：不问（以前楼层号差 2 就问了）');
+    w.say('user', '三');
+    await w.R.judgeFloor(w.say('assistant', '回复三'));
+    assert.equal(w.asked.length, 2, '第 2 条回复：问');
+});
+
+test('路线图：支线设成常驻——走到最后一段停着一直发，不问 AI 演完没有，手动「走完」才停，主线到终点一起停', async () => {
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.side.stay = true;
+    t.side.wait = true;
+    t.side.until = t.fork;
+    const route = R.normalizeRoute(JSON.parse(JSON.stringify(t.route)));
+    const side = route.sides[0];
+    assert.equal(side.stay, true);
+    assert.equal(side.wait, false, '常驻的不能让主线等（等不到头）');
+    assert.equal(side.until, '', '常驻的不按主线走到哪结束');
+    const state = R.normalizeRouteState(null, route);
+    R.sideStart(route, state, side);
+    R.sideStep(route, state, side);
+    assert.equal(R.sideStep(route, state, side).kind, 'stay', '最后一段点下一段：停着，不结束');
+    assert.equal(state.sides[side.id].status, 'on');
+    R.mainStep(route, state);
+    assert.equal(R.compose(route, state), '路口正文\n\n烟火正文', '主线往下走，常驻的支线一直跟着发');
+    const lines = R.judgeCase(route, state).lines.map(line => line.label);
+    assert.deepEqual(plain(lines), ['主线'], '停在最后一段的常驻支线不问 AI');
+    assert.equal(R.sideFinish(route, state, side), true, '手动「走完」');
+    assert.equal(R.compose(route, state), '路口正文');
+
+    const end = R.normalizeRouteState(null, route);
+    R.sideStart(route, end, side);
+    R.jumpTo(route, end, t.meet);
+    R.mainStep(route, end);
+    assert.equal(end.ended, true);
+    assert.equal(end.sides[side.id].status, 'done', '主线走到终点，常驻的支线一起停');
+
+    const exported = R.exportData(route);
+    assert.equal(exported.sides[0].stay, true, '导出带着常驻');
+    const back = R.importData(exported)[0];
+    assert.equal(back.route.sides[0].stay, true, '导入也认');
+    assert.deepEqual(plain(back.warnings), []);
+});
+
 test('自定义 API 请求体：带 top_p，TauriTavern 带 custom_api_format，流式时合并 stream_options', () => {
     const preset = { name: 'c', connection: 'custom', customApiFormat: 'claude_messages', apiurl: 'https://api.anthropic.com', key: 'sk', model: 'claude', maxTokens: 100, temperature: 0.5, bodyParams: '{"top_k":50}' };
     const plainBody = core.buildJudgeCustomRequestBody([{ role: 'user', content: 'q' }], preset, false);
