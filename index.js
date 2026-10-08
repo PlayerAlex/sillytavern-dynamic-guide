@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.8.2';
+    const VERSION = '4.8.3';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -5359,9 +5359,16 @@
             if (midSub && Object.entries(midSub.box).some(([col, [top, bottom]]) => box[col] && top <= box[col][1] && bottom >= box[col][0])) mid = -1;
             if (mid >= 0) put(midSub, 0);
             const split = mid >= 0 ? mid : Math.floor(routes.length / 2);
-            const base = mid >= 0 ? 1 : 0.5;
-            routes.slice(0, split).reverse().forEach(kid => { const sub = child(kid, -1); put(sub, Math.min(-base, free(sub, -1))); });
-            routes.slice(mid >= 0 ? mid + 1 : split).forEach(kid => { const sub = child(kid, 1); put(sub, Math.max(base, free(sub, 1))); });
+            // 上下一对一对排，同一对离中间一样远；都排在整行上（双数条时中间那行空着），整张图的行对得齐（v4.8.3）。
+            const above = routes.slice(0, split).reverse();
+            const below = routes.slice(mid >= 0 ? mid + 1 : split);
+            for (let i = 0; i < Math.max(above.length, below.length); i += 1) {
+                const up = i < above.length ? child(above[i], -1) : null;
+                const down = i < below.length ? child(below[i], 1) : null;
+                const d = Math.max(up ? -Math.min(-1, free(up, -1)) : 0, down ? Math.max(1, free(down, 1)) : 0);
+                if (up) put(up, -d);
+                if (down) put(down, Math.max(d, free(down, 1)));
+            }
             // 支线不固定排下面：上面、下面哪边离得近放哪边；一样近时往外放（在中间那一行就放下面），两边匀着摊开。
             kids.filter(item => item.kind === 'side').forEach(item => {
                 const sub = child(item.id, lean);
@@ -7364,10 +7371,15 @@
             xs[col] = acc;
             acc += (colW[col] || 80) + gapW(col);
         }
+        // 竖线摆在「左边那段的右边」到「右边那段」之间的正中（几条就均分），不按这一列最宽的段算，短的段后面不会偏到一大半。
+        const leftW = item => Math.max(...(item.type === 'in' ? item.list.map(e => e.from) : [item.type === 'out' ? item.id : item.from])
+            .map(id => rtNodeWidth(route.nodes[id].name)));
         const laneX = item => {
             const n = lanesUsed[item.gap] || 1;
             const lane = item.lane == null ? (n - 1) / 2 : item.lane;
-            return xs[item.gap] + (colW[item.gap] || 80) + gapW(item.gap) * (lane + 1) / (n + 1);
+            const left = xs[item.gap] + Math.max(...(item.lane == null ? [item] : lanes[item.gap]).map(leftW));
+            const right = xs[item.gap] + (colW[item.gap] || 80) + gapW(item.gap);
+            return left + (right - left) * (lane + 1) / (n + 1);
         };
         const rowCount = Math.max(0, ...Object.values(layout.pos).map(p => p.row)) + 1;
         const width = acc + RT_PAD + 30;
@@ -7399,7 +7411,8 @@
             d, fill: 'none', stroke: s.c, 'stroke-width': s.w, 'stroke-linecap': dash === '5 4' ? 'butt' : 'square', 'stroke-linejoin': 'round',
             'stroke-dasharray': dash || null,
         }) });
-        const pick = list => list.reduce((best, item) => (item.s.z > best.s.z || (item.s.z === best.s.z && best.dash && !item.dash) ? item : best), list[0]);
+        // 共用的一截跟着实线（主线 / 正常的下一段）的颜色走，支线的虚线只在分出去以后上色。
+        const pick = list => list.reduce((best, item) => ((!item.dash && best.dash) || (!item.dash === !best.dash && item.s.z > best.s.z) ? item : best), list[0]);
         const dashOf = list => (list.every(item => item.dash === list[0].dash) ? list[0].dash : null);
         // 一道竖线连着一头（分出去的那段 / 汇进去的那段）和另一头的好几段：竖线从这一头往外一截截画，
         // 每一截用经过它的线里最重要的那条的颜色，共用的部分只画一次。
