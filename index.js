@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.8.0';
+    const VERSION = '4.8.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -5197,8 +5197,9 @@
         return cls;
     }
 
-    // 排布：路口的几条路上下摊开，这一段和中间那条路同一行；支线排在路的下面。
-    // 已经排过的段再被接到，就画成虚线箭头（接回）。
+    // 排布（v4.8.1 重做）：列按「从起点最多走几步」排，几条路汇到同一段时，那一段排在它们全部的右边，接回线从左边汇进去。
+    // 行：路口、几条路汇回的那一段、再往后的路排在同一行；几条路在中间上下均匀摊开（单数条时中间那条也在这一行）；支线放上面下面离得近的那边。
+    // 每块只占它用到的那几列，左右不挨着的块可以共用同一行，不会越排越高。已经排过的段再被接到，就画成虚线箭头（接回）。
     function layoutRoute(route) {
         const children = {};
         const claimed = new Set([route.root]);
@@ -5222,6 +5223,73 @@
                 queue.push(side.root);
             });
         }
+        const ids = Object.keys(children).filter(id => route.nodes[id]);
+        const pos = {};
+        ids.forEach(id => { pos[id] = { col: 0, row: 0 }; });
+        // 排布的线先放（不会成圈），其余往后接的线一条条加，会绕成圈的不算（照旧画成往回接）；支线和主线之间的线不挤列。
+        const succ = {};
+        ids.forEach(id => { succ[id] = children[id].filter(child => pos[child.id]).map(child => child.id); });
+        const reaches = (from, to) => {
+            const seen = new Set([from]);
+            const stack = [from];
+            while (stack.length) {
+                const id = stack.pop();
+                if (id === to) return true;
+                succ[id].forEach(next => { if (!seen.has(next)) { seen.add(next); stack.push(next); } });
+            }
+            return false;
+        };
+        ids.forEach(id => route.nodes[id].next.forEach(edge => {
+            const to = edge.to;
+            if (!pos[to] || succ[id].includes(to) || route.nodes[to].side !== route.nodes[id].side || reaches(to, id)) return;
+            succ[id].push(to);
+        }));
+        const indeg = {};
+        ids.forEach(id => { indeg[id] = 0; });
+        ids.forEach(id => succ[id].forEach(next => { indeg[next] += 1; }));
+        const order = ids.filter(id => !indeg[id]);
+        for (let i = 0; i < order.length; i += 1) {
+            succ[order[i]].forEach(next => {
+                pos[next].col = Math.max(pos[next].col, pos[order[i]].col + 1);
+                indeg[next] -= 1;
+                if (!indeg[next]) order.push(next);
+            });
+        }
+        // 每个路口找它的几条路在哪一段汇回，外层的路口先认领。
+        const reachSet = id => {
+            const side = route.nodes[id].side;
+            const seen = new Set([id]);
+            const stack = [id];
+            while (stack.length) succ[stack.pop()].forEach(next => { if (!seen.has(next) && route.nodes[next].side === side) { seen.add(next); stack.push(next); } });
+            return seen;
+        };
+        const join = {};
+        const joined = new Set();
+        ids.slice().sort((p, q) => pos[p].col - pos[q].col).forEach(id => {
+            const kids = children[id].filter(child => child.kind === 'route' && pos[child.id]).map(child => child.id);
+            if (kids.length < 2) return;
+            const sets = kids.map(reachSet);
+            // 汇回的那一段：汇进来的路最多的里面最靠左的。
+            let best = null;
+            let most = 1;
+            sets.forEach(set => set.forEach(n => {
+                const count = sets.filter(other => other.has(n)).length;
+                if (count > most || (count === most && best && pos[n].col < pos[best].col)) { best = n; most = count; }
+            }));
+            if (!best || joined.has(best)) return;
+            joined.add(best);
+            const merging = kids.filter((kid, index) => kid !== best && sets[index].has(best));
+            // 摆在中间这一行的路：几条路正中间那条能汇回就用它，不然用汇回的几条里中间那条。
+            const middle = kids.length % 2 ? kids[(kids.length - 1) / 2] : null;
+            const center = kids.includes(best) ? null : (merging.includes(middle) ? middle : (merging.length % 2 ? merging[(merging.length - 1) / 2] : null));
+            join[id] = { to: best, center };
+            // 中间那条路直着接到汇回的那一段，这一截画实线，别的路画接回。
+            if (!center) return;
+            const from = [...reachSet(center)].find(n => succ[n].includes(best) && route.nodes[n].next.some(edge => edge.to === best));
+            if (!from || children[from].some(child => child.id === best)) return;
+            ids.forEach(n => { children[n] = children[n].filter(child => child.id !== best); });
+            children[from].push({ id: best, kind: 'route' });
+        });
         const treeEdge = new Set();
         Object.entries(children).forEach(([pid, list]) => list.forEach(child => treeEdge.add(`${pid}>${child.id}`)));
         const links = [];
@@ -5231,23 +5299,63 @@
                 if (!treeEdge.has(`${node.id}>${edge.to}`) && claimed.has(edge.to)) links.push([node.id, edge.to]);
             });
         });
-        const pos = {};
-        let cursor = 0;
-        const place = (id, col) => {
-            const list = children[id] || [];
-            const routes = list.filter(item => item.kind === 'route');
-            const sides = list.filter(item => item.kind === 'side');
-            if (!routes.length) {
-                pos[id] = { col, row: cursor++ };
-                sides.forEach(item => place(item.id, col + 1));
-                return pos[id].row;
-            }
-            const rows = routes.map(item => place(item.id, col + 1));
-            sides.forEach(item => place(item.id, col + 1));
-            pos[id] = { col, row: rows[Math.floor((rows.length - 1) / 2)] };
-            return pos[id].row;
+        // 一块 = 一段和排在它后面的所有段：rows 是各段相对这一段的行，box 是每一列从哪行占到哪行（线走过的空列也算）。
+        const mark = (box, col, top, bottom) => {
+            const have = box[col];
+            box[col] = have ? [Math.min(have[0], top), Math.max(have[1], bottom)] : [top, bottom];
         };
-        place(route.root, 0);
+        // lean：这一块在路口中间那一行的上面（-1）还是下面（1），里面的支线一样近时往外放，不挤进几条路中间。
+        const lay = (id, lean) => {
+            const rows = { [id]: 0 };
+            const box = {};
+            const kids = children[id].filter(child => pos[child.id] && !joined.has(child.id));
+            mark(box, pos[id].col, 0, 0);
+            succ[id].forEach(to => {
+                if (kids.some(child => child.id === to)) return;
+                for (let col = pos[id].col + 1; col < pos[to].col; col += 1) mark(box, col, 0, 0);
+            });
+            const put = (sub, off) => {
+                Object.entries(sub.rows).forEach(([n, row]) => { rows[n] = row + off; });
+                Object.entries(sub.box).forEach(([col, [top, bottom]]) => mark(box, col, top + off, bottom + off));
+            };
+            // 往上 / 往下挪多少才不和已经排好的叠在一起。
+            const free = (sub, dir) => {
+                let off = dir < 0 ? Infinity : -Infinity;
+                Object.entries(sub.box).forEach(([col, [top, bottom]]) => {
+                    if (!box[col]) return;
+                    off = dir < 0 ? Math.min(off, box[col][0] - 1 - bottom) : Math.max(off, box[col][1] + 1 - top);
+                });
+                return off;
+            };
+            const child = (kid, dir) => {
+                const sub = lay(kid, dir);
+                for (let col = pos[id].col + 1; col < pos[kid].col; col += 1) mark(sub.box, col, 0, 0);
+                return sub;
+            };
+            if (join[id]) put(lay(join[id].to, lean), 0);
+            const routes = kids.filter(item => item.kind === 'route').map(item => item.id);
+            let mid = join[id] ? routes.indexOf(join[id].center) : (routes.length % 2 ? (routes.length - 1) / 2 : -1);
+            const midSub = mid >= 0 ? child(routes[mid], lean) : null;
+            if (midSub && Object.entries(midSub.box).some(([col, [top, bottom]]) => box[col] && top <= box[col][1] && bottom >= box[col][0])) mid = -1;
+            if (mid >= 0) put(midSub, 0);
+            const split = mid >= 0 ? mid : Math.floor(routes.length / 2);
+            const base = mid >= 0 ? 1 : 0.5;
+            routes.slice(0, split).reverse().forEach(kid => { const sub = child(kid, -1); put(sub, Math.min(-base, free(sub, -1))); });
+            routes.slice(mid >= 0 ? mid + 1 : split).forEach(kid => { const sub = child(kid, 1); put(sub, Math.max(base, free(sub, 1))); });
+            // 支线不固定排下面：上面、下面哪边离得近放哪边；一样近时往外放（在中间那一行就放下面），两边匀着摊开。
+            kids.filter(item => item.kind === 'side').forEach(item => {
+                const sub = child(item.id, lean);
+                const up = Math.min(-1, free(sub, -1));
+                const down = Math.max(1, free(sub, 1));
+                put(sub, -up < down || (-up === down && lean < 0) ? up : down);
+            });
+            return { rows, box };
+        };
+        if (pos[route.root]) {
+            const { rows } = lay(route.root, 0);
+            const top = Math.min(...Object.values(rows));
+            Object.entries(rows).forEach(([id, row]) => { pos[id].row = row - top; });
+        }
         return { children, links, pos, treeEdge };
     }
 
@@ -7176,12 +7284,71 @@
         const cls = classifyRoute(route, state);
         const colW = [];
         Object.entries(layout.pos).forEach(([id, p]) => { colW[p.col] = Math.max(colW[p.col] || 0, rtNodeWidth(route.nodes[id].name)); });
+        const cyOf = id => RT_PAD + layout.pos[id].row * rowH + RT_NODE_H / 2;
+        // 先定每条线怎么走：out = 从这一段右边分出去（拐在它后面那道缝），in = 几条线在目标前面那道缝汇起来再进去，
+        // loop = 往回接 / 中间被别的段挡住，从上面或下面接进目标。
+        const cell = new Set(Object.values(layout.pos).map(p => `${p.row}:${p.col}`));
+        const clear = (row, from, to) => {
+            for (let col = from + 1; col < to; col += 1) if (cell.has(`${row}:${col}`)) return false;
+            return true;
+        };
+        const edges = [];
+        Object.entries(layout.children).forEach(([pid, list]) => {
+            if (layout.pos[pid]) list.forEach(child => { if (layout.pos[child.id]) edges.push({ from: pid, to: child.id, kind: child.kind }); });
+        });
+        layout.links.forEach(([from, to]) => { if (layout.pos[from] && layout.pos[to]) edges.push({ from, to, kind: 'link' }); });
+        const bundles = new Map();
+        const loops = [];
+        // 几条线进同一段时，统一在它前面那道缝汇起来再进去。
+        const fanIn = {};
+        edges.forEach(e => { if (layout.pos[e.to].col > layout.pos[e.from].col) fanIn[e.to] = (fanIn[e.to] || 0) + 1; });
+        edges.forEach(e => {
+            const pa = layout.pos[e.from];
+            const pb = layout.pos[e.to];
+            e.dash = e.kind === 'side' ? '2 3' : (e.kind === 'link' ? '5 4' : null);
+            const forward = pb.col > pa.col;
+            const outOk = forward && clear(pb.row, pa.col, pb.col);
+            const inOk = forward && clear(pa.row, pa.col, pb.col);
+            const type = e.kind === 'link' || fanIn[e.to] > 1 ? (inOk ? 'in' : (outOk ? 'out' : '')) : (outOk ? 'out' : (inOk ? 'in' : ''));
+            if (!type) {
+                const gy = pb.row > pa.row ? cyOf(e.to) - rowH / 2 : cyOf(e.to) + rowH / 2;
+                loops.push(Object.assign(e, { gap: pa.col, lo: Math.min(cyOf(e.from), gy), hi: Math.max(cyOf(e.from), gy) }));
+                return;
+            }
+            const id = type === 'out' ? e.from : e.to;
+            const key = `${type}:${id}`;
+            if (!bundles.has(key)) bundles.set(key, { type, id, gap: type === 'out' ? pa.col : pb.col - 1, list: [] });
+            bundles.get(key).list.push(e);
+        });
+        // 每道缝里的竖线各占一条道、均匀摊开：汇进来的靠左，分出去的靠右，往回接的最右；上下不重叠的可以共用一条道。
+        const lanes = [];
+        const lanesUsed = [];
+        const items = [...bundles.values()].map(item => {
+            const ys = [cyOf(item.id), ...item.list.map(e => cyOf(item.type === 'out' ? e.to : e.from))];
+            return Object.assign(item, { lo: Math.min(...ys), hi: Math.max(...ys) });
+        }).filter(item => item.hi > item.lo);
+        const rank = { in: 0, out: 1 };
+        items.sort((p, q) => (rank[p.type] - rank[q.type]) || (p.lo - q.lo)).concat(loops).forEach(item => {
+            const taken = lanes[item.gap] || (lanes[item.gap] = []);
+            let lane = 0;
+            while (taken.some(other => other.lane === lane && other.lo <= item.hi + 4 && item.lo <= other.hi + 4)) lane += 1;
+            item.lane = lane;
+            taken.push(item);
+            lanesUsed[item.gap] = Math.max(lanesUsed[item.gap] || 0, lane + 1);
+        });
+        // 一道缝里不止一条竖线时缝加宽，段—线—线—段之间一样宽。
+        const gapW = col => ((lanesUsed[col] || 1) > 1 ? 26 * (lanesUsed[col] + 1) : RT_GAP);
         const xs = [];
         let acc = RT_PAD;
         for (let col = 0; col < colW.length; col += 1) {
             xs[col] = acc;
-            acc += (colW[col] || 80) + RT_GAP;
+            acc += (colW[col] || 80) + gapW(col);
         }
+        const laneX = item => {
+            const n = lanesUsed[item.gap] || 1;
+            const lane = item.lane == null ? (n - 1) / 2 : item.lane;
+            return xs[item.gap] + (colW[item.gap] || 80) + gapW(item.gap) * (lane + 1) / (n + 1);
+        };
         const rowCount = Math.max(0, ...Object.values(layout.pos).map(p => p.row)) + 1;
         const width = acc + RT_PAD + 30;
         const height = RT_PAD * 2 + (rowCount - 1) * rowH + RT_NODE_H + 34;
@@ -7208,46 +7375,48 @@
             return { c: '#6A6D73', w: 1.5, z: 1 };
         };
         const paths = [];
-        const seg = (z, d, s, dotted) => paths.push({ z, node: svgEl('path', {
-            d, fill: 'none', stroke: s.c, 'stroke-width': s.w, 'stroke-linecap': 'square', 'stroke-linejoin': 'round',
-            'stroke-dasharray': dotted ? '2 3' : null,
+        const seg = (z, d, s, dash) => paths.push({ z, node: svgEl('path', {
+            d, fill: 'none', stroke: s.c, 'stroke-width': s.w, 'stroke-linecap': dash === '5 4' ? 'butt' : 'square', 'stroke-linejoin': 'round',
+            'stroke-dasharray': dash || null,
         }) });
-        const pick = list => list.reduce((best, item) => (item.s.z > best.s.z || (item.s.z === best.s.z && best.side && !item.side) ? item : best), list[0]);
-        // 一段后面的线：先画一截共用的主干，再从主干上一条条分出去（延伸），共用的部分只画一次。
-        Object.entries(layout.children).forEach(([pid, list]) => {
-            if (!layout.pos[pid]) return;
-            const a = box(pid);
-            const elbow = xs[a.col] + colW[a.col] + RT_GAP / 2;
-            const kids = list.filter(child => layout.pos[child.id]).map(child => ({ b: box(child.id), s: strokeOf(pid, child.id), side: child.kind === 'side' }));
-            if (!kids.length) return;
-            const trunk = pick(kids);
-            seg(trunk.s.z, `M${a.r},${a.cy} H${elbow}`, trunk.s, kids.every(k => k.side));
-            const walk = group => group.forEach((kid, index) => {
-                const rest = group.slice(index);
-                const owner = pick(rest);
-                const fromY = index ? group[index - 1].b.cy : a.cy;
-                seg(owner.s.z, `M${elbow},${fromY} V${kid.b.cy}`, owner.s, rest.every(k => k.side));
-            });
-            walk(kids.filter(k => k.b.cy < a.cy).sort((p, q) => q.b.cy - p.b.cy));
-            walk(kids.filter(k => k.b.cy > a.cy).sort((p, q) => p.b.cy - q.b.cy));
-            kids.forEach(kid => {
-                seg(kid.s.z, `M${elbow},${kid.b.cy} H${kid.b.x - 7}`, kid.s, kid.side);
-                paths.push({ z: kid.s.z, node: rtArrow(kid.b.x - 1, kid.b.cy, 'r', kid.s.c) });
-            });
+        const pick = list => list.reduce((best, item) => (item.s.z > best.s.z || (item.s.z === best.s.z && best.dash && !item.dash) ? item : best), list[0]);
+        const dashOf = list => (list.every(item => item.dash === list[0].dash) ? list[0].dash : null);
+        // 一道竖线连着一头（分出去的那段 / 汇进去的那段）和另一头的好几段：竖线从这一头往外一截截画，
+        // 每一截用经过它的线里最重要的那条的颜色，共用的部分只画一次。
+        const walk = (x, y0, group) => group.forEach((item, index) => {
+            const rest = group.slice(index);
+            const owner = pick(rest);
+            seg(owner.s.z, `M${x},${index ? group[index - 1].y : y0} V${item.y}`, owner.s, dashOf(rest));
         });
-        layout.links.forEach(([fromId, toId]) => {
-            const a = box(fromId);
-            const b = box(toId);
-            const s = strokeOf(fromId, toId);
-            const gx = xs[a.col] + colW[a.col] + 12;
+        bundles.forEach(bundle => {
+            const x = laneX(bundle);
+            const hub = box(bundle.id);
+            const ends = bundle.list.map(e => ({ b: box(bundle.type === 'out' ? e.to : e.from), s: strokeOf(e.from, e.to), dash: e.dash }))
+                .map(item => Object.assign(item, { y: item.b.cy }));
+            const all = pick(ends);
+            if (bundle.type === 'out') seg(all.s.z, `M${hub.r},${hub.cy} H${x}`, all.s, dashOf(ends));
+            else ends.forEach(item => seg(item.s.z, `M${item.b.r},${item.b.cy} H${x}`, item.s, item.dash));
+            walk(x, hub.cy, ends.filter(item => item.y < hub.cy).sort((p, q) => q.y - p.y));
+            walk(x, hub.cy, ends.filter(item => item.y > hub.cy).sort((p, q) => p.y - q.y));
+            if (bundle.type === 'out') {
+                ends.forEach(item => {
+                    seg(item.s.z, `M${x},${item.y} H${item.b.x - 7}`, item.s, item.dash);
+                    paths.push({ z: item.s.z, node: rtArrow(item.b.x - 1, item.y, 'r', item.s.c) });
+                });
+            } else {
+                seg(all.s.z, `M${x},${hub.cy} H${hub.x - 7}`, all.s, dashOf(ends));
+                paths.push({ z: all.s.z, node: rtArrow(hub.x - 1, hub.cy, 'r', all.s.c) });
+            }
+        });
+        loops.forEach(e => {
+            const a = box(e.from);
+            const b = box(e.to);
+            const s = strokeOf(e.from, e.to);
             const down = b.row > a.row;
             const gy = down ? b.cy - rowH / 2 : b.cy + rowH / 2;
             const endY = down ? b.y - 2 : b.y + RT_NODE_H + 2;
             const dir = down ? 'd' : 'u';
-            paths.push({ z: s.z, node: svgEl('path', {
-                d: `M${a.r},${a.cy} H${gx} V${gy} H${b.cx} V${endY + (dir === 'u' ? 7 : -7)}`,
-                fill: 'none', stroke: s.c, 'stroke-width': s.w, 'stroke-dasharray': '5 4', 'stroke-linejoin': 'round',
-            }) });
+            seg(s.z, `M${a.r},${a.cy} H${laneX(e)} V${gy} H${b.cx} V${endY + (dir === 'u' ? 7 : -7)}`, s, '5 4');
             paths.push({ z: s.z, node: rtArrow(b.cx, endY, dir, s.c) });
         });
         const svg = svgEl('svg', { width, height, class: 'dga-rt-svg' });
