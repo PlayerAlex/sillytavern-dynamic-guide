@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.8.1';
+    const VERSION = '4.8.2';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -5265,8 +5265,27 @@
         };
         const join = {};
         const joined = new Set();
+        // 排的时候每段后面挂哪几段（lkids）：一开始和画线的一样，下面会挪。
+        const lkids = {};
+        ids.forEach(id => { lkids[id] = children[id].slice(); });
+        // 路口直接接的一段，如果另一条路也走得到它，它就排在那条路上（跟在后面同一行），路口直接过去的线绕进来，不算单独一条路。
+        const skip = new Set();
         ids.slice().sort((p, q) => pos[p].col - pos[q].col).forEach(id => {
-            const kids = children[id].filter(child => child.kind === 'route' && pos[child.id]).map(child => child.id);
+            let kids = lkids[id].filter(child => child.kind === 'route' && pos[child.id]).map(child => child.id);
+            kids.slice().forEach(kid => {
+                const owner = kids.find(other => other !== kid && reachSet(other).has(kid));
+                const from = owner && [...reachSet(owner)].find(n => n !== kid && pos[n].col < pos[kid].col && route.nodes[n].next.some(edge => edge.to === kid));
+                if (!from) return;
+                lkids[id] = lkids[id].filter(child => child.id !== kid);
+                lkids[from].push({ id: kid, kind: 'route' });
+                // 画线也跟着换：那条路上接过去的一截画实线，路口直接过去的画接回。
+                if (children[id].some(child => child.id === kid)) {
+                    children[id] = children[id].filter(child => child.id !== kid);
+                    children[from].push({ id: kid, kind: 'route' });
+                }
+                skip.add(`${id}>${kid}`);
+                kids = kids.filter(other => other !== kid);
+            });
             if (kids.length < 2) return;
             const sets = kids.map(reachSet);
             // 汇回的那一段：汇进来的路最多的里面最靠左的。
@@ -5287,8 +5306,9 @@
             if (!center) return;
             const from = [...reachSet(center)].find(n => succ[n].includes(best) && route.nodes[n].next.some(edge => edge.to === best));
             if (!from || children[from].some(child => child.id === best)) return;
-            ids.forEach(n => { children[n] = children[n].filter(child => child.id !== best); });
+            ids.forEach(n => { children[n] = children[n].filter(child => child.id !== best); lkids[n] = lkids[n].filter(child => child.id !== best); });
             children[from].push({ id: best, kind: 'route' });
+            lkids[from].push({ id: best, kind: 'route' });
         });
         const treeEdge = new Set();
         Object.entries(children).forEach(([pid, list]) => list.forEach(child => treeEdge.add(`${pid}>${child.id}`)));
@@ -5308,10 +5328,10 @@
         const lay = (id, lean) => {
             const rows = { [id]: 0 };
             const box = {};
-            const kids = children[id].filter(child => pos[child.id] && !joined.has(child.id));
+            const kids = lkids[id].filter(child => pos[child.id] && !joined.has(child.id));
             mark(box, pos[id].col, 0, 0);
             succ[id].forEach(to => {
-                if (kids.some(child => child.id === to)) return;
+                if (kids.some(child => child.id === to) || skip.has(`${id}>${to}`)) return;
                 for (let col = pos[id].col + 1; col < pos[to].col; col += 1) mark(box, col, 0, 0);
             });
             const put = (sub, off) => {
@@ -7416,7 +7436,7 @@
             const gy = down ? b.cy - rowH / 2 : b.cy + rowH / 2;
             const endY = down ? b.y - 2 : b.y + RT_NODE_H + 2;
             const dir = down ? 'd' : 'u';
-            seg(s.z, `M${a.r},${a.cy} H${laneX(e)} V${gy} H${b.cx} V${endY + (dir === 'u' ? 7 : -7)}`, s, '5 4');
+            seg(s.z, `M${a.r},${a.cy} H${laneX(e)} V${gy} H${b.cx} V${endY + (dir === 'u' ? 7 : -7)}`, s, e.dash);
             paths.push({ z: s.z, node: rtArrow(b.cx, endY, dir, s.c) });
         });
         const svg = svgEl('svg', { width, height, class: 'dga-rt-svg' });
