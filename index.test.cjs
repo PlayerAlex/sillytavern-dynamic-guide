@@ -1373,6 +1373,48 @@ test('路线图：编辑时能「放弃修改」，名字和发的内容都回�
     assert.deepEqual(errors, []);
 });
 
+test('路线图：编辑时撤销一步，复制一份（副本先关着、另开条目）', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const R = load().core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(t.route)] };
+    const { errors, sandbox } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    const head = () => panel().querySelector(`.dga-rt-card-${t.route.id}`).querySelector('.dga-rt-head');
+    const settle = async () => { for (let i = 0; i < 10; i += 1) await new Promise(setImmediate); };
+    const list = () => world.state.variables.character.$dynamicGuideAssistant.routes.list;
+    findButton(head(), '编辑路线').listeners.click[0]();
+    assert.match(head().textContent, /撤销.*放弃修改.*完成编辑/);
+    assert.equal(findButton(head(), '撤销').disabled, true, '没改过时撤销是灰的');
+    head().querySelector('.dga-rt-name-input').listeners.change[0]({ target: { value: '改一次' } });
+    head().querySelector('.dga-rt-name-input').listeners.change[0]({ target: { value: '改两次' } });
+    await settle();
+    assert.equal(list()[0].name, '改两次');
+    findButton(head(), '撤销').listeners.click[0]();
+    await settle();
+    assert.equal(list()[0].name, '改一次', '退一步');
+    findButton(head(), '撤销').listeners.click[0]();
+    await settle();
+    assert.equal(list()[0].name, '海边书店', '再退一步回到原样');
+    assert.equal(findButton(head(), '撤销').disabled, true);
+    findButton(head(), '完成编辑').listeners.click[0]();
+    findButton(head(), '设置').listeners.click[0]();
+    findButton(panel(), '复制').listeners.click[0]();
+    await settle();
+    assert.equal(list().length, 2);
+    assert.equal(list()[1].name, '海边书店 副本');
+    assert.equal(list()[1].off, true, '副本先关着');
+    assert.notEqual(list()[1].id, t.route.id);
+    assert.equal(Object.keys(list()[1].nodes).length, Object.keys(list()[0].nodes).length, '段都照搬');
+    assert.ok(world.state.books.书A.some(item => item.name === '海边书店 副本（动态指导）'), '世界书另开一个条目');
+    assert.ok(world.state.books.书A.some(item => item.name === '海边书店（动态指导）'), '原来的条目还在');
+    assert.deepEqual(errors, []);
+});
+
 test('路线图：位置和顺序不列数据库和 MVU 的条目；放到顺序数字一样的两条中间，后面的往后挪', async () => {
     const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
     const world = routeWorld();

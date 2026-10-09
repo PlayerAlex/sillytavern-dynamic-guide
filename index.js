@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.8.4';
+    const VERSION = '4.8.5';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2993,7 +2993,7 @@
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
         // arm：手机编辑时点了一下的那一段（`路线图id:段id`），只亮出「＋」「＋支线」，再点一下才打开改一段（v4.8.0）。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, cardFrom: '', folderShut: {}, folderEdit: '', bodyFocus: null, bodyRefocus: false, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, follow: {}, snap: {}, arm: '' },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, cardFrom: '', folderShut: {}, folderEdit: '', bodyFocus: null, bodyRefocus: false, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, follow: {}, snap: {}, undo: {}, arm: '' },
     };
 
     function el(tag, attrs, ...children) {
@@ -6687,7 +6687,51 @@
             }
             if (ui.rt.sel[route.id] && !route.nodes[ui.rt.sel[route.id]]) ui.rt.sel[route.id] = '';
         }
+        routeUndoRecord(route, structural);
         scheduleRouteSave(structural ? 0 : 600);
+    }
+
+    // 撤销（v4.8.5）：编辑时每改一下记一步改之前的样子，连着打字（1.5 秒内）只算一步，最多记 30 步。
+    const ROUTE_UNDO_MAX = 30;
+
+    function routeUndoRecord(route, structural) {
+        const undo = ui.rt.undo[route.id];
+        if (!undo || ui.rt.mode[route.id] !== 'edit') return;
+        const now = JSON.stringify(route);
+        if (now === undo.last) return;
+        const at = Date.now();
+        const typing = !structural && undo.typing && at - undo.typing < 1500;
+        if (!typing) {
+            undo.stack.push(undo.last);
+            if (undo.stack.length > ROUTE_UNDO_MAX) undo.stack.shift();
+        }
+        undo.typing = structural ? 0 : at;
+        undo.last = now;
+        // 打字时不整页重画，按钮在这里点亮。
+        const doc = hostDocument();
+        const btn = doc && typeof doc.querySelector === 'function' ? doc.querySelector(`.dga-rt-card-${route.id} .dga-rt-hbtn.is-undo`) : null;
+        if (btn) btn.disabled = false;
+    }
+
+    function routeUndo(route) {
+        const undo = ui.rt.undo[route.id];
+        if (!undo || !undo.stack.length) return;
+        const prev = undo.stack.pop();
+        // 条目编号、位置跟世界书对上的，不退（同「放弃修改」）。
+        const keep = { worldbookName: route.worldbookName, entryUid: route.entryUid, placement: route.placement };
+        const back = normalizeRoute(JSON.parse(prev));
+        Object.keys(route).forEach(key => { delete route[key]; });
+        Object.assign(route, back, keep);
+        undo.last = JSON.stringify(route);
+        undo.typing = 0;
+        cleanupRoute(route);
+        const before = JSON.stringify(ui.routeStates[route.id] || null);
+        ui.routeStates[route.id] = normalizeRouteState(ui.routeStates[route.id], route);
+        if (JSON.stringify(ui.routeStates[route.id]) !== before) writeRouteState(route.id, ui.routeStates[route.id]).catch(() => {});
+        if (ui.rt.sel[route.id] && !route.nodes[ui.rt.sel[route.id]]) ui.rt.sel[route.id] = '';
+        ui.rt.peek = null;
+        scheduleRouteSave(0);
+        render();
     }
 
     // 走了一步：先画出来，再存进度、换条目内容。
@@ -6801,6 +6845,27 @@
             LogModule.info('路线图', `新建路线图「${route.name}」，条目写在「${book}」`);
             return true;
         }, { refresh: false, success: '新建了一张路线图，世界书里多了一个「（动态指导）」条目。' });
+    }
+
+    // 复制一份（v4.8.5）：段、支线、资料、设置都照搬，世界书里另开一个条目。
+    // 副本先关着（route.off），不然两张一样的图会一起发给 AI；进度从头开始。
+    function copyRoute(route) {
+        return runAction('复制路线图', async () => {
+            const copy = normalizeRoute(cloneData(route));
+            copy.id = routeId('t');
+            copy.name = uniqueRouteName(`${route.name} 副本`);
+            copy.entryUid = null;
+            copy.off = true;
+            ui.routes.push(copy);
+            ui.routeStates[copy.id] = normalizeRouteState(null, copy);
+            ui.rt.panel[route.id] = '';
+            await saveRoutesNow();
+            const api = routeApiName(route, true);
+            if (api) await setRouteApi(copy, api);
+            ui.routeCurrent = copy.id;
+            LogModule.info('路线图', `复制了路线图「${route.name}」，副本叫「${copy.name}」`);
+            return true;
+        }, { refresh: false, success: '复制好了。副本先关着，要用时在左栏打开。' });
     }
 
     // 导出：一张图一个文件，格式见 exportRouteData。
@@ -6939,6 +7004,7 @@
     function enterRouteEdit(route) {
         if (ui.rt.mode[route.id] !== 'edit' || !ui.rt.snap[route.id]) {
             ui.rt.snap[route.id] = { route: cloneData(route), state: cloneData(routeStateOf(route)) };
+            ui.rt.undo[route.id] = { stack: [], last: JSON.stringify(route), typing: 0 };
         }
         ui.rt.mode[route.id] = 'edit';
     }
@@ -6948,6 +7014,7 @@
         ui.rt.mode[route.id] = 'view';
         ui.rt.sel[route.id] = '';
         delete ui.rt.snap[route.id];
+        delete ui.rt.undo[route.id];
     }
 
     function routeEditChanged(route) {
@@ -7066,6 +7133,7 @@
         edit: [['path', { d: 'M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z' }], ['path', { d: 'M13.5 8.5l3 3' }]],
         done: [['path', { d: 'M5 12.5l4.5 4.5L19 7.5' }]],
         undo: [['path', { d: 'M9 14L4 9l5-5' }], ['path', { d: 'M4 9h10.5a5.5 5.5 0 0 1 0 11H11' }]],
+        back: [['path', { d: 'M4 5v5h5' }], ['path', { d: 'M4.6 15a8 8 0 1 0 .9-7.5L4 10' }]],
         place: [['path', { d: 'M5 7h14M5 12h9M5 17h5' }], ['path', { d: 'M17 14v6M14.5 17.5L17 20l2.5-2.5' }]],
         cards: [['rect', { x: 4, y: 5, width: 16, height: 14, rx: 2.5 }], ['path', { d: 'M8 10h8M8 14h5' }]],
         gear: [['circle', { cx: 12, cy: 12, r: 3 }], ['path', { d: 'M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8' }]],
@@ -7075,6 +7143,14 @@
         const svg = svgEl('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' });
         ROUTE_HEAD_ICONS[icon].forEach(([tag, attrs]) => svg.appendChild(svgEl(tag, attrs)));
         return el('button', { type: 'button', class: `dga-rt-hbtn ${cls || ''}`, onclick }, svg, el('span', { text: label }));
+    }
+
+    function routeUndoBtn(route) {
+        const undo = ui.rt.undo[route.id];
+        const btn = routeHeadBtn('back', '撤销', () => routeUndo(route), 'is-undo');
+        btn.title = '撤销上一步（Ctrl+Z）';
+        btn.disabled = !(undo && undo.stack.length);
+        return btn;
     }
 
     // 缩放放在图的右下角，像地图那样：− 100% ＋，点百分比回到 100%。
@@ -7096,6 +7172,7 @@
                     ? el('input', { type: 'text', class: 'dga-rt-name-input', value: route.name, title: '路线图的名字，也是世界书条目的名字', onchange: event => renameRoute(route, event.target.value) })
                     : el('span', { class: 'dga-rt-name', text: route.name }),
                 el('div', { class: 'dga-rt-tools' },
+                    edit ? routeUndoBtn(route) : null,
                     edit ? routeHeadBtn('undo', '放弃修改', () => discardRouteEditDialog(route)) : null,
                     edit
                         ? routeHeadBtn('done', '完成编辑', () => { leaveRouteEdit(route); render(); }, 'is-primary')
@@ -7287,6 +7364,7 @@
                 routeRuleGroup(route, 'excludeRules', '排除')) : null,
             setSection(el('h3', { class: 'dga-set-title' }, '这张路线图'), null,
                 setRow('导出成文件', rtBtn('导出', () => exportRoute(route), 'small')),
+                setRow('复制一份', rtBtn('复制', () => copyRoute(route), 'small')),
                 el('div', { class: 'dga-set-row is-danger' },
                     el('div', { class: 'dga-set-label', text: '删掉这张路线图' }),
                     el('div', { class: 'dga-set-ctl' }, rtBtn('删掉', () => deleteRouteDialog(route), 'small danger')))));
@@ -7703,6 +7781,15 @@
         });
         shell.addEventListener('keydown', event => {
             if (event.key === 'Escape' && ui.rt.peek) dropRoutePeek();
+            // Ctrl+Z 撤销一步；光标在输入框里时留给输入框自己撤销打的字。
+            if ((event.ctrlKey || event.metaKey) && !event.shiftKey && String(event.key).toLowerCase() === 'z') {
+                const tag = event.target && event.target.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (event.target && event.target.isContentEditable)) return;
+                const route = ui.view === 'route' && ui.routes.find(item => item.id === ui.routeCurrent);
+                if (!route || ui.rt.mode[route.id] !== 'edit' || ui.rt.modal) return;
+                event.preventDefault();
+                routeUndo(route);
+            }
         });
     }
 
@@ -9294,6 +9381,7 @@ ${P} .dga-rt-hbtn svg { width: 15px; height: 15px; fill: none; stroke: currentCo
 ${P} .dga-rt-hbtn:hover { color: var(--dga-text-1); border-color: var(--dga-text-3); }
 ${P} .dga-rt-hbtn.is-on { color: var(--dga-text-1); border-color: var(--dga-text-3); background: var(--dga-bg-2); }
 ${P} .dga-rt-hbtn.is-primary { color: var(--dga-on-accent); border-color: var(--dga-accent); background: var(--dga-accent); font-weight: 600; }
+${P} .dga-rt-hbtn:disabled { opacity: .4; cursor: default; color: var(--dga-text-2); border-color: var(--dga-border-2); }
 /* 缩放在图的右下角，像地图那样 */
 ${P} .dga-rt-graph-slot { position: relative; }
 ${P} .dga-rt-zoomf { position: absolute; right: 10px; bottom: 10px; z-index: 4; display: flex; align-items: center; padding: 2px; border-radius: 999px; border: 1px solid var(--dga-border-2); background: color-mix(in srgb, var(--dga-bg-1) 92%, transparent); box-shadow: 0 4px 14px rgba(0, 0, 0, .35); }
