@@ -1189,7 +1189,8 @@ test('路线图：打开面板就是选中的那棵树，主线一行、支线�
     findButton(card, '下一段').listeners.click[0]();
     for (let i = 0; i < 10; i += 1) await new Promise(setImmediate);
     const after = panel().querySelector(`.dga-rt-card-${t.route.id}`);
-    assert.match(after.querySelector('.dga-rt-rows').textContent, /现在：路口/, '点下一段走到路口');
+    assert.equal(after.querySelector('.dga-rt-goto').textContent, '路口', '点下一段走到路口');
+    assert.ok(!after.querySelector('.dga-rt-rows').textContent.includes('现在：'), '段名前面不加「现在：」');
     const saved = world.state.variables.chat.$dynamicGuideAssistant.routeState.routes[t.route.id];
     assert.equal(saved.cur, t.fork, '进度存进聊天变量');
     assert.match(documentRef.getElementById('dynamic-guide-assistant-style').textContent, /\.dga-rt-drawer \{/, '带上路线图的样式');
@@ -1232,7 +1233,7 @@ test('路线图：左栏是标志、路线图列表、API / 运行日志 / 设�
     const panel = () => documentRef.getElementById(PANEL_ID);
     const rail = () => panel().querySelector('.dga-rail');
     assert.equal(rail().querySelector('.dga-rail-toggle'), null, '标志那一行不放总开关');
-    assert.equal(rail().querySelector('[role="switch"]'), null);
+    assert.equal(rail().querySelector('.dga-rail-brand [role="switch"]'), null);
     assert.match(rail().querySelector('.dga-rail-state').textContent, /^v\d+\.\d+\.\d+$/, '标题下面只写版本号');
     const trees = rail().querySelector('.dga-rail-trees');
     assert.equal(trees.children.length, 2, '每棵树一行');
@@ -1243,6 +1244,21 @@ test('路线图：左栏是标志、路线图列表、API / 运行日志 / 设�
     findButton(trees, '高二上学期').listeners.click[0]();
     assert.ok(panel().querySelector(`.dga-rt-card-${b.id}`), '点哪棵右边就显示哪棵');
     assert.equal(panel().querySelector(`.dga-rt-card-${a.route.id}`), null, '右边一次只放一棵');
+    // v4.8.4：每行右边一个开关，单独关掉一张路线图：存在路线图上，世界书条目关掉，这一行变灰。
+    const rowOf = name => findAllClass(rail(), 'dga-rail-tree-row').find(row => row.textContent.includes(name));
+    assert.equal(findAllClass(rail(), 'dga-rail-tree-row').length, 2, '每行一个开关');
+    findAllClass(rowOf('高二上学期'), 'dga-sw')[0].listeners.click[0]();
+    await new Promise(setImmediate);
+    await new Promise(setImmediate);
+    const savedB = world.state.variables.character.$dynamicGuideAssistant.routes.list.find(item => item.id === b.id);
+    assert.equal(savedB.off, true, '关掉存在路线图上（跟角色卡走）');
+    assert.match(rowOf('高二上学期').className, /is-off/, '关掉的那行变灰');
+    const entryB = world.state.books.书A.find(item => item.name === '高二上学期（动态指导）');
+    if (entryB) assert.equal(entryB.enabled, false, '关掉后世界书条目不发');
+    findAllClass(rowOf('高二上学期'), 'dga-sw')[0].listeners.click[0]();
+    await new Promise(setImmediate);
+    await new Promise(setImmediate);
+    assert.equal(world.state.variables.character.$dynamicGuideAssistant.routes.list.find(item => item.id === b.id).off, undefined, '打开后去掉标记');
     findButton(rail(), '设置').listeners.click[0]();
     const settingsText = panel().querySelector('.dga-body').textContent;
     assert.match(settingsText, /往下走.*AI 判断.*多久问一次.*给它看几段回复.*流式输出.*判断提示词/, '设置页：往下走、AI 判断、判断提示词');

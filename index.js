@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.8.3';
+    const VERSION = '4.8.4';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -2993,7 +2993,7 @@
         routeError: '',
         // 路线图界面态：每张图的看 / 改、选中的段、打开的侧边栏、缩放；弹窗和侧边栏大小。
         // arm：手机编辑时点了一下的那一段（`路线图id:段id`），只亮出「＋」「＋支线」，再点一下才打开改一段（v4.8.0）。
-        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, cardFrom: '', folderShut: {}, folderEdit: '', bodyFocus: null, bodyRefocus: false, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, snap: {}, arm: '' },
+        rt: { mode: {}, sel: {}, panel: {}, zoom: {}, card: {}, cardFrom: '', folderShut: {}, folderEdit: '', bodyFocus: null, bodyRefocus: false, tab: 'node', more: false, modal: null, size: {}, book: {}, scroll: {}, follow: {}, snap: {}, arm: '' },
     };
 
     function el(tag, attrs, ...children) {
@@ -3186,6 +3186,8 @@
         if (ui.navOpen) shell.appendChild(renderNavDrawer());
         // 左栏抽屉开着时重画（比如点了里面的按钮）不再播一遍滑入。
         ui.navShown = ui.navOpen;
+        const openTip = shell.querySelector('.dga-info.is-open');
+        if (openTip) placeInfoPop(openTip);
     }
 
     function closePanel() {
@@ -3289,7 +3291,17 @@
                     .map(side => el('span', { class: 'dga-rail-side', style: `color:${side.color}`, text: side.name })));
             const badge = state.ended ? ['终点', ''] : (cur && cur.next.length > 1 ? ['路口', ' is-warn'] : null);
             const selected = ui.view === 'route' && ui.routeCurrent === route.id;
-            return el('button', {
+            // 每行右边一个开关（v4.8.4 用户要的）：单独关掉这张路线图，整张角色卡都关；关了这一行变灰。
+            const toggle = switchBtn(!route.off, on => {
+                if (on) delete route.off;
+                else route.off = true;
+                routeEdited(route, false);
+                scheduleRouteSave(0);
+                render();
+                notify(on ? `「${route.name}」打开了` : `「${route.name}」关掉了：不发给 AI、不判断，进度留着`, 'info');
+            }, route.off ? `打开「${route.name}」` : `关掉「${route.name}」`);
+            toggle.title = route.off ? '打开这张路线图' : '关掉这张路线图（不发给 AI、不判断，进度留着）';
+            return el('div', { class: `dga-rail-tree-row${route.off ? ' is-off' : ''}` }, el('button', {
                 type: 'button',
                 class: `dga-rail-tree${selected ? ' is-on' : ''}`,
                 onclick: () => { ui.routeCurrent = route.id; openView('route'); },
@@ -3297,7 +3309,7 @@
             el('span', { class: 'dga-rail-tree-text' },
                 el('b', { text: route.name }),
                 el('small', {}, ...parts)),
-            badge ? el('span', { class: `dga-rail-badge${badge[1]}`, text: badge[0] }) : null);
+            badge && !route.off ? el('span', { class: `dga-rail-badge${badge[1]}`, text: badge[0] }) : null), toggle);
         });
         const presets = readJudgeApiPresets().length;
         const errors = LogModule.list().filter(entry => entry.level === 'error').length;
@@ -3371,12 +3383,41 @@
     // 小标题旁边的「!」：电脑上鼠标移上去、手机上点一下，弹出一小块说明。
     function infoTip(key, items) {
         const open = ui.infoOpen === key;
-        return el('span', { class: `dga-info${open ? ' is-open' : ''}` },
+        return el('span', { class: `dga-info${open ? ' is-open' : ''}`, onmouseenter: event => placeInfoPop(event.currentTarget) },
             el('button', { type: 'button', class: 'dga-info-dot', 'aria-label': '怎么用', onclick: () => { ui.infoOpen = open ? '' : key; render(); } }, '!'),
             el('span', { class: 'dga-info-pop', role: 'tooltip' },
                 ...items.map(item => (typeof item === 'string'
                     ? el('span', { class: 'dga-info-item', text: item })
                     : el('span', { class: 'dga-info-item' }, el('b', { text: item[0] }), el('span', { text: item[1] }))))));
+    }
+
+    // 「!」的说明框不跑出屏幕 / 侧边栏外（v4.8.4 用户）：下面放不下而上面更宽就往上翻，
+    // 还是放不下就限高、框里自己滚；左右超出就往回挪。
+    function placeInfoPop(info) {
+        const pop = info && typeof info.querySelector === 'function' ? info.querySelector('.dga-info-pop') : null;
+        if (!pop || typeof pop.getBoundingClientRect !== 'function') return;
+        pop.classList.remove('is-up');
+        pop.style.maxHeight = '';
+        pop.style.marginLeft = '';
+        const rect = pop.getBoundingClientRect();
+        if (!rect.height) return;
+        const view = info.ownerDocument.defaultView || hostWindow;
+        const clip = info.closest('.dga-rt-drawer-body, .dga-body, .dga-shell');
+        const box = clip ? clip.getBoundingClientRect() : { top: 0, bottom: view.innerHeight, left: 0, right: view.innerWidth };
+        const top = Math.max(box.top, 0) + 8;
+        const bottom = Math.min(box.bottom, view.innerHeight) - 8;
+        const anchor = (pop.offsetParent || info).getBoundingClientRect();
+        const below = bottom - rect.top;
+        const above = anchor.top - 8 - top;
+        const up = rect.height > below && above > below;
+        if (up) pop.classList.add('is-up');
+        const room = up ? above : below;
+        if (rect.height > room) pop.style.maxHeight = `${Math.max(120, Math.floor(room))}px`;
+        const left = Math.max(box.left, 0) + 8;
+        const right = Math.min(box.right, view.innerWidth) - 8;
+        const now = pop.getBoundingClientRect();
+        if (now.right > right) pop.style.marginLeft = `${Math.max(left - now.left, right - now.right)}px`;
+        else if (now.left < left) pop.style.marginLeft = `${left - now.left}px`;
     }
 
     // 设置：对所有路线图都有效的东西，加上判断提示词。每张路线图自己的东西在它的「设置」里。
@@ -4593,6 +4634,8 @@
             placement: normalizeRoutePlacement(src.placement),
             // 怎么往下走：'' 跟随设置页 / 'off' 只能手动 / 'judge' 让 AI 判断。
             advance: src.advance === 'off' || src.advance === 'judge' ? src.advance : '',
+            // 单独关掉这张路线图（v4.8.4，左栏每行的开关，跟角色卡走）：不发给 AI、不判断、不报幕。
+            ...(src.off === true ? { off: true } : {}),
             // prompt 仅用于旧名称迁移；新引用使用稳定 ID，专用副本随角色携带。
             prompt: oneLine(src.prompt || ''),
             ...(src.promptId ? { promptId: String(src.promptId) } : {}),
@@ -5767,7 +5810,8 @@
             }
             const state = normalizeRouteState(states[route.id], route);
             const content = composeRoute(route, state);
-            const enabled = Boolean(content);
+            // 单独关掉的路线图（v4.8.4）：条目关掉，进度留着，打开接着走。
+            const enabled = !route.off && Boolean(content);
             let current;
             try {
                 current = await getWorldbook(route.worldbookName);
@@ -6333,7 +6377,7 @@
         // 先把「看的回复已经换了」的判断退掉（重新生成 / 滑动 / 删掉），再问新的这条。
         let moved = await reconcileRouteJudges();
         const config = await readConfig();
-        const routes = (await readRoutes()).filter(route => routeAdvanceMode(route, config) === 'judge');
+        const routes = (await readRoutes()).filter(route => !route.off && routeAdvanceMode(route, config) === 'judge');
         if (!routes.length) {
             if (moved) await syncRouteEntriesNow({ config });
             return;
@@ -6451,8 +6495,8 @@
     }
 
     function routeAnnounce(route, ids) {
-        // 玩的人在设置里关了「显示报幕」：写卡的人开了也不报。
-        if (readUserPrefs().announce === false) return;
+        // 玩的人在设置里关了「显示报幕」：写卡的人开了也不报。关掉的路线图也不报。
+        if (readUserPrefs().announce === false || route.off) return;
         // 报幕的字里写的 {{char}} {{user}} 换成真名字（取不到酒馆就原样）。
         let substitute = null;
         try { substitute = routeHostTexts().substitute; } catch (error) { substitute = null; }
@@ -6687,17 +6731,48 @@
     function restoreRouteScroll(root) {
         if (!root || typeof root.querySelector !== 'function') return;
         ui.routes.forEach(route => {
-            const saved = ui.rt.scroll[route.id];
-            if (!saved) return;
             const card = root.querySelector(`.dga-rt-card-${route.id}`) || (root.classList && root.classList.contains(`dga-rt-card-${route.id}`) ? root : null);
             const wrap = card && card.querySelector('.dga-rt-graph-wrap');
-            if (wrap) {
+            if (!wrap) return;
+            const saved = ui.rt.scroll[route.id];
+            if (saved) {
                 wrap.scrollLeft = saved[0];
                 wrap.scrollTop = saved[1];
             }
+            // 图跟着「现在在这」（v4.8.4）：第一次打开、或者主线挪到别的段了，那一段不在框里就挪过去。
+            // 用户自己拖开的不管，只在进度变了的时候跟一次。
+            const cur = routeStateOf(route).cur;
+            if (ui.rt.follow[route.id] !== cur && routeCenterNode(route, wrap, cur)) ui.rt.follow[route.id] = cur;
         });
         const body = root.querySelector('.dga-rt-drawer-body');
         if (body && ui.rt.drawerScroll && ui.rt.drawerScroll.key === ui.rt.drawerKey) body.scrollTop = ui.rt.drawerScroll.top;
+    }
+
+    // 把一段挪进图的框里（放不下的那个方向挪到正中间）；force = 两个方向都放正中间。
+    // 框还没显示出来（量不出大小）时返回 false，等下次再跟。
+    function routeCenterNode(route, wrap, id, force) {
+        if (!id || typeof wrap.getBoundingClientRect !== 'function') return false;
+        const node = wrap.querySelector(`.dga-rt-node[data-node="${id}"]`);
+        if (!node) return false;
+        const box = wrap.getBoundingClientRect();
+        if (!box.width || !box.height) return false;
+        const rect = node.getBoundingClientRect();
+        if (force || rect.left < box.left || rect.right > box.right) wrap.scrollLeft += rect.left + rect.width / 2 - (box.left + box.width / 2);
+        if (force || rect.top < box.top || rect.bottom > box.bottom) wrap.scrollTop += rect.top + rect.height / 2 - (box.top + box.height / 2);
+        ui.rt.scroll[route.id] = [wrap.scrollLeft, wrap.scrollTop];
+        return true;
+    }
+
+    // 主线 / 支线那行的段名点一下：图挪到这一段，段闪一下。
+    function routeLocateNode(route, id) {
+        const doc = hostDocument();
+        const card = doc && typeof doc.querySelector === 'function' ? doc.querySelector(`.dga-rt-card-${route.id}`) : null;
+        const wrap = card && card.querySelector('.dga-rt-graph-wrap');
+        if (!wrap || !routeCenterNode(route, wrap, id, true)) return;
+        const node = wrap.querySelector(`.dga-rt-node[data-node="${id}"]`);
+        node.classList.remove('is-flash');
+        void node.offsetWidth;
+        node.classList.add('is-flash');
     }
 
     // ---- 新建 / 改名 / 删除 ----
@@ -7038,7 +7113,7 @@
             el('div', { class: 'dga-rt-rows-slot' }, renderRouteRows(route)));
     }
 
-    // 主线 → 在走的支线 → 可以开始的支线，顺序固定。每条线只写「现在：某段」；
+    // 主线 → 在走的支线 → 可以开始的支线，顺序固定。每条线只写现在在哪一段（v4.8.4 用户：前面不加「现在：」）；
     // 要你动手的时候（到路口了、在等支线）下面一行黄字。这张图怎么往下走在「设置」里。
     function renderRouteRows(route) {
         const state = routeStateOf(route);
@@ -7047,10 +7122,14 @@
         const rows = [];
         const note = text => el('small', { class: 'dga-rt-note', text });
         const atFork = node => node && node.next.length > 1;
+        // 线名单独包一层：手机上挤的时候不折成竖排（v4.8.4），太长的支线名省略。
+        const line = (color, text) => el('span', { class: 'dga-rt-line', style: `--cc:${color}`, title: text }, el('i'), el('span', { text }));
+        // 段名点一下，图挪到这一段（v4.8.4）。
+        const here = node => el('b', { class: 'dga-rt-goto', title: `${node ? node.name : ''}（点一下在图上找到它）`, text: node ? node.name : '', onclick: () => node && routeLocateNode(route, node.id) });
         rows.push(el('div', { class: 'dga-rt-row' },
-            el('span', { class: 'dga-rt-line', style: `--cc:${ROUTE_MAIN_COLOR}` }, el('i'), '主线'),
+            line(ROUTE_MAIN_COLOR, '主线'),
             el('div', { class: 'dga-rt-now' },
-                el('span', {}, '现在：', el('b', { text: cur ? cur.name : '' })),
+                el('span', {}, here(cur)),
                 // 正在问 AI（v4.8.0，照数据库规划时的「终止」）：一行灰字 +「停下」，点了这次不算。
                 routeJudging.has(route.id)
                     ? el('small', { class: 'dga-rt-note is-busy' }, '正在问 AI 这一段演完没有…',
@@ -7065,9 +7144,9 @@
             // 常驻的支线走到最后一段：停着一直发，「走完」由你来点（v4.7.0）。
             const staying = side.stay && !node.next.length;
             rows.push(el('div', { class: 'dga-rt-row' },
-                el('span', { class: 'dga-rt-line', style: `--cc:${side.color}` }, el('i'), `支线 · ${side.name}`),
+                line(side.color, `支线 · ${side.name}`),
                 el('div', { class: 'dga-rt-now' },
-                    el('span', {}, '现在：', el('b', { text: node.name }), staying ? el('span', { class: 'dga-rt-tag', text: '常驻' }) : null),
+                    el('span', {}, here(node), staying ? el('span', { class: 'dga-rt-tag', text: '常驻' }) : null),
                     atFork(node) ? note('到路口了，等着选一条路') : null),
                 el('div', { class: 'dga-rt-acts' },
                     rtBtn('上一段', () => routeSideBackUi(route, side), 'small'),
@@ -7077,7 +7156,7 @@
         });
         routeOfferedSides(route, state).forEach(side => {
             rows.push(el('div', { class: 'dga-rt-row is-offer' },
-                el('span', { class: 'dga-rt-line', style: `--cc:${side.color}` }, el('i'), '可以开始'),
+                line(side.color, '可以开始'),
                 el('div', { class: 'dga-rt-now is-inline' },
                     el('b', { text: `支线 · ${side.name}` }),
                     el('span', { class: 'dga-rt-cond', text: `进入条件：${side.cond || '（没写）'}` })),
@@ -7919,7 +7998,7 @@
         }
         // 这一段：正文、完成条件，路口时再加每条路（v4.3.7 用户定，v4.6.2 删了「下一段」）。往后接一段、挂支线在图上点「＋」；
         // 资料在标题栏「资料」里写，正文上面的资料按钮把它放进正文（v4.6）；最下面常驻「预览」：走到这一段时发出去的样子。
-        const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
+        const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec is-box' }, el('div', { class: 'dga-rt-nd-label dga-tip-host' }, ...[].concat(label)), ...kids);
         const moveRoute = (index, delta) => {
             const to = index + delta;
             if (to < 0 || to >= node.next.length) return;
@@ -8246,7 +8325,7 @@
 
     function renderRouteCardEdit(route, card) {
         const live = () => { routeLive(route); scheduleRouteSave(600); };
-        const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec' }, el('div', { class: 'dga-rt-nd-label', text: label }), ...kids);
+        const sec = (label, ...kids) => el('div', { class: 'dga-rt-nd-sec is-box' }, el('div', { class: 'dga-rt-nd-label', text: label }), ...kids);
         const uses = routeCardUses(route, card);
         // 从改一段的颜色框点进来的，返回时回到那一段。
         const from = ui.rt.cardFrom && route.nodes[ui.rt.cardFrom] && ui.rt.mode[route.id] === 'edit' ? route.nodes[ui.rt.cardFrom] : null;
@@ -8392,6 +8471,8 @@
                 if (!item.card) {
                     const area = textArea(item, index, 'dga-rt-bt', '');
                     area.rows = String(Math.max(1, item.text.split('\n').length));
+                    if (!item.text) area.classList.add('is-empty');
+                    area.addEventListener('input', () => area.classList.toggle('is-empty', !area.value));
                     return area;
                 }
                 const card = route.cards.find(other => other.id === item.card);
@@ -9046,6 +9127,10 @@ ${P} .dga-rail-tree-text { flex: 1; display: flex; flex-direction: column; min-w
 ${P} .dga-rail-tree-text b { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 ${P} .dga-rail-tree-text small { display: flex; gap: 8px; min-width: 0; color: var(--dga-text-3); font-size: 11.5px; overflow: hidden; white-space: nowrap; }
 ${P} .dga-rail-tree-text small span { overflow: hidden; text-overflow: ellipsis; }
+${P} .dga-rail-tree-row { position: relative; }
+${P} .dga-rail-tree-row > .dga-rail-tree { padding-right: 52px; }
+${P} .dga-rail-tree-row > .dga-sw { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); }
+${P} .dga-rail-tree-row.is-off .dga-rail-tree-text { opacity: .45; }
 ${P} .dga-rail-side { flex: 0 1 auto; opacity: .85; }
 ${P} .dga-rail-badge { flex: 0 0 auto; padding: 0 7px; border-radius: 999px; border: 1px solid var(--dga-border-2); color: var(--dga-text-3); font-size: 10.5px; line-height: 18px; }
 ${P} .dga-rail-badge.is-warn { color: #E3B45A; border-color: rgba(227, 180, 90, .45); }
@@ -9126,6 +9211,8 @@ ${P} .dga-info-dot { width: 16px; height: 16px; padding: 0; display: grid; place
 ${P} .dga-info.is-open .dga-info-dot, ${P} .dga-info-dot:hover { border-color: var(--dga-text-2); color: var(--dga-text-1); }
 ${P} .dga-info-pop { display: none; position: absolute; left: -8px; top: calc(100% + 8px); z-index: 30; width: min(320px, 80vw); padding: 12px 14px; border-radius: 12px; border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); box-shadow: 0 10px 30px rgba(0, 0, 0, .45); flex-direction: column; gap: 10px; letter-spacing: 0; text-align: left; white-space: normal; }
 ${P} .dga-info.is-open .dga-info-pop { display: flex; }
+${P} .dga-info-pop { overflow-y: auto; overscroll-behavior: contain; }
+${P} .dga-info-pop.is-up { top: auto; bottom: calc(100% + 8px); }
 @media (hover: hover) { ${P} .dga-info:hover .dga-info-pop { display: flex; } }
 ${P} .dga-info-item { display: flex; flex-direction: column; gap: 2px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 400; line-height: 1.6; }
 ${P} .dga-info-item b { color: var(--dga-text-1); font-weight: 600; }
@@ -9250,10 +9337,19 @@ ${P} .dga-rt-lg.is-dead { opacity: .35; border-style: dashed; background: var(--
 ${P} .dga-rt-lg.is-link { width: 22px; height: 0; border: 0; border-top: 1.5px dashed var(--dga-text-3); border-radius: 0; background: none; }
 ${P} .dga-rt-rows .dga-rt-row { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 9px 14px; border-top: 1px solid var(--dga-border); }
 ${P} .dga-rt-row.is-offer { background: color-mix(in srgb, var(--dga-text-1) 3%, transparent); }
-${P} .dga-rt-line { display: inline-flex; align-items: center; gap: 6px; min-width: 96px; font-size: 12px; font-weight: 700; color: var(--cc); }
-${P} .dga-rt-line i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; }
+${P} .dga-rt-line { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; min-width: 96px; white-space: nowrap; font-size: 12px; font-weight: 700; color: var(--cc); }
+${P} .dga-rt-line i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; flex: 0 0 auto; }
+${P} .dga-rt-line > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+${P} .dga-rt-goto { cursor: pointer; }
+${P} .dga-rt-goto:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+${P} .dga-rt-node.is-flash { animation: dga-focus-in 1.2s ease-out; }
 ${P} .dga-rt-now { flex: 1 1 180px; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 ${P} .dga-rt-now b { font-size: 14.5px; }
+/* 段名：白色、不加粗（v4.8.4 用户） */
+${P} .dga-rt-now:not(.is-inline) > span { font-size: 13px; font-weight: 400; color: var(--dga-text-1); }
+${P} .dga-rt-now:not(.is-inline) > span b { font-size: 12.5px; font-weight: 400; color: var(--dga-text-1); }
+${P} .dga-rt-now .dga-rt-note { font-size: 10px; }
+${P} .dga-rt-now .dga-rt-tag { font-weight: 400; }
 ${P} .dga-rt-now.is-inline { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; }
 ${P} .dga-rt-acts { flex: 0 0 auto; display: flex; gap: 6px; }
 ${P} .dga-rt-note { color: #E3B45A; font-size: 12px; line-height: 1.5; }
@@ -9394,6 +9490,12 @@ ${P} .dga-rt-peek-text.is-none { color: var(--dga-text-3); }
 ${P} .dga-rt-node.is-peek { outline: 2px solid var(--dga-accent); outline-offset: 3px; }
 /* 改一段：正文、完成条件、下一段，标签在上、框在下（v4.3.7） */
 ${P} .dga-rt-nd-sec { margin-bottom: 20px; }
+/* 改一段 / 改资料：每一块一张小卡片，块和块之间留空（v4.8.4 用户：分区不明显，加了路口、资料以后很乱） */
+${P} .dga-rt-nd-sec.is-box { margin-bottom: 12px; padding: 12px; border-radius: var(--dga-radius-md); border: 1px solid var(--dga-border); background: color-mix(in srgb, var(--dga-text-1) 3.5%, var(--dga-bg-1)); }
+${P} .dga-rt-nd-sec.is-box > .dga-rt-nd-label { margin-bottom: 6px; color: var(--dga-text-1); font-size: 13.5px; }
+${P} .dga-rt-nd-sec.is-box > .dga-rt-nd-label:last-child { margin-bottom: 0; }
+${P} .dga-rt-nd-sec.is-box > .dga-rt-nd-label + * { margin-top: 0 !important; }
+${P} .dga-rt-nd-sec.is-box .dga-rt-nd-next + .dga-rt-nd-next { padding-top: 10px; border-top: 1px dashed var(--dga-border-2); }
 ${P} .dga-rt-nd-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--dga-text-2); font-size: 12.5px; font-weight: 600; }
 ${P} .dga-rt-nd-label > .dga-sw { margin-left: auto; }
 ${P} textarea.dga-rt-nd-body { min-height: 120px; line-height: 1.8; }
@@ -9472,9 +9574,12 @@ ${P} .dga-rt-bc-fname::after { content: ' ·'; }
 ${P} .dga-rt-bc-chip { border-color: color-mix(in srgb, var(--cc) 60%, transparent); color: var(--cc); background: color-mix(in srgb, var(--cc) 8%, var(--dga-bg-2)); }
 ${P} .dga-rt-bc-chip:hover:not(:disabled) { border-style: solid; border-color: var(--cc); color: var(--cc); }
 ${P} .dga-rt-bc-chip:disabled { opacity: .4; cursor: default; }
-${P} .dga-rt-bed { display: flex; flex-direction: column; gap: 6px; min-height: 120px; padding: 6px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
+${P} .dga-rt-bed { display: flex; flex-direction: column; gap: 6px; padding: 6px; border-radius: var(--dga-radius-sm); border: 1px solid var(--dga-border-2); background: var(--dga-bg-2); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); }
 ${P} .dga-rt-bed:focus-within { border-color: var(--dga-accent); box-shadow: 0 0 0 2px var(--dga-accent-glow); }
 ${P} .dga-rt-drawer textarea.dga-rt-bt { display: block; min-height: 28px !important; height: auto; padding: 2px 6px !important; border: 0 !important; background: transparent !important; box-shadow: none !important; outline: none; resize: none; overflow: hidden; line-height: 1.8; font-size: 13.5px; color: var(--dga-text-1); }
+/* 资料前后、两块资料中间没写字的地方不占一行（v4.8.4 用户：不要自动空一行）：平时一条细缝，点进去才展开能写 */
+${P} .dga-rt-drawer textarea.dga-rt-bt.is-empty:not(:focus) { min-height: 0 !important; height: 6px !important; padding: 0 !important; cursor: text; }
+${P} .dga-rt-drawer textarea.dga-rt-bt.is-empty:not(:focus):hover { background: var(--dga-hover) !important; border-radius: 4px; }
 ${P} .dga-rt-bc { padding: 4px 10px 6px; border-radius: 8px; border: 1px solid color-mix(in srgb, var(--cc) 32%, transparent); background: color-mix(in srgb, var(--cc) 5%, transparent); }
 ${P} .dga-rt-bc-head { display: flex; align-items: center; gap: 4px; min-height: 22px; }
 ${P} .dga-rt-bc-name { flex: 1; min-width: 0; padding: 0; border: 0; background: none; color: color-mix(in srgb, var(--cc) 80%, var(--dga-text-3)); font: inherit; font-size: 11.5px; font-weight: 600; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -9521,7 +9626,9 @@ ${P} .dga-rt-pv-gap { height: 14px; }
     ${P} .dga-rt-mm-row { flex-wrap: wrap; }
     /* 手机上路线图区域跟着图的高度走，底下只留一条放缩放；「主线」后面不留固定宽度（v4.0.1） */
     ${P} .dga-rt-single .dga-rt-graph-wrap { min-height: 0; padding-bottom: 46px; }
-    ${P} .dga-rt-rows .dga-rt-line { min-width: 0; }
+    ${P} .dga-rt-rows .dga-rt-line { min-width: 0; max-width: 38%; }
+    /* 段名只占一行，放不下省略（v4.8.4 用户：不要折成两行） */
+    ${P} .dga-rt-rows .dga-rt-now > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     /* 手机上标题栏按钮排成一排小工具条：图标在上、字在下，几个按钮一样宽，不再挤成两行大胶囊（v4.4.2） */
     ${P} .dga-rt-head { padding: 10px 12px; }
     ${P} .dga-rt-name-input { width: 100%; }
@@ -9533,7 +9640,6 @@ ${P} .dga-rt-pv-gap { height: 14px; }
     ${P} .dga-rt-legend { gap: 2px 12px; padding: 6px 12px; font-size: 11px; }
     ${P} .dga-rt-rows .dga-rt-row { flex-wrap: nowrap; gap: 8px; padding: 8px 12px; }
     ${P} .dga-rt-now { flex: 1 1 auto; }
-    ${P} .dga-rt-now > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     ${P} .dga-rt-acts .dga-btn { height: 30px; min-height: 30px; padding: 0 12px; font-size: 12.5px; }
 }
 /* 触屏上手指拖得动，路线图底下不显示那条滚动条 */
