@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.8.5';
+    const VERSION = '4.8.6';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';

@@ -2716,21 +2716,22 @@ test('路线图导入：「路线图写法-给AI看.md」里的例子能原样�
     const guide = fs.readFileSync(path.join(__dirname, '..', '..', '..', '路线图写法-给AI看.md'), 'utf8');
     assert.match(guide, /dynamic-guide-route/);
     assert.doesNotMatch(source, /路线图的写法（写给 AI 看）|复制给 AI 的写法说明/, '写法说明单独给，不写进插件');
-    const example = guide.slice(guide.indexOf('## 七、完整例子'), guide.indexOf('## 八'));
+    const example = guide.slice(guide.indexOf('## 十二、完整例子'), guide.indexOf('## 十三'));
     const [{ route, warnings }] = R.importData(R.parseImport(example));
     assert.deepEqual(plain(warnings), []);
-    assert.equal(route.name, '夏天的约定');
-    assert.equal(Object.keys(route.nodes).length, 7);
-    assert.equal(route.sides[0].name, '夏日祭');
-    assert.equal(route.nodes[route.sides[0].until].name, '暑假结束');
-    const fork = Object.values(route.nodes).find(node => node.name === '帮忙看店');
+    assert.equal(route.name, '旧书店的夏天');
+    assert.equal(Object.keys(route.nodes).length, 17);
+    const side = name => route.sides.find(item => item.name === name);
+    assert.equal(route.nodes[side('扉页上的签名').until].name, '暑假最后一天');
+    assert.equal(side('店里的猫').stay, true);
+    const fork = Object.values(route.nodes).find(node => node.name === '小满来约');
     assert.equal(fork.next.length, 2);
     assert.equal(fork.fallback, 1, '「都对不上时走」按代号对上');
-    assert.equal(Object.values(route.nodes).find(node => node.name === '海边的傍晚').doneMode, 'ai');
-    assert.equal(Object.values(route.nodes).find(node => node.name === '初到小镇').doneMode, 'text', '写了 done 默认按那句判断');
+    assert.equal(Object.values(route.nodes).find(node => node.name === '小满来约').doneMode, 'ai', '路口那段不写 done');
+    assert.equal(Object.values(route.nodes).find(node => node.name === '来书店帮忙').doneMode, 'text', '写了 done 默认按那句判断');
     assert.equal(route.start, '', '写的开头就是起点 = 不设');
     const uses = plain(route.cards.map(card => Object.values(route.nodes).filter(node => node.content.includes(`⟦资料:${card.id}⟧`)).map(node => node.name)));
-    assert.deepEqual(uses, [['初到小镇'], ['帮忙看店', '平常的一天']], '正文里的资料按代号对上');
+    assert.deepEqual(uses, [['来书店帮忙', '台风夜守店']], '正文里的资料按代号对上');
 });
 
 test('路线图导入：AI 包了代码块也能读；接错的地方照导、告诉用户', () => {
