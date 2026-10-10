@@ -1920,6 +1920,40 @@ async function judgeWorld(answers, settings) {
 const YES = '<answer n="1"><basis>演完了</basis><done>YES</done></answer><start>0</start>';
 const NO = '<answer n="1"><basis>还没</basis><done>NO</done></answer><start>0</start>';
 
+// v4.9.0：发送时判断（缺省）——酒馆生成前先问，带上玩家这次的话，等结论落地、条目换好再生成。
+test('路线图：发送时判断——生成前带着玩家的话问，这一次生成就用新的一段；dryRun 和收到回复时不问', async () => {
+    const w = await judgeWorld([YES]);
+    w.say('user', '你好');
+    const reply = w.say('assistant', '开场演完了');
+    await w.world.state.events.get('message_received')(reply);
+    for (let i = 0; i < 5; i += 1) await new Promise(setImmediate);
+    assert.equal(w.asked.length, 0, '发送时判断：收到回复时不问');
+    await w.world.state.events.get('generate')('normal', {}, true);
+    assert.equal(w.asked.length, 0, 'dryRun（提示词查看器之类）不问');
+
+    w.say('user', '我们去码头吧');
+    await w.world.state.events.get('generate')('normal', {}, false);
+    assert.equal(w.asked.length, 1, '普通发送：生成前问一次');
+    const sent = JSON.stringify(w.asked[0]);
+    assert.ok(sent.includes('玩家这次的行动') && sent.includes('我们去码头吧'), '带上玩家这次发的话');
+    assert.equal(await w.cur(), w.t.fork, '走到「路口」');
+    assert.equal(w.entry().content, '路口正文', '这次生成用的就是新的一段');
+
+    // 新的回复到了，玩家点重新生成：不再问，发送时那次判断（看的是前一条回复）留着。
+    w.say('assistant', '到了码头');
+    await w.world.state.events.get('generate')('regenerate', {}, false);
+    assert.equal(w.asked.length, 1);
+    assert.equal(await w.cur(), w.t.fork, '重新生成的是新回复，发送时那次判断留着');
+    assert.deepEqual(w.run.errors, []);
+
+    // 选「回复后」：发送时不问（还是收到回复后问）。
+    const r = await judgeWorld([YES], { judgeTiming: 'reply' });
+    r.say('assistant', '开场演完了');
+    r.say('user', '走吧');
+    await r.world.state.events.get('generate')('normal', {}, false);
+    assert.equal(r.asked.length, 0, '回复后：发送时不问');
+});
+
 test('路线图：重新生成判断过的回复，那次判断退掉、条目换回去，新回复重新问', async () => {
     const w = await judgeWorld([YES, NO]);
     w.say('user', '你好');
