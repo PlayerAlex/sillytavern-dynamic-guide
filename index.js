@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.9.0';
+    const VERSION = '4.9.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -5760,6 +5760,34 @@
             || null;
     }
 
+    // 世界书改了名（或角色卡换了绑的书）：路线图记着的书名对不上，读写、删除都会报找不到（v4.9.1）。
+    // 记着的书还在就用它；不在了，到角色现在绑的书里按条目找回来；都找不到，就退到绑的第一本（同步时在那里重建条目）。
+    // found = 条目所在的书是确定的（记着的书还在，或者找回来了）；退到第一本时为 false，删除时不能去那本里删东西。
+    // known = 酒馆里全部世界书的名字，一次同步里传进来避免重复读；读不到列表（空）时照信记着的书名。
+    async function resolveRouteBook(route, known) {
+        const names = known || await allWorldbookNames();
+        const exists = name => !names.length || names.includes(name);
+        if (route.worldbookName && exists(route.worldbookName)) return { book: route.worldbookName, found: true };
+        const bound = (await currentBoundWorldbooks()).filter(exists);
+        for (const name of bound) {
+            try {
+                if (findRouteEntry(await getWorldbook(name), route)) return { book: name, found: true };
+            } catch (error) {
+                // 读不到这一本就看下一本。
+            }
+        }
+        return { book: bound[0] || '', found: false };
+    }
+
+    // 把路线图换到找回来的书上；退到第一本时条目编号作废，免得按编号认错别的路线图的条目。返回有没有改。
+    function moveRouteBook(route, resolved) {
+        if (!resolved.book || resolved.book === route.worldbookName) return false;
+        if (route.worldbookName) LogModule.info('路线图', `「${route.name}」原来的世界书「${route.worldbookName}」找不到了（可能改了名），改用「${resolved.book}」`);
+        route.worldbookName = resolved.book;
+        if (!resolved.found) route.entryUid = null;
+        return true;
+    }
+
     // 新建的条目：照抄同一本世界书里一个普通条目的字段形态（保证酒馆认得），改成一直发送。
     function buildRouteEntry(worldbook, route, content, enabled) {
         const template = worldbookEntries(worldbook).find(item => !isAssistantEntry(item)) || {};
@@ -5822,18 +5850,15 @@
             try { config = await readConfig(); } catch (error) { config = null; }
         }
         const states = await readRouteStates();
-        let fallbackBook = '';
+        const known = await allWorldbookNames();
         let dirty = false;
         for (const route of routes) {
-            if (!route.worldbookName) {
-                if (!fallbackBook) fallbackBook = (await currentBoundWorldbooks())[0] || '';
-                if (!fallbackBook) {
-                    reportOnce(`route-book-${route.id}`, `路线图「${route.name}」找不到世界书：先在酒馆里给角色绑定一本世界书。`);
-                    continue;
-                }
-                route.worldbookName = fallbackBook;
-                dirty = true;
+            const resolved = await resolveRouteBook(route, known);
+            if (!resolved.book) {
+                reportOnce(`route-book-${route.id}`, `路线图「${route.name}」找不到世界书：先在酒馆里给角色绑定一本世界书。`);
+                continue;
             }
+            if (moveRouteBook(route, resolved)) dirty = true;
             const state = normalizeRouteState(states[route.id], route);
             const content = composeRoute(route, state);
             // 单独关掉的路线图（v4.8.4）：条目关掉，进度留着，打开接着走。
@@ -5872,7 +5897,7 @@
                     if (!synced) return;
                     item.entryUid = synced.entryUid;
                     item.placement = synced.placement;
-                    if (!item.worldbookName) item.worldbookName = synced.worldbookName;
+                    item.worldbookName = synced.worldbookName;
                 });
                 await writeRoutes(latest);
             }
@@ -5884,6 +5909,7 @@
     async function writeRoutePlacement(route, placement, shifts) {
         const next = normalizeRoutePlacement(placement);
         route.placement = next;
+        moveRouteBook(route, await resolveRouteBook(route));
         if (route.worldbookName) {
             await updateWorldbook(route.worldbookName, worldbook => {
                 const entry = findRouteEntry(worldbook, route);
@@ -5900,9 +5926,11 @@
         }
     }
 
+    // 书改了名也能删：按条目找回所在的书；哪本都找不到条目，就只删路线图（没有条目可删）。
     async function removeRouteEntry(route) {
-        if (!route.worldbookName) return;
-        await updateWorldbook(route.worldbookName, worldbook => {
+        const { book, found } = await resolveRouteBook(route);
+        if (!book || !found) return;
+        await updateWorldbook(book, worldbook => {
             const entry = findRouteEntry(worldbook, route);
             if (entry) removeEntryFromWorldbook(worldbook, entry);
             return worldbook;
@@ -5912,6 +5940,7 @@
     // 「位置和顺序」右边那一列：整本世界书的条目，按位置分组、组里按顺序。
     // 数据库（ACU）和 MVU 写的条目不列、也不参与算顺序数字（v4.0.1）。
     async function readRouteBook(route) {
+        moveRouteBook(route, await resolveRouteBook(route));
         if (!route.worldbookName) return [];
         const entries = worldbookEntries(await getWorldbook(route.worldbookName)).filter(entry => !isDatabaseEntry(entry) && !isMvuEntry(entry));
         return entries.map(entry => ({
@@ -10038,6 +10067,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             writeState: writeRouteState,
             sync: options => syncRouteEntriesNow(options),
             setPlacement: writeRoutePlacement,
+            removeEntry: removeRouteEntry,
             judge: (route, messageId) => readConfig().then(config => judgeRoute(route, messageId, config, { force: true })),
             // 和每条回复后自动问的一样：看间隔、先核对换掉的回复（v4.7.0 测试用）。
             judgeFloor: messageId => checkRoutesFloor(messageId),

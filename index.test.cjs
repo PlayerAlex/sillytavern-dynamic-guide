@@ -1094,6 +1094,30 @@ function routeWorld() {
     return world;
 }
 
+test('路线图：世界书改了名，同步和删除按条目找回新名字的书，不报找不到（v4.9.1）', async () => {
+    const world = routeWorld();
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    await R.write([t.route]);
+    await R.sync();
+    // 在酒馆里把「书A」改名成「书B」，角色卡跟着绑「书B」。
+    world.state.books.书B = world.state.books.书A;
+    delete world.state.books.书A;
+    world.helper.getCharData = () => ({ name: '测试角色', data: { name: '测试角色', extensions: { world: '书B' } } });
+    await R.sync();
+    const saved = (await R.read())[0];
+    assert.equal(saved.worldbookName, '书B', '记着的书名跟上新名字');
+    assert.equal(world.state.books.书B.filter(item => item.name === '海边书店（动态指导）').length, 1, '不另建条目');
+    await R.removeEntry({ ...saved, worldbookName: '书A' });
+    assert.equal(world.state.books.书B.some(item => item.name === '海边书店（动态指导）'), false, '拿旧书名也能删掉条目');
+    assert.equal(world.state.books.书A, undefined, '不会按旧名字新建一本书');
+    await R.removeEntry({ ...saved, worldbookName: '书A' });
+    assert.equal(world.state.books.书B.length, 2, '哪本都找不到条目时什么都不删');
+});
+
 test('路线图：世界书里一棵树只有一个条目，走一步换内容，位置和顺序不被盖掉', async () => {
     const world = routeWorld();
     const run = load(world.helper);
