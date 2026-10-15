@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.11.0';
+    const VERSION = '4.12.0';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -145,6 +145,19 @@
             },
         };
     })();
+
+    // 只记录调用点当时传入的数据；不补历史，也不为记录日志重新执行业务动作。
+    let runtimeSequence = 0;
+    function nextTraceId(prefix) { return `${prefix}${++runtimeSequence}`; }
+
+    function debugRecord(tag, message, data) {
+        if (!LogModule.isDebugEnabled()) return;
+        try {
+            LogModule.debug(tag, data === undefined ? message : `${message}\n${JSON.stringify(data, null, 2)}`);
+        } catch (error) {
+            LogModule.debug(tag, message, data);
+        }
+    }
 
     // ---------------------------------------------------------------
     // 一、核心：报错处理建议
@@ -1264,10 +1277,15 @@
 
     async function updateVariables(type, updater) {
         const updateVariablesWith = api('updateVariablesWith', true);
-        return Promise.resolve(updateVariablesWith(variables => {
+        const result = await Promise.resolve(updateVariablesWith(variables => {
             const safe = variables && typeof variables === 'object' ? variables : {};
             return updater(safe) || safe;
         }, { type }));
+        if (result === false || (result && (result.ok === false || result.saved === false))) {
+            LogModule.warn('存取', `${type} 变量更新接口明确拒绝写入`);
+            throw new Error(`${type} 变量更新接口明确拒绝写入`);
+        }
+        return result;
     }
 
     async function readRootField(type, field) {
@@ -1764,9 +1782,57 @@
         const { context, settings, root } = apiSettingsContext();
         if (typeof context.saveSettingsDebounced !== 'function') throw new Error('酒馆设置保存接口不可用，没存上。');
         const target = root || {};
-        target[USER_PREFS_FIELD] = { ...readUserPrefs(), [key]: value };
+        const previous = target[USER_PREFS_FIELD];
+        const next = { ...readUserPrefs(), [key]: value };
+        target[USER_PREFS_FIELD] = next;
         settings[EXTENSION_SETTINGS_KEY] = target;
-        await context.saveSettingsDebounced();
+        try {
+            const result = await context.saveSettingsDebounced();
+            if (result === false || (result && (result.ok === false || result.saved === false))) throw new Error('酒馆偏好保存接口明确拒绝写入');
+        } catch (error) {
+            if (target[USER_PREFS_FIELD] === next) {
+                if (previous === undefined) delete target[USER_PREFS_FIELD];
+                else target[USER_PREFS_FIELD] = previous;
+            }
+            throw error;
+        }
+    }
+
+    async function captureDebugSnapshot() {
+        const trace = nextTraceId('SNAP');
+        const epoch = ioCache.epoch;
+        const chat = currentChatKey();
+        debugRecord('调试', `[${trace}] 开始读取当前快照（不是历史运行记录）`, {
+            version: VERSION, chat, database: databaseLinkStatus(),
+        });
+        try {
+            const routes = await readRoutes();
+            const states = await readRouteStates();
+            // readConfig 会触发旧配置迁移；快照直接读取正本，不能借调试触发写入。
+            const storedConfig = await currentStoredConfig();
+            if (epoch !== ioCache.epoch || chat !== currentChatKey() || !isCurrentInstance()) {
+                LogModule.warn('调试', `[${trace}] 读取期间聊天或实例改变，快照已放弃`);
+                return;
+            }
+            debugRecord('调试', `[${trace}] 当前快照读取完成（未执行判断、注入或写入）`, {
+                chat, settingsSource: storedConfig === undefined ? '角色尚未存储配置' : '角色正本（规范化）',
+                settings: storedConfig === undefined ? null : configForCharacter(storedConfig).settings,
+                routes: routes.map(route => {
+                    const state = normalizeRouteState(states[route.id], route);
+                    return { route, state, currentContent: composeRoute(route, state) };
+                }),
+            });
+        } catch (error) {
+            LogModule.warn('调试', `[${trace}] 当前快照读取失败`, error);
+        }
+    }
+
+    async function setDebugLogging(enabled) {
+        await writeUserPref('debugLogging', Boolean(enabled));
+        LogModule.setDebugEnabled(enabled);
+        LogModule.info('调试', enabled ? '详细 Debug 已开启：从现在开始记录实际执行及输入输出' : '详细 Debug 已关闭：继续记录基本运行结果');
+        if (enabled) await captureDebugSnapshot();
+        return Boolean(enabled);
     }
 
 
@@ -1927,7 +1993,12 @@
     async function updateWorldbook(name, updater) {
         ioCache.books.delete(name);
         try {
-            return await Promise.resolve(api('updateWorldbookWith', true)(name, updater));
+            const result = await Promise.resolve(api('updateWorldbookWith', true)(name, updater));
+            if (result === false || (result && (result.ok === false || result.saved === false))) {
+                LogModule.warn('世界书', `世界书「${name}」更新接口明确拒绝写入`);
+                throw new Error(`世界书「${name}」更新接口明确拒绝写入`);
+            }
+            return result;
         } finally {
             ioCache.books.delete(name);
         }
@@ -2116,6 +2187,7 @@
     // v4.9.0：发送时判断——普通发送先问判断 AI（judgeBeforeSend），结论落地后再写条目，这一次生成就用上。
     // 判断放在 withIoCache 外面：要等好一阵，别让这段时间里别的读写都拿到缓存。
     async function syncMirrors(generationType, params, dryRun) {
+        debugRecord('同步', '进入生成前处理', { generationType: generationType || 'normal', dryRun: dryRun === true, hasParams: params !== undefined });
         if (params !== undefined) {
             try {
                 await judgeBeforeSend(generationType, params, dryRun);
@@ -2141,10 +2213,10 @@
         }
         try {
             await syncRouteEntriesNow({ config });
+            debugRecord('同步', `路线图同步流程返回（${generationType || 'normal'}）；各条目的写入或跳过结果见世界书日志`);
         } catch (error) {
             LogModule.warn('路线图', `同步路线图条目失败：${error.message || String(error)}`);
         }
-        LogModule.debug('同步', `路线图同步完成（${generationType || 'normal'}）`);
     }
 
     const MODEL_RETRY_FEEDBACK = '【上次作答无效】上一次回复没有按作答表填标签，系统读不到结论。这次请按案卷末尾的作答表把标签完整填好。';
@@ -2249,20 +2321,25 @@
     // validate(text)：true = 能用；false = 缺作答标签；一句话 = 别的毛病。都重试，最后一次仍不行就原样交回，调用方照常「不推进」。
     function askModel(messages, preset, settings, validate) {
         const epoch = modelAbort.epoch;
+        const trace = settings && settings.traceId || nextTraceId('AI');
+        debugRecord('判断AI', `[${trace}] 请求已进入本地串行队列`, { preset: preset && preset.name, connection: preset && preset.connection || '酒馆主 API' });
         const run = async () => {
             if (epoch !== modelAbort.epoch) throw modelAbortError();
             const Controller = typeof AbortController === 'function' ? AbortController : (hostWindow && hostWindow.AbortController);
             const controller = typeof Controller === 'function' ? new Controller() : null;
             modelAbort.controller = controller;
-            const options = { ...(settings || {}), abortSignal: controller ? controller.signal : null };
+            const options = { ...(settings || {}), traceId: trace, abortSignal: controller ? controller.signal : null };
             const stale = error => isAbortError(error) || epoch !== modelAbort.epoch;
             try {
                 let text;
                 let sending = messages;
                 for (let attempt = 1; attempt <= MODEL_MAX_ATTEMPTS; attempt += 1) {
                     try {
+                        debugRecord('判断AI', `[${trace}] 第 ${attempt} 次调用判断通道：提示词全文`, sending);
                         text = await askJudge(sending, preset, options);
+                        debugRecord('判断AI', `[${trace}] 第 ${attempt} 次判断通道返回：正文全文`, { text });
                     } catch (error) {
+                        LogModule.warn('判断AI', `[${trace}] 第 ${attempt} 次判断通道抛出异常`, error);
                         if (stale(error) || !isRetryableModelError(error) || attempt === MODEL_MAX_ATTEMPTS) throw error;
                         LogModule.warn('判断AI', `第 ${attempt}/${MODEL_MAX_ATTEMPTS} 次请求失败，${MODEL_RETRY_DELAY / 1000} 秒后重试：${error && error.message ? error.message : error}`);
                         await modelDelay(MODEL_RETRY_DELAY);
@@ -2272,6 +2349,7 @@
                     if (epoch !== modelAbort.epoch) throw modelAbortError();
                     // validate 返回 true = 能用；false = 缺作答标签；一句话 = 别的毛病（比如太短），重试时把这句告诉模型。
                     const verdict = typeof validate === 'function' ? validate(text) : true;
+                    debugRecord('判断AI', `[${trace}] 第 ${attempt} 次回复校验`, { passed: verdict === true, verdict, willRetry: verdict !== true && attempt < MODEL_MAX_ATTEMPTS });
                     if (verdict === true || attempt === MODEL_MAX_ATTEMPTS) break;
                     LogModule.warn('判断AI', `第 ${attempt}/${MODEL_MAX_ATTEMPTS} 次回复${typeof verdict === 'string' ? '太短' : '缺作答标签'}，${MODEL_RETRY_DELAY / 1000} 秒后重试`);
                     // 重试时把错在哪告诉模型，不再原样重发。
@@ -2687,20 +2765,24 @@
     // 判断回复短，照酒馆 quiet 生成一律不流式。
     const CHAT_COMPLETION_GENERATE_URL = '/api/backends/chat-completions/generate';
 
-    async function postChatCompletionDirect(payload, signal) {
+    async function postChatCompletionDirect(payload, signal, traceId) {
         const context = sillyTavernContext();
         const service = context && context.ChatCompletionService;
         const data = service && typeof service.createRequestData === 'function'
             ? service.createRequestData.call(service, payload)
             : { ...payload };
+        const trace = traceId || nextTraceId('HTTP');
+        const body = JSON.stringify({ ...data, stream: false });
+        debugRecord('判断AI', `[${trace}] 准备调用生成端点：最终 messages`, JSON.parse(body).messages);
         const response = await pristineFetch(CHAT_COMPLETION_GENERATE_URL, {
             method: 'POST',
             headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
             cache: 'no-cache',
-            body: JSON.stringify({ ...data, stream: false }),
+            body,
             ...(signal ? { signal } : {}),
         });
         const raw = await response.text();
+        debugRecord('判断AI', `[${trace}] 生成端点已返回：HTTP ${response.status}，响应全文`, { status: response.status, ok: response.ok, raw });
         let json = null;
         try {
             json = raw ? JSON.parse(raw) : null;
@@ -2790,7 +2872,7 @@
         const temperature = preset && Number.isFinite(Number(preset.temperature)) ? Number(preset.temperature) : 0.2;
         const payload = await mainApiDirectPayload(context, messages, maxTokens, temperature);
         LogModule.debug('判断AI', '酒馆主 API：直发生成端点');
-        return postChatCompletionDirect(payload, settings && settings.abortSignal);
+        return postChatCompletionDirect(payload, settings && settings.abortSignal, settings && settings.traceId);
     }
 
     // 「自定义」连接：直连酒馆后端 /api/backends/chat-completions/generate
@@ -2829,20 +2911,26 @@
         return text;
     }
 
-    async function askJudgeViaCustomApi(messages, preset, streaming, signal) {
+    async function askJudgeViaCustomApi(messages, preset, streaming, signal, traceId) {
+        const trace = traceId || nextTraceId('HTTP');
+        const body = JSON.stringify(buildJudgeCustomRequestBody(messages, preset, streaming));
+        debugRecord('判断AI', `[${trace}] 准备调用自定义通道：最终 messages`, JSON.parse(body).messages);
         const response = await pristineFetch(CHAT_COMPLETION_GENERATE_URL, {
             method: 'POST',
             headers: { ...hostRequestHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify(buildJudgeCustomRequestBody(messages, preset, streaming)),
+            body,
             ...(signal ? { signal } : {}),
         });
+        debugRecord('判断AI', `[${trace}] 自定义通道 HTTP 返回`, { status: response.status, ok: response.ok, streaming });
         if (!response.ok) {
             const detail = await response.text();
+            debugRecord('判断AI', `[${trace}] 自定义通道错误响应全文`, { detail });
             throw new Error(`自定义 API 请求失败：${response.status} ${response.statusText || ''}${detail ? `。详情：${detail}` : ''}`.trim());
         }
         // 流式：后端可能返回 SSE，也可能归一化成 JSON——两种都认。
         if (streaming) {
             const raw = await response.text();
+            debugRecord('判断AI', `[${trace}] 自定义通道流式响应全文`, { raw });
             try {
                 const text = judgeTextFromJson(JSON.parse(raw));
                 if (text) return text;
@@ -2854,6 +2942,7 @@
             return text;
         }
         const data = await response.json();
+        debugRecord('判断AI', `[${trace}] 自定义通道 JSON 响应全文`, data);
         const text = judgeTextFromJson(data);
         if (!text) throw new Error('自定义 API 返回无效响应（没有正文）。');
         return text;
@@ -2865,7 +2954,7 @@
             if (!preset.apiurl || !preset.model) {
                 throw new Error(`API 预设「${preset.name}」缺少端点(基础URL)或模型名。`);
             }
-            return askJudgeViaCustomApi(messages, preset, streaming, settings && settings.abortSignal);
+            return askJudgeViaCustomApi(messages, preset, streaming, settings && settings.abortSignal, settings && settings.traceId);
         }
         // 酒馆主 API（或无预设）：Chat Completion 时直发生成端点（v3.4）；文本补全照旧走酒馆助手 generateRaw。
         const direct = await askJudgeViaMainApiDirect(messages, preset, settings);
@@ -2873,7 +2962,7 @@
         // generateRaw 回退：完整段列表直接交给 ordered_prompts。
         // 最近剧情已通过 {{history}} 占位符写进段内容，不再叠加聊天历史。
         const generateRaw = api('generateRaw', false);
-        if (!generateRaw) return null;
+        if (!generateRaw) { debugRecord('判断AI', '跳过：酒馆助手 generateRaw 接口不可用'); return null; }
         const request = {
             should_silence: true,
             should_stream: streaming,
@@ -2886,7 +2975,9 @@
             // 酒馆主 API 通道：预设里填了温度就用预设的，和另外两条通道一致；没选预设时压到 0.2。
             request.temperature = preset && Number.isFinite(Number(preset.temperature)) ? Number(preset.temperature) : 0.2;
         }
+        debugRecord('判断AI', `[${settings && settings.traceId || 'AI'}] 准备调用酒馆助手 generateRaw`, request);
         const result = await generateRaw(request);
+        debugRecord('判断AI', `[${settings && settings.traceId || 'AI'}] 酒馆助手 generateRaw 已返回`, result);
         return typeof result === 'string'
             ? result
             : (result && typeof result === 'object' ? String(result.text || result.content || '') : '');
@@ -3235,15 +3326,20 @@
     // 所有按钮动作都从这里走：置忙、执行、失败时把原因显示在页面上。
     async function runAction(label, action, options) {
         const settings = options || {};
-        if (ui.busy) return;
+        if (ui.busy) { debugRecord('操作', `${label}：界面正在处理其他操作，本次跳过`); return; }
+        const trace = nextTraceId('UI');
+        const started = Date.now();
+        debugRecord('操作', `[${trace}] 开始：${label}`);
         ui.busy = true;
         ui.message = null;
         render();
         try {
             const result = await action();
+            debugRecord('操作', `[${trace}] 操作函数返回：${label}`, { result, elapsedMs: Date.now() - started });
             if (result !== false && settings.refresh !== false) await refresh();
             if (result !== false && settings.success) setMessage(settings.success, 'success');
         } catch (error) {
+            LogModule.error('操作', `[${trace}] ${label}失败`, error);
             console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
             setMessage(error.message || String(error), 'error');
         } finally {
@@ -3499,6 +3595,12 @@
         rows.push(setRow('联动状态', el('span', {}, status.reason)));
         if (status.lastResult) rows.push(setRow('最近一次处理', el('span', {}, status.lastResult)));
         if (status.injections) rows.push(setRow('本次加载已注入', el('span', {}, `${status.injections} 次 · 最近任务：${status.lastTask}`)));
+        rows.push(setRow('详细 Debug', switchBtn(LogModule.isDebugEnabled(), on => runAction('修改调试日志', () => setDebugLogging(on), { refresh: false }), '详细 Debug')));
+        rows.push(btn('查看联动日志', () => {
+            ui.logTagFilter = '数据库联动'; ui.logLevelFilter = 'all'; ui.logKeyword = '';
+            ui.logPaused = false; ui.logSnapshot = null; ui.logPending = 0;
+            ui.view = 'logs'; render();
+        }, { ghost: true }));
         rows.push(el('div', { class: 'dga-hint' }, '把当前阶段内容追加给数据库的推进任务。默认召回继续使用世界书；识别不到任务时不额外注入。'));
         return setSection(el('h3', { class: 'dga-set-title' }, '数据库联动'), btn('刷新状态', () => { databaseLinkInstall(); render(); }, { ghost: true }), ...rows);
     }
@@ -4058,7 +4160,7 @@
         // 选中的模块被清空后不在列表里了，回到全部。
         if (ui.logTagFilter && ui.logTagFilter !== 'all' && !tags.includes(ui.logTagFilter)) ui.logTagFilter = 'all';
         const debugOn = LogModule.isDebugEnabled();
-        if (ui.logLevelFilter === 'debug' && !debugOn) ui.logLevelFilter = 'all';
+        if (ui.logLevelFilter === 'debug' && !debugOn && !all.some(entry => entry.level === 'debug')) ui.logLevelFilter = 'all';
         const filter = ui.logLevelFilter || 'all';
         const tagFilter = ui.logTagFilter || 'all';
         const keyword = String(ui.logKeyword || '');
@@ -4073,12 +4175,21 @@
         const rows = filtered.slice().reverse().map(entry => {
             const hint = resolveLogErrorHint(entry);
             const loud = entry.level === 'warn' || entry.level === 'error';
+            const long = entry.message.length > 400 || entry.message.includes('\n');
+            const expanded = Boolean(ui.logExpanded && ui.logExpanded[entry.id]);
+            const display = long && !expanded ? `${entry.message.split('\n')[0].slice(0, 220)} …` : entry.message;
             return el('div', { class: `dga-log-row is-${entry.level}` },
                 el('span', { class: 'dga-log-time', text: logTimeText(entry.time).slice(0, 8) }),
                 el('span', { class: 'dga-log-tag', text: entry.tag }),
                 el('div', { class: 'dga-log-msg' },
                     loud ? el('b', { class: 'dga-log-lv', text: LOG_LEVEL_LABELS[entry.level] }) : null,
-                    el('span', { text: entry.message }),
+                    el('span', { text: display }),
+                    long ? el('div', { class: 'dga-log-acts' },
+                        rtBtn(expanded ? '收起全文' : '展开全文', () => {
+                            if (!ui.logExpanded) ui.logExpanded = {};
+                            ui.logExpanded[entry.id] = !expanded; render();
+                        }, 'ghost small'),
+                        rtBtn('复制本条', () => copyText(formatLine(entry)), 'ghost small')) : null,
                     hint ? el('div', { class: 'dga-log-hint', 'data-hint': hint.id },
                         el('div', {}, el('b', { text: '可能是：' }), hint.summary),
                         el('div', {}, el('b', { text: '可以这样做：' })),
@@ -4113,21 +4224,13 @@
             rtBtn('⋯', () => { ui.logMenu = !ui.logMenu; render(); }, 'ghost small', { title: '更多', 'aria-label': '更多' }),
             ui.logMenu ? el('div', { class: 'dga-menu' },
                 el('button', { type: 'button', disabled: filtered.length === 0, onclick: () => { ui.logMenu = false; exportJson(); render(); } }, '导出 JSON'),
-                el('button', {
-                    type: 'button',
-                    onclick: () => {
-                        ui.logMenu = false;
-                        LogModule.setDebugEnabled(!debugOn);
-                        setMessage(debugOn ? '不再采集调试日志' : '开始采集调试日志，查完问题记得关掉', 'info');
-                        render();
-                    },
-                }, '采集调试日志', el('span', { class: `dga-sw is-sm${debugOn ? ' is-on' : ''}` })),
                 el('div', { class: 'dga-menu-sep' }),
                 el('button', {
                     type: 'button', class: 'is-danger', disabled: all.length === 0,
                     onclick: () => {
                         ui.logMenu = false;
                         LogModule.clear();
+                        ui.logExpanded = {};
                         ui.logSnapshot = paused ? [] : null;
                         ui.logPending = 0;
                         setMessage('日志清空了', 'success');
@@ -4139,6 +4242,11 @@
             header('运行日志', '', back, '返回', null, { subpage: true, nav: true }),
             el('div', { class: 'dga-body' },
                 el('div', { class: 'dga-pg is-wide' },
+                    setRow('详细 Debug', switchBtn(debugOn, on => runAction('修改调试日志', () => setDebugLogging(on), { refresh: false }), '详细 Debug')),
+                    el('div', { class: 'dga-hint' }, debugOn
+                        ? '正在采集实际执行过程、阶段正文、提示词和返回内容。仅保留本次加载最近 2000 条；复制和导出包含折叠的全文。'
+                        : '基本运行日志始终记录。开启详细 Debug 后，记录每次处理的输入、分支、实际内容和结果；开启前的过程无法补录。'),
+                    debugOn ? rtBtn('记录当前快照', () => runAction('读取调试快照', captureDebugSnapshot, { refresh: false }), 'ghost small') : null,
                     el('div', { class: 'dga-log-bar' },
                         el('div', { class: 'dga-log-bar-top' },
                             el('label', { class: 'dga-log-search' }, el('span', { text: '⌕' }), search),
@@ -4158,7 +4266,7 @@
                                 more)),
                         el('div', { class: 'dga-log-chips' },
                             chip('all', '全部'), chip('error', '错误'), chip('warn', '警告'), chip('info', '信息'),
-                            debugOn ? chip('debug', '调试') : null)),
+                            debugOn || counts.debug ? chip('debug', '调试') : null)),
                     rows.length
                         ? el('div', { class: 'dga-log-list' }, ...rows)
                         : el('div', { class: 'dga-log-empty' }, el('b', { text: all.length ? '没有符合条件的日志' : '还没有日志' })))),
@@ -5733,28 +5841,39 @@
     async function readRoutes() {
         const raw = await readRootField('character', 'routes');
         const list = raw && Array.isArray(raw.list) ? raw.list : [];
-        return list.map(normalizeRoute);
+        const routes = list.map(normalizeRoute);
+        debugRecord('存取', '角色路线读取并规范化：本次实际结果', routes);
+        return routes;
     }
 
     async function writeRoutes(list) {
-        await writeRootField('character', 'routes', { version: 1, list: (list || []).map(normalizeRoute) });
+        const data = { version: 1, list: (list || []).map(normalizeRoute) };
+        debugRecord('存取', '准备更新角色路线变量', data);
+        await writeRootField('character', 'routes', data);
+        LogModule.info('存取', `角色路线变量更新接口已返回：${data.list.length} 张路线图`);
     }
 
     async function readRouteStates() {
         const raw = await readRootField('chat', 'routeState');
-        return raw && raw.routes && typeof raw.routes === 'object' ? raw.routes : {};
+        const states = raw && raw.routes && typeof raw.routes === 'object' ? raw.routes : {};
+        debugRecord('存取', '聊天进度读取：本次实际结果', states);
+        return states;
     }
 
     async function writeRouteState(id, state) {
-        return updateVariables('chat', variables => {
+        const submitted = state ? cloneData(state) : null;
+        debugRecord('存取', `准备更新聊天进度：${id}`, submitted);
+        const result = await updateVariables('chat', variables => {
             const root = variables[VARIABLE_ROOT] && typeof variables[VARIABLE_ROOT] === 'object' ? variables[VARIABLE_ROOT] : {};
             const old = root.routeState && root.routeState.routes && typeof root.routeState.routes === 'object' ? root.routeState.routes : {};
             const routes = { ...old };
-            if (state) routes[id] = cloneData(state);
+            if (submitted) routes[id] = cloneData(submitted);
             else delete routes[id];
             variables[VARIABLE_ROOT] = { ...root, routeState: { version: 1, routes } };
             return variables;
         });
+        LogModule.info('存取', `聊天进度更新接口已返回：${id}${submitted ? '' : '（删除进度）'}`);
+        return result;
     }
 
     function entryPlacement(entry) {
@@ -5863,9 +5982,11 @@
 
     // 把每棵树现在该发的内容写进它的条目。只在有变化时写世界书。
     async function syncRouteEntriesNow(options) {
+        const trace = nextTraceId('SYNC');
         const settings = options || {};
         const routes = settings.routes || await readRoutes();
-        if (!routes.length) return routes;
+        debugRecord('世界书', `[${trace}] 开始同步路线条目`, { routeIds: routes.map(route => route.id) });
+        if (!routes.length) { debugRecord('世界书', `[${trace}] 跳过：当前没有路线图`); return routes; }
         let config = settings.config;
         if (config === undefined) {
             try { config = await readConfig(); } catch (error) { config = null; }
@@ -5875,6 +5996,7 @@
         let dirty = false;
         for (const route of routes) {
             const resolved = await resolveRouteBook(route, known);
+            debugRecord('世界书', `[${trace}] 解析路线目标世界书：${route.name}`, resolved);
             if (!resolved.book) {
                 reportOnce(`route-book-${route.id}`, `路线图「${route.name}」找不到世界书：先在酒馆里给角色绑定一本世界书。`);
                 continue;
@@ -5884,6 +6006,7 @@
             const content = composeRoute(route, state);
             // 单独关掉的路线图（v4.8.4）：条目关掉，进度留着，打开接着走。
             const enabled = !route.off && Boolean(content);
+            debugRecord('世界书', `[${trace}] 本次准备同步的阶段正文与状态`, { routeId: route.id, routeName: route.name, worldbook: route.worldbookName, state, enabled, content });
             let current;
             try {
                 current = await getWorldbook(route.worldbookName);
@@ -5897,6 +6020,10 @@
                     result = syncRouteEntryInPlace(worldbook, route, content, enabled);
                     return worldbook;
                 });
+                LogModule.info('世界书', `[${trace}] 「${route.worldbookName}」条目「${routeEntryName(route)}」更新接口已返回：${enabled ? '启用' : '关闭'}，${content.length} 字`);
+                debugRecord('世界书', `[${trace}] 条目更新返回结果`, { routeId: route.id, worldbook: route.worldbookName, ...result });
+            } else {
+                debugRecord('世界书', `[${trace}] 条目内容及开关无变化，未调用写入`, { routeId: route.id, worldbook: route.worldbookName, uid: result.uid });
             }
             if (!sameUid(route.entryUid, result.uid)) {
                 route.entryUid = result.uid;
@@ -6366,21 +6493,25 @@
 
     // 问一张图。force = 不看间隔，出错直接报出来（测试和以后的手动入口用）。
     async function judgeRoute(route, messageId, config, options) {
+        const trace = nextTraceId('JUDGE');
         const settings = (config && config.settings) || {};
         const force = Boolean(options && options.force);
         const states = await readRouteStates();
         const state = normalizeRouteState(states[route.id], route);
         const last = state.judge && state.judge.lastId;
         const replies = !force && judgeCheckInterval(settings) > 1 ? await routeRepliesSince(last, messageId) : null;
-        if (!routeJudgeDue(route, state, messageId, settings, force, replies == null ? undefined : replies)) return false;
+        const due = routeJudgeDue(route, state, messageId, settings, force, replies == null ? undefined : replies);
+        debugRecord('判断AI', `[${trace}] 判断触发条件`, { routeId: route.id, routeName: route.name, messageId, force, ended: state.ended, lastId: last, repliesSinceLast: replies, interval: judgeCheckInterval(settings), due, state });
+        if (!due) { debugRecord('判断AI', `[${trace}] 跳过：${state.ended ? '路线已结束' : last != null && Number(messageId) === Number(last) ? '这一层已经判断过' : '判断间隔未到'}`); return false; }
         const item = routeJudgeCase(route, state);
-        if (!item || !item.lines.length) return false;
+        if (!item || !item.lines.length) { debugRecord('判断AI', `[${trace}] 跳过：没有可判断的进行中阶段`); return false; }
         // 设置不可读时拒绝判断，不能把读取失败当成「跟随主 API」而发给错误的模型。
         const channel = usableChannel({ ...settings, judgePreset: routeApiName(route, true) }, force);
-        if (!channel) return false;
+        if (!channel) { debugRecord('判断AI', `[${trace}] 跳过：判断通道不可用，详见配置提示`); return false; }
         const rules = { extractRules: route.extractRules, excludeRules: route.excludeRules };
         const history = await recentHistoryText(messageId, judgeHistoryCount(settings), rules, options && options.userText);
         const messages = routeJudgeMessages(route, item, history, routePromptSegments(route), routeHostTexts());
+        debugRecord('判断AI', `[${trace}] 本次判断材料与提取规则`, { routeId: route.id, messageId, item, history, rules });
         const before = routeProgressKey(state);
         const reply = await routeReplyAt(messageId);
         LogModule.info('判断AI', `「${route.name}」第 ${messageId} 层${options && options.userText ? '和玩家这次发的话' : ''}：问 ${item.lines.length} 条在走的线${item.offers.length ? `、${item.offers.length} 条可以开始的支线` : ''}`);
@@ -6395,7 +6526,7 @@
         routeJudging.set(route.id, true);
         refreshOpenPanel();
         try {
-            text = await askModel(messages, cappedPreset(channel.preset, judgeReplyTokens(channel.preset)), { ...settings, judgeMaxTokens: judgeReplyTokens(channel.preset) }, validate);
+            text = await askModel(messages, cappedPreset(channel.preset, judgeReplyTokens(channel.preset)), { ...settings, traceId: trace, judgeMaxTokens: judgeReplyTokens(channel.preset) }, validate);
         } catch (error) {
             if (isAbortError(error)) return false;
             LogModule.error('判断AI', `「${route.name}」判断失败：${error && error.message ? error.message : error}`, error);
@@ -6406,6 +6537,7 @@
         }
         const raw = String(text || '');
         const filtered = applyBoundaryRules(raw, rules);
+        debugRecord('判断AI', `[${trace}] 实际用于解析的回复全文（规则处理后）`, { raw, filtered });
         judgeRuntime.lastRaw = raw;
         judgeRuntime.lastFiltered = filtered;
         judgeRuntime.lastAt = Date.now();
@@ -6424,6 +6556,7 @@
         }
         const startedAt = routeProgressOf(fresh);
         const result = applyRouteJudge(route, fresh, item, filtered);
+        debugRecord('判断AI', `[${trace}] 解析及推进计算结果（尚未写入聊天变量）`, { result, before: startedAt, after: routeProgressOf(fresh) });
         // 记一笔（只记看的是 AI 回复的那几次），以后这条回复换了就能退回去。
         const mark = { id: messageId == null ? null : Number(messageId), swipe: reply ? reply.swipe : 0, print: reply ? reply.print : '', prev: fresh.judge ? fresh.judge.lastId : null };
         if (result.moves.length && routeProgressKey(fresh) !== before) Object.assign(mark, { before: startedAt, after: routeProgressOf(fresh) });
@@ -6432,6 +6565,7 @@
         const parked = (fresh.judge && fresh.judge.parked) || [];
         fresh.judge = { lastId: mark.id, basis: result.basis, moved: result.moves.join('；'), ...(log.length ? { log: log.slice(-ROUTE_JUDGE_LOG_MAX) } : {}), ...(parked.length ? { parked } : {}) };
         await writeRouteState(route.id, fresh);
+        debugRecord('判断AI', `[${trace}] 判断结论写入接口已返回`, { routeId: route.id, messageId, state: fresh });
         if (ui.routeStates) ui.routeStates[route.id] = fresh;
         LogModule.info('判断AI', `「${route.name}」${result.moves.length ? result.moves.join('；') : '这一层不走'}${result.basis ? `（${result.basis.slice(0, 120)}）` : ''}`);
         routeAnnounce(route, routeEnteredNodes(route, startedAt, fresh));
@@ -6457,7 +6591,9 @@
         let moved = await reconcileRouteJudges();
         const config = await readConfig();
         const routes = (await readRoutes()).filter(route => !route.off && routeAdvanceMode(route, config) === 'judge');
+        debugRecord('判断AI', `检查第 ${messageId} 层：筛选自动判断路线`, { routeIds: routes.map(route => route.id), noSync: Boolean(opts.noSync) });
         if (!routes.length) {
+            debugRecord('判断AI', `第 ${messageId} 层跳过：没有启用 AI 判断的路线`);
             if (moved) await sync(config);
             return moved;
         }
@@ -6522,19 +6658,19 @@
     }
 
     async function handleRouteMessage() {
-        if (!isCurrentInstance()) return;
+        if (!isCurrentInstance()) { debugRecord('事件', '收到消息事件但实例已失效，跳过'); return; }
         const args = Array.from(arguments);
         const getLastMessageId = api('getLastMessageId', false);
         const getChatMessages = api('getChatMessages', false);
-        if (!getLastMessageId || !getChatMessages) return;
+        if (!getLastMessageId || !getChatMessages) { debugRecord('事件', '跳过消息处理：聊天读取接口不可用'); return; }
         const requested = messageIdFromArgs(args);
         const messageId = requested == null ? await Promise.resolve(getLastMessageId()) : requested;
         const messages = await Promise.resolve(getChatMessages(messageId, { include_swipes: false }));
         const message = Array.isArray(messages) ? messages[0] : null;
-        if (!message || message.role !== 'assistant' || typeof message.message !== 'string') return;
-        LogModule.debug('事件', `收到正文（第 ${messageId} 层）`);
+        if (!message || message.role !== 'assistant' || typeof message.message !== 'string') { debugRecord('事件', '跳过消息处理：没有可读的 AI 正文', { messageId, role: message && message.role }); return; }
+        debugRecord('事件', `实际读取的正文（第 ${messageId} 层）`, { messageId, role: message.role, content: message.message });
         // 发送时判断（缺省）：这条回复留到玩家下次发送时连同玩家的话一起问。
-        if (judgeTiming((await readConfig()).settings) === 'send') return;
+        if (judgeTiming((await readConfig()).settings) === 'send') { debugRecord('判断AI', '本次回复后不判断：当前设置为发送时判断'); return; }
         await runRouteFloorCheck(messageId);
     }
 
@@ -6546,21 +6682,23 @@
     const sendJudge = { active: null };
 
     async function judgeBeforeSend(type, params, dryRun) {
-        if (dryRun || !isCurrentInstance()) return false;
-        if (type && type !== 'normal') return false;
-        if (params && params.quiet_prompt) return false;
+        const skip = reason => { debugRecord('判断AI', `发送时判断跳过：${reason}`, { type, dryRun: Boolean(dryRun) }); return false; };
+        if (dryRun) return skip('提示词预览（dryRun）不调用判断 AI');
+        if (!isCurrentInstance()) return skip('实例已失效');
+        if (type && type !== 'normal') return skip('本次不是普通发送');
+        if (params && params.quiet_prompt) return skip('后台静默生成');
         const config = await readConfig();
-        if (judgeTiming(config.settings) !== 'send') return false;
-        if (!(await readRoutes()).some(route => !route.off && routeAdvanceMode(route, config) === 'judge')) return false;
+        if (judgeTiming(config.settings) !== 'send') return skip('设置为回复后判断');
+        if (!(await readRoutes()).some(route => !route.off && routeAdvanceMode(route, config) === 'judge')) return skip('没有启用 AI 判断的路线');
         const getLastMessageId = api('getLastMessageId', false);
         const getChatMessages = api('getChatMessages', false);
-        if (!getLastMessageId || !getChatMessages) return false;
+        if (!getLastMessageId || !getChatMessages) return skip('聊天读取接口不可用');
         const last = Number(await Promise.resolve(getLastMessageId()));
-        if (!Number.isFinite(last) || last < 0) return false;
+        if (!Number.isFinite(last) || last < 0) return skip('没有有效聊天楼层');
         const list = await Promise.resolve(getChatMessages(`${Math.max(0, last - 20)}-${last}`, { include_swipes: false }));
         const messages = (Array.isArray(list) ? list : []).filter(item => item && Number(item.message_id) <= last);
         const reply = messages.filter(item => item.role === 'assistant').pop();
-        if (!reply) return false;
+        if (!reply) return skip('未找到可判断的 AI 回复');
         const messageId = Number(reply.message_id);
         // 玩家的话：最后那条 AI 回复后面已经进了聊天的（/send、上次没生成出来又点了发送），加上输入框里还没发的。
         const said = messages.filter(item => Number(item.message_id) > messageId && item.role === 'user' && typeof item.message === 'string')
@@ -6571,7 +6709,9 @@
             if (box && typeof box.value === 'string' && box.value.trim()) said.push(box.value.trim());
         }
         if (routeFloor.active) await routeFloor.active.catch(() => undefined);
-        const run = checkRoutesFloor(messageId, { userText: said.filter(Boolean).join('\n'), noSync: true });
+        const userText = said.filter(Boolean).join('\n');
+        debugRecord('判断AI', '发送时判断条件通过：开始处理', { messageId, userText });
+        const run = checkRoutesFloor(messageId, { userText, noSync: true });
         sendJudge.active = run;
         let timer = null;
         const late = new Promise(resolve => {
@@ -6877,11 +7017,19 @@
         render();
         // 存之前先读一下存着的进度，和现在比：往前走进了开报幕的段就报（面板关上以后才出来）。
         const after = cloneData(routeStateOf(route));
+        const trace = nextTraceId('WALK');
+        debugRecord('操作', `[${trace}] 手动修改了内存中的路线进度，准备保存`, { routeId: route.id, action: text || '', after });
         readRouteStates()
-            .then(states => routeAnnounce(route, routeEnteredNodes(route, normalizeRouteState(states[route.id], route), after)))
-            .catch(() => {})
+            .then(states => {
+                const before = normalizeRouteState(states[route.id], route);
+                debugRecord('操作', `[${trace}] 保存前实际读取的聊天进度`, { routeId: route.id, before });
+                routeAnnounce(route, routeEnteredNodes(route, before, after));
+            })
+            .catch(error => { LogModule.warn('操作', `[${trace}] 读取报幕前进度失败，继续尝试保存`, error); })
             .then(() => saveRouteState(route))
+            .then(() => { LogModule.info('操作', `[${trace}] 「${route.name}」手动进度保存接口及同步流程已返回`); })
             .catch(error => {
+                LogModule.error('操作', `[${trace}] 保存进度或同步条目失败`, error);
                 setMessage(`保存进度失败：${error.message || String(error)}`, 'error');
                 render();
             });
@@ -7536,6 +7684,7 @@
     function routeMainNextUi(route) {
         const state = routeStateOf(route);
         const result = routeMainStep(route, state);
+        debugRecord('操作', '手动主线下一段：实际计算结果', { routeId: route.id, result, state });
         if (result.kind === 'wait') {
             notify(`主线在等支线「${result.side.name}」走完`, 'info');
             return;
@@ -7553,6 +7702,7 @@
 
     function routeMainBackUi(route) {
         if (!routeMainBack(route, routeStateOf(route))) {
+            debugRecord('操作', '手动主线上一段跳过：已经在起点', { routeId: route.id });
             notify('已经在起点了', 'info');
             return;
         }
@@ -7562,6 +7712,7 @@
     function routeSideNextUi(route, side) {
         const state = routeStateOf(route);
         const result = routeSideStep(route, state, side);
+        debugRecord('操作', '手动支线下一段：实际计算结果', { routeId: route.id, sideId: side.id, result, state });
         if (result.kind === 'pick') {
             routePickDialog(route, result.node, to => {
                 routeSideGo(route, routeStateOf(route), side, to);
@@ -10018,6 +10169,8 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         injections: 0,
         lastTask: '',
         lastReason: '',
+        statusKey: '',
+        observedRequests: 0,
         disposed: false,
         revision: 0,
     };
@@ -10128,7 +10281,19 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             injections: databaseLinkRuntime.injections,
             lastTask: databaseLinkRuntime.lastTask,
             lastResult: databaseLinkRuntime.lastReason,
+            observedRequests: databaseLinkRuntime.observedRequests,
         };
+    }
+
+    function databaseLinkReportStatus() {
+        const status = databaseLinkStatus();
+        const key = JSON.stringify([status.enabled, status.available, status.presetName, status.selectedTaskId, status.reason, databaseLinkRuntime.slots.length]);
+        if (key !== databaseLinkRuntime.statusKey) {
+            databaseLinkRuntime.statusKey = key;
+            LogModule.info('数据库联动', `状态变化：${status.reason}；已挂接 ${databaseLinkRuntime.slots.length} 个请求入口`);
+            debugRecord('数据库联动', '当前预设与任务识别结果（状态快照）', status);
+        }
+        return status;
     }
 
     // EJS 会执行任意动态代码，无法从发送后的正文反推原任务，遇到它就保守放弃该段。
@@ -10210,35 +10375,60 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     }
 
     function databaseLinkInspectRequest(input, init, slotWindow, stack) {
-        if (!init || String(init.method || 'GET').toUpperCase() !== 'POST'
-            || typeof init.body !== 'string' || init.body.includes(DATABASE_LINK_MARKER)
-            || !databaseLinkUrlMatches(input, slotWindow) || !databaseLinkStackMatches(stack)) return null;
+        if (!databaseLinkUrlMatches(input, slotWindow)) return null;
+        const trace = nextTraceId('DB');
+        databaseLinkRuntime.observedRequests += 1;
+        const fromDatabase = databaseLinkStackMatches(stack);
+        debugRecord('数据库联动', `[${trace}] 捕获生成端点调用`, { method: init && init.method || 'GET', databaseStackMatched: fromDatabase });
+        const skip = reason => {
+            if (fromDatabase) databaseLinkRuntime.lastReason = reason;
+            debugRecord('数据库联动', `[${trace}] 跳过：${reason}`);
+            return null;
+        };
+        if (!fromDatabase) return skip('调用栈未同时包含数据库推进的两个函数，无法确认来源，保持原样');
+        if (!init || String(init.method || 'GET').toUpperCase() !== 'POST') return skip('不是带独立参数的 POST 请求');
+        if (typeof init.body !== 'string') return skip('请求体不是可读取的字符串');
+        if (init.body.includes(DATABASE_LINK_MARKER)) return skip('已有指导标记，不重复追加');
         try {
             const payload = JSON.parse(init.body);
-            if (!payload || !Array.isArray(payload.messages)) return null;
+            if (!payload || !Array.isArray(payload.messages)) return skip('请求体没有 messages 数组');
             const snapshot = databaseLinkPresetSnapshot();
-            if (!snapshot.name || snapshot.name === DATABASE_DEFAULT_PRESET || !snapshot.preset) return null;
+            debugRecord('数据库联动', `[${trace}] 注入前的原始 messages（实际捕获）`, payload.messages);
+            if (!snapshot.api) return skip('未检测到数据库接口');
+            if (!snapshot.name || snapshot.name === DATABASE_DEFAULT_PRESET) return skip('默认召回模式不联动，继续使用世界书');
+            if (!snapshot.preset) return skip('当前预设不可读取');
             const selection = databaseLinkSelection(snapshot);
-            if (!selection.selected || !selection.selected.eligible) return null;
+            debugRecord('数据库联动', `[${trace}] 实际预设与任务检查`, {
+                preset: snapshot.name, selectedTaskId: selection.selectedTaskId,
+                tasks: selection.tasks.map(task => ({ id: task.id, name: task.name, eligible: task.eligible, reason: task.reason, promptMatched: databaseLinkTaskMatches(task, payload.messages) })),
+            });
+            if (!selection.selected) return skip('尚未选定可识别的推进任务');
+            if (!selection.selected.eligible) return skip(selection.selected.reason || '所选任务不可联动');
             const matched = databaseLinkMatchedTask(selection.tasks, payload.messages);
             if (!matched || matched.id !== selection.selected.id) {
-                databaseLinkRuntime.lastReason = matched ? '其他任务保持原样' : '没有唯一匹配的推进任务，保持世界书模式';
-                return null;
+                return skip(matched ? `其他任务「${matched.name}」保持原样` : '没有唯一匹配的推进任务，保持世界书模式');
             }
-            return { payload, snapshot, selection, matched };
+            debugRecord('数据库联动', `[${trace}] 唯一匹配选定任务「${matched.name}」，开始读取阶段`);
+            return { payload, snapshot, selection, matched, trace };
         } catch (error) {
-            return null;
+            LogModule.warn('数据库联动', `[${trace}] 解析请求或检查预设失败，保持原请求`, error);
+            return skip('解析请求或检查预设失败');
         }
     }
 
-    async function databaseLinkReadGuide() {
+    async function databaseLinkReadGuide(trace) {
         // 这里只读取两份变量，不占用共享世界书缓存；超时的读取不能让缓存一直处于打开状态。
         const routes = await readRoutes();
         const states = await readRouteStates();
-        return routes.filter(route => route && !route.off).map(route => {
+        return routes.filter(Boolean).map(route => {
             const state = normalizeRouteState(states[route.id], route);
-            if (state.ended) return '';
-            return composeRoute(route, state).trim();
+            if (route.off || state.ended) {
+                debugRecord('数据库联动', `[${trace}] 跳过路线「${route.name}」：${route.off ? '路线已关闭' : '路线已结束'}`);
+                return '';
+            }
+            const content = composeRoute(route, state).trim();
+            debugRecord('数据库联动', `[${trace}] 实际读取的当前阶段内容`, { routeId: route.id, routeName: route.name, state, content });
+            return content;
         }).filter(Boolean).join('\n\n');
     }
 
@@ -10272,33 +10462,77 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     async function databaseLinkRewrite(inspected, init) {
         const epoch = ioCache.epoch;
         const revision = databaseLinkRuntime.revision;
+        const trace = inspected.trace;
+        const skip = reason => {
+            databaseLinkRuntime.lastReason = reason;
+            debugRecord('数据库联动', `[${trace}] 本次未追加：${reason}`);
+            return init;
+        };
         try {
-            if (!databaseLinkPrefs().enabled || !isCurrentInstance() || databaseLinkRuntime.disposed || init.signal?.aborted) return init;
+            if (!databaseLinkPrefs().enabled || !isCurrentInstance() || databaseLinkRuntime.disposed || init.signal?.aborted) return skip('读取前联动已关闭、实例失效或请求已取消');
             const chat = currentChatKey();
             const prepared = await databaseLinkWithTimeout(async () => {
                 const scope = await currentScopeId();
-                const guide = await databaseLinkReadGuide();
+                const guide = await databaseLinkReadGuide(trace);
                 return { scope, guide, currentScope: await currentScopeId() };
             }, 1800);
             const { scope, guide, currentScope } = prepared;
             const now = databaseLinkPresetSnapshot();
             const currentSelection = databaseLinkSelection(now);
-            if (!guide || !scope || ioCache.epoch !== epoch || !isCurrentInstance() || databaseLinkRuntime.disposed
+            if (!guide) return skip('当前阶段正文为空，保持世界书模式');
+            if (!scope) return skip('无法读取角色身份，保持原请求');
+            if (ioCache.epoch !== epoch || !isCurrentInstance() || databaseLinkRuntime.disposed
                 || revision !== databaseLinkRuntime.revision || init.signal?.aborted
                 || !databaseLinkPrefs().enabled || currentScope !== scope || currentChatKey() !== chat
                 || now.name !== inspected.snapshot.name || currentSelection.selectedTaskId !== inspected.selection.selectedTaskId
                 || !currentSelection.selected || !currentSelection.selected.eligible
-                || JSON.stringify(currentSelection.selected.promptGroup) !== JSON.stringify(inspected.selection.selected.promptGroup)) return init;
+                || JSON.stringify(currentSelection.selected.promptGroup) !== JSON.stringify(inspected.selection.selected.promptGroup)) {
+                debugRecord('数据库联动', `[${trace}] 读取后的状态核对未通过`, {
+                    chatChanged: currentChatKey() !== chat, scopeChanged: currentScope !== scope, epochChanged: ioCache.epoch !== epoch,
+                    revisionChanged: revision !== databaseLinkRuntime.revision, aborted: Boolean(init.signal?.aborted),
+                    enabled: databaseLinkPrefs().enabled, currentInstance: isCurrentInstance(), disposed: databaseLinkRuntime.disposed,
+                    previousPreset: inspected.snapshot.name, currentPreset: now.name,
+                    previousTask: inspected.selection.selectedTaskId, currentTask: currentSelection.selectedTaskId,
+                });
+                return skip('读取期间聊天、联动设置、任务或请求状态发生变化');
+            }
             const rewritten = databaseLinkAppend(inspected.payload, guide);
+            const body = JSON.stringify(rewritten);
             databaseLinkRuntime.injections += 1;
             databaseLinkRuntime.lastTask = inspected.matched.name;
-            databaseLinkRuntime.lastReason = '已注入';
-            LogModule.info('数据库联动', `已向任务「${inspected.matched.name}」追加 ${guide.length} 字阶段指导`);
-            return { ...init, body: JSON.stringify(rewritten) };
+            databaseLinkRuntime.lastReason = '请求内容已追加，等待调用 fetch';
+            LogModule.info('数据库联动', `[${trace}] 已向任务「${inspected.matched.name}」的请求内容追加 ${guide.length} 字阶段指导，尚未确认 HTTP 结果`);
+            debugRecord('数据库联动', `[${trace}] 本次追加的阶段指导全文`, { guide });
+            return { ...init, body };
         } catch (error) {
             databaseLinkRuntime.lastReason = error && error.message ? error.message : '读取阶段指导失败';
-            LogModule.warn('数据库联动', `本次未注入：${databaseLinkRuntime.lastReason}`);
+            LogModule.warn('数据库联动', `[${trace}] 本次未注入：${databaseLinkRuntime.lastReason}`);
             return init;
+        }
+    }
+
+    async function databaseLinkSend(target, thisArg, args, inspected, originalInit, nextInit) {
+        const trace = inspected.trace;
+        const appended = nextInit !== originalInit;
+        const started = Date.now();
+        // 这里读取的就是下一行传给原生 fetch 的正文，不重新生成提示词。
+        if (LogModule.isDebugEnabled()) {
+            try { debugRecord('数据库联动', `[${trace}] 准备调用 fetch：实际提交的 messages 全文`, JSON.parse(nextInit.body).messages); }
+            catch (error) { debugRecord('数据库联动', `[${trace}] 提交前 messages 无法解析，保留原参数`); }
+        }
+        try {
+            const pending = Reflect.apply(target, thisArg, [args[0], nextInit, ...args.slice(2)]);
+            debugRecord('数据库联动', `[${trace}] 已调用原生 fetch，等待响应`, { task: inspected.matched.name, appended });
+            const response = await pending;
+            const hasStatus = response && Number.isFinite(response.status);
+            const statusText = hasStatus ? `HTTP ${response.status}` : '没有可读取的 HTTP 状态';
+            LogModule[response && response.ok === false ? 'warn' : 'info']('数据库联动', `[${trace}] 任务「${inspected.matched.name}」fetch 已返回：${statusText}；${appended ? '请求含阶段指导' : '请求未追加指导'}；耗时 ${Date.now() - started} ms`);
+            if (appended) databaseLinkRuntime.lastReason = `请求已追加；fetch 已返回：${statusText}`;
+            return response;
+        } catch (error) {
+            LogModule.warn('数据库联动', `[${trace}] 任务「${inspected.matched.name}」fetch 失败：${error && error.message || String(error)}`);
+            if (appended) databaseLinkRuntime.lastReason = '请求已追加，但 fetch 失败';
+            throw error;
         }
     }
 
@@ -10396,7 +10630,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
                     const init = args[1];
                     const inspected = databaseLinkInspectRequest(input, init, ownerWindow, new Error().stack);
                     if (!inspected) return Reflect.apply(target, thisArg, args);
-                    return databaseLinkRewrite(inspected, init).then(nextInit => Reflect.apply(target, thisArg, [input, nextInit, ...args.slice(2)]));
+                    return databaseLinkRewrite(inspected, init).then(nextInit => databaseLinkSend(target, thisArg, args, inspected, init, nextInit));
                 },
             });
             try {
@@ -10409,21 +10643,32 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
                 if (isCurrentInstance() && !databaseLinkRuntime.disposed) databaseLinkInstall();
             }, 5000);
         }
-        return databaseLinkStatus();
+        return databaseLinkReportStatus();
     }
 
     function databaseLinkDispose() {
         if (databaseLinkRuntime.disposed) return;
+        const slotCount = databaseLinkRuntime.slots.length;
+        let restored = 0;
+        let replaced = 0;
+        let failed = 0;
         databaseLinkRuntime.disposed = true;
         databaseLinkRuntime.revision += 1;
         databaseLinkRuntime.slots.forEach(slot => {
-            try { if (slot.object[slot.key] === slot.proxy) slot.object[slot.key] = slot.original; } catch (error) {}
+            try {
+                if (slot.object[slot.key] !== slot.proxy) { replaced += 1; return; }
+                slot.object[slot.key] = slot.original;
+                if (slot.object[slot.key] === slot.original) restored += 1;
+                else failed += 1;
+            } catch (error) { failed += 1; }
         });
         databaseLinkRuntime.slots = [];
         if (databaseLinkRuntime.timer != null && currentWindow && typeof currentWindow.clearInterval === 'function') {
             currentWindow.clearInterval(databaseLinkRuntime.timer);
         }
         databaseLinkRuntime.timer = null;
+        databaseLinkRuntime.statusKey = '';
+        LogModule[failed ? 'warn' : 'info']('数据库联动', `联动停止：尝试释放 ${slotCount} 个入口，已恢复 ${restored}，已被其他代码替换 ${replaced}，恢复失败 ${failed}`);
         try {
             const owner = instanceWindow[DATABASE_LINK_OWNER_KEY];
             if (owner && owner.token === instanceToken) delete instanceWindow[DATABASE_LINK_OWNER_KEY];
@@ -10434,6 +10679,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         databaseLinkRuntime.lastReason = '';
         if (!on) databaseLinkDispose();
         await writeUserPref('databaseGuideLink', Boolean(on));
+        LogModule.info('数据库联动', on ? '联动开关已开启' : '联动开关已关闭，继续使用世界书模式');
         if (on) {
             databaseLinkRuntime.disposed = false;
             try { instanceWindow[DATABASE_LINK_OWNER_KEY] = { token: instanceToken, dispose: databaseLinkDispose }; } catch (error) {}
@@ -10453,18 +10699,27 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             else delete tasks[name];
         }
         await writeUserPref('databaseGuideTasks', tasks);
-        return databaseLinkStatus();
+        LogModule.info('数据库联动', `推进任务选择已保存：预设「${name}」，${tasks[name] ? `任务 ID「${tasks[name]}」` : '自动识别'}`);
+        return databaseLinkReportStatus();
     }
 
     function runEventTask(label, task) {
-        if (!isCurrentInstance()) return Promise.resolve();
+        if (!isCurrentInstance()) { debugRecord('事件', `${label}：实例已失效，未执行`); return Promise.resolve(); }
+        const trace = nextTraceId('EVT');
+        const started = Date.now();
+        debugRecord('事件', `[${trace}] 开始处理：${label}`);
         try {
             // 先同步调用 task，让菜单点击可以立即把面板显示出来。
-            return Promise.resolve(task()).catch(error => {
+            return Promise.resolve(task()).then(result => {
+                debugRecord('事件', `[${trace}] 处理函数已返回：${label}`, { elapsedMs: Date.now() - started, result });
+                return result;
+            }).catch(error => {
+                LogModule.error('事件', `[${trace}] ${label}失败`, error);
                 console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
                 reportOnce(label, `${label}失败：${error.message || String(error)}`);
             });
         } catch (error) {
+            LogModule.error('事件', `[${trace}] ${label}失败`, error);
             console.error(`[${SCRIPT_NAME}] ${label}失败`, error);
             reportOnce(label, `${label}失败：${error.message || String(error)}`);
             return Promise.resolve();
@@ -10494,6 +10749,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         getJudgeRuntime: () => ({ ...judgeRuntime }),
         normalizeRulePairs: RuleModule.normalize,
         log: LogModule,
+        debug: { setEnabled: setDebugLogging, snapshot: captureDebugSnapshot },
         resolveLogErrorHint,
         isMvuEntry,
         migrateJudgeSegments,
@@ -10574,6 +10830,14 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     };
     currentWindow.DynamicGuideAssistantCore = publicApi;
 
+    LogModule.setDebugEnabled(readUserPrefs().debugLogging === true);
+    LogModule.info('系统', `${SCRIPT_NAME} v${VERSION} 已加载；详细 Debug ${LogModule.isDebugEnabled() ? '已恢复开启' : '关闭'}`);
+    debugRecord('系统', '启动时实际检测到的接口', {
+        helper: Boolean(helper), eventOn: Boolean(api('eventOn', false)),
+        getVariables: Boolean(api('getVariables', false)), updateVariablesWith: Boolean(api('updateVariablesWith', false)),
+        generateRaw: Boolean(api('generateRaw', false)), database: Boolean(databaseLinkApi()),
+    });
+
     // 热重载先归还旧实例占用的 fetch 槽；旧实例只会恢复仍由它自己占用的槽。
     try {
         const previousOwner = instanceWindow[DATABASE_LINK_OWNER_KEY];
@@ -10581,6 +10845,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         instanceWindow[DATABASE_LINK_OWNER_KEY] = { token: instanceToken, dispose: databaseLinkDispose };
     } catch (error) {}
     if (databaseLinkPrefs().enabled) databaseLinkInstall();
+    else LogModule.info('数据库联动', '启动检查：联动未开启，继续使用世界书模式');
     try {
         if (currentWindow && typeof currentWindow.addEventListener === 'function') {
             currentWindow.addEventListener('pagehide', databaseLinkDispose, { once: true });
@@ -10593,7 +10858,6 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         return;
     }
 
-    LogModule.info('系统', `${SCRIPT_NAME} v${VERSION} 已加载`);
     removeStaleUi();
     registerMenuEntry(0);
     // 迁移失败不妨碍路线图本身加载；可在 API 页重试。
@@ -10612,11 +10876,13 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         reportOnce('events', '当前酒馆助手缺少事件接口，面板可以用，但无法在生成前同步路线图条目。');
         return;
     }
+    debugRecord('系统', '准备注册酒馆事件监听', Object.keys(events).filter(key => ['GENERATION_AFTER_COMMANDS', 'GENERATION_STOPPED', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'CHAT_CHANGED'].includes(key)));
     if (events.GENERATION_AFTER_COMMANDS) {
         // v4.9.0：排在最前面（eventMakeFirst）。酒馆一个一个等监听器做完，所以先等我们判断完、条目换好，
         // 后面数据库的剧情推进才开始规划，拿到的就是新的一段。
         const eventFirst = api('eventMakeFirst', false) || eventOn;
         eventFirst(events.GENERATION_AFTER_COMMANDS, function (type, params, dryRun) {
+            debugRecord('事件', '收到 GENERATION_AFTER_COMMANDS', { type, dryRun: dryRun === true, quiet: Boolean(params && params.quiet_prompt), automaticTrigger: Boolean(params && params.automatic_trigger) });
             databaseLinkInstall();
             // 不跳过 dryRun：提示词查看器等预组装也必须看到当前内容。
             // SillyTavern 会等待这个监听器返回的 Promise，所以把同步任务返回，赶上这一次生成。
@@ -10627,6 +10893,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     // 生成还没开始就点了酒馆的停止：发送时那次判断也放弃，不再卡着。
     if (events.GENERATION_STOPPED) {
         eventOn(events.GENERATION_STOPPED, () => {
+            debugRecord('事件', '收到 GENERATION_STOPPED', { activeSendJudge: Boolean(sendJudge.active) });
             if (sendJudge.active) abortModelRequests('停止了生成');
         });
     }
@@ -10641,7 +10908,7 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     // 正在问的那次判断不用管：问完发现回复换了就不落地。
     ['MESSAGE_DELETED', 'MESSAGE_SWIPED'].forEach(key => {
         if (!events[key]) return;
-        eventOn(events[key], () => runEventTask('核对回复', () => withIoCache(async () => {
+        eventOn(events[key], () => runEventTask(`核对回复（${key}）`, () => withIoCache(async () => {
             if (await reconcileRouteJudges()) {
                 await syncRouteEntriesNow({});
                 refreshOpenPanel();
@@ -10665,4 +10932,5 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
             if (panel && !panel.hidden) await runAction('刷新', async () => {});
         }));
     }
+    LogModule.info('系统', '酒馆事件监听注册流程已完成，等待操作或生成事件');
 })();

@@ -1807,7 +1807,7 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     world.state.messages = [{ message_id: 4, role: 'assistant', message: '<thinking>先想想怎么写</thinking>小林决定离开小镇，提着箱子去了码头。' }];
     world.state.lastMessageId = 4;
     const storage = memoryStorage({
-        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'k', model: 'm-small' }]),
+        'dynamic-guide-assistant:judge-api-presets:v1': JSON.stringify([{ name: '便宜的', connection: 'custom', customApiFormat: 'openai_compat', apiurl: 'https://api.example.com/v1', key: 'SECRET_JUDGE_KEY_MUST_NOT_BE_LOGGED', model: 'm-small' }]),
     });
     const fetches = [];
     const fetchMock = async (url, options) => {
@@ -1824,6 +1824,7 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     t.route.advance = 'judge';
     t.route.promptId = await run.core.promptStorage.save({ name: '简短', segments: [{ role: 'system', content: '只看正文' }, { role: 'user', content: '{{最近正文}}\n{{作答表}}' }] });
     t.route.excludeRules = [{ start: '<thinking>', end: '</thinking>' }];
+    run.core.log.setDebugEnabled(true);
     world.state.variables.character.$dynamicGuideAssistant.config.settings = {
 
         // 旧版设置里的全局规则不再用：要是还用，下面「小林决定离开小镇」会被删掉。
@@ -1845,6 +1846,12 @@ test('路线图：AI 判断按这张图自己选的 API 和提示词发，结论
     assert.doesNotMatch(run.core.getJudgeRuntime().lastFiltered, /草稿/, '也作用在判断 AI 的回答上');
     const saved = (await R.readStates())[t.route.id];
     assert.equal(saved.cur, t.leave, '路口按 <road>2</road> 走了「离开」');
+    assert.deepEqual(debugData(run.core.log, '准备调用自定义通道：最终 messages'), fetches[0].body.messages);
+    const filtered = debugData(run.core.log, '实际用于解析的回复全文');
+    assert.equal(filtered.raw, run.core.getJudgeRuntime().lastRaw);
+    assert.equal(filtered.filtered, run.core.getJudgeRuntime().lastFiltered);
+    assert.deepEqual(debugData(run.core.log, '判断结论写入接口已返回').state, plain(saved));
+    assert.doesNotMatch(run.core.log.list().map(entry => entry.message).join('\n'), /SECRET_JUDGE_KEY_MUST_NOT_BE_LOGGED/);
     assert.deepEqual(run.errors, []);
 });
 
@@ -2940,6 +2947,7 @@ function databaseLinkHarness(options = {}) {
     const settings = {
         'dynamic-guide-assistant': {
             prefs: {
+                debugLogging: options.debug === true,
                 databaseGuideLink: options.enabled !== false,
                 databaseGuideTasks: presetName ? { [presetName]: options.selectedTaskId || 'progress' } : {},
             },
@@ -2950,6 +2958,7 @@ function databaseLinkHarness(options = {}) {
     const calls = [];
     const transport = nativeFetchDouble((input, init) => {
         calls.push({ input, init });
+        if (options.respond) return options.respond(input, init);
         if (options.rejectNetwork) return Promise.reject(new Error('network rejected'));
         return Promise.resolve({ ok: true, status: 200, text: async () => '{}' });
     });
@@ -3269,4 +3278,226 @@ test('数据库联动：设置页可在数据库未加载时开关待命，不�
     assert.equal(sandbox.DynamicGuideAssistantCore.databaseLink.status().reason, '未检测到数据库接口');
     assert.deepEqual(plain(characterRoot(world)), before);
     assert.deepEqual(errors, []);
+});
+
+// v4.12：断言日志来自真实传参和返回值，不用预写的示例日志充当运行证据。
+function debugData(log, fragment) {
+    const entry = log.list().find(item => item.level === 'debug' && item.message.includes(fragment));
+    assert.ok(entry, `应记录 ${fragment}`);
+    const newline = entry.message.indexOf('\n');
+    assert.ok(newline >= 0, '应有结构化正文');
+    return JSON.parse(entry.message.slice(newline + 1));
+}
+
+test('Debug：开关持久化，重载时恢复；快照仅反映读取结果且不执行请求或写入', async () => {
+    const run = databaseLinkHarness({ enabled: false });
+    await new Promise(setImmediate);
+    // 特意放回未迁移的配置；主动快照也不能顺手做配置迁移。
+    delete run.world.state.variables.character.$dynamicGuideAssistant.config.storageVersion;
+    const before = plain(run.world.state.variables);
+    const entries = plain(run.world.state.entries);
+    await run.core.debug.setEnabled(true);
+    assert.equal(run.host.state.persisted['dynamic-guide-assistant'].prefs.debugLogging, true);
+    assert.equal(run.core.log.isDebugEnabled(), true);
+    assert.deepEqual(plain(run.world.state.variables), before);
+    assert.deepEqual(plain(run.world.state.entries), entries);
+    assert.equal(run.calls.length, 0);
+    const snapshot = debugData(run.core.log, '当前快照读取完成');
+    assert.equal(snapshot.routes[0].currentContent, run.route.nodes[run.route.root].content);
+    vm.runInNewContext(source, run.sandbox, { filename: 'index.js' });
+    const reloaded = run.sandbox.DynamicGuideAssistantCore;
+    assert.equal(reloaded.log.isDebugEnabled(), true);
+    assert.ok(reloaded.log.list().some(item => item.message.includes('详细 Debug 已恢复开启')));
+    await reloaded.debug.setEnabled(false);
+    assert.equal(run.host.state.persisted['dynamic-guide-assistant'].prefs.debugLogging, false);
+    assert.equal(reloaded.log.isDebugEnabled(), false);
+});
+
+test('Debug：数据库日志逐字等于实际捕获与提交的 messages，并以同一编号串联 HTTP 返回', async () => {
+    const run = databaseLinkHarness({ debug: true });
+    const init = run.makeInit();
+    const body = JSON.parse(init.body);
+    body.proxy_password = 'SECRET_PROXY_KEY_MUST_NOT_BE_LOGGED';
+    init.body = JSON.stringify(body);
+    init.headers.Authorization = 'Bearer SECRET_HEADER_MUST_NOT_BE_LOGGED';
+    const response = await run.send(init);
+    assert.equal(response.status, 200);
+    assert.deepEqual(debugData(run.core.log, '注入前的原始 messages'), body.messages);
+    assert.deepEqual(debugData(run.core.log, '实际提交的 messages 全文'), JSON.parse(run.calls[0].init.body).messages);
+    const captured = run.core.log.list().find(entry => entry.message.includes('捕获生成端点调用'));
+    const id = captured.message.match(/^\[(DB\d+)\]/)[1];
+    const finished = run.core.log.list().find(entry => entry.message.includes(`[${id}]`) && entry.message.includes('fetch 已返回'));
+    assert.ok(finished);
+    assert.match(finished.message, /HTTP 200/);
+    const text = run.core.log.list().map(entry => entry.message).join('\n');
+    assert.doesNotMatch(text, /SECRET_PROXY_KEY_MUST_NOT_BE_LOGGED|SECRET_HEADER_MUST_NOT_BE_LOGGED/);
+    assert.equal(run.calls.length, 1);
+});
+
+test('Debug：HTTP 返回前没有返回日志，网络失败只记失败且不会重发', async () => {
+    let resolveNetwork;
+    const run = databaseLinkHarness({ debug: true, respond: () => new Promise(resolve => { resolveNetwork = resolve; }) });
+    const pending = run.send();
+    while (!resolveNetwork) await new Promise(setImmediate);
+    assert.ok(run.core.log.list().some(entry => entry.message.includes('请求内容追加')));
+    assert.equal(run.core.log.list().some(entry => entry.message.includes('fetch 已返回')), false);
+    const actualResponse = { ok: false, status: 503 };
+    resolveNetwork(actualResponse);
+    assert.equal(await pending, actualResponse, '返回原 response 对象，不改业务结果');
+    assert.ok(run.core.log.list().some(entry => entry.level === 'warn' && entry.message.includes('HTTP 503')));
+    const failed = databaseLinkHarness({ debug: true, rejectNetwork: true });
+    await assert.rejects(failed.send(), /network rejected/);
+    assert.ok(failed.core.log.list().some(entry => entry.message.includes('fetch 失败')));
+    assert.equal(failed.core.log.list().some(entry => entry.message.includes('fetch 已返回')), false);
+    assert.equal(failed.calls.length, 1);
+});
+
+test('Debug：默认召回、未知来源、歧义任务和空阶段记录真实跳过原因', async () => {
+    const recall = databaseLinkHarness({ debug: true, presetName: '' });
+    await recall.send();
+    assert.ok(recall.core.log.list().some(entry => entry.level === 'debug' && entry.message.includes('默认召回模式不联动')));
+    assert.equal(recall.core.log.list().some(entry => entry.message.includes('请求内容追加')), false);
+    const ordinary = databaseLinkHarness({ debug: true });
+    await ordinary.sandbox.fetch('/api/backends/chat-completions/generate', ordinary.makeInit());
+    assert.ok(ordinary.core.log.list().some(entry => entry.message.includes('无法确认来源')));
+    assert.equal(ordinary.core.databaseLink.status().injections, 0);
+    const prompt = '用于识别剧情推进的固定提示词，两个启用任务共享这段文字时不能确定来自哪个任务。';
+    const ambiguous = databaseLinkHarness({ debug: true, prompt, tasks: [
+        { id: 'progress', name: '剧情推进', promptGroup: [{ role: 'user', content: prompt }] },
+        { id: 'other', name: '另一任务', promptGroup: [{ role: 'user', content: prompt }] },
+    ] });
+    await ambiguous.send();
+    assert.ok(ambiguous.core.log.list().some(entry => entry.message.includes('没有唯一匹配')));
+    const empty = databaseLinkHarness({ debug: true, guide: '   ' });
+    await empty.send();
+    assert.ok(empty.core.log.list().some(entry => entry.message.includes('当前阶段正文为空')));
+    assert.equal(empty.core.databaseLink.status().injections, 0);
+});
+
+test('Debug：重复扫描不重复写待命日志；关闭 Debug 后仍有基本运行结果但不采集正文', async () => {
+    const run = databaseLinkHarness();
+    const before = run.core.log.list().filter(entry => entry.message.includes('状态变化')).length;
+    run.core.databaseLink.install();
+    run.core.databaseLink.install();
+    assert.equal(run.core.log.list().filter(entry => entry.message.includes('状态变化')).length, before);
+    await run.send();
+    const logs = run.core.log.list();
+    assert.equal(logs.some(entry => entry.level === 'debug'), false);
+    assert.ok(logs.some(entry => entry.message.includes('已加载')));
+    assert.ok(logs.some(entry => entry.message.includes('请求内容追加')));
+    assert.ok(logs.some(entry => entry.message.includes('fetch 已返回')));
+    assert.equal(logs.some(entry => entry.message.includes('实际提交的 messages')), false);
+});
+
+test('Debug：世界书日志使用本次实际正文；写入失败时没有完成记录', async () => {
+    const world = routeWorld();
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    run.core.log.setDebugEnabled(true);
+    const R = run.core.routes;
+    const t = demoRoute(R);
+    t.route.worldbookName = '书A';
+    t.route.nodes[t.route.root].content = '本次真实正文：甲乙丙，标点与换行\n都必须原样记录。';
+    await R.write([t.route]);
+    await R.sync();
+    const saved = world.state.books.书A.find(entry => entry.name === '海边书店（动态指导）');
+    assert.equal(debugData(run.core.log, '本次准备同步的阶段正文与状态').content, saved.content);
+    assert.ok(run.core.log.list().some(entry => entry.tag === '世界书' && entry.message.includes('更新接口已返回')));
+    run.core.log.clear();
+    const state = R.normalizeRouteState(null, t.route);
+    R.mainStep(t.route, state);
+    await R.writeState(t.route.id, state);
+    world.helper.updateWorldbookWith = () => { throw new Error('WRITE_REJECTED_FOR_TEST'); };
+    await run.core.sync();
+    assert.ok(run.core.log.list().some(entry => entry.message.includes('WRITE_REJECTED_FOR_TEST')));
+    assert.equal(run.core.log.list().some(entry => /路线图同步完成|路线图同步流程返回/.test(entry.message)), false);
+    assert.equal(run.core.log.list().some(entry => entry.tag === '世界书' && entry.message.includes('更新接口已返回')), false);
+});
+
+test('Debug：日志页顶栏与设置区共用持久化开关，长正文可展开且不执行内容', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector('.dga-rail'), '运行日志').listeners.click[0]();
+    const toggle = () => findAllClass(panel(), 'dga-sw').find(node => node.getAttribute('aria-label') === '详细 Debug');
+    assert.equal(toggle().getAttribute('aria-checked'), 'false');
+    await toggle().listeners.click[0]();
+    assert.equal(toggle().getAttribute('aria-checked'), 'true');
+    const core = sandbox.DynamicGuideAssistantCore;
+    assert.equal(sandbox.SillyTavern.getContext().extensionSettings['dynamic-guide-assistant'].prefs.debugLogging, true);
+    const full = '测试实际正文\n<img src=x onerror=throwNewError>\n' + '很长的真实内容'.repeat(90);
+    core.log.debug('数据库联动', full);
+    const row = () => findAllClass(panel(), 'dga-log-row').find(node => node.textContent.includes('测试实际正文'));
+    assert.doesNotMatch(row().textContent, /onerror=/, '长正文初始折叠');
+    findButton(row(), '展开全文').listeners.click[0]();
+    assert.ok(row().textContent.includes(full));
+    assert.ok(findButton(row(), '复制本条'));
+    assert.equal(row().children.some(node => node.tagName === 'IMG'), false, '正文作为文本显示');
+    findButton(panel().querySelector('.dga-rail'), '设置').listeners.click[0]();
+    assert.equal(toggle().getAttribute('aria-checked'), 'true');
+    await toggle().listeners.click[0]();
+    assert.equal(core.log.isDebugEnabled(), false);
+    assert.equal(sandbox.SillyTavern.getContext().extensionSettings['dynamic-guide-assistant'].prefs.debugLogging, false);
+    assert.deepEqual(errors, []);
+});
+
+test('Debug：宿主明确拒绝变量或世界书写入时不会记录已完成', async () => {
+    for (const rejection of [false, { ok: false }, { saved: false }]) {
+        const world = routeWorld();
+        const run = load(world.helper);
+        await new Promise(setImmediate);
+        run.core.log.setDebugEnabled(true);
+        const R = run.core.routes;
+        const t = demoRoute(R);
+        t.route.worldbookName = '书A';
+        await R.write([t.route]);
+        const originalUpdate = world.helper.updateVariablesWith;
+        world.helper.updateVariablesWith = () => rejection;
+        run.core.log.clear();
+        await assert.rejects(R.writeState(t.route.id, R.normalizeRouteState(null, t.route)), /明确拒绝写入/);
+        await assert.rejects(R.write([t.route]), /明确拒绝写入/);
+        assert.equal(run.core.log.list().some(entry => /变量更新接口已返回|进度更新接口已返回/.test(entry.message)), false);
+        world.helper.updateVariablesWith = originalUpdate;
+        world.helper.updateWorldbookWith = () => rejection;
+        run.core.log.clear();
+        await assert.rejects(R.sync(), /明确拒绝写入/);
+        assert.equal(run.core.log.list().some(entry => entry.message.includes('更新接口已返回')), false);
+    }
+});
+
+test('Debug：判断写进度被拒绝时记录失败，不把计算出的进度当成保存结果', async () => {
+    const world = routeWorld();
+    world.state.messages = [{ message_id: 0, role: 'assistant', message: '这段剧情已经结束。' }];
+    world.helper.generateRaw = async () => '<answer n="1"><basis>结束了</basis><done>YES</done><road>1</road></answer><start>0</start>';
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const t = demoRoute(R);
+    await R.write([t.route]);
+    run.core.log.setDebugEnabled(true);
+    const original = world.helper.updateVariablesWith;
+    world.helper.updateVariablesWith = (updater, options) => options.type === 'chat' ? false : original(updater, options);
+    await assert.rejects(R.judge(t.route, 0), /明确拒绝写入/);
+    assert.ok(run.core.log.list().some(entry => entry.message.includes('解析及推进计算结果')));
+    assert.equal(run.core.log.list().some(entry => entry.message.includes('判断结论写入接口已返回')), false);
+});
+
+test('Debug：偏好保存被拒绝时不打开采集、不误报开启；释放日志对应实际恢复结果', async () => {
+    const run = databaseLinkHarness();
+    await new Promise(setImmediate);
+    run.host.context.saveSettingsDebounced = () => ({ saved: false });
+    await assert.rejects(run.core.debug.setEnabled(true), /明确拒绝写入/);
+    assert.equal(run.core.log.isDebugEnabled(), false);
+    assert.notEqual(run.host.context.extensionSettings['dynamic-guide-assistant'].prefs.debugLogging, true);
+    assert.equal(run.core.log.list().some(entry => entry.message.includes('详细 Debug 已开启')), false);
+    const proxy = run.sandbox.fetch;
+    run.sandbox.fetch = function replacement(...args) { return proxy(...args); };
+    run.core.databaseLink.dispose();
+    assert.ok(run.core.log.list().some(entry => /已恢复 0，已被其他代码替换 1，恢复失败 0/.test(entry.message)));
+    const locked = databaseLinkHarness();
+    Object.defineProperty(locked.sandbox, 'fetch', { value: locked.sandbox.fetch, writable: false, configurable: false });
+    locked.core.databaseLink.dispose();
+    assert.ok(locked.core.log.list().some(entry => entry.level === 'warn' && entry.message.includes('恢复失败 1')));
 });
