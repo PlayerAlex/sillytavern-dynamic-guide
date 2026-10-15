@@ -1118,6 +1118,113 @@ test('路线图：世界书改了名，同步和删除按条目找回新名字�
     assert.equal(world.state.books.书B.length, 2, '哪本都找不到条目时什么都不删');
 });
 
+test('路线图：同一本世界书重复绑定同一 UID，完整名称匹配的一路保留，其余路线另建条目', async () => {
+    const world = routeWorld();
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const first = demoRoute(R).route;
+    const second = demoRoute(R).route;
+    first.name = '时间';
+    second.name = '剧情';
+    first.worldbookName = '书A';
+    second.worldbookName = '书A';
+    first.entryUid = 248;
+    second.entryUid = 248;
+    second.nodes[second.root].content = '剧情正文';
+    world.state.books.书A.push({ uid: 248, name: '时间（动态指导）', comment: '时间（动态指导）', content: '旧内容', enabled: true, position: { type: 'after_character_definition', order: 248 } });
+
+    await R.write([first, second]);
+    await R.sync();
+
+    const time = world.state.books.书A.find(item => item.name === '时间（动态指导）');
+    const plot = world.state.books.书A.find(item => item.name === '剧情（动态指导）');
+    assert.equal(time.uid, 248, '真实名称匹配的路线保留原绑定');
+    assert.equal(time.content, '开场正文');
+    assert.ok(plot, '另一条路线新建自己的条目');
+    assert.notEqual(String(plot.uid), '248');
+    assert.equal(plot.content, '剧情正文');
+    const saved = await R.read();
+    assert.equal(String(saved.find(item => item.name === '时间').entryUid), '248');
+    assert.equal(String(saved.find(item => item.name === '剧情').entryUid), String(plot.uid));
+    assert.notEqual(String(saved[0].entryUid), String(saved[1].entryUid), '修复后的绑定编号彼此独立');
+    assert.match(run.core.log.list().map(item => item.message).join('\n'), /重复的路线条目编号 248/, '日志只在实际发现并修复冲突时记录');
+    assert.deepEqual(run.errors, []);
+});
+
+test('路线图：重复 UID 没有唯一名称归属时全部解除，按各自完整名称找回或新建', async () => {
+    const world = routeWorld();
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const first = demoRoute(R).route;
+    const second = demoRoute(R).route;
+    const owner = demoRoute(R).route;
+    first.name = '时间';
+    second.name = '剧情';
+    owner.name = '遗留路线';
+    first.worldbookName = '书A';
+    second.worldbookName = '书A';
+    owner.worldbookName = '书A';
+    first.entryUid = 248;
+    second.entryUid = 248;
+    owner.entryUid = 999;
+    second.nodes[second.root].content = '剧情正文';
+    owner.nodes[owner.root].content = '遗留正文';
+    world.state.books.书A.push(
+        { uid: 248, name: '遗留路线（动态指导）', comment: '遗留路线（动态指导）', content: '不要改', enabled: true },
+        { uid: 300, name: '时间（动态指导）', comment: '时间（动态指导）', content: '旧时间', enabled: true },
+    );
+
+    await R.write([first, second, owner]);
+    await R.sync();
+
+    const legacy = world.state.books.书A.find(item => item.uid === 248);
+    const time = world.state.books.书A.find(item => item.name === '时间（动态指导）');
+    const plot = world.state.books.书A.find(item => item.name === '剧情（动态指导）');
+    assert.equal(legacy.name, '遗留路线（动态指导）');
+    assert.equal(legacy.content, '遗留正文', '重复组不能抢走名称属于另一条无冲突路线的旧条目');
+    assert.equal(time.uid, 300, '清空错误 UID 后优先按完整名称找回已有条目');
+    assert.equal(time.content, '开场正文');
+    assert.ok(plot);
+    assert.notEqual(String(plot.uid), '248');
+    assert.notEqual(String(plot.uid), '300');
+    const saved = await R.read();
+    assert.equal(String(saved.find(item => item.name === '时间').entryUid), '300');
+    assert.equal(String(saved.find(item => item.name === '剧情').entryUid), String(plot.uid));
+    assert.equal(String(saved.find(item => item.name === '遗留路线').entryUid), '248', '无冲突路线按完整名称找回旧条目');
+    assert.deepEqual(run.errors, []);
+});
+
+test('路线图：重复 UID 尚未同步修复时，改位置和删除不会误伤另一条路线的条目', async () => {
+    const world = routeWorld();
+    const run = load(world.helper);
+    await new Promise(setImmediate);
+    const R = run.core.routes;
+    const first = demoRoute(R).route;
+    const second = demoRoute(R).route;
+    first.name = '时间';
+    second.name = '剧情';
+    first.worldbookName = '书A';
+    second.worldbookName = '书A';
+    first.entryUid = 248;
+    second.entryUid = 248;
+    world.state.books.书A.push({ uid: 248, name: '时间（动态指导）', comment: '时间（动态指导）', content: '时间正文', enabled: true, position: { type: 'after_character_definition', order: 248 } });
+    await R.write([first, second]);
+
+    await R.setPlacement(second, { pos: 'before_character_definition', order: 9 }, []);
+    const time = () => world.state.books.书A.find(item => item.uid === 248);
+    assert.deepEqual(plain(time().position), { type: 'after_character_definition', order: 248 }, '剧情路线不能靠冲突 UID 改掉时间路线的位置');
+    await R.removeEntry(second);
+    assert.ok(time(), '剧情路线不能靠冲突 UID 删除时间路线的条目');
+
+    await R.setPlacement(first, { pos: 'before_character_definition', order: 9 }, []);
+    assert.deepEqual(plain(time().position), { type: 'before_character_definition', order: 9 }, '完整名称匹配的一路仍可正常改位置');
+    await R.removeEntry(first);
+    assert.equal(time(), undefined, '完整名称匹配的一路仍可正常删除');
+    assert.deepEqual(run.errors, []);
+});
+
 test('路线图：世界书里一棵树只有一个条目，走一步换内容，位置和顺序不被盖掉', async () => {
     const world = routeWorld();
     const run = load(world.helper);
@@ -1330,7 +1437,7 @@ test('路线图：卡片标题栏是编辑路线 / 位置和顺序 / 资料 / �
     assert.match(drawer().textContent, /判断用的 API.*跟随当前活动API.*判断提示词/, '选了 AI 判断才出现');
     assert.match(drawer().textContent, /判断提示词.*提取 \/ 排除规则.*删掉这张路线图/, '提取 / 排除规则在 AI 判断下面、删除上面');
     assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 0, '没有规则时不列空行');
-    assert.equal(findAllClass(drawer(), 'dga-set-sec').length, 4, '设置分四组：怎么走 / AI 判断 / 提取 / 排除规则 / 这张路线图');
+    assert.equal(findAllClass(drawer(), 'dga-set-sec').length, 5, '设置分五组：怎么走 / 数据库联动 / AI 判断 / 提取、排除规则 / 这张路线图');
     findButton(drawer(), '＋ 加一条').listeners.click[0]();
     assert.equal(findAllClass(drawer(), 'dga-rs-rule').length, 1, '点「加一条」多一行开始 / 结束');
     assert.doesNotMatch(drawer().textContent, /›/, '判断提示词右边不放跳转箭头');
@@ -2928,6 +3035,7 @@ function nativeFetchDouble(handler) {
 function databaseLinkHarness(options = {}) {
     const route = demoRoute(core.routes).route;
     route.worldbookName = '测试世界书';
+    if (options.routeLinked !== false) route.databaseGuide = true;
     route.nodes[route.root].content = options.guide || '当前阶段：主角刚抵达旧书店，需要先认识店主并了解眼前困境。';
     const entry = { uid: 1, name: '测试世界书', content: '' };
     const world = helperFor(entry);
@@ -2973,6 +3081,7 @@ function databaseLinkHarness(options = {}) {
     }
     const result = load(world.helper, {
         fetch: suppliedFetch,
+        JSON: { parse: JSON.parse, stringify: JSON.stringify },
         URL,
         location: { href: 'https://tavern.example/chat', origin: 'https://tavern.example' },
         setTimeout,
@@ -2995,7 +3104,21 @@ function databaseLinkHarness(options = {}) {
         function callApiWithPlotPreset_ACU() { return result.sandbox.fetch(input, init); }
         return executeSinglePlotTask_ACU();
     };
-    return { ...result, world, route, calls, transport, suppliedFetch, wrapperCalls: () => wrapperCalls, host, preset, tasks, makeInit, send };
+    const serialize = (payload = JSON.parse(makeInit().body), ...rest) => {
+        function executeSinglePlotTask_ACU() { return callApiWithPlotPreset_ACU(); }
+        function callApiWithPlotPreset_ACU() { return result.sandbox.JSON.stringify(payload, ...rest); }
+        return executeSinglePlotTask_ACU();
+    };
+    // 模拟数据库已取得独立 iframe 原生 fetch：完全绕过助手安装在 sandbox.fetch 的代理。
+    const sendSerialized = (payload = JSON.parse(makeInit().body), hooked = false) => {
+        function executeSinglePlotTask_ACU() { return callApiWithPlotPreset_ACU(); }
+        function callApiWithPlotPreset_ACU() {
+            const init = { method: 'POST', body: result.sandbox.JSON.stringify(payload) };
+            return (hooked ? result.sandbox.fetch : transport)('/api/backends/chat-completions/generate', init);
+        }
+        return executeSinglePlotTask_ACU();
+    };
+    return { ...result, world, route, calls, transport, suppliedFetch, wrapperCalls: () => wrapperCalls, host, preset, tasks, makeInit, send, serialize, sendSerialized };
 }
 
 test('数据库联动：安装的 callable Proxy 仍通过数据库原版 native 判据，并在真实命名调用栈注入当前阶段', async () => {
@@ -3289,6 +3412,190 @@ function debugData(log, fragment) {
     return JSON.parse(entry.message.slice(newline + 1));
 }
 
+test('数据库联动：独立 iframe 发送绕过 fetch Proxy 时，真实序列化结果仍携带所选路线指导', async () => {
+    const run = databaseLinkHarness({ debug: true });
+    await new Promise(setImmediate);
+    const payload = JSON.parse(run.makeInit().body);
+    payload.proxy_password = 'SERIALIZE_SECRET_NOT_LOGGED';
+    const before = plain(payload);
+    const variables = plain(run.world.state.variables);
+    const response = await run.sendSerialized(payload);
+    assert.equal(response.status, 200);
+    assert.equal(run.calls.length, 1);
+    const actual = JSON.parse(run.calls[0].init.body);
+    assert.match(actual.messages[0].content, /DGA_DATABASE_GUIDE:v1/);
+    assert.match(actual.messages[0].content, /当前阶段：主角刚抵达旧书店/);
+    assert.deepEqual(payload, before, '调用方原对象未被改写');
+    assert.deepEqual(plain(run.world.state.variables), variables, '读取阶段不修改角色或聊天变量');
+    assert.equal(run.core.databaseLink.status().observedRequests, 0, '独立发送确实没有经过 fetch 代理');
+    assert.equal(run.core.databaseLink.status().serializationInjections, 1);
+    assert.deepEqual(debugData(run.core.log, '请求组装后实际返回的 messages 全文'), actual.messages);
+    const log = run.core.log.list().map(entry => entry.message).join('\n');
+    assert.match(log, /捕获数据库推进请求组装/);
+    assert.match(log, /尚未确认网络发送或 HTTP 结果/);
+    assert.doesNotMatch(log, /fetch 已返回|SERIALIZE_SECRET_NOT_LOGGED/);
+});
+
+test('数据库联动：组装后又经过 fetch 入口只追加一次；读取的是发送当时的最新阶段', async () => {
+    const run = databaseLinkHarness();
+    await new Promise(setImmediate);
+    const stored = run.world.state.variables.character.$dynamicGuideAssistant.routes.list[0];
+    stored.nodes[stored.root].content = '发送前刚改好的阶段，不能使用旧快照。';
+    await run.sendSerialized(undefined, true);
+    const text = JSON.parse(run.calls[0].init.body).messages[0].content;
+    assert.equal((text.match(/DGA_DATABASE_GUIDE:v1/g) || []).length, 1);
+    assert.match(text, /发送前刚改好的阶段/);
+    assert.doesNotMatch(text, /刚抵达旧书店/);
+    assert.equal(run.core.databaseLink.status().injections, 1);
+});
+
+test('数据库联动：JSON 入口放行普通序列化、默认召回、召回任务、歧义任务与关闭的路线', () => {
+    const normal = databaseLinkHarness();
+    const payload = JSON.parse(normal.makeInit().body);
+    assert.equal(normal.sandbox.JSON.stringify(payload), JSON.stringify(payload));
+    for (const options of [{ enabled: false }, { presetName: '__ACU_DEFAULT_PRESET__' }, { routeLinked: false }]) {
+        const run = databaseLinkHarness(options);
+        assert.equal(run.serialize(payload), JSON.stringify(payload));
+    }
+    const prompt = '明确识别这一段固定任务提示词，用来测试数据库不会误注入召回或者混合任务。';
+    for (const tasks of [
+        [{ id: 'progress', name: '召回', extractTags: '<recall>', promptGroup: [{ role: 'user', content: prompt }] }],
+        ['progress', 'other'].map(id => ({ id, name: id, promptGroup: [{ role: 'user', content: prompt }] })),
+    ]) {
+        const run = databaseLinkHarness({ prompt, tasks });
+        const original = JSON.parse(run.makeInit().body);
+        assert.equal(run.serialize(original), JSON.stringify(original));
+    }
+});
+
+test('数据库联动：同步入口读取失败、异步接口或身份变化时原样放行并留下实际原因', async () => {
+    for (const kind of ['promise', 'rejection', 'throw', 'chat', 'scope', 'toggle', 'empty', 'off', 'ended']) {
+        const run = databaseLinkHarness({ debug: true });
+        await new Promise(setImmediate);
+        const get = run.world.helper.getVariables;
+        const stored = run.world.state.variables.character.$dynamicGuideAssistant.routes.list[0];
+        if (kind === 'empty') stored.nodes[stored.root].content = '';
+        if (kind === 'off') stored.off = true;
+        if (kind === 'ended') run.world.state.variables.chat.$dynamicGuideAssistant.routeState.routes[stored.id].ended = true;
+        run.world.helper.getVariables = ({ type }) => {
+            if (type === 'chat') {
+                if (kind === 'promise') return Promise.resolve(get({ type }));
+                if (kind === 'rejection') return Promise.reject(new Error('async read rejected'));
+                if (kind === 'throw') throw new Error('sync read failed');
+                if (kind === 'chat') run.host.context.chatId = 'chat-b';
+                if (kind === 'scope') run.world.helper.getCharData = () => ({ avatar: 'other.png' });
+                if (kind === 'toggle') run.host.state.settings['dynamic-guide-assistant'].prefs.databaseGuideLink = false;
+            }
+            return get({ type });
+        };
+        const payload = JSON.parse(run.makeInit().body);
+        assert.equal(run.serialize(payload), JSON.stringify(payload), kind);
+        assert.equal(run.core.databaseLink.status().serializationInjections, 0, kind);
+        assert.ok(run.core.log.list().some(entry => entry.message.includes('请求组装未追加')), kind);
+    }
+    await new Promise(setImmediate); // 被拒绝的异步接口不得留下 unhandled rejection。
+});
+
+test('数据库联动：JSON 接口保留 replacer、toJSON、getter、原生异常并能重复安装及正确卸载', async () => {
+    const run = databaseLinkHarness({ debug: true });
+    const installed = run.sandbox.JSON.stringify;
+    run.core.databaseLink.install();
+    assert.equal(run.sandbox.JSON.stringify, installed);
+    const payload = JSON.parse(run.makeInit().body);
+    assert.equal(run.serialize(payload, ['messages', 'role', 'content'], 2), JSON.stringify(payload, ['messages', 'role', 'content'], 2));
+    let toJSONCalls = 0;
+    const custom = { ...payload, toJSON() { toJSONCalls += 1; return { ordinary: true }; } };
+    assert.equal(run.serialize(custom), '{"ordinary":true}');
+    assert.equal(toJSONCalls, 1);
+    let getterCalls = 0;
+    const getter = { get messages() { getterCalls += 1; return payload.messages; } };
+    assert.equal(run.serialize(getter), JSON.stringify(payload.messages && { messages: payload.messages }));
+    assert.equal(getterCalls, 1);
+    assert.throws(() => run.serialize({ ...payload, value: 1n }), /BigInt/);
+    assert.match(run.serialize(payload), /DGA_DATABASE_GUIDE/);
+    await run.core.databaseLink.setEnabled(false);
+    assert.equal(run.sandbox.JSON.stringify, JSON.stringify);
+    await run.core.databaseLink.setEnabled(true);
+    assert.notEqual(run.sandbox.JSON.stringify, JSON.stringify);
+    const proxy = run.sandbox.JSON.stringify;
+    const later = (...args) => proxy(...args);
+    run.sandbox.JSON.stringify = later;
+    run.core.databaseLink.dispose();
+    assert.equal(run.sandbox.JSON.stringify, later, '不覆盖之后安装的第三方包装');
+    assert.equal(run.serialize(payload), JSON.stringify(payload));
+});
+
+test('数据库联动：同源子窗口 JSON 入口可注入，只读 JSON 入口不影响发送', async () => {
+    const run = databaseLinkHarness();
+    const childJSON = { stringify: JSON.stringify, parse: JSON.parse };
+    const child = { JSON: childJSON };
+    run.sandbox.document = { querySelectorAll: () => [{ contentWindow: child }] };
+    run.core.databaseLink.install();
+    const payload = JSON.parse(run.makeInit().body);
+    function executeSinglePlotTask_ACU() { return callApiWithPlotPreset_ACU(); }
+    function callApiWithPlotPreset_ACU() { return child.JSON.stringify(payload); }
+    assert.match(executeSinglePlotTask_ACU(), /DGA_DATABASE_GUIDE/);
+    run.core.databaseLink.dispose();
+    assert.equal(child.JSON.stringify, JSON.stringify);
+    Object.freeze(childJSON);
+    await run.core.databaseLink.setEnabled(true);
+    assert.equal(child.JSON.stringify, JSON.stringify);
+    await run.sendSerialized();
+    assert.match(run.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+});
+
+test('路线图数据库开关：旧路线默认世界书，选中的路线进入推进，模式变化后恢复世界书', async () => {
+    const run = databaseLinkHarness({ debug: true });
+    await new Promise(setImmediate);
+    const other = plain(run.core.routes.makeRoute('仅世界书路线'));
+    other.worldbookName = '测试世界书';
+    other.nodes[other.root].content = '这是只给世界书的路线正文。';
+    assert.notEqual(other.databaseGuide, true);
+    await run.core.routes.write([run.route, other]);
+    await run.core.routes.sync();
+    let entries = run.world.state.entries;
+    assert.equal(entries.find(entry => entry.name === `${run.route.name}（动态指导）`).enabled, false);
+    assert.equal(entries.find(entry => entry.name === '仅世界书路线（动态指导）').enabled, true);
+    await run.sendSerialized();
+    assert.match(run.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+    assert.doesNotMatch(run.calls[0].init.body, /这是只给世界书的路线正文/);
+    const exported = run.core.routes.exportData(run.route);
+    assert.equal(exported.settings.databaseGuide, true);
+    assert.equal(run.core.routes.importData(plain(exported))[0].route.databaseGuide, true);
+    await run.core.databaseLink.setEnabled(false);
+    await run.core.routes.sync();
+    assert.equal(run.world.state.entries.find(entry => entry.name === `${run.route.name}（动态指导）`).enabled, true);
+    await run.core.databaseLink.setEnabled(true);
+    run.sandbox.AutoCardUpdaterAPI.getCurrentPlotPreset = () => '__ACU_DEFAULT_PRESET__';
+    await run.core.routes.sync();
+    assert.equal(run.world.state.entries.find(entry => entry.name === `${run.route.name}（动态指导）`).enabled, true);
+    await run.sendSerialized();
+    assert.doesNotMatch(run.calls[1].init.body, /DGA_DATABASE_GUIDE/);
+});
+
+test('路线图设置：数据库联动只有一个默认关闭的发送开关，点击后保存并可关闭', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const route = demoRoute(core.routes).route;
+    route.worldbookName = '书A';
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(route)] };
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    await sandbox.DynamicGuideAssistantCore.refresh();
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector(`.dga-rt-card-${route.id}`).querySelector('.dga-rt-head'), '设置').listeners.click[0]();
+    const toggle = () => findAllClass(panel().querySelector('.dga-rt-drawer'), 'dga-sw').filter(node => node.getAttribute('aria-label') === '发送到数据库剧情推进');
+    assert.equal(toggle().length, 1);
+    assert.equal(toggle()[0].getAttribute('aria-checked'), 'false');
+    await toggle()[0].listeners.click[0]();
+    assert.equal(world.state.variables.character.$dynamicGuideAssistant.routes.list[0].databaseGuide, true);
+    assert.equal(toggle()[0].getAttribute('aria-checked'), 'true');
+    await toggle()[0].listeners.click[0]();
+    assert.notEqual(world.state.variables.character.$dynamicGuideAssistant.routes.list[0].databaseGuide, true);
+    assert.equal(toggle()[0].getAttribute('aria-checked'), 'false');
+    assert.deepEqual(errors, []);
+});
+
 test('Debug：开关持久化，重载时恢复；快照仅反映读取结果且不执行请求或写入', async () => {
     const run = databaseLinkHarness({ enabled: false });
     await new Promise(setImmediate);
@@ -3495,7 +3802,7 @@ test('Debug：偏好保存被拒绝时不打开采集、不误报开启；释放
     const proxy = run.sandbox.fetch;
     run.sandbox.fetch = function replacement(...args) { return proxy(...args); };
     run.core.databaseLink.dispose();
-    assert.ok(run.core.log.list().some(entry => /已恢复 0，已被其他代码替换 1，恢复失败 0/.test(entry.message)));
+    assert.ok(run.core.log.list().some(entry => /已恢复 1，已被其他代码替换 1，恢复失败 0/.test(entry.message)));
     const locked = databaseLinkHarness();
     Object.defineProperty(locked.sandbox, 'fetch', { value: locked.sandbox.fetch, writable: false, configurable: false });
     locked.core.databaseLink.dispose();
