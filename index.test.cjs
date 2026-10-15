@@ -28,7 +28,7 @@ function load(helper, extra) {
     };
     Object.assign(sandbox, extra || {});
     vm.runInNewContext(source, sandbox, { filename: 'index.js' });
-    return { core: sandbox.DynamicGuideAssistantCore, logs, errors };
+    return { core: sandbox.DynamicGuideAssistantCore, logs, errors, sandbox };
 }
 
 const { core } = load();
@@ -2771,7 +2771,7 @@ test('路线图导出再导入：段、路口、接回、支线、资料、开�
 
 test('路线图导入：「路线图写法-给AI看.md」里的例子能原样导入，一处都不报；插件里不带写法说明', () => {
     const R = load().core.routes;
-    const guide = fs.readFileSync(path.join(__dirname, '..', '..', '..', '路线图写法-给AI看.md'), 'utf8');
+    const guide = fs.readFileSync(path.join(__dirname, '路线图写法-给AI看.md'), 'utf8');
     assert.match(guide, /dynamic-guide-route/);
     assert.doesNotMatch(source, /路线图的写法（写给 AI 看）|复制给 AI 的写法说明/, '写法说明单独给，不写进插件');
     const example = guide.slice(guide.indexOf('## 十二、完整例子'), guide.indexOf('## 十三'));
@@ -2905,5 +2905,368 @@ test('路线图：左栏「导入」贴 JSON 导入成新的一张，设置里�
     assert.equal(list[1].name, '海边书店 2', '名字撞了后面加数字');
     assert.equal(Object.keys(list[1].nodes).length, Object.keys(t.route.nodes).length);
     assert.ok(world.state.books.书A.some(item => item.name === '海边书店 2（动态指导）'), '世界书里多一个条目');
+    assert.deepEqual(errors, []);
+});
+
+// ---------------------------------------------------------------
+// v4.11：数据库剧情推进请求联动（脚本侧 native fetch Proxy）
+// ---------------------------------------------------------------
+
+function nativeFetchDouble(handler) {
+    const nativeShape = (function fetchShape() {}).bind(null);
+    Object.defineProperty(nativeShape, 'name', { value: 'fetch' });
+    return new Proxy(nativeShape, { apply(_target, thisArg, args) { return handler.apply(thisArg, args); } });
+}
+
+function databaseLinkHarness(options = {}) {
+    const route = demoRoute(core.routes).route;
+    route.worldbookName = '测试世界书';
+    route.nodes[route.root].content = options.guide || '当前阶段：主角刚抵达旧书店，需要先认识店主并了解眼前困境。';
+    const entry = { uid: 1, name: '测试世界书', content: '' };
+    const world = helperFor(entry);
+    world.helper.getCharData = () => ({ avatar: 'test.png', name: '测试角色' });
+    world.helper.getWorldbookNames = () => ['测试世界书'];
+    world.state.variables.character.$dynamicGuideAssistant.routes = { version: 1, list: [plain(route)] };
+    world.state.variables.chat.$dynamicGuideAssistant = {
+        routeState: { version: 1, routes: { [route.id]: plain(core.routes.normalizeRouteState(null, route)) } },
+    };
+    const prompt = options.prompt || '你负责执行剧情推进规划，请结合以下已有信息生成下一阶段安排，并严格保持指定输出格式。玩家：{{user}}';
+    const tasks = options.tasks || [{
+        id: 'progress', name: '剧情推进', enabled: true,
+        promptGroup: [{ role: 'user', content: prompt }], extractTags: '<plot>', extractInjectTags: '',
+    }];
+    const presetName = options.presetName === undefined ? '测试推进预设' : options.presetName;
+    const preset = { name: presetName, plotTasks: tasks };
+    const settings = {
+        'dynamic-guide-assistant': {
+            prefs: {
+                databaseGuideLink: options.enabled !== false,
+                databaseGuideTasks: presetName ? { [presetName]: options.selectedTaskId || 'progress' } : {},
+            },
+        },
+    };
+    const host = settingsHost(settings);
+    host.context.chatId = 'chat-a';
+    const calls = [];
+    const transport = nativeFetchDouble((input, init) => {
+        calls.push({ input, init });
+        if (options.rejectNetwork) return Promise.reject(new Error('network rejected'));
+        return Promise.resolve({ ok: true, status: 200, text: async () => '{}' });
+    });
+    let suppliedFetch = transport;
+    let wrapperCalls = 0;
+    if (options.knownWrapper) {
+        suppliedFetch = function existingFetchWrapper(input, init) {
+            wrapperCalls += 1;
+            return suppliedFetch.__keminiFetchInterceptor__.original.call(this, input, init);
+        };
+        suppliedFetch.__keminiFetchInterceptor__ = { original: transport };
+    }
+    const result = load(world.helper, {
+        fetch: suppliedFetch,
+        URL,
+        location: { href: 'https://tavern.example/chat', origin: 'https://tavern.example' },
+        setTimeout,
+        clearTimeout,
+        SillyTavern: host.SillyTavern,
+        AutoCardUpdaterAPI: {
+            getCurrentPlotPreset: () => presetName,
+            getPlotPresetDetails: name => name === presetName ? preset : null,
+        },
+    });
+    const rendered = prompt.replace('{{user}}', '小林');
+    const makeInit = (overrides = {}) => ({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'test', messages: [{ role: 'user', content: rendered }] }),
+        ...overrides,
+    });
+    const send = (init = makeInit(), input = '/api/backends/chat-completions/generate') => {
+        function executeSinglePlotTask_ACU() { return callApiWithPlotPreset_ACU(); }
+        function callApiWithPlotPreset_ACU() { return result.sandbox.fetch(input, init); }
+        return executeSinglePlotTask_ACU();
+    };
+    return { ...result, world, route, calls, transport, suppliedFetch, wrapperCalls: () => wrapperCalls, host, preset, tasks, makeInit, send };
+}
+
+test('数据库联动：安装的 callable Proxy 仍通过数据库原版 native 判据，并在真实命名调用栈注入当前阶段', async () => {
+    const run = databaseLinkHarness();
+    const originalInit = run.makeInit();
+    const originalBody = originalInit.body;
+    const installedFetch = run.sandbox.fetch;
+    assert.equal(installedFetch.name, 'fetch');
+    assert.match(Function.prototype.toString.call(installedFetch), /\{\s*\[native code\]\s*\}\s*$/);
+    assert.notEqual(installedFetch, run.transport, '实际安装了 Proxy');
+    await run.send(originalInit);
+    assert.equal(run.calls.length, 1);
+    const sent = JSON.parse(run.calls[0].init.body);
+    assert.match(sent.messages[0].content, /DGA_DATABASE_GUIDE:v1/);
+    assert.match(sent.messages[0].content, /当前阶段：主角刚抵达旧书店/);
+    assert.match(sent.messages[0].content, /不要提前跳到后续阶段/);
+    assert.equal(originalInit.body, originalBody, '不改调用方 init 和原 payload');
+    assert.equal(run.core.databaseLink.status().injections, 1);
+    assert.equal(run.core.databaseLink.status().lastTask, '剧情推进');
+});
+
+test('数据库联动：默认模式、召回标签和混合召回标签都不能成为推进任务', async () => {
+    const defaults = databaseLinkHarness({ presetName: '' });
+    assert.equal(defaults.core.databaseLink.status().reason, '默认召回模式不联动');
+    await defaults.send();
+    assert.equal(defaults.calls.length, 1);
+    assert.doesNotMatch(defaults.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+
+    for (const extractTags of ['<recall>', '<plot><supplement>']) {
+        const run = databaseLinkHarness({ tasks: [{
+            id: 'progress', name: '剧情推进', enabled: true, extractTags,
+            promptGroup: [{ role: 'user', content: '这是一段足够长且唯一的剧情推进固定提示文本，用来确保不会误中普通召回请求。' }],
+        }], prompt: '这是一段足够长且唯一的剧情推进固定提示文本，用来确保不会误中普通召回请求。' });
+        const task = run.core.databaseLink.status().tasks[0];
+        assert.equal(task.eligible, false);
+        assert.match(task.reason, /召回或补充/);
+        await run.send();
+        assert.doesNotMatch(run.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+    }
+});
+
+test('数据库联动：普通聊天、填表任务、错误 URL 和错误方法原样直通', async () => {
+    const run = databaseLinkHarness();
+    const normal = run.makeInit();
+    await run.sandbox.fetch('/api/backends/chat-completions/generate', normal);
+    const table = run.makeInit({ body: JSON.stringify({ messages: [{ role: 'user', content: '请填写数据库表格字段。' }] }) });
+    await run.send(table);
+    await run.send(run.makeInit(), '/api/backends/chat-completions/status');
+    await run.send(run.makeInit({ method: 'GET' }));
+    assert.equal(run.calls.length, 4);
+    run.calls.forEach(call => assert.doesNotMatch(call.init.body, /DGA_DATABASE_GUIDE/));
+});
+
+test('数据库联动：开关、重复安装、卸载和已带标识的请求保持幂等', async () => {
+    const run = databaseLinkHarness({ enabled: false });
+    assert.equal(run.sandbox.fetch, run.transport, '默认关闭时不接管 fetch');
+    await run.core.databaseLink.setEnabled(true);
+    const installed = run.sandbox.fetch;
+    run.core.databaseLink.install();
+    assert.equal(run.sandbox.fetch, installed, '重复安装不叠 Proxy');
+    const marked = run.makeInit();
+    const parsed = JSON.parse(marked.body);
+    parsed.messages[0].content += '\n<!-- DGA_DATABASE_GUIDE:v1 -->';
+    marked.body = JSON.stringify(parsed);
+    await run.send(marked);
+    assert.equal((run.calls[0].init.body.match(/DGA_DATABASE_GUIDE:v1/g) || []).length, 1);
+    run.core.databaseLink.dispose();
+    assert.equal(run.sandbox.fetch, run.transport, '卸载只归还自己的槽');
+    await run.core.databaseLink.setEnabled(true);
+    assert.notEqual(run.sandbox.fetch, run.transport, '重新开启可再次安装');
+});
+
+test('数据库联动：读取失败时原请求只发一次，网络拒绝也不会在 catch 中重发', async () => {
+    const readFail = databaseLinkHarness();
+    const originalGetVariables = readFail.world.helper.getVariables;
+    readFail.world.helper.getVariables = ({ type }) => {
+        if (type === 'chat') throw new Error('chat read failed');
+        return originalGetVariables({ type });
+    };
+    const init = readFail.makeInit();
+    await readFail.send(init);
+    assert.equal(readFail.calls.length, 1);
+    assert.equal(readFail.calls[0].init, init, '准备注入失败时使用原 init');
+
+    const rejected = databaseLinkHarness({ rejectNetwork: true });
+    await assert.rejects(rejected.send(), /network rejected/);
+    assert.equal(rejected.calls.length, 1, '网络层 reject 后不重新发送');
+});
+
+test('数据库联动：等待阶段内容时切换聊天就放弃注入；并发请求各自只追加一次', async () => {
+    const switched = databaseLinkHarness();
+    await new Promise(setImmediate);
+    const originalGetVariables = switched.world.helper.getVariables;
+    let releaseChat;
+    switched.world.helper.getVariables = ({ type }) => type === 'chat'
+        ? new Promise(resolve => { releaseChat = () => resolve(originalGetVariables({ type })); })
+        : originalGetVariables({ type });
+    const init = switched.makeInit();
+    const pending = switched.send(init);
+    while (!releaseChat) await new Promise(setImmediate);
+    switched.host.context.chatId = 'chat-b';
+    releaseChat();
+    await pending;
+    assert.equal(switched.calls[0].init, init);
+    assert.doesNotMatch(switched.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+
+    const concurrent = databaseLinkHarness();
+    await Promise.all([concurrent.send(), concurrent.send()]);
+    assert.equal(concurrent.calls.length, 2);
+    concurrent.calls.forEach(call => {
+        assert.equal((call.init.body.match(/DGA_DATABASE_GUIDE:v1/g) || []).length, 1);
+    });
+});
+
+test('数据库联动：两个任务共享同一提示词时保守判为歧义，不向所选任务注入', async () => {
+    const prompt = '这是两个数据库任务共享的足够长固定提示词，无法只凭消息确认究竟是哪一个任务。';
+    const run = databaseLinkHarness({ prompt, tasks: [
+        { id: 'progress', name: '剧情推进', enabled: true, promptGroup: [{ role: 'user', content: prompt }], extractTags: '<plot>' },
+        { id: 'other', name: '其他处理', enabled: true, promptGroup: [{ role: 'user', content: prompt }], extractTags: '<other>' },
+    ] });
+    await run.send();
+    assert.equal(run.calls.length, 1);
+    assert.doesNotMatch(run.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+});
+
+test('数据库联动：已知第三方 fetch 包装保持在原位，只替换其登记的 native 叶子', async () => {
+    const run = databaseLinkHarness({ knownWrapper: true });
+    assert.equal(run.sandbox.fetch, run.suppliedFetch, '不覆盖第三方外层包装');
+    assert.notEqual(run.suppliedFetch.__keminiFetchInterceptor__.original, run.transport, '只代理登记的原生叶子');
+    assert.match(Function.prototype.toString.call(run.suppliedFetch.__keminiFetchInterceptor__.original), /\[native code\]/);
+    await run.send();
+    assert.equal(run.wrapperCalls(), 1, '第三方包装行为仍执行');
+    assert.match(run.calls[0].init.body, /DGA_DATABASE_GUIDE:v1/);
+});
+
+test('数据库联动：备用 about:blank 窗口按宿主基址识别请求，扫描不重复创建 iframe', async () => {
+    const run = databaseLinkHarness();
+    run.sandbox.fetch = function unknownWrapper() { throw new Error('数据库不应调用未知包装'); };
+    let frame;
+    let created = 0;
+    const child = {
+        fetch: run.transport,
+        location: { href: 'about:blank', origin: 'null' },
+        document: { baseURI: 'https://tavern.example/chat', querySelectorAll: () => [] },
+    };
+    run.sandbox.document = {
+        baseURI: 'https://tavern.example/chat',
+        getElementById: () => frame,
+        createElement: () => { created += 1; return { style: {}, setAttribute() {}, contentWindow: child }; },
+        body: { appendChild(value) { frame = value; frame.isConnected = true; } },
+        querySelectorAll: () => frame ? [frame] : [],
+    };
+    run.core.databaseLink.install();
+    run.core.databaseLink.install();
+    assert.equal(created, 1);
+    const init = run.makeInit();
+    function executeSinglePlotTask_ACU() { return callApiWithPlotPreset_ACU(); }
+    function callApiWithPlotPreset_ACU() { return child.fetch('https://tavern.example/api/backends/chat-completions/generate', init); }
+    await executeSinglePlotTask_ACU();
+    assert.equal(run.calls.length, 1);
+    assert.match(run.calls[0].init.body, /DGA_DATABASE_GUIDE:v1/);
+    run.core.databaseLink.dispose();
+    assert.equal(child.fetch, run.transport);
+    assert.equal(frame.isConnected, true, '保留备用浏览上下文，不取消仍在发送的请求');
+});
+
+test('数据库联动：开关切换或停止期间未完成的读取不能继续注入', async () => {
+    for (const stop of ['toggle', 'abort']) {
+        const run = databaseLinkHarness();
+        await new Promise(setImmediate);
+        const get = run.world.helper.getVariables;
+        let release;
+        run.world.helper.getVariables = ({ type }) => type === 'chat'
+            ? new Promise(resolve => { release = () => resolve(get({ type })); }) : get({ type });
+        const controller = new AbortController();
+        const init = run.makeInit({ signal: controller.signal });
+        const pending = run.send(init);
+        while (!release) await new Promise(setImmediate);
+        if (stop === 'toggle') {
+            await run.core.databaseLink.setEnabled(false);
+            await run.core.databaseLink.setEnabled(true);
+        } else controller.abort();
+        release();
+        await pending;
+        assert.equal(run.calls.length, 1);
+        assert.equal(run.calls[0].init, init);
+    }
+});
+
+test('数据库联动：不发送关闭、结束、空白路线，阶段文本保留字面模板符号', async () => {
+    for (const kind of ['off', 'ended', 'empty']) {
+        const run = databaseLinkHarness();
+        await new Promise(setImmediate);
+        const stored = run.world.state.variables.character.$dynamicGuideAssistant.routes.list[0];
+        const state = run.world.state.variables.chat.$dynamicGuideAssistant.routeState.routes[stored.id];
+        if (kind === 'off') stored.off = true;
+        if (kind === 'ended') state.ended = true;
+        if (kind === 'empty') stored.nodes[stored.root].content = '';
+        const init = run.makeInit();
+        await run.send(init);
+        assert.equal(run.calls[0].init, init, kind);
+    }
+    const literal = '$1 / $& / {{user}} / <% throw new Error("不应执行") %>';
+    const run = databaseLinkHarness({ guide: literal });
+    await run.send();
+    assert.ok(JSON.parse(run.calls[0].init.body).messages[0].content.includes(literal));
+});
+
+test('数据库联动：异源请求不追加，替换原生入口后可重装', async () => {
+    const run = databaseLinkHarness();
+    await run.send(run.makeInit(), 'https://other.example/api/backends/chat-completions/generate');
+    run.calls.forEach(call => assert.doesNotMatch(call.init.body, /DGA_DATABASE_GUIDE/));
+    const replacement = nativeFetchDouble((input, init) => {
+        run.calls.push({ input, init });
+        return Promise.resolve({ ok: true });
+    });
+    run.sandbox.fetch = replacement;
+    run.core.databaseLink.install();
+    assert.notEqual(run.sandbox.fetch, replacement);
+    await run.send();
+    assert.match(run.calls[1].init.body, /DGA_DATABASE_GUIDE:v1/);
+    run.core.databaseLink.dispose();
+    assert.equal(run.sandbox.fetch, replacement, '卸载恢复后安装的原生入口，不恢复旧入口');
+});
+
+test('数据库联动：读取超时放行原请求，下一次正常读取仍可注入', async () => {
+    const run = databaseLinkHarness();
+    await new Promise(setImmediate);
+    const get = run.world.helper.getVariables;
+    run.world.helper.getVariables = ({ type }) => type === 'chat' ? new Promise(() => {}) : get({ type });
+    run.sandbox.setTimeout = callback => setTimeout(callback, 10);
+    const init = run.makeInit();
+    await run.send(init);
+    assert.equal(run.calls.length, 1);
+    assert.equal(run.calls[0].init, init);
+    run.world.helper.getVariables = get;
+    await run.send();
+    assert.match(run.calls[1].init.body, /DGA_DATABASE_GUIDE:v1/);
+});
+
+test('数据库联动：其他启用任务无法辨识时，不把未知动态结果误认成推进', async () => {
+    const prompt = '这是一段足够长的固定提示词，但另一动态召回任务也可能渲染出完全相同的正文。';
+    const run = databaseLinkHarness({ prompt, tasks: [
+        { id: 'progress', name: '剧情推进', enabled: true, promptGroup: [{ role: 'user', content: prompt }], extractTags: '<plot>' },
+        { id: 'recall', name: '召回', enabled: true, promptGroup: [{ role: 'user', content: '<%= getDynamicPrompt() %>' }], extractTags: '<recall>' },
+    ] });
+    await run.send();
+    assert.doesNotMatch(run.calls[0].init.body, /DGA_DATABASE_GUIDE/);
+});
+
+test('数据库联动：重载恢复旧代理，卸载不覆盖后来安装的第三方包装', async () => {
+    const run = databaseLinkHarness();
+    const oldProxy = run.sandbox.fetch;
+    vm.runInNewContext(source, run.sandbox, { filename: 'index.js' });
+    const nextCore = run.sandbox.DynamicGuideAssistantCore;
+    assert.notEqual(run.sandbox.fetch, oldProxy);
+    await run.send();
+    assert.equal((run.calls[0].init.body.match(/DGA_DATABASE_GUIDE:v1/g) || []).length, 1);
+    const currentProxy = run.sandbox.fetch;
+    const laterWrapper = function (input, init) { return currentProxy(input, init); };
+    run.sandbox.fetch = laterWrapper;
+    nextCore.databaseLink.dispose();
+    assert.equal(run.sandbox.fetch, laterWrapper);
+    await run.send();
+    assert.doesNotMatch(run.calls[1].init.body, /DGA_DATABASE_GUIDE/);
+});
+
+test('数据库联动：设置页可在数据库未加载时开关待命，不改角色变量', async () => {
+    const documentRef = fakeDocument('<body><div id="extensionsMenu"></div><button id="extensionsMenuButton"></button></body>');
+    const world = routeWorld();
+    const { sandbox, errors } = loadWithDocument(documentRef, world.helper);
+    await touchEntry(documentRef.getElementById('dynamic-guide-assistant-menu-item'));
+    const panel = () => documentRef.getElementById(PANEL_ID);
+    findButton(panel().querySelector('.dga-rail'), '设置').listeners.click[0]();
+    const toggle = () => findAllClass(panel(), 'dga-sw').find(node => node.getAttribute('aria-label') === '剧情推进联动');
+    assert.equal(toggle().getAttribute('aria-checked'), 'false');
+    const before = plain(characterRoot(world));
+    await toggle().listeners.click[0]();
+    assert.equal(toggle().getAttribute('aria-checked'), 'true');
+    assert.equal(sandbox.DynamicGuideAssistantCore.databaseLink.status().reason, '未检测到数据库接口');
+    assert.deepEqual(plain(characterRoot(world)), before);
     assert.deepEqual(errors, []);
 });
