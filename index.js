@@ -28,7 +28,7 @@
     // ---------------------------------------------------------------
 
     const SCRIPT_NAME = '动态指导助手';
-    const VERSION = '4.13.0';
+    const VERSION = '4.13.1';
     const VARIABLE_ROOT = '$dynamicGuideAssistant';
     const INSTANCE_KEY = '__dynamicGuideAssistantInstance';
     const UI_PREFIX = 'dynamic-guide-assistant';
@@ -1765,7 +1765,7 @@
     // 世界书列表里看不到，保存世界书时也不会把这份数据清掉。
     const EXTENSION_SETTINGS_KEY = 'dynamic-guide-assistant';
 
-    // 玩的人自己的偏好：跟着酒馆用户走，不进角色卡，包括报幕和数据库联动。
+    // 玩的人自己的偏好：跟着酒馆用户走，不进角色卡，包括报幕和详细 Debug。
     const USER_PREFS_FIELD = 'prefs';
 
     function readUserPrefs() {
@@ -1803,7 +1803,7 @@
         const epoch = ioCache.epoch;
         const chat = currentChatKey();
         debugRecord('调试', `[${trace}] 开始读取当前快照（不是历史运行记录）`, {
-            version: VERSION, chat, database: databaseLinkStatus(),
+            version: VERSION, chat,
         });
         try {
             const routes = await readRoutes();
@@ -3566,7 +3566,6 @@
                 setRow('给它看几段回复', stepper('最近', judgeHistoryCount(settings), '段', 1, 20, value => save({ judgeHistoryCount: value }))),
                 setRow('回复至少几个字', stepper('', judgeMinChars(settings), '字', 0, JUDGE_MIN_CHARS_MAX, value => save({ judgeMinChars: value }))),
                 setRow('流式输出', switchBtn(settings.streamingEnabled === true, on => save({ streamingEnabled: on }), '流式输出'))),
-                renderDatabaseLinkSection(),
                 setSection(el('h3', { class: 'dga-set-title' }, '报幕', infoTip('announce', [
                     ['是什么', '写路线图的人可以给某几段开「进入时报幕」：剧情走进那一段时，酒馆页面最上面滑下一条横幅，写着这一幕叫什么。'],
                     ['显示报幕', '关掉以后这些横幅都不出来，路线图照常走。只管你自己（换浏览器也一样），不会改角色卡上的设置。'],
@@ -3575,34 +3574,10 @@
                     await writeUserPref('announce', on);
                     return true;
                 }), '显示报幕'))),
+                setSection(el('h3', { class: 'dga-set-title' }, '运行日志'), null,
+                    setRow('详细 Debug', switchBtn(LogModule.isDebugEnabled(), on => runAction('修改调试日志', () => setDebugLogging(on), { refresh: false }), '详细 Debug'))),
                 renderPromptSection(settings)));
         return [header('设置', '', closePanel, '×'), body];
-    }
-
-    function renderDatabaseLinkSection() {
-        const status = databaseLinkStatus();
-        const rows = [
-            setRow('剧情推进联动', switchBtn(status.enabled, on => runAction('修改数据库联动', async () => { await databaseLinkSetEnabled(on); await syncRouteEntriesNow({}); }), '剧情推进联动')),
-            setRow('当前预设', el('span', {}, !status.available ? '未检测到数据库' : (status.presetName && status.presetName !== DATABASE_DEFAULT_PRESET ? status.presetName : '默认召回'))),
-        ];
-        if (status.tasks.length) {
-            const select = el('select', { onchange: event => runAction('选择推进任务', async () => { await databaseLinkSetTask(status.presetName, event.target.value); await syncRouteEntriesNow({}); }) },
-                el('option', { value: '' }, '自动识别明确的推进任务'),
-                ...status.tasks.map(task => el('option', { value: task.id, disabled: !task.eligible }, task.eligible ? task.name : `${task.name}（${task.reason}）`)));
-            select.value = status.configuredTaskId;
-            rows.push(setRow('推进任务', select));
-        }
-        rows.push(setRow('联动状态', el('span', {}, status.reason)));
-        if (status.lastResult) rows.push(setRow('最近一次处理', el('span', {}, status.lastResult)));
-        if (status.injections) rows.push(setRow('本次加载已追加', el('span', {}, `${status.injections} 次 · 最近任务：${status.lastTask}`)));
-        rows.push(setRow('详细 Debug', switchBtn(LogModule.isDebugEnabled(), on => runAction('修改调试日志', () => setDebugLogging(on), { refresh: false }), '详细 Debug')));
-        rows.push(btn('查看联动日志', () => {
-            ui.logTagFilter = '数据库联动'; ui.logLevelFilter = 'all'; ui.logKeyword = '';
-            ui.logPaused = false; ui.logSnapshot = null; ui.logPending = 0;
-            ui.view = 'logs'; render();
-        }, { ghost: true }));
-        rows.push(el('div', { class: 'dga-hint' }, '在各路线图设置里打开「发送到数据库剧情推进」，选择需要联动的路线。默认召回继续使用世界书；识别不到任务时不额外注入。'));
-        return setSection(el('h3', { class: 'dga-set-title' }, '数据库联动'), btn('刷新状态', () => { databaseLinkInstall(); render(); }, { ghost: true }), ...rows);
     }
 
     // ---- 判断提示词：和 API 预设一样，「下拉 ＋ 删除」管一套套提示词，下面编辑选中的那一套 ----
@@ -4791,8 +4766,6 @@
             advance: src.advance === 'off' || src.advance === 'judge' ? src.advance : '',
             // 单独关掉这张路线图（v4.8.4，左栏每行的开关，跟角色卡走）：不发给 AI、不判断、不报幕。
             ...(src.off === true ? { off: true } : {}),
-            // 每张路线图独立选择发送通道；旧路线默认继续走世界书。
-            ...(src.databaseGuide === true ? { databaseGuide: true } : {}),
             // prompt 仅用于旧名称迁移；新引用使用稳定 ID，专用副本随角色携带。
             prompt: oneLine(src.prompt || ''),
             ...(src.promptId ? { promptId: String(src.promptId) } : {}),
@@ -4916,7 +4889,7 @@
             if (folderCode[card.folder]) out.folder = folderCode[card.folder];
             return out;
         });
-        data.settings = { advance: route.advance, extractRules: route.extractRules, excludeRules: route.excludeRules, placement: route.placement, ...(route.databaseGuide === true ? { databaseGuide: true } : {}) };
+        data.settings = { advance: route.advance, extractRules: route.extractRules, excludeRules: route.excludeRules, placement: route.placement };
         return data;
     }
 
@@ -5104,7 +5077,6 @@
             folders,
             placement: settings.placement,
             advance: settings.advance,
-            databaseGuide: settings.databaseGuide,
             extractRules: settings.extractRules,
             excludeRules: settings.excludeRules,
         });
@@ -6069,9 +6041,8 @@
             const state = normalizeRouteState(states[route.id], route);
             const content = composeRoute(route, state);
             // 单独关掉的路线图（v4.8.4）：条目关掉，进度留着，打开接着走。
-            const databaseDelivery = route.databaseGuide === true && databaseLinkStatus().ready;
-            const enabled = !route.off && Boolean(content) && !databaseDelivery;
-            debugRecord('世界书', `[${trace}] 本次准备同步的阶段正文与状态`, { routeId: route.id, routeName: route.name, worldbook: route.worldbookName, state, enabled, delivery: databaseDelivery ? '数据库剧情推进' : '世界书', content });
+            const enabled = !route.off && Boolean(content);
+            debugRecord('世界书', `[${trace}] 本次准备同步的阶段正文与状态`, { routeId: route.id, routeName: route.name, worldbook: route.worldbookName, state, enabled, content });
             let current;
             try {
                 current = await getWorldbook(route.worldbookName);
@@ -7699,21 +7670,6 @@
                 setRow('开新聊天从',
                     rtSelect(routeOrderedNodes(route, route.root, '').map(node => [node.id === route.root ? '' : node.id, node.name]),
                         route.start || '', value => routeSetStart(route, value)))),
-            setSection(el('h3', { class: 'dga-set-title' }, '数据库联动'), null,
-                setRow('发送到数据库剧情推进', switchBtn(route.databaseGuide === true, on => runAction('保存路线图数据库联动', async () => {
-                    const previous = route.databaseGuide;
-                    if (on) route.databaseGuide = true;
-                    else delete route.databaseGuide;
-                    try { await writeRoutes(ui.routes); }
-                    catch (error) {
-                        if (previous === true) route.databaseGuide = true;
-                        else delete route.databaseGuide;
-                        throw error;
-                    }
-                    LogModule.info('数据库联动', `路线图「${route.name}」发送开关已保存：${on ? '数据库剧情推进' : '世界书'}`);
-                    await syncRouteEntriesNow({ routes: ui.routes });
-                }), '发送到数据库剧情推进')),
-                el('div', { class: 'dga-hint' }, '关闭时通过世界书发送。开启后需同时打开全局剧情推进联动；默认召回或全局联动未生效时仍通过世界书。')),
             judging ? setSection(el('h3', { class: 'dga-set-title' }, 'AI 判断', infoTip(`judge-${route.id}`, [
                 ['判断用的 API', '用哪个 AI 来判断。「跟随当前活动API」就是你现在聊天用的那个；也可以在「API」页加一个便宜的，专门用来判断。'],
                 ['判断提示词', '问它的时候发什么话，一般用「默认」。'],
@@ -10233,704 +10189,6 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         menu.appendChild(item);
     }
 
-    // ---------------------------------------------------------------
-    // 数据库剧情推进联动：只在数据库真正发送“剧情推进任务”时，把当前阶段
-    // 追加到那一次请求。数据库本体、数据库预设和正常世界书都不改。
-    // ---------------------------------------------------------------
-
-    const DATABASE_LINK_OWNER_KEY = '__dynamicGuideDatabaseLinkOwner';
-    const DATABASE_LINK_MARKER = '<!-- DGA_DATABASE_GUIDE:v1 -->';
-    const DATABASE_GENERATE_PATH = '/api/backends/chat-completions/generate';
-    const DATABASE_DEFAULT_PRESET = '__ACU_DEFAULT_PRESET__';
-    const DATABASE_PRISTINE_FRAME_ID = 'acu-pristine-fetch-frame';
-    const DATABASE_KNOWN_FETCH_MARKERS = ['__keminiAntiTruncation__', '__keminiFetchInterceptor__'];
-    const databaseLinkRuntime = {
-        slots: [],
-        jsonSlots: [],
-        serializing: false,
-        observedSerializations: 0,
-        serializationInjections: 0,
-        timer: null,
-        attempted: false,
-        injections: 0,
-        lastTask: '',
-        lastReason: '',
-        statusKey: '',
-        observedRequests: 0,
-        disposed: false,
-        revision: 0,
-    };
-
-    function databaseLinkApi() {
-        for (const candidate of windowCandidates) {
-            try {
-                const value = candidate && candidate.AutoCardUpdaterAPI;
-                if (value && typeof value.getCurrentPlotPreset === 'function'
-                    && typeof value.getPlotPresetDetails === 'function') return value;
-            } catch (error) { /* 跨域窗口不可读。 */ }
-        }
-        return null;
-    }
-
-    function databaseLinkPresetSnapshot() {
-        const acu = databaseLinkApi();
-        if (!acu) return { api: null, name: '', preset: null };
-        try {
-            const current = acu.getCurrentPlotPreset();
-            const name = typeof current === 'string' ? current.trim() : '';
-            const preset = name && name !== DATABASE_DEFAULT_PRESET ? acu.getPlotPresetDetails(name) : null;
-            return { api: acu, name, preset: preset && typeof preset === 'object' ? preset : null };
-        } catch (error) {
-            return { api: acu, name: '', preset: null };
-        }
-    }
-
-    function databaseLinkPromptGroup(task, preset) {
-        const group = task && Array.isArray(task.promptGroup) ? task.promptGroup
-            : (preset && Array.isArray(preset.promptGroup) ? preset.promptGroup : []);
-        return group.filter(segment => segment && typeof segment.content === 'string')
-            .map(segment => ({ role: String(segment.role || 'user').toLowerCase(), content: segment.content }));
-    }
-
-    function databaseLinkTasks(preset) {
-        if (!preset || typeof preset !== 'object') return [];
-        const source = Array.isArray(preset.plotTasks) && preset.plotTasks.length
-            ? preset.plotTasks
-            : [{
-                id: 'defaultPlotTask',
-                name: preset.name || '默认任务',
-                enabled: true,
-                promptGroup: preset.promptGroup,
-                extractTags: preset.extractTags,
-                extractInjectTags: preset.extractInjectTags,
-            }];
-        return source.map((raw, index) => {
-            const task = raw && typeof raw === 'object' ? raw : {};
-            const id = String(task.id || task.name || `plotTask${index + 1}`).trim() || `plotTask${index + 1}`;
-            const name = String(task.name || id).trim() || id;
-            const tagText = `${task.extractTags || ''}\n${task.extractInjectTags || ''}`;
-            const excludedTag = /(?:^|[^a-z])(recall|supplement)(?:[^a-z]|$)/i.test(tagText)
-                || /召回|补充|\brecall\b|\bsupplement\b/i.test(name);
-            const promptGroup = databaseLinkPromptGroup(task, preset);
-            let reason = '';
-            if (task.enabled === false) reason = '任务已关闭';
-            else if (excludedTag) reason = '召回或补充任务不联动';
-            else if (!promptGroup.length) reason = '任务没有提示词';
-            else if (!promptGroup.some(segment => databaseLinkSegmentSignature(segment))) reason = '提示词缺少可安全识别的固定内容';
-            return { id, name, enabled: task.enabled !== false, excludedTag, promptGroup, eligible: !reason, reason };
-        });
-    }
-
-    function databaseLinkPrefs() {
-        const prefs = readUserPrefs();
-        return {
-            enabled: prefs.databaseGuideLink === true,
-            tasks: prefs.databaseGuideTasks && typeof prefs.databaseGuideTasks === 'object' && !Array.isArray(prefs.databaseGuideTasks)
-                ? prefs.databaseGuideTasks : {},
-        };
-    }
-
-    function databaseLinkSelection(snapshot) {
-        const tasks = databaseLinkTasks(snapshot.preset);
-        const prefs = databaseLinkPrefs();
-        let selectedTaskId = snapshot.name ? String(prefs.tasks[snapshot.name] || '') : '';
-        if (!selectedTaskId) {
-            const automatic = tasks.filter(task => task.eligible && /剧情推进|剧情规划|推演/.test(task.name));
-            if (automatic.length === 1) selectedTaskId = automatic[0].id;
-        }
-        return { tasks, selectedTaskId, selected: tasks.find(task => task.id === selectedTaskId) || null };
-    }
-
-    function databaseLinkStatus() {
-        const prefs = databaseLinkPrefs();
-        const snapshot = databaseLinkPresetSnapshot();
-        const selection = databaseLinkSelection(snapshot);
-        let reason = '';
-        let ready = false;
-        if (!prefs.enabled) reason = '联动未开启';
-        else if (!snapshot.api) reason = '未检测到数据库接口';
-        else if (!snapshot.name || snapshot.name === DATABASE_DEFAULT_PRESET) reason = '默认召回模式不联动';
-        else if (!snapshot.preset) reason = '当前数据库预设不可读取';
-        else if (!selection.tasks.length) reason = '当前预设没有任务';
-        else if (!selection.selectedTaskId) reason = '请选择一个剧情推进任务';
-        else if (!selection.selected || !selection.selected.eligible) reason = (selection.selected && selection.selected.reason) || '所选任务不可联动';
-        else if (databaseLinkMatchedTask(selection.tasks, selection.selected.promptGroup)?.id !== selection.selected.id) reason = '任务提示词无法唯一识别，保持世界书模式';
-        else if (!databaseLinkRuntime.slots.length && !databaseLinkRuntime.jsonSlots.length) reason = '尚未找到可用请求入口';
-        else { reason = `等待任务「${selection.selected.name}」的推进请求`; ready = true; }
-        return {
-            ready,
-            enabled: prefs.enabled,
-            available: Boolean(snapshot.api),
-            presetName: snapshot.name,
-            tasks: selection.tasks.map(task => ({ id: task.id, name: task.name, eligible: task.eligible, reason: task.reason })),
-            selectedTaskId: selection.selectedTaskId,
-            configuredTaskId: String(prefs.tasks[snapshot.name] || ''),
-            reason,
-            installed: databaseLinkRuntime.slots.length + databaseLinkRuntime.jsonSlots.length > 0,
-            fetchEntrances: databaseLinkRuntime.slots.length,
-            serializationEntrances: databaseLinkRuntime.jsonSlots.length,
-            injections: databaseLinkRuntime.injections,
-            lastTask: databaseLinkRuntime.lastTask,
-            lastResult: databaseLinkRuntime.lastReason,
-            observedRequests: databaseLinkRuntime.observedRequests,
-            observedSerializations: databaseLinkRuntime.observedSerializations,
-            serializationInjections: databaseLinkRuntime.serializationInjections,
-        };
-    }
-
-    function databaseLinkReportStatus() {
-        const status = databaseLinkStatus();
-        const key = JSON.stringify([status.enabled, status.available, status.presetName, status.selectedTaskId, status.reason, status.fetchEntrances, status.serializationEntrances]);
-        if (key !== databaseLinkRuntime.statusKey) {
-            databaseLinkRuntime.statusKey = key;
-            LogModule.info('数据库联动', `状态变化：${status.reason}；已挂接 ${status.fetchEntrances} 个 fetch 入口、${status.serializationEntrances} 个请求组装入口`);
-            debugRecord('数据库联动', '当前预设与任务识别结果（状态快照）', status);
-        }
-        return status;
-    }
-
-    // EJS 会执行任意动态代码，无法从发送后的正文反推原任务，遇到它就保守放弃该段。
-    // 数据库已知的 $数字 和 {{...}} 替换则切成固定片段，按顺序、首尾锚定匹配。
-    function databaseLinkSegmentSignature(segment) {
-        const content = String(segment && segment.content || '');
-        if (!content || /<%[=-]?|%>/.test(content)) return null;
-        const parts = content.split(/(\$\d+|\{\{[^{}]+\}\})/g);
-        const fixed = parts.filter((_, index) => index % 2 === 0);
-        const fixedLength = fixed.reduce((sum, value) => sum + value.trim().length, 0);
-        if (fixedLength < 24) return null;
-        return { role: String(segment.role || 'user').toLowerCase(), fixed, fixedLength };
-    }
-
-    function databaseLinkSignatureMatches(signature, content) {
-        const parts = signature.fixed;
-        if (parts.length === 1) return content === parts[0];
-        if (!content.startsWith(parts[0]) || !content.endsWith(parts[parts.length - 1])) return false;
-        let at = parts[0].length;
-        const end = content.length - parts[parts.length - 1].length;
-        for (let index = 1; index < parts.length - 1; index += 1) {
-            if (!parts[index]) continue;
-            const found = content.indexOf(parts[index], at);
-            if (found < 0 || found + parts[index].length > end) return false;
-            at = found + parts[index].length;
-        }
-        return at <= end;
-    }
-
-    function databaseLinkTaskMatches(task, messages) {
-        if (!task || !Array.isArray(messages)) return false;
-        const signatures = task.promptGroup.map(databaseLinkSegmentSignature).filter(Boolean);
-        if (!signatures.length) return false;
-        let at = 0;
-        for (const signature of signatures) {
-            let found = false;
-            while (at < messages.length) {
-                const message = messages[at++];
-                if (message && String(message.role || '').toLowerCase() === signature.role
-                    && typeof message.content === 'string' && databaseLinkSignatureMatches(signature, message.content)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        return true;
-    }
-
-    function databaseLinkMatchedTask(tasks, messages) {
-        const active = tasks.filter(task => task.enabled !== false);
-        // 未知动态任务可能生成相同正文，不能将“无法识别”当成“肯定不是它”。
-        if (active.some(task => !task.promptGroup.some(databaseLinkSegmentSignature))) return null;
-        const matches = active.filter(task => databaseLinkTaskMatches(task, messages));
-        return matches.length === 1 ? matches[0] : null;
-    }
-
-    function databaseLinkStackMatches(stack) {
-        const lines = String(stack || '').split(/\r?\n/);
-        const hasFrame = name => lines.some(line => new RegExp(`(?:^|\\s|@)${name}(?:\\s|@|\\()`).test(line));
-        return hasFrame('callApiWithPlotPreset_ACU') && hasFrame('executeSinglePlotTask_ACU');
-    }
-
-    function databaseLinkUrlMatches(input, slotWindow) {
-        try {
-            const raw = typeof input === 'string' ? input : (input && typeof input.url === 'string' ? input.url : '');
-            if (!raw) return false;
-            const base = slotWindow && slotWindow.document && slotWindow.document.baseURI
-                ? slotWindow.document.baseURI
-                : (slotWindow && slotWindow.location && slotWindow.location.href
-                    ? slotWindow.location.href : (currentWindow.location && currentWindow.location.href));
-            const parsed = new URL(raw, base);
-            // about:blank iframe 的 location.origin 为 "null"，文档基址继承宿主来源。
-            const origin = new URL(base).origin;
-            return parsed.origin === origin && parsed.pathname === DATABASE_GENERATE_PATH;
-        } catch (error) {
-            return false;
-        }
-    }
-
-    function databaseLinkInspectRequest(input, init, slotWindow, stack) {
-        if (!databaseLinkUrlMatches(input, slotWindow)) return null;
-        const trace = nextTraceId('DB');
-        databaseLinkRuntime.observedRequests += 1;
-        const fromDatabase = databaseLinkStackMatches(stack);
-        debugRecord('数据库联动', `[${trace}] 捕获生成端点调用`, { method: init && init.method || 'GET', databaseStackMatched: fromDatabase });
-        const skip = reason => {
-            if (fromDatabase) databaseLinkRuntime.lastReason = reason;
-            debugRecord('数据库联动', `[${trace}] 跳过：${reason}`);
-            return null;
-        };
-        if (!fromDatabase) return skip('调用栈未同时包含数据库推进的两个函数，无法确认来源，保持原样');
-        if (!init || String(init.method || 'GET').toUpperCase() !== 'POST') return skip('不是带独立参数的 POST 请求');
-        if (typeof init.body !== 'string') return skip('请求体不是可读取的字符串');
-        if (init.body.includes(DATABASE_LINK_MARKER)) return skip('已有指导标记，不重复追加');
-        try {
-            const payload = JSON.parse(init.body);
-            return databaseLinkInspectPayload(payload, trace, skip);
-        } catch (error) {
-            LogModule.warn('数据库联动', `[${trace}] 解析请求或检查预设失败，保持原请求`, error);
-            return skip('解析请求或检查预设失败');
-        }
-    }
-
-    function databaseLinkInspectPayload(payload, trace, skip) {
-        if (!payload || !Array.isArray(payload.messages)) return skip('请求体没有 messages 数组');
-        const snapshot = databaseLinkPresetSnapshot();
-        debugRecord('数据库联动', `[${trace}] 注入前的原始 messages（实际捕获）`, payload.messages);
-        if (!snapshot.api) return skip('未检测到数据库接口');
-        if (!snapshot.name || snapshot.name === DATABASE_DEFAULT_PRESET) return skip('默认召回模式不联动，继续使用世界书');
-        if (!snapshot.preset) return skip('当前预设不可读取');
-        const selection = databaseLinkSelection(snapshot);
-        debugRecord('数据库联动', `[${trace}] 实际预设与任务检查`, {
-            preset: snapshot.name, selectedTaskId: selection.selectedTaskId,
-            tasks: selection.tasks.map(task => ({ id: task.id, name: task.name, eligible: task.eligible, reason: task.reason, promptMatched: databaseLinkTaskMatches(task, payload.messages) })),
-        });
-        if (!selection.selected) return skip('尚未选定可识别的推进任务');
-        if (!selection.selected.eligible) return skip(selection.selected.reason || '所选任务不可联动');
-        const matched = databaseLinkMatchedTask(selection.tasks, payload.messages);
-        if (!matched || matched.id !== selection.selected.id) {
-            return skip(matched ? `其他任务「${matched.name}」保持原样` : '没有唯一匹配的推进任务，保持世界书模式');
-        }
-        debugRecord('数据库联动', `[${trace}] 唯一匹配选定任务「${matched.name}」，开始读取阶段`);
-        return { payload, snapshot, selection, matched, trace };
-    }
-
-    async function databaseLinkReadGuide(trace) {
-        // 这里只读取两份变量，不占用共享世界书缓存；超时的读取不能让缓存一直处于打开状态。
-        const routes = await readRoutes();
-        const states = await readRouteStates();
-        return databaseLinkComposeGuide(routes, states, trace);
-    }
-
-    function databaseLinkComposeGuide(routes, states, trace) {
-        return routes.filter(Boolean).map(route => {
-            if (route.databaseGuide !== true) {
-                debugRecord('数据库联动', `[${trace}] 跳过路线「${route.name}」：发送到数据库剧情推进开关未开启，继续使用世界书`);
-                return '';
-            }
-            const state = normalizeRouteState(states[route.id], route);
-            if (route.off || state.ended) {
-                debugRecord('数据库联动', `[${trace}] 跳过路线「${route.name}」：${route.off ? '路线已关闭' : '路线已结束'}`);
-                return '';
-            }
-            const content = composeRoute(route, state).trim();
-            debugRecord('数据库联动', `[${trace}] 实际读取的当前阶段内容`, { routeId: route.id, routeName: route.name, state, content });
-            return content;
-        }).filter(Boolean).join('\n\n');
-    }
-
-    function databaseLinkSyncValue(value, label) {
-        if (value && typeof value.then === 'function') {
-            // 同步边界不能等待异步接口，也不能留下未处理的 rejection。
-            Promise.resolve(value).catch(() => {});
-            throw new Error(`${label}返回 Promise，请求组装阶段无法同步读取`);
-        }
-        return value;
-    }
-
-    function databaseLinkScopeSync() {
-        const get = api('getCharData', false);
-        if (get) return characterScopeId(databaseLinkSyncValue(get('current'), '角色接口'));
-        const context = sillyTavernContext();
-        return characterScopeId(context && Array.isArray(context.characters) ? context.characters[context.characterId] : null);
-    }
-
-    function databaseLinkReadGuideSync(trace) {
-        const get = api('getVariables', true);
-        const read = type => {
-            const value = databaseLinkSyncValue(get({ type }), `${type} 变量接口`);
-            if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${type} 变量不可读取`);
-            return value[VARIABLE_ROOT] || {};
-        };
-        const character = read('character');
-        const chat = read('chat');
-        const routes = character.routes && Array.isArray(character.routes.list) ? character.routes.list.map(normalizeRoute) : [];
-        const states = chat.routeState && chat.routeState.routes && typeof chat.routeState.routes === 'object' ? chat.routeState.routes : {};
-        return databaseLinkComposeGuide(routes, states, trace);
-    }
-
-    // 数据库可能临时取走隐藏 iframe 的原生 fetch。它在自己的 realm 里组装请求体，
-    // 所以另挂同步序列化入口；不修改数据库代码、预设或变量，也不依赖宿主生成事件。
-    function databaseLinkSerialize(target, thisArg, args) {
-        if (databaseLinkRuntime.serializing || databaseLinkRuntime.disposed || !isCurrentInstance()) return Reflect.apply(target, thisArg, args);
-        const value = args[0];
-        // 仅看数据属性，不额外执行调用方的 getter/toJSON；普通序列化保持原生行为。
-        let descriptor;
-        try { descriptor = value && typeof value === 'object' ? Object.getOwnPropertyDescriptor(value, 'messages') : null; }
-        catch (error) { return Reflect.apply(target, thisArg, args); }
-        if (!descriptor || !Array.isArray(descriptor.value) || !databaseLinkPrefs().enabled
-            || !databaseLinkStackMatches(new Error().stack)) return Reflect.apply(target, thisArg, args);
-        databaseLinkRuntime.serializing = true;
-        try {
-            // 先原样执行一次，保留原生异常及 replacer/toJSON 的行为；只处理其真实输出。
-            const original = Reflect.apply(target, thisArg, args);
-            const trace = nextTraceId('DBJSON');
-            databaseLinkRuntime.observedSerializations += 1;
-            debugRecord('数据库联动', `[${trace}] 捕获数据库推进请求组装（JSON.stringify），尚未观察网络发送`);
-            const skip = reason => {
-                databaseLinkRuntime.lastReason = reason;
-                debugRecord('数据库联动', `[${trace}] 请求组装未追加：${reason}`);
-                return original;
-            };
-            try {
-                if (args[1] != null) return skip('自定义 replacer 无法保证改写语义，保持原样');
-                if (typeof original !== 'string') return skip('序列化结果不是字符串');
-                if (original.includes(DATABASE_LINK_MARKER)) return skip('已有指导标记，不重复追加');
-                const inspected = databaseLinkInspectPayload(JSON.parse(original), trace, reason => { skip(reason); return null; });
-                if (!inspected) return original;
-                const epoch = ioCache.epoch;
-                const revision = databaseLinkRuntime.revision;
-                const chat = currentChatKey();
-                const scope = databaseLinkScopeSync();
-                if (!chat || !scope) return skip('无法同步确认当前聊天和角色身份');
-                const guide = databaseLinkReadGuideSync(trace);
-                if (!guide) return skip('当前阶段正文为空，保持世界书模式');
-                const now = databaseLinkPresetSnapshot();
-                const selection = databaseLinkSelection(now);
-                if (ioCache.epoch !== epoch || revision !== databaseLinkRuntime.revision
-                    || !isCurrentInstance() || databaseLinkRuntime.disposed || !databaseLinkPrefs().enabled
-                    || currentChatKey() !== chat || databaseLinkScopeSync() !== scope
-                    || now.api !== inspected.snapshot.api || now.name !== inspected.snapshot.name
-                    || !selection.selected || !selection.selected.eligible
-                    || selection.selectedTaskId !== inspected.selection.selectedTaskId
-                    || JSON.stringify(selection.tasks) !== JSON.stringify(inspected.selection.tasks)) {
-                    return skip('同步读取期间聊天、角色、联动设置或任务发生变化');
-                }
-                const rewritten = databaseLinkAppend(inspected.payload, guide);
-                const body = Reflect.apply(target, thisArg, [rewritten, null, args[2]]);
-                const actual = JSON.parse(body);
-                if (!actual.messages.some(message => typeof message?.content === 'string' && message.content.includes(DATABASE_LINK_MARKER))) {
-                    return skip('序列化结果没有指导标记，保持原样');
-                }
-                databaseLinkRuntime.injections += 1;
-                databaseLinkRuntime.serializationInjections += 1;
-                databaseLinkRuntime.lastTask = inspected.matched.name;
-                databaseLinkRuntime.lastReason = '请求组装已追加阶段指导；此入口不能确认网络发送或 HTTP 结果';
-                LogModule.info('数据库联动', `[${trace}] 已向任务「${inspected.matched.name}」的请求组装结果追加 ${guide.length} 字阶段指导；尚未确认网络发送或 HTTP 结果`);
-                debugRecord('数据库联动', `[${trace}] 本次追加的阶段指导全文`, { guide });
-                debugRecord('数据库联动', `[${trace}] 请求组装后实际返回的 messages 全文（不是 HTTP 回执）`, actual.messages);
-                return body;
-            } catch (error) {
-                LogModule.warn('数据库联动', `[${trace}] 请求组装保持原样：${error && error.message || String(error)}`);
-                return skip(error && error.message || '同步读取或组装指导失败');
-            }
-        } finally {
-            databaseLinkRuntime.serializing = false;
-        }
-    }
-
-    function databaseLinkWithTimeout(work, milliseconds) {
-        const set = currentWindow && typeof currentWindow.setTimeout === 'function' ? currentWindow.setTimeout.bind(currentWindow) : null;
-        const clear = currentWindow && typeof currentWindow.clearTimeout === 'function' ? currentWindow.clearTimeout.bind(currentWindow) : null;
-        if (!set) return Promise.resolve().then(work);
-        let timer = null;
-        return Promise.race([
-            Promise.resolve().then(work),
-            new Promise((_, reject) => { timer = set(() => reject(new Error('读取阶段指导超时')), milliseconds); }),
-        ]).finally(() => { if (timer != null && clear) clear(timer); });
-    }
-
-    function databaseLinkAppend(payload, guide) {
-        const messages = payload.messages.map(message => message && typeof message === 'object' ? { ...message } : message);
-        let userIndex = -1;
-        for (let index = messages.length - 1; index >= 0; index -= 1) {
-            if (messages[index] && String(messages[index].role || '').toLowerCase() === 'user'
-                && typeof messages[index].content === 'string') {
-                userIndex = index;
-                break;
-            }
-        }
-        const block = `${DATABASE_LINK_MARKER}\n<动态指导助手阶段指引>\n${guide}\n</动态指导助手阶段指引>\n请依据当前阶段规划剧情推进，不要提前跳到后续阶段，并严格保留原任务要求的输出格式。`;
-        if (userIndex >= 0) messages[userIndex] = { ...messages[userIndex], content: `${messages[userIndex].content}\n\n${block}` };
-        else messages.push({ role: 'user', content: block });
-        return { ...payload, messages };
-    }
-
-    async function databaseLinkRewrite(inspected, init) {
-        const epoch = ioCache.epoch;
-        const revision = databaseLinkRuntime.revision;
-        const trace = inspected.trace;
-        const skip = reason => {
-            databaseLinkRuntime.lastReason = reason;
-            debugRecord('数据库联动', `[${trace}] 本次未追加：${reason}`);
-            return init;
-        };
-        try {
-            if (!databaseLinkPrefs().enabled || !isCurrentInstance() || databaseLinkRuntime.disposed || init.signal?.aborted) return skip('读取前联动已关闭、实例失效或请求已取消');
-            const chat = currentChatKey();
-            const prepared = await databaseLinkWithTimeout(async () => {
-                const scope = await currentScopeId();
-                const guide = await databaseLinkReadGuide(trace);
-                return { scope, guide, currentScope: await currentScopeId() };
-            }, 1800);
-            const { scope, guide, currentScope } = prepared;
-            const now = databaseLinkPresetSnapshot();
-            const currentSelection = databaseLinkSelection(now);
-            if (!guide) return skip('当前阶段正文为空，保持世界书模式');
-            if (!scope) return skip('无法读取角色身份，保持原请求');
-            if (ioCache.epoch !== epoch || !isCurrentInstance() || databaseLinkRuntime.disposed
-                || revision !== databaseLinkRuntime.revision || init.signal?.aborted
-                || !databaseLinkPrefs().enabled || currentScope !== scope || currentChatKey() !== chat
-                || now.name !== inspected.snapshot.name || currentSelection.selectedTaskId !== inspected.selection.selectedTaskId
-                || !currentSelection.selected || !currentSelection.selected.eligible
-                || JSON.stringify(currentSelection.selected.promptGroup) !== JSON.stringify(inspected.selection.selected.promptGroup)) {
-                debugRecord('数据库联动', `[${trace}] 读取后的状态核对未通过`, {
-                    chatChanged: currentChatKey() !== chat, scopeChanged: currentScope !== scope, epochChanged: ioCache.epoch !== epoch,
-                    revisionChanged: revision !== databaseLinkRuntime.revision, aborted: Boolean(init.signal?.aborted),
-                    enabled: databaseLinkPrefs().enabled, currentInstance: isCurrentInstance(), disposed: databaseLinkRuntime.disposed,
-                    previousPreset: inspected.snapshot.name, currentPreset: now.name,
-                    previousTask: inspected.selection.selectedTaskId, currentTask: currentSelection.selectedTaskId,
-                });
-                return skip('读取期间聊天、联动设置、任务或请求状态发生变化');
-            }
-            const rewritten = databaseLinkAppend(inspected.payload, guide);
-            const body = JSON.stringify(rewritten);
-            databaseLinkRuntime.injections += 1;
-            databaseLinkRuntime.lastTask = inspected.matched.name;
-            databaseLinkRuntime.lastReason = '请求内容已追加，等待调用 fetch';
-            LogModule.info('数据库联动', `[${trace}] 已向任务「${inspected.matched.name}」的请求内容追加 ${guide.length} 字阶段指导，尚未确认 HTTP 结果`);
-            debugRecord('数据库联动', `[${trace}] 本次追加的阶段指导全文`, { guide });
-            return { ...init, body };
-        } catch (error) {
-            databaseLinkRuntime.lastReason = error && error.message ? error.message : '读取阶段指导失败';
-            LogModule.warn('数据库联动', `[${trace}] 本次未注入：${databaseLinkRuntime.lastReason}`);
-            return init;
-        }
-    }
-
-    async function databaseLinkSend(target, thisArg, args, inspected, originalInit, nextInit) {
-        const trace = inspected.trace;
-        const appended = nextInit !== originalInit;
-        const started = Date.now();
-        // 这里读取的就是下一行传给原生 fetch 的正文，不重新生成提示词。
-        if (LogModule.isDebugEnabled()) {
-            try { debugRecord('数据库联动', `[${trace}] 准备调用 fetch：实际提交的 messages 全文`, JSON.parse(nextInit.body).messages); }
-            catch (error) { debugRecord('数据库联动', `[${trace}] 提交前 messages 无法解析，保留原参数`); }
-        }
-        try {
-            const pending = Reflect.apply(target, thisArg, [args[0], nextInit, ...args.slice(2)]);
-            debugRecord('数据库联动', `[${trace}] 已调用原生 fetch，等待响应`, { task: inspected.matched.name, appended });
-            const response = await pending;
-            const hasStatus = response && Number.isFinite(response.status);
-            const statusText = hasStatus ? `HTTP ${response.status}` : '没有可读取的 HTTP 状态';
-            LogModule[response && response.ok === false ? 'warn' : 'info']('数据库联动', `[${trace}] 任务「${inspected.matched.name}」fetch 已返回：${statusText}；${appended ? '请求含阶段指导' : '请求未追加指导'}；耗时 ${Date.now() - started} ms`);
-            if (appended) databaseLinkRuntime.lastReason = `请求已追加；fetch 已返回：${statusText}`;
-            return response;
-        } catch (error) {
-            LogModule.warn('数据库联动', `[${trace}] 任务「${inspected.matched.name}」fetch 失败：${error && error.message || String(error)}`);
-            if (appended) databaseLinkRuntime.lastReason = '请求已追加，但 fetch 失败';
-            throw error;
-        }
-    }
-
-    function databaseLinkIsNativeFetch(candidate) {
-        if (typeof candidate !== 'function') return false;
-        try {
-            return candidate.name === 'fetch' && /\{\s*\[native code\]\s*\}\s*$/.test(Function.prototype.toString.call(candidate));
-        } catch (error) {
-            return false;
-        }
-    }
-
-    function databaseLinkNativeSlot(object, key) {
-        let holder = object;
-        let property = key;
-        const seen = new Set();
-        for (let depth = 0; depth < 16; depth += 1) {
-            let candidate;
-            try { candidate = holder && holder[property]; } catch (error) { return null; }
-            if (typeof candidate !== 'function' || seen.has(candidate)) return null;
-            seen.add(candidate);
-            let next = null;
-            for (const marker of DATABASE_KNOWN_FETCH_MARKERS) {
-                try {
-                    const slot = candidate[marker];
-                    if (slot && typeof slot === 'object' && typeof slot.original === 'function') {
-                        next = { object: slot, key: 'original' };
-                        break;
-                    }
-                } catch (error) { /* 继续看下一个标记。 */ }
-            }
-            if (!next) return databaseLinkIsNativeFetch(candidate) ? { object: holder, key: property, original: candidate } : null;
-            holder = next.object;
-            property = next.key;
-        }
-        return null;
-    }
-
-    function databaseLinkWindows() {
-        const found = [];
-        const queue = windowCandidates.slice();
-        while (queue.length && found.length < 32) {
-            const candidate = queue.shift();
-            if (!candidate || found.includes(candidate)) continue;
-            found.push(candidate);
-            try {
-                const frames = candidate.document && typeof candidate.document.querySelectorAll === 'function'
-                    ? Array.from(candidate.document.querySelectorAll('iframe')).slice(0, 24) : [];
-                frames.forEach(frame => { try { if (frame.contentWindow) queue.push(frame.contentWindow); } catch (error) {} });
-            } catch (error) { /* 跨域或未就绪。 */ }
-        }
-        return found;
-    }
-
-    // 数据库会在第一次直发时同步创建这个 iframe 并立刻取走它的 fetch。联动开启后
-    // 由助手先建立同名同源 iframe，数据库随后会直接复用，第一轮请求也能经过代理。
-    function databaseLinkEnsurePristineFrames() {
-        windowCandidates.forEach(candidate => {
-            try {
-                if (databaseLinkNativeSlot(candidate, 'fetch')) return;
-                const doc = candidate && candidate.document;
-                if (!doc || typeof doc.createElement !== 'function' || typeof doc.getElementById !== 'function') return;
-                let frame = doc.getElementById(DATABASE_PRISTINE_FRAME_ID);
-                if (frame && frame.isConnected && frame.contentWindow) return;
-                if (frame && typeof frame.remove === 'function') frame.remove();
-                frame = doc.createElement('iframe');
-                frame.id = DATABASE_PRISTINE_FRAME_ID;
-                frame.setAttribute('aria-hidden', 'true');
-                frame.tabIndex = -1;
-                frame.style.cssText = 'display:none !important;width:0;height:0;border:0;position:absolute;';
-                const parent = doc.body || doc.documentElement;
-                if (parent && typeof parent.appendChild === 'function') parent.appendChild(frame);
-            } catch (error) { /* 文档未就绪或跨域时等下一轮发现。 */ }
-        });
-    }
-
-    function databaseLinkInstall() {
-        if (databaseLinkRuntime.disposed || !isCurrentInstance()) return databaseLinkStatus();
-        if (!databaseLinkPrefs().enabled) return databaseLinkStatus();
-        databaseLinkRuntime.attempted = true;
-        databaseLinkEnsurePristineFrames();
-        databaseLinkRuntime.slots = databaseLinkRuntime.slots.filter(slot => {
-            try { return slot.object[slot.key] === slot.proxy; } catch (error) { return false; }
-        });
-        databaseLinkRuntime.jsonSlots = databaseLinkRuntime.jsonSlots.filter(slot => {
-            try { return slot.object[slot.key] === slot.proxy; } catch (error) { return false; }
-        });
-        for (const candidate of databaseLinkWindows()) {
-            try {
-                const object = candidate.JSON;
-                if (object && typeof object.stringify === 'function' && !databaseLinkRuntime.jsonSlots.some(item => item.object === object)) {
-                    const original = object.stringify;
-                    const proxy = new Proxy(original, { apply: databaseLinkSerialize });
-                    object.stringify = proxy;
-                    if (object.stringify === proxy) databaseLinkRuntime.jsonSlots.push({ object, key: 'stringify', original, proxy });
-                }
-            } catch (error) { /* 跨域或只读入口等下次发现，其余入口继续工作。 */ }
-            const slot = databaseLinkNativeSlot(candidate, 'fetch');
-            if (!slot || databaseLinkRuntime.slots.some(item => item.object === slot.object && item.key === slot.key)) continue;
-            const ownerWindow = candidate;
-            const proxy = new Proxy(slot.original, {
-                apply(target, thisArg, args) {
-                    if (databaseLinkRuntime.disposed || !isCurrentInstance() || !databaseLinkPrefs().enabled) {
-                        return Reflect.apply(target, thisArg, args);
-                    }
-                    const input = args[0];
-                    const init = args[1];
-                    const inspected = databaseLinkInspectRequest(input, init, ownerWindow, new Error().stack);
-                    if (!inspected) return Reflect.apply(target, thisArg, args);
-                    return databaseLinkRewrite(inspected, init).then(nextInit => databaseLinkSend(target, thisArg, args, inspected, init, nextInit));
-                },
-            });
-            try {
-                slot.object[slot.key] = proxy;
-                if (slot.object[slot.key] === proxy) databaseLinkRuntime.slots.push({ ...slot, proxy });
-            } catch (error) { /* 只读槽无法安装，继续找其它窗口。 */ }
-        }
-        if (!databaseLinkRuntime.timer && currentWindow && typeof currentWindow.setInterval === 'function') {
-            let previousReady = databaseLinkStatus().ready;
-            databaseLinkRuntime.timer = currentWindow.setInterval(() => {
-                if (!isCurrentInstance() || databaseLinkRuntime.disposed) return;
-                const status = databaseLinkInstall();
-                if (status.ready !== previousReady) {
-                    previousReady = status.ready;
-                    runEventTask('数据库模式变化后同步路线发送通道', async () => {
-                        const routes = await readRoutes();
-                        if (routes.some(route => route.databaseGuide === true)) await syncRouteEntriesNow({});
-                    });
-                }
-            }, 5000);
-        }
-        return databaseLinkReportStatus();
-    }
-
-    function databaseLinkDispose() {
-        if (databaseLinkRuntime.disposed) return;
-        const allSlots = [...databaseLinkRuntime.slots, ...databaseLinkRuntime.jsonSlots];
-        const slotCount = allSlots.length;
-        let restored = 0;
-        let replaced = 0;
-        let failed = 0;
-        databaseLinkRuntime.disposed = true;
-        databaseLinkRuntime.revision += 1;
-        allSlots.forEach(slot => {
-            try {
-                if (slot.object[slot.key] !== slot.proxy) { replaced += 1; return; }
-                slot.object[slot.key] = slot.original;
-                if (slot.object[slot.key] === slot.original) restored += 1;
-                else failed += 1;
-            } catch (error) { failed += 1; }
-        });
-        databaseLinkRuntime.slots = [];
-        databaseLinkRuntime.jsonSlots = [];
-        if (databaseLinkRuntime.timer != null && currentWindow && typeof currentWindow.clearInterval === 'function') {
-            currentWindow.clearInterval(databaseLinkRuntime.timer);
-        }
-        databaseLinkRuntime.timer = null;
-        databaseLinkRuntime.statusKey = '';
-        LogModule[failed ? 'warn' : 'info']('数据库联动', `联动停止：尝试释放 ${slotCount} 个入口，已恢复 ${restored}，已被其他代码替换 ${replaced}，恢复失败 ${failed}`);
-        try {
-            const owner = instanceWindow[DATABASE_LINK_OWNER_KEY];
-            if (owner && owner.token === instanceToken) delete instanceWindow[DATABASE_LINK_OWNER_KEY];
-        } catch (error) {}
-    }
-
-    async function databaseLinkSetEnabled(on) {
-        databaseLinkRuntime.lastReason = '';
-        if (!on) databaseLinkDispose();
-        await writeUserPref('databaseGuideLink', Boolean(on));
-        LogModule.info('数据库联动', on ? '联动开关已开启' : '联动开关已关闭，继续使用世界书模式');
-        if (on) {
-            databaseLinkRuntime.disposed = false;
-            try { instanceWindow[DATABASE_LINK_OWNER_KEY] = { token: instanceToken, dispose: databaseLinkDispose }; } catch (error) {}
-            databaseLinkInstall();
-        }
-        return databaseLinkStatus();
-    }
-
-    async function databaseLinkSetTask(presetName, taskId) {
-        databaseLinkRuntime.revision += 1;
-        databaseLinkRuntime.lastReason = '';
-        const name = String(presetName || '').trim();
-        const tasks = { ...databaseLinkPrefs().tasks };
-        if (name) {
-            const id = String(taskId || '').trim();
-            if (id) tasks[name] = id;
-            else delete tasks[name];
-        }
-        await writeUserPref('databaseGuideTasks', tasks);
-        LogModule.info('数据库联动', `推进任务选择已保存：预设「${name}」，${tasks[name] ? `任务 ID「${tasks[name]}」` : '自动识别'}`);
-        return databaseLinkReportStatus();
-    }
-
     function runEventTask(label, task) {
         if (!isCurrentInstance()) { debugRecord('事件', `${label}：实例已失效，未执行`); return Promise.resolve(); }
         const trace = nextTraceId('EVT');
@@ -10991,17 +10249,6 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
         openManager,
         refresh: () => runAction('刷新', async () => {}),
         sync: () => syncMirrors('normal'),
-        databaseLink: {
-            status: databaseLinkStatus,
-            setEnabled: databaseLinkSetEnabled,
-            setTask: databaseLinkSetTask,
-            install: databaseLinkInstall,
-            dispose: databaseLinkDispose,
-            taskMatches: databaseLinkTaskMatches,
-            segmentSignature: databaseLinkSegmentSignature,
-            inspectRequest: databaseLinkInspectRequest,
-            append: databaseLinkAppend,
-        },
         // 路线图（v4.0）：纯函数和存取，给测试和预览壳用。
         routes: {
             makeRoute,
@@ -11063,22 +10310,20 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     debugRecord('系统', '启动时实际检测到的接口', {
         helper: Boolean(helper), eventOn: Boolean(api('eventOn', false)),
         getVariables: Boolean(api('getVariables', false)), updateVariablesWith: Boolean(api('updateVariablesWith', false)),
-        generateRaw: Boolean(api('generateRaw', false)), database: Boolean(databaseLinkApi()),
+        generateRaw: Boolean(api('generateRaw', false)),
     });
 
-    // 热重载先归还旧实例占用的 fetch 槽；旧实例只会恢复仍由它自己占用的槽。
+    // 从带数据库拦截的旧版热重载时，先请旧实例归还它的请求入口。
     try {
-        const previousOwner = instanceWindow[DATABASE_LINK_OWNER_KEY];
-        if (previousOwner && previousOwner.token !== instanceToken && typeof previousOwner.dispose === 'function') previousOwner.dispose();
-        instanceWindow[DATABASE_LINK_OWNER_KEY] = { token: instanceToken, dispose: databaseLinkDispose };
-    } catch (error) {}
-    if (databaseLinkPrefs().enabled) databaseLinkInstall();
-    else LogModule.info('数据库联动', '启动检查：联动未开启，继续使用世界书模式');
-    try {
-        if (currentWindow && typeof currentWindow.addEventListener === 'function') {
-            currentWindow.addEventListener('pagehide', databaseLinkDispose, { once: true });
+        const oldOwner = instanceWindow.__dynamicGuideDatabaseLinkOwner;
+        if (oldOwner && typeof oldOwner.dispose === 'function') {
+            oldOwner.dispose();
+            LogModule.info('升级', '已调用旧版请求拦截入口的清理函数');
         }
-    } catch (error) {}
+        if (instanceWindow.__dynamicGuideDatabaseLinkOwner === oldOwner) delete instanceWindow.__dynamicGuideDatabaseLinkOwner;
+    } catch (error) {
+        LogModule.warn('升级', `旧版请求拦截入口清理失败：${error.message || String(error)}`);
+    }
 
     if (!helper) {
         LogModule.warn('系统', '未检测到酒馆助手；只开放解析函数');
@@ -11107,11 +10352,10 @@ ${P} .dga-rt-drawer.is-shown, ${P} .dga-nav-drawer.is-shown { animation: none; }
     debugRecord('系统', '准备注册酒馆事件监听', Object.keys(events).filter(key => ['GENERATION_AFTER_COMMANDS', 'GENERATION_STOPPED', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'CHAT_CHANGED'].includes(key)));
     if (events.GENERATION_AFTER_COMMANDS) {
         // v4.9.0：排在最前面（eventMakeFirst）。酒馆一个一个等监听器做完，所以先等我们判断完、条目换好，
-        // 后面数据库的剧情推进才开始规划，拿到的就是新的一段。
+        // 随后的生成读取世界书时，拿到的就是新的一段。
         const eventFirst = api('eventMakeFirst', false) || eventOn;
         eventFirst(events.GENERATION_AFTER_COMMANDS, function (type, params, dryRun) {
             debugRecord('事件', '收到 GENERATION_AFTER_COMMANDS', { type, dryRun: dryRun === true, quiet: Boolean(params && params.quiet_prompt), automaticTrigger: Boolean(params && params.automatic_trigger) });
-            databaseLinkInstall();
             // 不跳过 dryRun：提示词查看器等预组装也必须看到当前内容。
             // SillyTavern 会等待这个监听器返回的 Promise，所以把同步任务返回，赶上这一次生成。
             // v4.9.0：普通发送时先等判断 AI（发送时判断），dryRun 不问。
